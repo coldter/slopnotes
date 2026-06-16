@@ -1,0 +1,509 @@
+---
+title: OAuth2 Resource Server with Keycloak
+description: Configure a Spring Boot resource server that validates Keycloak-issued JWTs and maps realm roles to Spring Security authorities.
+sidebar:
+  order: 2
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Security & Auth"
+  href="/kotlin-backend/14-security-auth/"
+/>
+
+## Goal
+
+Run Keycloak as an identity provider and wire a Spring Boot app as an OAuth2
+**resource server** that validates the JWTs Keycloak issues — no password handling,
+no session, just "is this token signed by a trusted issuer, and what is it allowed
+to do?" This is the real-world split: a dedicated IdP mints tokens, your API only
+verifies them.
+
+In the previous exercise you issued your own JWTs and validated them with a shared
+secret. Here the tokens come from an **external** authority (Keycloak), and Spring
+fetches the issuer's public keys to verify signatures — your app never sees a
+password or a signing key.
+
+## What you'll build
+
+<Steps>
+
+1. A Keycloak instance (via Docker) holding a realm, a client, roles, and a test
+   user.
+2. A Spring Boot resource server pointed at Keycloak's `issuer-uri`, so Spring
+   auto-discovers the JWKS endpoint and validates token signatures.
+3. A converter that turns Keycloak's `realm_access.roles` claim into Spring
+   Security authorities (`ROLE_USER`, `ROLE_ADMIN`).
+4. Three endpoints: a public health check, an authenticated profile, and an
+   admin-only route guarded by `@PreAuthorize`.
+
+</Steps>
+
+If you've done this in TS (e.g. `express-jwt` + `jwks-rsa`) or Go
+(`coreos/go-oidc`), the moving parts are familiar: discover the issuer, pull the
+JWKS, verify the signature and `iss`/`exp` claims, then map claims to roles. Spring
+just does most of that from a single `issuer-uri` line.
+
+## How the flow works
+
+The resource server never talks to the user directly for credentials. The client
+gets a token from Keycloak; your API only verifies it and reads the public keys
+from Keycloak's JWKS endpoint (fetched once and cached).
+
+<Mermaid title="Token issuance and validation" height={560} code={`
+sequenceDiagram
+  participant C as Client (curl)
+  participant K as Keycloak (IdP :8180)
+  participant API as Resource Server (:8080)
+  C->>K: POST /token (username + password + client_secret)
+  K-->>C: access_token (signed JWT)
+  C->>API: GET /api/profile (Authorization: Bearer <jwt>)
+  Note over API: First request only
+  API->>K: GET /protocol/openid-connect/certs (JWKS)
+  K-->>API: public signing keys (cached)
+  API->>API: verify signature, iss, exp
+  API->>API: map realm_access.roles to ROLE_*
+  API-->>C: 200 + profile (or 401 / 403)
+`} />
+
+The `Authorization: Bearer <jwt>` header carries the token. The `realm_access`
+claim Keycloak embeds is what `KeycloakRoleConverter` reads to build authorities.
+
+## The worked solution
+
+A standard Spring Boot layout — the security wiring lives in two small classes
+under `config/`, plus one controller and the Keycloak `docker-compose.yml`.
+
+<FileTree>
+- oauth2-keycloak/
+  - build.gradle.kts Spring Boot + OAuth2 resource-server deps
+  - settings.gradle.kts project name
+  - docker-compose.yml Keycloak (dev mode) on port `8180`
+  - src/main/kotlin/com/example/oauth2/
+    - OAuth2Application.kt Spring Boot entry point
+    - config/
+      - **SecurityConfig.kt** filter chain + JWT validation
+      - **KeycloakRoleConverter.kt** maps realm roles to authorities
+    - controller/
+      - ProfileController.kt public / profile / admin endpoints
+  - src/main/resources/
+    - application.yml the `issuer-uri` — the whole config
+  - src/test/kotlin/com/example/oauth2/
+    - OAuth2SecurityTest.kt MockMvc auth tests
+</FileTree>
+
+### build.gradle.kts
+
+The one dependency that does the heavy lifting is
+`spring-boot-starter-oauth2-resource-server` — it brings the JWT decoder, JWKS
+fetching, and the `oauth2ResourceServer` DSL.
+
+```kotlin title="build.gradle.kts" {3-4,7}
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-security")
+    implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("org.springframework.security:spring-security-test")
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
+}
+```
+
+### application.yml — the entire JWT config
+
+This is the part that surprises people coming from Node or Go: validating tokens
+from a real IdP is **one line**. Spring takes the `issuer-uri`, hits
+`{issuer}/.well-known/openid-configuration`, discovers the JWKS endpoint, and
+caches the public keys. It also enforces that every token's `iss` claim matches.
+
+```yaml title="src/main/resources/application.yml" {7}
+spring:
+  application:
+    name: oauth2-keycloak-demo
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:8180/realms/task-app
+
+server:
+  port: 8080
+```
+
+### KeycloakRoleConverter.kt
+
+Spring validates the token but doesn't know *your* IdP's role format. Keycloak puts
+realm roles in a nested `realm_access.roles` claim, e.g.
+`{ "realm_access": { "roles": ["USER", "ADMIN"] } }`. Spring's default converter
+looks at `scope`/`scp` instead, so we write a `Converter<Jwt, Collection<GrantedAuthority>>`
+to read that claim and prefix each role with `ROLE_` (Spring's convention for
+`hasRole(...)`).
+
+```kotlin title="src/main/kotlin/com/example/oauth2/config/KeycloakRoleConverter.kt" {10-18}
+package com.example.oauth2.config
+
+import org.springframework.core.convert.converter.Converter
+import org.springframework.security.core.GrantedAuthority
+import org.springframework.security.core.authority.SimpleGrantedAuthority
+import org.springframework.security.oauth2.jwt.Jwt
+
+class KeycloakRoleConverter : Converter<Jwt, Collection<GrantedAuthority>> {
+
+    override fun convert(jwt: Jwt): Collection<GrantedAuthority> {
+        val realmAccess = jwt.getClaimAsMap("realm_access") ?: return emptyList()
+
+        @Suppress("UNCHECKED_CAST")
+        val roles = realmAccess["roles"] as? List<String> ?: return emptyList()
+
+        return roles.map { role ->
+            SimpleGrantedAuthority("ROLE_${role.uppercase()}")
+        }
+    }
+}
+```
+
+A few Kotlin idioms to notice if you're coming from TS/Go:
+
+- `jwt.getClaimAsMap("realm_access") ?: return emptyList()` — the elvis operator
+  `?:` does a null-guard-and-early-return in one line. The claim type is
+  `Map<String, Any>?`, so the `?:` handles the missing-claim case.
+- `realmAccess["roles"] as? List<String>` — `as?` is a *safe cast* that yields
+  `null` instead of throwing if the value isn't a list (think a non-panicking type
+  assertion in Go).
+- `"ROLE_${role.uppercase()}"` — a string template; `ROLE_` is the prefix Spring's
+  `hasRole("ADMIN")` expects (it checks for the authority `ROLE_ADMIN`).
+
+### SecurityConfig.kt
+
+The filter chain: which paths are public, which need a role, and how to validate
+JWTs. The `http { ... }` block is the Kotlin Security DSL (cleaner than the Java
+builder chains). `oauth2ResourceServer { jwt { ... } }` plugs in our custom role
+converter; `@EnableMethodSecurity` turns on the `@PreAuthorize` annotations used in
+the controller.
+
+```kotlin title="src/main/kotlin/com/example/oauth2/config/SecurityConfig.kt" {12-14,22-26,28-32}
+package com.example.oauth2.config
+
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity
+import org.springframework.security.config.annotation.web.builders.HttpSecurity
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity
+import org.springframework.security.config.annotation.web.invoke
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter
+import org.springframework.security.web.SecurityFilterChain
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+class SecurityConfig {
+
+    @Bean
+    fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
+        http {
+            csrf { disable() }
+
+            authorizeHttpRequests {
+                authorize("/api/public/**", permitAll)
+                authorize("/api/admin/**", hasRole("ADMIN"))
+                authorize("/api/**", authenticated)
+            }
+
+            oauth2ResourceServer {
+                jwt {
+                    jwtAuthenticationConverter = jwtAuthenticationConverter()
+                }
+            }
+        }
+        return http.build()
+    }
+
+    private fun jwtAuthenticationConverter(): JwtAuthenticationConverter {
+        val grantedAuthoritiesConverter = KeycloakRoleConverter()
+
+        return JwtAuthenticationConverter().apply {
+            setJwtGrantedAuthoritiesConverter(grantedAuthoritiesConverter)
+        }
+    }
+}
+```
+
+:::note[Rule ordering matters]
+`authorizeHttpRequests` rules match top-down, first-match-wins. The specific
+`/api/admin/**` (needs `ADMIN`) is listed *before* the catch-all `/api/**`
+(needs any authenticated user). Flip them and the admin guard would never fire,
+because `/api/**` would match the admin path first.
+:::
+
+### ProfileController.kt
+
+Three endpoints covering the three access levels. `@AuthenticationPrincipal jwt: Jwt`
+injects the validated token, so you can read claims like `subject` and
+`preferred_username` directly. The admin route is double-guarded — by the URL rule
+in `SecurityConfig` *and* by `@PreAuthorize` — to show both mechanisms.
+
+```kotlin title="src/main/kotlin/com/example/oauth2/controller/ProfileController.kt" {14-24,26-30,32-35}
+package com.example.oauth2.controller
+
+import org.springframework.security.access.prepost.PreAuthorize
+import org.springframework.security.core.annotation.AuthenticationPrincipal
+import org.springframework.security.oauth2.jwt.Jwt
+import org.springframework.web.bind.annotation.GetMapping
+import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RestController
+
+@RestController
+@RequestMapping("/api")
+class ProfileController {
+
+    @GetMapping("/profile")
+    fun getProfile(@AuthenticationPrincipal jwt: Jwt): Map<String, Any?> {
+        return mapOf(
+            "sub" to jwt.subject,
+            "email" to jwt.getClaimAsString("email"),
+            "name" to jwt.getClaimAsString("preferred_username"),
+            "roles" to extractRoles(jwt),
+            "issued_at" to jwt.issuedAt,
+            "expires_at" to jwt.expiresAt,
+        )
+    }
+
+    @GetMapping("/admin/users")
+    @PreAuthorize("hasRole('ADMIN')")
+    fun adminOnly(): Map<String, String> {
+        return mapOf("message" to "You have admin access")
+    }
+
+    @GetMapping("/public/health")
+    fun healthCheck(): Map<String, String> {
+        return mapOf("status" to "ok")
+    }
+
+    private fun extractRoles(jwt: Jwt): List<String> {
+        val realmAccess = jwt.getClaimAsMap("realm_access") ?: return emptyList()
+        @Suppress("UNCHECKED_CAST")
+        return realmAccess["roles"] as? List<String> ?: emptyList()
+    }
+}
+```
+
+### OAuth2Application.kt
+
+The standard Spring Boot entry point — nothing OAuth-specific here; auto-config
+wires the resource server from `application.yml`.
+
+```kotlin title="src/main/kotlin/com/example/oauth2/OAuth2Application.kt"
+package com.example.oauth2
+
+import org.springframework.boot.autoconfigure.SpringBootApplication
+import org.springframework.boot.runApplication
+
+@SpringBootApplication
+class OAuth2Application
+
+fun main(args: Array<String>) {
+    runApplication<OAuth2Application>(*args)
+}
+```
+
+### docker-compose.yml — Keycloak
+
+Keycloak runs in dev mode (`start-dev`, in-memory-ish, no HTTPS) on host port
+`8180` — matching the `issuer-uri`. The named volume persists your realm/users
+across restarts.
+
+```yaml title="docker-compose.yml"
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8180:8080"
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+
+volumes:
+  keycloak_data:
+```
+
+### The test — auth without a live Keycloak
+
+The tests use `@WithMockUser` to fake authorities, so they verify the
+*authorization* rules (public open, protected returns `401`, admin needs `ADMIN`,
+non-admin gets `403`) without standing up Keycloak. The `401` vs `403` distinction
+is worth internalizing: `401` = "not authenticated" (no/invalid token), `403` =
+"authenticated but not allowed".
+
+```kotlin title="src/test/kotlin/com/example/oauth2/OAuth2SecurityTest.kt" {17-24,32-40,42-47}
+package com.example.oauth2
+
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc
+import org.springframework.boot.test.context.SpringBootTest
+import org.springframework.security.test.context.support.WithMockUser
+import org.springframework.test.web.servlet.MockMvc
+import org.springframework.test.web.servlet.get
+import kotlin.test.Test
+
+@SpringBootTest
+@AutoConfigureMockMvc
+class OAuth2SecurityTest {
+
+    @Autowired lateinit var mockMvc: MockMvc
+
+    @Test
+    fun `public endpoint is accessible without auth`() {
+        mockMvc.get("/api/public/health")
+            .andExpect {
+                status { isOk() }
+                jsonPath("$.status") { value("ok") }
+            }
+    }
+
+    @Test
+    fun `protected endpoint returns 401 without auth`() {
+        mockMvc.get("/api/profile")
+            .andExpect { status { isUnauthorized() } }
+    }
+
+    @Test
+    @WithMockUser(username = "admin", roles = ["ADMIN"])
+    fun `admin endpoint accessible with ADMIN role`() {
+        mockMvc.get("/api/admin/users")
+            .andExpect {
+                status { isOk() }
+                jsonPath("$.message") { value("You have admin access") }
+            }
+    }
+
+    @Test
+    @WithMockUser(username = "user", roles = ["USER"])
+    fun `admin endpoint returns 403 for non-admin`() {
+        mockMvc.get("/api/admin/users")
+            .andExpect { status { isForbidden() } }
+    }
+}
+```
+
+## Set up Keycloak
+
+Start the IdP, then configure a realm, client, roles, and a test user through the
+admin console.
+
+<Steps>
+
+1. Start Keycloak (admin console comes up on `http://localhost:8180`, login
+   `admin` / `admin`):
+
+   ```bash
+   docker compose up -d
+   ```
+
+2. **Create the realm**: "Create Realm" → Name: `task-app`.
+
+3. **Create the client**: Clients → Create.
+   - Client ID: `task-api`
+   - Client authentication: **ON** (this makes it a confidential client with a
+     secret, which you'll need for the token request)
+   - Save
+
+4. **Create realm roles**: Realm roles → Create — add `USER` and `ADMIN`.
+
+5. **Create a user**: Users → Add user.
+   - Username: `testuser`, Email: `test@example.com`
+   - Credentials tab → set password `password123` (Temporary: **OFF**)
+   - Role Mapping tab → assign `USER`
+
+</Steps>
+
+:::note
+The realm name `task-app` must match the path in `application.yml`'s
+`issuer-uri` (`/realms/task-app`). Change one and you must change the other, or
+token validation fails with an issuer mismatch.
+:::
+
+## Run and test
+
+<Steps>
+
+1. Start the resource server (Keycloak must already be up from the step above):
+
+   ```bash
+   ./gradlew bootRun
+   ```
+
+2. Grab a token. The Resource Owner Password grant is fine for local testing only
+   — get the client secret from the Keycloak client's Credentials tab and drop it
+   in:
+
+   ```bash
+   TOKEN=$(curl -s -X POST http://localhost:8180/realms/task-app/protocol/openid-connect/token \
+     -H "Content-Type: application/x-www-form-urlencoded" \
+     -d "grant_type=password" \
+     -d "client_id=task-api" \
+     -d "client_secret=<your-client-secret>" \
+     -d "username=testuser" \
+     -d "password=password123" | jq -r '.access_token')
+
+   echo $TOKEN
+   ```
+
+3. Hit the endpoints. Public works with no token; profile needs the bearer token;
+   admin returns `403` for `testuser` (only has `USER`):
+
+   ```bash
+   # Public — no auth
+   curl http://localhost:8080/api/public/health
+
+   # Profile — needs a valid Keycloak JWT
+   curl http://localhost:8080/api/profile \
+     -H "Authorization: Bearer $TOKEN"
+
+   # Admin — needs the ADMIN role
+   curl http://localhost:8080/api/admin/users \
+     -H "Authorization: Bearer $TOKEN"
+   ```
+
+4. Run the (Keycloak-free) authorization tests:
+
+   ```bash
+   ./gradlew test
+   ```
+
+5. Tear it down when finished:
+
+   ```bash
+   docker compose down -v
+   ```
+
+</Steps>
+
+## What to take away
+
+- Spring Security validates JWTs from an external IdP off a single `issuer-uri` —
+  it discovers the JWKS endpoint and caches the public keys for you.
+- Keycloak realm roles arrive in a nested `realm_access.roles` claim; a small
+  `Converter` maps them to Spring's `ROLE_*` authorities.
+- `@PreAuthorize` and URL-based rules both read those authorities — use either or
+  both.
+- The key contrast with the previous exercise: self-issued JWTs are verified with
+  a shared secret you hold; IdP-issued JWTs are verified with the issuer's public
+  keys, and your app never handles a credential or signing key.
+
+:::tip[Stretch goals]
+- Add an `ADMIN` user (or assign `ADMIN` to `testuser`) and confirm the admin
+  endpoint now returns `200` with that token.
+- Import the realm from a JSON file (`--import-realm`) so the whole Keycloak setup
+  is reproducible instead of hand-clicked in the console.
+- Map Keycloak *client* roles (`resource_access.<client>.roles`) in addition to
+  realm roles.
+- Switch the token grant to the authorization-code flow with a real browser login
+  instead of the password grant.
+:::

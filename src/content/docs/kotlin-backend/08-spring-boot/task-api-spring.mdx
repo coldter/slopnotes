@@ -1,0 +1,636 @@
+---
+title: "Task Management CRUD API (Spring Boot)"
+description: Build a layered Spring Boot 3 REST API in Kotlin — controller, service, repository, DTO validation, and global error handling.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Spring Boot REST APIs"
+  href="/kotlin-backend/08-spring-boot/"
+/>
+
+## Goal
+
+Build a complete REST API for task management using Spring Boot 3.x with Kotlin —
+full CRUD, request validation, and centralized error handling, organized into the
+classic controller → service → repository layers. Module 09 builds the same API in
+Ktor, so you can compare the two frameworks head to head.
+
+If you've written an Express or NestJS app, the shape will feel familiar:
+annotations replace decorators, constructor injection replaces manual wiring, and
+the type system does the work that Zod/`io-ts` does in TS.
+
+## Requirements
+
+- Full CRUD: create, read, update, delete tasks.
+- Input validation with Jakarta Bean Validation (`@NotBlank`, `@Size`, `@Pattern`).
+- Global error handling with `@RestControllerAdvice` — no `try`/`catch` scattered
+  across controllers.
+- Type-safe configuration with `@ConfigurationProperties`.
+- Health check and metrics via Spring Actuator.
+- In-memory storage — no database needed for this exercise.
+- Unit and integration tests.
+
+### API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/tasks` | List all tasks |
+| `GET` | `/api/tasks/{id}` | Get a task by ID |
+| `POST` | `/api/tasks` | Create a new task |
+| `PUT` | `/api/tasks/{id}` | Update an existing task |
+| `DELETE` | `/api/tasks/{id}` | Delete a task |
+| `GET` | `/api/tasks/status/{status}` | Filter tasks by status |
+| `GET` | `/api/tasks/search?q=term` | Search tasks by title/description |
+| `GET` | `/actuator/health` | Health check |
+| `GET` | `/actuator/metrics` | Available metrics |
+
+## The worked solution
+
+A standard layered Spring Boot project. The package layout mirrors the
+responsibilities — one folder per layer:
+
+<FileTree>
+- task-api-spring/
+  - build.gradle.kts Spring Boot plugins + starters
+  - src/main/kotlin/com/example/taskapi/
+    - TaskApiApplication.kt entry point
+    - config/AppProperties.kt type-safe configuration
+    - controller/**TaskController.kt** REST endpoints
+    - dto/TaskDtos.kt request/response DTOs with validation
+    - exception/Exceptions.kt custom exception classes
+    - exception/GlobalExceptionHandler.kt centralized error handling
+    - model/Task.kt domain model
+    - repository/TaskRepository.kt in-memory data access
+    - service/TaskService.kt business logic
+  - src/main/resources/application.yml ports, actuator, app config
+  - src/test/kotlin/com/example/taskapi/ unit + integration tests
+</FileTree>
+
+The request flows down through the layers and the response bubbles back up:
+
+<Mermaid title="Request flow" height={360} code={`
+flowchart LR
+  Client["HTTP client"] -->|"JSON"| C["TaskController\n@RestController"]
+  C -->|"DTO"| S["TaskService\n@Service"]
+  S -->|"Task"| R["TaskRepository\nin-memory"]
+  R --> S
+  S -->|"TaskResponse"| C
+  C -->|"JSON"| Client
+  C -.->|"throws"| EH["GlobalExceptionHandler\n@RestControllerAdvice"]
+  S -.->|"throws"| EH
+`} />
+
+We'll show the key files — entity, DTOs, repository, service, controller, and the
+exception handler. The build file and tests round it out.
+
+### model/Task.kt — the domain model
+
+A Kotlin `data class` with defaults is the whole entity. There's no ORM here; the
+`id` defaults to a fresh UUID and the timestamps default to now, so creating a task
+is just `Task(title = "…")`. The two enums model the closed sets of valid states.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/model/Task.kt"
+package com.example.taskapi.model
+
+import java.time.Instant
+import java.util.UUID
+
+data class Task(
+    val id: String = UUID.randomUUID().toString(),
+    val title: String,
+    val description: String = "",
+    val status: TaskStatus = TaskStatus.TODO,
+    val priority: Priority = Priority.MEDIUM,
+    val createdAt: Instant = Instant.now(),
+    val updatedAt: Instant = Instant.now()
+)
+
+enum class TaskStatus {
+    TODO, IN_PROGRESS, DONE
+}
+
+enum class Priority {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+```
+
+:::note[Why a separate DTO instead of returning `Task`?]
+The domain `Task` uses `enum` types and is owned by the service. The wire format
+should be stable and string-based so clients aren't coupled to your enums. That's
+what `TaskResponse` below is for — the boundary between "what we store" and "what
+we send."
+:::
+
+### dto/TaskDtos.kt — request validation + response shaping
+
+The DTOs are where validation lives. The `@field:` annotations attach Jakarta Bean
+Validation rules to the constructor properties; Spring runs them automatically when
+the controller method is marked `@Valid`. Note `CreateTaskRequest` has non-null
+fields (everything required up front) while `UpdateTaskRequest` makes every field
+nullable — a `null` means "leave this field alone." The `Task.toResponse()`
+extension function maps the domain model to the wire DTO, turning enums into their
+`.name` strings.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/dto/TaskDtos.kt" {2-12,24-30,54-62}
+package com.example.taskapi.dto
+
+import com.example.taskapi.model.Task
+import jakarta.validation.constraints.NotBlank
+import jakarta.validation.constraints.Pattern
+import jakarta.validation.constraints.Size
+import java.time.Instant
+
+data class CreateTaskRequest(
+    @field:NotBlank(message = "Title is required")
+    @field:Size(min = 1, max = 200, message = "Title must be 1-200 characters")
+    val title: String,
+
+    @field:Size(max = 2000, message = "Description must be at most 2000 characters")
+    val description: String = "",
+
+    @field:Pattern(
+        regexp = "LOW|MEDIUM|HIGH|CRITICAL",
+        message = "Priority must be one of: LOW, MEDIUM, HIGH, CRITICAL"
+    )
+    val priority: String = "MEDIUM"
+)
+
+data class UpdateTaskRequest(
+    @field:Size(min = 1, max = 200, message = "Title must be 1-200 characters")
+    val title: String? = null,
+
+    @field:Size(max = 2000, message = "Description must be at most 2000 characters")
+    val description: String? = null,
+
+    @field:Pattern(
+        regexp = "TODO|IN_PROGRESS|DONE",
+        message = "Status must be one of: TODO, IN_PROGRESS, DONE"
+    )
+    val status: String? = null,
+
+    @field:Pattern(
+        regexp = "LOW|MEDIUM|HIGH|CRITICAL",
+        message = "Priority must be one of: LOW, MEDIUM, HIGH, CRITICAL"
+    )
+    val priority: String? = null
+)
+
+data class TaskResponse(
+    val id: String,
+    val title: String,
+    val description: String,
+    val status: String,
+    val priority: String,
+    val createdAt: Instant,
+    val updatedAt: Instant
+)
+
+fun Task.toResponse() = TaskResponse(
+    id = id,
+    title = title,
+    description = description,
+    status = status.name,
+    priority = priority.name,
+    createdAt = createdAt,
+    updatedAt = updatedAt
+)
+```
+
+:::tip[The `@field:` prefix matters]
+On a Kotlin constructor property, an annotation could target the parameter, the
+backing field, or the getter. Jakarta validation reads the *field*, so you must
+write `@field:NotBlank`. Drop the `@field:` and the rule silently does nothing —
+a classic Kotlin/Spring gotcha.
+:::
+
+### repository/TaskRepository.kt — data access behind an interface
+
+The repository is an `interface` plus an in-memory implementation backed by a
+`ConcurrentHashMap`. Coding the service against the interface (not the concrete
+class) means you could swap in a JDBC or JPA implementation later without touching
+the service. `findById` returns a nullable `Task?` — the Kotlin equivalent of
+`Optional<Task>`, and the service handles the null.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/repository/TaskRepository.kt" {8-16,18-20}
+package com.example.taskapi.repository
+
+import com.example.taskapi.model.Task
+import com.example.taskapi.model.TaskStatus
+import org.springframework.stereotype.Repository
+import java.util.concurrent.ConcurrentHashMap
+
+interface TaskRepository {
+    fun findAll(): List<Task>
+    fun findById(id: String): Task?
+    fun save(task: Task): Task
+    fun deleteById(id: String): Boolean
+    fun findByStatus(status: TaskStatus): List<Task>
+    fun search(query: String): List<Task>
+    fun count(): Int
+}
+
+@Repository
+class InMemoryTaskRepository : TaskRepository {
+    private val tasks = ConcurrentHashMap<String, Task>()
+
+    override fun findAll(): List<Task> =
+        tasks.values.sortedByDescending { it.createdAt }
+
+    override fun findById(id: String): Task? = tasks[id]
+
+    override fun save(task: Task): Task {
+        tasks[task.id] = task
+        return task
+    }
+
+    override fun deleteById(id: String): Boolean = tasks.remove(id) != null
+
+    override fun findByStatus(status: TaskStatus): List<Task> =
+        tasks.values.filter { it.status == status }.sortedByDescending { it.createdAt }
+
+    override fun search(query: String): List<Task> =
+        tasks.values.filter { task ->
+            task.title.contains(query, ignoreCase = true) ||
+                task.description.contains(query, ignoreCase = true)
+        }.sortedByDescending { it.createdAt }
+
+    override fun count(): Int = tasks.size
+}
+```
+
+### service/TaskService.kt — business logic
+
+The service holds the rules. It's a `@Service` with the repository injected through
+the constructor (`private val repository: TaskRepository`) — Spring sees one
+constructor and wires it automatically; no `@Autowired` needed. A few things worth
+calling out:
+
+- `findById` and `update` use the Elvis operator: `repository.findById(id) ?:
+  throw TaskNotFoundException(id)`. If the lookup returns `null`, throw — the
+  global handler turns it into a 404.
+- `update` uses `existing.copy(...)` with `request.field ?: existing.field` so a
+  `null` in the request means "keep the current value." That's the partial-update
+  pattern on an immutable `data class`.
+- `parseStatus` converts a user string to the `TaskStatus` enum and translates the
+  `IllegalArgumentException` from `valueOf` into a domain exception.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/service/TaskService.kt" {17-18,25-29,42-56,73-79}
+package com.example.taskapi.service
+
+import com.example.taskapi.dto.CreateTaskRequest
+import com.example.taskapi.dto.TaskResponse
+import com.example.taskapi.dto.UpdateTaskRequest
+import com.example.taskapi.dto.toResponse
+import com.example.taskapi.exception.InvalidTaskStatusException
+import com.example.taskapi.exception.TaskNotFoundException
+import com.example.taskapi.model.Priority
+import com.example.taskapi.model.Task
+import com.example.taskapi.model.TaskStatus
+import com.example.taskapi.repository.TaskRepository
+import org.slf4j.LoggerFactory
+import org.springframework.stereotype.Service
+import java.time.Instant
+
+@Service
+class TaskService(private val repository: TaskRepository) {
+
+    private val logger = LoggerFactory.getLogger(javaClass)
+
+    fun findAll(): List<TaskResponse> =
+        repository.findAll().map { it.toResponse() }
+
+    fun findById(id: String): TaskResponse {
+        val task = repository.findById(id)
+            ?: throw TaskNotFoundException(id)
+        return task.toResponse()
+    }
+
+    fun create(request: CreateTaskRequest): TaskResponse {
+        val task = Task(
+            title = request.title,
+            description = request.description,
+            priority = Priority.valueOf(request.priority)
+        )
+        val saved = repository.save(task)
+        logger.info("Created task: id={}, title={}", saved.id, saved.title)
+        return saved.toResponse()
+    }
+
+    fun update(id: String, request: UpdateTaskRequest): TaskResponse {
+        val existing = repository.findById(id)
+            ?: throw TaskNotFoundException(id)
+
+        val updated = existing.copy(
+            title = request.title ?: existing.title,
+            description = request.description ?: existing.description,
+            status = request.status?.let { parseStatus(it) } ?: existing.status,
+            priority = request.priority?.let { Priority.valueOf(it) } ?: existing.priority,
+            updatedAt = Instant.now()
+        )
+        val saved = repository.save(updated)
+        logger.info("Updated task: id={}", saved.id)
+        return saved.toResponse()
+    }
+
+    fun delete(id: String) {
+        if (!repository.deleteById(id)) {
+            throw TaskNotFoundException(id)
+        }
+        logger.info("Deleted task: id={}", id)
+    }
+
+    fun findByStatus(status: String): List<TaskResponse> {
+        val taskStatus = parseStatus(status)
+        return repository.findByStatus(taskStatus).map { it.toResponse() }
+    }
+
+    fun search(query: String): List<TaskResponse> =
+        repository.search(query).map { it.toResponse() }
+
+    private fun parseStatus(status: String): TaskStatus {
+        return try {
+            TaskStatus.valueOf(status.uppercase())
+        } catch (e: IllegalArgumentException) {
+            throw InvalidTaskStatusException(status)
+        }
+    }
+}
+```
+
+### controller/TaskController.kt — the HTTP layer
+
+The controller is thin: it maps HTTP verbs and paths to service calls and nothing
+else. `@RestController` means every return value is serialized to JSON (no view
+resolution). `@RequestMapping("/api/tasks")` prefixes every route. The interesting
+return type is `ResponseEntity<TaskResponse>` on create — it lets you set the
+`201 Created` status and a `Location` header. The other methods just return the
+DTO directly (Spring defaults to `200 OK`), and `deleteTask` uses
+`@ResponseStatus(HttpStatus.NO_CONTENT)` for a `204`.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/controller/TaskController.kt" {13-15,25-31,39-43}
+package com.example.taskapi.controller
+
+import com.example.taskapi.dto.CreateTaskRequest
+import com.example.taskapi.dto.TaskResponse
+import com.example.taskapi.dto.UpdateTaskRequest
+import com.example.taskapi.service.TaskService
+import jakarta.validation.Valid
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.annotation.*
+import java.net.URI
+
+@RestController
+@RequestMapping("/api/tasks")
+class TaskController(private val taskService: TaskService) {
+
+    @GetMapping
+    fun getAllTasks(): List<TaskResponse> =
+        taskService.findAll()
+
+    @GetMapping("/{id}")
+    fun getTask(@PathVariable id: String): TaskResponse =
+        taskService.findById(id)
+
+    @PostMapping
+    fun createTask(@Valid @RequestBody request: CreateTaskRequest): ResponseEntity<TaskResponse> {
+        val task = taskService.create(request)
+        return ResponseEntity
+            .created(URI.create("/api/tasks/${task.id}"))
+            .body(task)
+    }
+
+    @PutMapping("/{id}")
+    fun updateTask(
+        @PathVariable id: String,
+        @Valid @RequestBody request: UpdateTaskRequest
+    ): TaskResponse = taskService.update(id, request)
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    fun deleteTask(@PathVariable id: String) {
+        taskService.delete(id)
+    }
+
+    @GetMapping("/status/{status}")
+    fun getTasksByStatus(@PathVariable status: String): List<TaskResponse> =
+        taskService.findByStatus(status)
+
+    @GetMapping("/search")
+    fun searchTasks(@RequestParam q: String): List<TaskResponse> =
+        taskService.search(q)
+}
+```
+
+Notice what's *not* here: no `try`/`catch`, no status-code juggling for missing
+tasks. The controller assumes the happy path. When the service throws
+`TaskNotFoundException`, the next file catches it.
+
+### exception/GlobalExceptionHandler.kt — one place for all errors
+
+`@RestControllerAdvice` registers a class whose `@ExceptionHandler` methods run for
+exceptions thrown anywhere in the request pipeline. Each handler maps an exception
+type to an HTTP status and a consistent `ErrorResponse` body. The
+`MethodArgumentNotValidException` handler is special — Spring throws it when a
+`@Valid` DTO fails validation, and here we unpack the field errors into a
+`details` map so the client sees exactly which fields were wrong.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/exception/GlobalExceptionHandler.kt" {11-17,19-20,24-25,57-61}
+package com.example.taskapi.exception
+
+import org.slf4j.LoggerFactory
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.MethodArgumentNotValidException
+import org.springframework.web.bind.annotation.ExceptionHandler
+import org.springframework.web.bind.annotation.RestControllerAdvice
+import java.time.Instant
+
+data class ErrorResponse(
+    val status: Int,
+    val error: String,
+    val message: String,
+    val timestamp: Instant = Instant.now(),
+    val details: Map<String, String>? = null
+)
+
+@RestControllerAdvice
+class GlobalExceptionHandler {
+
+    private val logger = LoggerFactory.getLogger(javaClass)
+
+    @ExceptionHandler(TaskNotFoundException::class)
+    fun handleNotFound(ex: TaskNotFoundException): ResponseEntity<ErrorResponse> {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(
+            ErrorResponse(
+                status = 404,
+                error = "Not Found",
+                message = ex.message ?: "Resource not found"
+            )
+        )
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException::class)
+    fun handleValidation(ex: MethodArgumentNotValidException): ResponseEntity<ErrorResponse> {
+        val details = ex.bindingResult.fieldErrors.associate { error ->
+            error.field to (error.defaultMessage ?: "Invalid value")
+        }
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(
+            ErrorResponse(
+                status = 400,
+                error = "Validation Failed",
+                message = "Request validation failed",
+                details = details
+            )
+        )
+    }
+
+    @ExceptionHandler(Exception::class)
+    fun handleGeneric(ex: Exception): ResponseEntity<ErrorResponse> {
+        logger.error("Unhandled exception", ex)
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(
+            ErrorResponse(
+                status = 500,
+                error = "Internal Server Error",
+                message = "An unexpected error occurred"
+            )
+        )
+    }
+}
+```
+
+:::note[Trimmed for brevity]
+The real `GlobalExceptionHandler` also handles `InvalidTaskStatusException` (`400`)
+and `TaskLimitExceededException` (`409`) with the same pattern. The custom
+exceptions live in `exception/Exceptions.kt` — each is a small `RuntimeException`
+subclass like `class TaskNotFoundException(val taskId: String) :
+RuntimeException("Task not found: $taskId")`.
+:::
+
+### build.gradle.kts and configuration
+
+The build pulls in the Spring Boot plugins and the `web`, `actuator`, and
+`validation` starters. `jackson-module-kotlin` teaches Jackson to serialize Kotlin
+data classes; `kotlin("plugin.spring")` makes Spring-managed classes open so the
+framework can proxy them.
+
+```kotlin title="build.gradle.kts" {2-5,22-26}
+plugins {
+    kotlin("jvm") version "2.1.0"
+    kotlin("plugin.spring") version "2.1.0"
+    id("org.springframework.boot") version "3.4.1"
+    id("io.spring.dependency-management") version "1.1.7"
+}
+
+group = "com.example"
+version = "1.0.0"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+    implementation("org.springframework.boot:spring-boot-starter-validation")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+    implementation("org.jetbrains.kotlin:kotlin-reflect")
+
+    developmentOnly("org.springframework.boot:spring-boot-devtools")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+```
+
+Configuration lives in `application.yml` and is bound to the type-safe
+`AppProperties` data class via `@ConfigurationProperties(prefix = "app")` plus
+`@ConfigurationPropertiesScan` on the application class — so `app.max-tasks-per-user`
+becomes `AppProperties.maxTasksPerUser: Int`, validated at startup instead of read
+as a loose string.
+
+```yaml title="src/main/resources/application.yml"
+server:
+  port: 8080
+
+app:
+  name: Task Management API (Spring Boot)
+  version: 1.0.0
+  max-tasks-per-user: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+```
+
+## Run it
+
+No database needed — storage is in-memory, so there's nothing to spin up first.
+
+<Steps>
+
+1. Build and run the app:
+
+   ```bash
+   ./gradlew bootRun
+   ```
+
+2. Create a task:
+
+   ```bash
+   curl -X POST http://localhost:8080/api/tasks \
+     -H "Content-Type: application/json" \
+     -d '{"title": "Learn Spring Boot", "description": "Complete module 08", "priority": "HIGH"}'
+   ```
+
+3. List, search, and filter:
+
+   ```bash
+   curl http://localhost:8080/api/tasks
+   curl "http://localhost:8080/api/tasks/search?q=Spring"
+   curl http://localhost:8080/api/tasks/status/TODO
+   ```
+
+4. Check the health endpoint:
+
+   ```bash
+   curl http://localhost:8080/actuator/health
+   ```
+
+</Steps>
+
+### Test it
+
+The solution ships unit tests for the service and integration tests for the
+controller (using `MockMvc` from `spring-boot-starter-test`):
+
+```bash
+./gradlew test
+```
+
+## Stretch goals
+
+:::tip[Stretch goals]
+- Add a `PATCH /api/tasks/{id}` endpoint that updates only the provided fields.
+- Add pagination to `GET /api/tasks` with `?page=0&size=10`.
+- Add a custom health indicator that reports the total task count.
+- Add a request-logging filter that records method, path, status, and duration.
+- Add a `@Scheduled` task that logs statistics every 30 seconds.
+:::

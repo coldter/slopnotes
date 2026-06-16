@@ -1,0 +1,474 @@
+---
+title: Redis Rate Limiter
+description: Build fixed-window and sliding-window rate limiters with Redis and atomic Lua scripts, wired into a Spring MVC interceptor.
+sidebar:
+  order: 2
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Redis & Caching"
+  href="/kotlin-backend/11-redis-caching/"
+/>
+
+## Goal
+
+Build a rate limiter on top of Redis that supports two classic algorithms —
+**fixed window** (atomic `INCR` + `EXPIRE`) and **sliding window** (a sorted set
+of request timestamps) — and wire it into a Spring Boot app as a global MVC
+interceptor that returns a proper `429 Too Many Requests` with a `Retry-After`
+header.
+
+If you've reached for `express-rate-limit` in Node or a `golang.org/x/time/rate`
+limiter in Go, this is the distributed version: the counter lives in Redis, so
+every instance of your service shares one limit per client.
+
+## What you'll build
+
+<Steps>
+
+1. A `FixedWindowRateLimiter` backed by Redis `INCR` + `EXPIRE`.
+2. A `SlidingWindowRateLimiter` backed by a Redis sorted set (`ZSET`).
+3. A Spring MVC interceptor that applies a limit to every `/api/**` request.
+4. Client identification by **API key** (`X-API-Key` header) or **IP address**.
+5. A `429` response with a `Retry-After` header and a JSON error body.
+6. **Atomic** rate-limit checks using Redis Lua scripts (no race between the
+   read and the write).
+
+</Steps>
+
+The endpoints are simple: `/api/public` (limited by IP), `/api/protected`
+(limited by API key), and `/api/status`.
+
+| Method | URL | Description |
+|---|---|---|
+| GET | `/api/public` | Public endpoint (rate limited by IP) |
+| GET | `/api/protected` | Protected endpoint (rate limited by API key) |
+| GET | `/api/status` | Check the service status |
+
+## The worked solution
+
+A standard Spring Boot single-module project. The rate-limit logic lives in
+`ratelimit/`, the HTTP glue in `interceptor/` and `controller/`.
+
+<FileTree>
+- rate-limiter/
+  - build.gradle.kts Spring Boot + Data Redis
+  - settings.gradle.kts project name
+  - src/main/
+    - kotlin/com/example/
+      - Application.kt Spring Boot entry point
+      - config/
+        - RedisConfig.kt exposes a `StringRedisTemplate` bean
+      - ratelimit/
+        - **RateLimiter.kt** the interface + result type
+        - **FixedWindowRateLimiter.kt** INCR + EXPIRE via Lua
+        - **SlidingWindowRateLimiter.kt** sorted-set sliding window via Lua
+      - controller/
+        - ApiController.kt the three demo endpoints
+      - interceptor/
+        - **RateLimitInterceptor.kt** applies the limiter to `/api/**`
+    - resources/
+      - application.yml port + Redis connection
+</FileTree>
+
+### The contract
+
+Both limiters implement one interface. `isAllowed` takes a client `key`, a
+`limit`, and a window length in seconds, and returns whether the request is
+allowed plus how many requests remain and how long to wait. `RateLimitResult`
+is a plain `data class` — the same shape you'd return from a TS function or a
+Go struct.
+
+```kotlin title="src/main/kotlin/com/example/ratelimit/RateLimiter.kt"
+package com.example.ratelimit
+
+interface RateLimiter {
+    /**
+     * @param key unique identifier (e.g. IP address or API key)
+     * @param limit maximum number of requests allowed in the window
+     * @param windowSeconds duration of the rate-limit window in seconds
+     */
+    fun isAllowed(key: String, limit: Int, windowSeconds: Int): RateLimitResult
+}
+
+data class RateLimitResult(
+    val allowed: Boolean,
+    val remaining: Int,
+    val retryAfterSeconds: Long = 0
+)
+```
+
+### Fixed window: `INCR` + `EXPIRE`
+
+The fixed-window algorithm buckets time into fixed slices of `windowSeconds`. We
+derive the current bucket from the clock (`epochSeconds / windowSeconds`) and
+build a key like `rate:fixed:{client}:{bucket}`. Then we `INCR` that key — the
+first hit in a bucket returns `1`, so that's when we set the `EXPIRE`. If the
+count exceeds `limit`, the request is rejected until the bucket rolls over.
+
+The catch: a plain `INCR` followed by a separate `EXPIRE` is **two round-trips**,
+and if the process dies between them you get a key that never expires (a leaked
+counter). The fix is a **Lua script** — Redis runs it atomically as a single
+operation, so `INCR` and `EXPIRE` either both happen or neither does.
+
+The script increments, sets the TTL on first increment, reads the remaining TTL,
+and returns both the count and the TTL so we can compute `Retry-After`:
+
+```lua title="Lua: fixed-window check (atomic)"
+-- KEYS[1] = the bucket key   ARGV[1] = window seconds
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('TTL', KEYS[1])
+return {count, ttl}
+```
+
+In Kotlin we wrap that script in a `DefaultRedisScript` and run it with
+`redisTemplate.execute(...)`. Note the `@Component` annotation — Spring injects
+the `StringRedisTemplate` (configured in `RedisConfig`) automatically.
+
+```kotlin title="src/main/kotlin/com/example/ratelimit/FixedWindowRateLimiter.kt" {15-22,28-37,39-47}
+package com.example.ratelimit
+
+import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.data.redis.core.script.DefaultRedisScript
+import org.springframework.stereotype.Component
+
+/**
+ * Fixed Window Rate Limiter using Redis INCR + EXPIRE, made atomic with a
+ * Lua script (one round-trip, no leaked counters).
+ */
+@Component
+class FixedWindowRateLimiter(
+    private val redisTemplate: StringRedisTemplate
+) : RateLimiter {
+
+    // INCR the bucket; set the TTL only on the first hit; return count + ttl.
+    private val script = DefaultRedisScript(
+        """
+        local count = redis.call('INCR', KEYS[1])
+        if count == 1 then
+          redis.call('EXPIRE', KEYS[1], ARGV[1])
+        end
+        local ttl = redis.call('TTL', KEYS[1])
+        return {count, ttl}
+        """.trimIndent(),
+        List::class.java
+    )
+
+    override fun isAllowed(key: String, limit: Int, windowSeconds: Int): RateLimitResult {
+        // Bucket the clock into fixed windows of `windowSeconds`.
+        val window = System.currentTimeMillis() / (windowSeconds * 1000L)
+        val redisKey = "rate:fixed:$key:$window"
+
+        val result = redisTemplate.execute(
+            script,
+            listOf(redisKey),
+            windowSeconds.toString()
+        )
+
+        val count = (result?.get(0) as Long).toInt()
+        val ttl = (result[1] as Long)
+
+        val allowed = count <= limit
+        val remaining = (limit - count).coerceAtLeast(0)
+        return RateLimitResult(
+            allowed = allowed,
+            remaining = remaining,
+            retryAfterSeconds = if (allowed) 0 else ttl.coerceAtLeast(0)
+        )
+    }
+}
+```
+
+:::caution[The boundary-burst problem]
+Fixed windows are cheap but imprecise: a client can fire `limit` requests in the
+last millisecond of one window and another `limit` in the first millisecond of
+the next — `2 × limit` in a hair over zero seconds. That's what the sliding
+window fixes.
+:::
+
+### Sliding window: a sorted set of timestamps
+
+The sliding window keeps one Redis **sorted set** per client at
+`rate:sliding:{client}`, where every member is a request and its **score is the
+request timestamp in millis**. On each request we:
+
+1. Remove every member older than `now - windowSeconds * 1000` (`ZREMRANGEBYSCORE`).
+2. Count what's left (`ZCARD`).
+3. If the count is already at `limit`, reject — without adding the new request.
+4. Otherwise add the current request (`ZADD`) and refresh the key's TTL.
+
+Because the cleanup, the count, and the add must not interleave with another
+request, the whole thing is one Lua script. The member needs to be unique per
+request (two requests in the same millisecond would collide on score alone), so
+we pass a unique member id as an argument:
+
+```lua title="Lua: sliding-window check (atomic)"
+-- KEYS[1] = the ZSET key
+-- ARGV: now(ms), windowMs, limit, member, ttlSeconds
+local now    = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit  = tonumber(ARGV[3])
+
+-- Drop entries that have slid out of the window.
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+local count = redis.call('ZCARD', KEYS[1])
+
+if count >= limit then
+  -- Oldest surviving entry tells us when a slot frees up.
+  local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+  return {0, count, oldest[2]}
+end
+
+redis.call('ZADD', KEYS[1], now, ARGV[4])
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+return {1, count + 1, 0}
+```
+
+The Kotlin side computes the unique member, runs the script, and turns the
+returned `{allowed, count, oldestScore}` triple into a `RateLimitResult`. When
+rejected, `Retry-After` is how long until the oldest entry slides out:
+
+```kotlin title="src/main/kotlin/com/example/ratelimit/SlidingWindowRateLimiter.kt" {16-33,39-58}
+package com.example.ratelimit
+
+import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.data.redis.core.script.DefaultRedisScript
+import org.springframework.stereotype.Component
+import java.util.UUID
+
+/**
+ * Sliding Window Rate Limiter using a Redis sorted set of request timestamps.
+ * More accurate than fixed window — no boundary-burst problem.
+ */
+@Component
+class SlidingWindowRateLimiter(
+    private val redisTemplate: StringRedisTemplate
+) : RateLimiter {
+
+    private val script = DefaultRedisScript(
+        """
+        local now    = tonumber(ARGV[1])
+        local window = tonumber(ARGV[2])
+        local limit  = tonumber(ARGV[3])
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+        local count = redis.call('ZCARD', KEYS[1])
+        if count >= limit then
+          local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+          return {0, count, oldest[2]}
+        end
+        redis.call('ZADD', KEYS[1], now, ARGV[4])
+        redis.call('EXPIRE', KEYS[1], ARGV[5])
+        return {1, count + 1, 0}
+        """.trimIndent(),
+        List::class.java
+    )
+
+    override fun isAllowed(key: String, limit: Int, windowSeconds: Int): RateLimitResult {
+        val now = System.currentTimeMillis()
+        val windowMs = windowSeconds * 1000L
+        val redisKey = "rate:sliding:$key"
+        val member = "$now-${UUID.randomUUID()}"  // unique per request
+
+        val result = redisTemplate.execute(
+            script,
+            listOf(redisKey),
+            now.toString(),
+            windowMs.toString(),
+            limit.toString(),
+            member,
+            windowSeconds.toString()
+        )
+
+        val allowed = (result?.get(0) as Long) == 1L
+        val count = (result[1] as Long).toInt()
+        val oldestScore = (result[2] as? String)?.toLongOrNull() ?: now
+
+        val retryAfter = if (allowed) 0L else ((oldestScore + windowMs - now) / 1000).coerceAtLeast(1)
+        return RateLimitResult(
+            allowed = allowed,
+            remaining = (limit - count).coerceAtLeast(0),
+            retryAfterSeconds = retryAfter
+        )
+    }
+}
+```
+
+:::tip[Why a sorted set?]
+A `ZSET` gives you O(log n) range deletes by score, which is exactly "drop
+everything older than T." That's the data structure that makes a precise sliding
+window cheap — there's no equivalent in a plain counter.
+:::
+
+### Wiring it in: the MVC interceptor
+
+A Spring MVC `HandlerInterceptor` runs before every matched controller method —
+think Express middleware or a Go `http.Handler` wrapper. In `preHandle` we
+identify the client, call the limiter, attach the `X-RateLimit-*` headers, and
+short-circuit with a `429` (returning `false`) if the limit is blown.
+
+The `extractClientKey` helper prefers the `X-API-Key` header and falls back to
+the client IP (honouring `X-Forwarded-For` when behind a proxy).
+
+```kotlin title="src/main/kotlin/com/example/interceptor/RateLimitInterceptor.kt" {22-24,32-49,55-63}
+package com.example.interceptor
+
+import com.example.ratelimit.FixedWindowRateLimiter
+import com.fasterxml.jackson.databind.ObjectMapper
+import jakarta.servlet.http.HttpServletRequest
+import jakarta.servlet.http.HttpServletResponse
+import org.springframework.http.HttpStatus
+import org.springframework.http.MediaType
+import org.springframework.stereotype.Component
+import org.springframework.web.servlet.HandlerInterceptor
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer
+
+@Component
+class RateLimitInterceptor(
+    private val rateLimiter: FixedWindowRateLimiter,
+    private val objectMapper: ObjectMapper
+) : HandlerInterceptor {
+
+    companion object {
+        private const val DEFAULT_LIMIT = 10
+        private const val DEFAULT_WINDOW_SECONDS = 60
+    }
+
+    override fun preHandle(request: HttpServletRequest, response: HttpServletResponse, handler: Any): Boolean {
+        val clientKey = extractClientKey(request)
+        val result = rateLimiter.isAllowed(clientKey, DEFAULT_LIMIT, DEFAULT_WINDOW_SECONDS)
+
+        response.setHeader("X-RateLimit-Limit", DEFAULT_LIMIT.toString())
+        response.setHeader("X-RateLimit-Remaining", result.remaining.toString())
+
+        if (!result.allowed) {
+            response.status = HttpStatus.TOO_MANY_REQUESTS.value()
+            response.setHeader("Retry-After", result.retryAfterSeconds.toString())
+            response.contentType = MediaType.APPLICATION_JSON_VALUE
+            response.writer.write(
+                objectMapper.writeValueAsString(
+                    mapOf(
+                        "error" to "Too Many Requests",
+                        "message" to "Rate limit exceeded. Try again in ${result.retryAfterSeconds} seconds.",
+                        "retryAfter" to result.retryAfterSeconds
+                    )
+                )
+            )
+            return false
+        }
+        return true
+    }
+
+    private fun extractClientKey(request: HttpServletRequest): String {
+        // Prefer API key if present, otherwise fall back to IP address.
+        val apiKey = request.getHeader("X-API-Key")
+        if (!apiKey.isNullOrBlank()) {
+            return "apikey:$apiKey"
+        }
+        val ip = request.getHeader("X-Forwarded-For")?.split(",")?.firstOrNull()?.trim()
+            ?: request.remoteAddr
+        return "ip:$ip"
+    }
+}
+
+@Component
+class WebConfig(private val rateLimitInterceptor: RateLimitInterceptor) : WebMvcConfigurer {
+    override fun addInterceptors(registry: InterceptorRegistry) {
+        registry.addInterceptor(rateLimitInterceptor)
+            .addPathPatterns("/api/**")
+    }
+}
+```
+
+The interceptor injects the `FixedWindowRateLimiter` by type. To switch the whole
+app to the sliding-window strategy, change that one constructor parameter to
+`SlidingWindowRateLimiter` (both are `@Component`s implementing the same
+`RateLimiter` interface) — or inject the `RateLimiter` interface and select the
+bean with `@Qualifier`.
+
+### Supporting pieces
+
+`RedisConfig` exposes the `StringRedisTemplate` the limiters depend on, and
+`application.yml` sets the port and Redis connection.
+
+```kotlin title="src/main/kotlin/com/example/config/RedisConfig.kt"
+package com.example.config
+
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.data.redis.connection.RedisConnectionFactory
+import org.springframework.data.redis.core.StringRedisTemplate
+
+@Configuration
+class RedisConfig {
+    @Bean
+    fun stringRedisTemplate(connectionFactory: RedisConnectionFactory): StringRedisTemplate {
+        return StringRedisTemplate(connectionFactory)
+    }
+}
+```
+
+```yaml title="src/main/resources/application.yml"
+server:
+  port: 8083
+
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 5000
+```
+
+## Run it
+
+<Steps>
+
+1. Start Redis from the shared infra (the app talks to it on `localhost:6379`):
+
+   ```bash
+   cd shared-infra
+   docker compose up -d redis
+   ```
+
+2. Start the app — it listens on port `8083`:
+
+   ```bash
+   ./gradlew bootRun
+   ```
+
+3. Hammer the public endpoint past its limit (10 requests/minute by IP) and
+   watch the `429` kick in:
+
+   ```bash
+   for i in $(seq 1 12); do
+     echo "Request $i:"
+     curl -s -w "\nHTTP Status: %{http_code}\n" http://localhost:8083/api/public
+     echo "---"
+   done
+   ```
+
+4. After the 10th request you'll get `429 Too Many Requests` — check the
+   `Retry-After` header. The protected endpoint is keyed by API key instead:
+
+   ```bash
+   curl -H "X-API-Key: my-key" http://localhost:8083/api/protected
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- Make the limit configurable **per endpoint** (e.g. an annotation that the
+  interceptor reads) instead of one global `DEFAULT_LIMIT`.
+- Add a **token-bucket** limiter as a third `RateLimiter` implementation and
+  benchmark burst behaviour against the two windows.
+- Expose the chosen algorithm via `@Qualifier` / config so it's swappable
+  without editing the interceptor.
+- Emit `X-RateLimit-Reset` (the epoch second when the window resets) alongside
+  the existing headers.
+:::

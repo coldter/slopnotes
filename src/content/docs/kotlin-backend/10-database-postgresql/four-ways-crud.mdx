@@ -1,0 +1,604 @@
+---
+title: Four Ways to CRUD
+description: Implement the same User CRUD operations with JDBC, JPA, Exposed, and jOOQ, then compare the developer experience side by side.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← PostgreSQL Access"
+  href="/kotlin-backend/10-database-postgresql/"
+/>
+
+## Goal
+
+Implement the exact same `User` CRUD operations four different ways — raw JDBC,
+Spring Data JPA, JetBrains Exposed, and jOOQ — against one PostgreSQL table, and
+feel the trade-offs in your fingers. Same table, same DTO, same REST endpoints;
+four very different code shapes. By the end you'll have an opinion about which
+one you'd reach for, and why.
+
+This is the JVM version of a debate every backend dev has had: hand-written SQL
+(`database/sql` in Go, `pg` in Node) vs. an ORM (`gorm`, Prisma, TypeORM) vs. a
+type-safe query builder (`sqlc`, Knex, Kysely).
+
+## What you'll build
+
+A single Spring Boot app that wires up the same table behind four repositories,
+each exposed under its own path prefix so you can `curl` them side by side:
+
+| Approach | What it is | Closest TS/Go analogue | Base URL |
+|---|---|---|---|
+| JDBC | Raw SQL strings + manual row mapping | `database/sql` (Go), `pg` (Node) | `/api/jdbc/users` |
+| JPA | Full ORM, entities, dirty checking | `gorm`, Prisma, TypeORM | `/api/jpa/users` |
+| Exposed | Kotlin DSL query builder | Knex / Kysely (TS) | `/api/exposed/users` |
+| jOOQ | Type-safe SQL from generated code | `sqlc` (Go) | `/api/jooq/users` |
+
+All four read and write the **same** Postgres table and map into the **same**
+shared DTO, so the only thing that changes between them is the access library.
+
+### The shared pieces
+
+One migration creates the table. Flyway runs it on startup.
+
+```sql title="src/main/resources/db/migration/V1__create_users_table.sql"
+CREATE TABLE IF NOT EXISTS mod10_database.users (
+    id          BIGSERIAL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    email       VARCHAR(255) NOT NULL UNIQUE,
+    active      BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_email ON mod10_database.users (email);
+CREATE INDEX IF NOT EXISTS idx_users_active ON mod10_database.users (active);
+```
+
+One set of plain Kotlin data classes is the common currency. Every repository
+returns a `UserDTO`, no matter how it talks to the database — so the controller
+never has to care which backend it's hitting.
+
+```kotlin title="src/main/kotlin/com/example/model/User.kt"
+package com.example.model
+
+import java.time.Instant
+
+/**
+ * Shared DTO used by all four approaches.
+ * Each approach maps from their own representation to this DTO.
+ */
+data class UserDTO(
+    val id: Long = 0,
+    val name: String,
+    val email: String,
+    val active: Boolean = true,
+    val createdAt: Instant? = null
+)
+
+data class CreateUserRequest(
+    val name: String,
+    val email: String
+)
+
+data class UpdateUserRequest(
+    val name: String,
+    val email: String,
+    val active: Boolean
+)
+```
+
+## The worked solution
+
+A single Spring Boot module holds all four repositories side by side, plus one
+controller that fans the same REST API out to each.
+
+<FileTree>
+- four-ways-crud/
+  - build.gradle.kts Spring Boot, JPA, Exposed, jOOQ deps
+  - settings.gradle.kts project name
+  - src/main/
+    - kotlin/com/example/
+      - **Application.kt** Spring Boot entrypoint plus the shared REST controller
+      - model/User.kt shared `UserDTO` and request DTOs
+      - jdbc/UserJdbcRepository.kt raw SQL via `JdbcTemplate`
+      - jpa/UserJpaEntity.kt JPA `@Entity`
+      - jpa/UserJpaRepository.kt Spring Data repository interface
+      - exposed/UserExposedRepository.kt Exposed table object plus DSL repository
+      - jooq/UserJooqRepository.kt jOOQ `DSLContext` repository
+    - resources/
+      - application.yml datasource, JPA, Flyway config
+      - db/migration/V1__create_users_table.sql the schema
+</FileTree>
+
+### The same five operations, four ways
+
+Here is the heart of the exercise: `create`, `findById`, `findAll`, `update`,
+and `delete`, written once per library. Flip the tabs and watch the same five
+operations change shape. The amount of code goes **up** as you give up magic and
+take back control of the SQL.
+
+<Tabs syncKey="dbaccess">
+  <TabItem label="JDBC">
+
+Raw SQL strings and a hand-written `RowMapper`. There is no magic: you write
+the `INSERT`, you pull each column out of the `ResultSet` by name, you read the
+affected-row count yourself. This is exactly Go's `database/sql` or Node's `pg`
+— maximum control, maximum boilerplate. Note the `GeneratedKeyHolder` dance just
+to get the new `id` back.
+
+```kotlin title="src/main/kotlin/com/example/jdbc/UserJdbcRepository.kt"
+package com.example.jdbc
+
+import com.example.model.UserDTO
+import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.jdbc.core.RowMapper
+import org.springframework.jdbc.support.GeneratedKeyHolder
+import org.springframework.stereotype.Repository
+import java.sql.Statement
+
+@Repository
+class UserJdbcRepository(private val jdbcTemplate: JdbcTemplate) {
+
+    private val rowMapper = RowMapper<UserDTO> { rs, _ ->
+        UserDTO(
+            id = rs.getLong("id"),
+            name = rs.getString("name"),
+            email = rs.getString("email"),
+            active = rs.getBoolean("active"),
+            createdAt = rs.getTimestamp("created_at").toInstant()
+        )
+    }
+
+    fun create(name: String, email: String): UserDTO {
+        val keyHolder = GeneratedKeyHolder()
+        jdbcTemplate.update({ conn ->
+            val stmt = conn.prepareStatement(
+                "INSERT INTO mod10_database.users (name, email) VALUES (?, ?)",
+                Statement.RETURN_GENERATED_KEYS
+            )
+            stmt.setString(1, name)
+            stmt.setString(2, email)
+            stmt
+        }, keyHolder)
+
+        val id = keyHolder.keys?.get("id") as Long
+        return findById(id)!!
+    }
+
+    fun findById(id: Long): UserDTO? {
+        val results = jdbcTemplate.query(
+            "SELECT * FROM mod10_database.users WHERE id = ?",
+            rowMapper,
+            id
+        )
+        return results.firstOrNull()
+    }
+
+    fun findAll(): List<UserDTO> {
+        return jdbcTemplate.query("SELECT * FROM mod10_database.users ORDER BY id", rowMapper)
+    }
+
+    fun update(id: Long, name: String, email: String, active: Boolean): Boolean {
+        val rows = jdbcTemplate.update(
+            "UPDATE mod10_database.users SET name = ?, email = ?, active = ? WHERE id = ?",
+            name, email, active, id
+        )
+        return rows > 0
+    }
+
+    fun delete(id: Long): Boolean {
+        return jdbcTemplate.update("DELETE FROM mod10_database.users WHERE id = ?", id) > 0
+    }
+}
+```
+
+  </TabItem>
+  <TabItem label="JPA">
+
+The ORM end of the spectrum. You declare an `@Entity` and then you barely write
+any query code at all — `JpaRepository<UserJpaEntity, Long>` gives you `save`,
+`findById`, `findAll`, `deleteById`, `existsById` for free, and derived queries
+like `findByEmail` are generated from the method name. The cost is hidden
+behavior: a persistence context, dirty checking, lazy loading, and SQL you
+didn't write. This is `gorm`/Prisma/TypeORM territory.
+
+First the entity — note it's a mutable `class` (not a `data class`), with
+custom `equals`/`hashCode` keyed on the database `id`, which is the JPA-correct
+way to avoid the identity pitfalls of entities:
+
+```kotlin title="src/main/kotlin/com/example/jpa/UserJpaEntity.kt"
+package com.example.jpa
+
+import jakarta.persistence.*
+import java.time.Instant
+
+@Entity
+@Table(name = "users", schema = "mod10_database")
+class UserJpaEntity(
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    val id: Long = 0,
+
+    @Column(nullable = false)
+    var name: String = "",
+
+    @Column(nullable = false, unique = true)
+    var email: String = "",
+
+    @Column(nullable = false)
+    var active: Boolean = true,
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    val createdAt: Instant = Instant.now()
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is UserJpaEntity) return false
+        return id != 0L && id == other.id
+    }
+
+    override fun hashCode(): Int = id.hashCode()
+
+    override fun toString(): String = "UserJpaEntity(id=$id, name=$name, email=$email)"
+}
+```
+
+Then the repository — an interface with no body. Spring Data writes the
+implementation for you at startup:
+
+```kotlin title="src/main/kotlin/com/example/jpa/UserJpaRepository.kt"
+package com.example.jpa
+
+import org.springframework.data.jpa.repository.JpaRepository
+
+interface UserJpaRepository : JpaRepository<UserJpaEntity, Long> {
+    fun findByEmail(email: String): UserJpaEntity?
+    fun findByActiveTrue(): List<UserJpaEntity>
+}
+```
+
+  </TabItem>
+  <TabItem label="Exposed">
+
+JetBrains' Kotlin-native query builder. You describe the table once as a Kotlin
+`object`, then build queries with a typed DSL — `insert`, `selectAll`,
+`update`, `deleteWhere` — that reads like SQL but is real Kotlin code the
+compiler checks. This is the Knex/Kysely sweet spot: no string SQL, no full ORM,
+just typed queries. The `@Transactional` annotations come from the Exposed
+Spring Boot starter, which binds each call to a Spring-managed transaction.
+
+```kotlin title="src/main/kotlin/com/example/exposed/UserExposedRepository.kt"
+package com.example.exposed
+
+import com.example.model.UserDTO
+import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.javatime.timestamp
+import org.springframework.stereotype.Repository
+import org.springframework.transaction.annotation.Transactional
+
+// Exposed table definition
+object UsersTable : Table("mod10_database.users") {
+    val id = long("id").autoIncrement()
+    val name = varchar("name", 255)
+    val email = varchar("email", 255)
+    val active = bool("active").default(true)
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+@Repository
+@Transactional
+class UserExposedRepository {
+
+    fun create(name: String, email: String): UserDTO {
+        val id = UsersTable.insert {
+            it[UsersTable.name] = name
+            it[UsersTable.email] = email
+        } get UsersTable.id
+
+        return findById(id)!!
+    }
+
+    @Transactional(readOnly = true)
+    fun findById(id: Long): UserDTO? {
+        return UsersTable
+            .selectAll()
+            .where { UsersTable.id eq id }
+            .map { it.toUserDTO() }
+            .singleOrNull()
+    }
+
+    @Transactional(readOnly = true)
+    fun findAll(): List<UserDTO> {
+        return UsersTable
+            .selectAll()
+            .orderBy(UsersTable.id)
+            .map { it.toUserDTO() }
+    }
+
+    fun update(id: Long, name: String, email: String, active: Boolean): Boolean {
+        val updated = UsersTable.update({ UsersTable.id eq id }) {
+            it[UsersTable.name] = name
+            it[UsersTable.email] = email
+            it[UsersTable.active] = active
+        }
+        return updated > 0
+    }
+
+    fun delete(id: Long): Boolean {
+        return UsersTable.deleteWhere { UsersTable.id eq id } > 0
+    }
+
+    private fun ResultRow.toUserDTO() = UserDTO(
+        id = this[UsersTable.id],
+        name = this[UsersTable.name],
+        email = this[UsersTable.email],
+        active = this[UsersTable.active],
+        createdAt = this[UsersTable.createdAt]
+    )
+}
+```
+
+  </TabItem>
+  <TabItem label="jOOQ">
+
+The fourth way, and the bonus in this exercise. jOOQ is the closest JVM
+equivalent to Go's `sqlc`: you point a code generator at your real database
+schema, and it emits typed Kotlin/Java classes — here `USERS` with `USERS.ID`,
+`USERS.NAME` and friends. You then write SQL through a fluent, fully type-safe
+`DSLContext`. If you rename a column and regenerate, the queries that reference
+it stop compiling. Spring Boot auto-configures the `DSLContext` bean when
+`spring-boot-starter-jooq` is on the classpath, so the repository just injects
+it.
+
+```kotlin title="src/main/kotlin/com/example/jooq/UserJooqRepository.kt"
+package com.example.jooq
+
+import com.example.generated.tables.references.USERS
+import com.example.model.UserDTO
+import org.jooq.DSLContext
+import org.jooq.Record
+import org.springframework.stereotype.Repository
+
+@Repository
+class UserJooqRepository(private val dsl: DSLContext) {
+
+    fun create(name: String, email: String): UserDTO {
+        val id = dsl.insertInto(USERS)
+            .set(USERS.NAME, name)
+            .set(USERS.EMAIL, email)
+            .returning(USERS.ID)
+            .fetchOne()!!
+            .id
+
+        return findById(id)!!
+    }
+
+    fun findById(id: Long): UserDTO? {
+        return dsl.selectFrom(USERS)
+            .where(USERS.ID.eq(id))
+            .fetchOne()
+            ?.toUserDTO()
+    }
+
+    fun findAll(): List<UserDTO> {
+        return dsl.selectFrom(USERS)
+            .orderBy(USERS.ID)
+            .fetch()
+            .map { it.toUserDTO() }
+    }
+
+    fun update(id: Long, name: String, email: String, active: Boolean): Boolean {
+        val rows = dsl.update(USERS)
+            .set(USERS.NAME, name)
+            .set(USERS.EMAIL, email)
+            .set(USERS.ACTIVE, active)
+            .where(USERS.ID.eq(id))
+            .execute()
+        return rows > 0
+    }
+
+    fun delete(id: Long): Boolean {
+        return dsl.deleteFrom(USERS)
+            .where(USERS.ID.eq(id))
+            .execute() > 0
+    }
+
+    private fun Record.toUserDTO() = UserDTO(
+        id = this[USERS.ID]!!,
+        name = this[USERS.NAME]!!,
+        email = this[USERS.EMAIL]!!,
+        active = this[USERS.ACTIVE]!!,
+        createdAt = this[USERS.CREATED_AT]?.toInstant(java.time.ZoneOffset.UTC)
+    )
+}
+```
+
+:::note[jOOQ needs code generation first]
+Unlike the other three, jOOQ won't compile until you run its generator against
+a live (or migrated) schema to produce the `USERS` reference. Add the
+`org.jooq.jooq-codegen-gradle` plugin, point it at your Postgres URL, and run
+`./gradlew jooqCodegen`. See the
+[jOOQ section of the lesson](/kotlin-backend/10-database-postgresql/#jooq-type-safe-sql)
+for the full Gradle setup. That generation step is the price of jOOQ's
+compile-time safety — and exactly what makes it feel like `sqlc`.
+:::
+
+  </TabItem>
+</Tabs>
+
+### One controller, four backends
+
+The controller is deliberately dumb: it just delegates the same five operations
+to each repository under a different prefix, mapping everything to the shared
+`UserDTO`. This is what lets you `curl` `/api/jdbc/users` and `/api/jpa/users`
+and get identical responses from completely different machinery.
+
+```kotlin title="src/main/kotlin/com/example/Application.kt" {32-38,40-68}
+@RestController
+@RequestMapping("/api")
+class UserController(
+    private val jdbcRepo: UserJdbcRepository,
+    private val jpaRepo: UserJpaRepository,
+    private val exposedRepo: UserExposedRepository
+) {
+
+    // ==================== JDBC ====================
+
+    @PostMapping("/jdbc/users")
+    fun jdbcCreate(@RequestBody req: CreateUserRequest): ResponseEntity<UserDTO> {
+        val user = jdbcRepo.create(req.name, req.email)
+        return ResponseEntity.status(HttpStatus.CREATED).body(user)
+    }
+
+    @GetMapping("/jdbc/users")
+    fun jdbcList(): List<UserDTO> = jdbcRepo.findAll()
+
+    @GetMapping("/jdbc/users/{id}")
+    fun jdbcGet(@PathVariable id: Long): ResponseEntity<UserDTO> {
+        val user = jdbcRepo.findById(id) ?: return ResponseEntity.notFound().build()
+        return ResponseEntity.ok(user)
+    }
+
+    // ... jpaCreate / jpaList / jpaGet ... mirror these under /jpa/users
+    // ... exposedCreate / exposedList / ... mirror these under /exposed/users
+}
+```
+
+The JPA branch is the one place the controller does extra work: because JPA
+deals in `UserJpaEntity`, an extension function maps it back to the shared DTO,
+and the create/update handlers are `@Transactional` so the persistence context
+flushes correctly.
+
+```kotlin title="src/main/kotlin/com/example/Application.kt"
+// Extension to convert JPA entity to DTO
+private fun UserJpaEntity.toDTO() = UserDTO(
+    id = id,
+    name = name,
+    email = email,
+    active = active,
+    createdAt = createdAt
+)
+```
+
+### What changed, and what it tells you
+
+Read top to bottom and the trade-off is physical:
+
+- **JDBC** — most lines, all explicit. You own every SQL string and every column
+  read. Zero magic, zero surprises, but you maintain the mapping by hand and a
+  typo in a column name is a runtime error.
+- **JPA** — fewest lines: the repository is an empty interface. The price is the
+  most hidden behavior — a managed persistence context, dirty checking, lazy
+  loading. Great for standard CRUD, frustrating when you need to reason about the
+  exact SQL.
+- **Exposed** — Kotlin-native middle ground. Typed queries, no string SQL, no
+  full ORM. The table `object` is the single source of truth and the DSL reads
+  like the SQL it generates.
+- **jOOQ** — type safety rooted in your *actual* schema. The generator means the
+  compiler knows your columns; rename one and the build breaks instead of
+  production. The cost is the generation step in your build.
+
+There's no universal winner. JPA for boring CRUD, JDBC/jOOQ when you need to own
+the SQL (reporting, complex joins, performance), Exposed when you want idiomatic
+Kotlin without buying into a full ORM. A real Spring Boot app can mix them —
+JPA for entities, jOOQ for the gnarly reporting query — over the same
+`DataSource`.
+
+## Configuration
+
+The datasource, JPA, and Flyway settings live in one file. Note
+`ddl-auto: validate` (Flyway owns the schema; Hibernate only checks it matches)
+and `show-sql: true` so you can watch the SQL each approach actually emits.
+
+```yaml title="src/main/resources/application.yml"
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/kotlin_course
+    username: dev
+    password: dev
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        default_schema: mod10_database
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    schemas: mod10_database
+    baseline-on-migrate: true
+
+server:
+  port: 8080
+```
+
+## Run and test
+
+<Steps>
+
+1. Start PostgreSQL from the shared infra (one-time per session):
+
+   ```bash
+   cd shared-infra
+   docker compose up -d postgres
+   ```
+
+2. Run the app — Flyway applies the migration on startup:
+
+   ```bash
+   ./gradlew bootRun
+   ```
+
+3. Create the same user through each prefix and watch the SQL log differ:
+
+   ```bash
+   curl -X POST http://localhost:8080/api/jdbc/users \
+     -H "Content-Type: application/json" \
+     -d '{"name": "Alice", "email": "alice@example.com"}'
+   ```
+
+4. List, get by id, update, and delete — the API is identical across prefixes:
+
+   ```bash
+   curl http://localhost:8080/api/jpa/users
+   curl http://localhost:8080/api/exposed/users/1
+
+   curl -X PUT http://localhost:8080/api/jdbc/users/1 \
+     -H "Content-Type: application/json" \
+     -d '{"name": "Alice Updated", "email": "alice@example.com", "active": true}'
+
+   curl -X DELETE http://localhost:8080/api/jpa/users/1
+   ```
+
+</Steps>
+
+:::tip[Watch the SQL]
+With `spring.jpa.show-sql: true`, every JPA call prints the SQL Hibernate
+generated. Run the same create/update through JDBC, Exposed, and JPA and compare
+the console output — it's the fastest way to build intuition for what each layer
+is actually doing on your behalf.
+:::
+
+## Stretch goals
+
+:::tip[Stretch goals]
+- Add a `findByEmail` method to all four repositories. (JPA already has it as a
+  derived query — see how much more code it takes in the other three.)
+- Add a `countActiveUsers` method to all four repositories.
+- Wire up jOOQ as the fourth live approach: add the codegen plugin, generate
+  against the migrated schema, and expose it under `/api/jooq/users` next to the
+  others.
+- Run the same operation through every prefix and diff the SQL each one emits.
+:::

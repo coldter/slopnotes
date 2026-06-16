@@ -1,0 +1,481 @@
+---
+title: API Caching Layer
+description: Add a Redis cache-aside layer to a Spring Boot Products API using @Cacheable, @CachePut, and @CacheEvict.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Redis & Caching"
+  href="/kotlin-backend/11-redis-caching/"
+/>
+
+## Goal
+
+Take a plain Spring Boot Products REST API (Postgres-backed) and bolt on a Redis
+caching layer using Spring's declarative cache annotations. You write zero
+hand-rolled `GET`/`SET` Redis calls — `@Cacheable`, `@CachePut`, and `@CacheEvict`
+turn the cache-aside pattern into annotations on your service methods, and Spring
+handles the lookup → miss → load → store dance for you.
+
+## What you'll build
+
+A `ProductService` whose read methods are cached and whose writes keep the cache
+coherent:
+
+| Method | URL | Cache behavior |
+|---|---|---|
+| GET | `/api/products` | No caching (always fresh) |
+| GET | `/api/products/{id}` | Cached (`@Cacheable`) |
+| GET | `/api/products/category/{cat}` | Cached (`@Cacheable`) |
+| POST | `/api/products` | Writes through (`@CachePut` + evicts category cache) |
+| PUT | `/api/products/{id}` | Writes through (`@CachePut` + evicts category cache) |
+| DELETE | `/api/products/{id}` | Evicts (`@CacheEvict`) |
+
+If you're coming from TS/Go: this is the same cache-aside pattern you'd write by
+hand around a `redis.get(key) ?? loadFromDb()`, except Spring weaves it in via AOP
+proxies — the annotation IS the wiring. The TTLs live in config, not scattered
+through call sites.
+
+## How cache-aside reads work
+
+A `@Cacheable` method is intercepted by a proxy. On each call Spring computes a
+key, checks Redis first, and only runs your method body on a miss — then stores
+the return value before handing it back.
+
+<Mermaid title="Cache-aside read path" code={`
+sequenceDiagram
+  participant C as Controller
+  participant P as Cache proxy
+  participant R as Redis
+  participant S as Service body
+  participant DB as Postgres
+  C->>P: getProduct(1)
+  P->>R: GET products::1
+  alt cache hit
+    R-->>P: cached ProductDTO
+    P-->>C: return (no DB query)
+  else cache miss
+    R-->>P: nil
+    P->>S: run method body
+    S->>DB: findById(1)
+    DB-->>S: Product row
+    S-->>P: ProductDTO
+    P->>R: SET products::1 (TTL 30m)
+    P-->>C: return
+  end
+`} height={460} />
+
+## The worked solution
+
+A standard Spring Boot layered project. The caching lives entirely in two files:
+`CacheConfig.kt` (the Redis cache manager + per-cache TTLs) and `ProductService.kt`
+(the annotations). Everything else is an ordinary JPA-backed CRUD API.
+
+<FileTree>
+- api-caching/
+  - build.gradle.kts Spring Boot, JPA, Data Redis, Flyway
+  - settings.gradle.kts project name
+  - src/main/
+    - kotlin/com/example/
+      - Application.kt Spring Boot entry point
+      - config/
+        - **CacheConfig.kt** Redis cache manager + TTLs
+      - controller/
+        - ProductController.kt REST endpoints
+      - service/
+        - **ProductService.kt** the cache-aside annotations
+      - repository/
+        - ProductRepository.kt Spring Data JPA
+      - model/
+        - Product.kt JPA entity
+      - dto/
+        - ProductDTO.kt request/response types
+    - resources/
+      - application.yml datasource, redis, cache config
+      - db/migration/
+        - V1__create_products.sql schema + seed data
+</FileTree>
+
+### build.gradle.kts
+
+The one dependency that enables everything is
+`spring-boot-starter-data-redis` — it pulls in the Lettuce client and the
+`RedisCacheManager` Spring needs to back the cache abstraction with Redis.
+
+```kotlin title="build.gradle.kts" {7}
+dependencies {
+    // Spring Boot
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    implementation("org.springframework.boot:spring-boot-starter-data-redis")
+
+    // Database
+    runtimeOnly("org.postgresql:postgresql")
+    implementation("org.flywaydb:flyway-core")
+    implementation("org.flywaydb:flyway-database-postgresql")
+
+    // Jackson
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")
+
+    // Kotlin
+    implementation("org.jetbrains.kotlin:kotlin-reflect")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+}
+```
+
+### CacheConfig.kt
+
+This is where the cache-aside layer is configured. `@EnableCaching` turns on
+Spring's annotation processing; the `cacheManager` bean tells Spring to use Redis
+as the backing store and sets the serialization and TTL policy.
+
+A few things worth calling out if you've only ever set TTLs inline with
+`SET key val EX 1800`:
+
+- Keys are serialized as plain strings (`StringRedisSerializer`) so they're
+  readable in `redis-cli`: you get `products::1`, not a binary blob.
+- Values are serialized as JSON (`GenericJackson2JsonRedisSerializer`), which is
+  why a cached `ProductDTO` round-trips cleanly. This also embeds type info so
+  Jackson can deserialize back into the right class.
+- `disableCachingNullValues()` means a `null` return is never cached — a missing
+  product won't poison the cache with a negative entry.
+- TTLs are set **per cache name**: the default is 10 minutes, but the `products`
+  cache gets 30 minutes and `products-by-category` gets 15. The cache name is the
+  first argument you pass to `@Cacheable(value = ["products"])`.
+
+```kotlin title="src/main/kotlin/com/example/config/CacheConfig.kt" {15-16,20,22,30-31,33-36}
+package com.example.config
+
+import org.springframework.cache.CacheManager
+import org.springframework.cache.annotation.EnableCaching
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.data.redis.cache.RedisCacheConfiguration
+import org.springframework.data.redis.cache.RedisCacheManager
+import org.springframework.data.redis.connection.RedisConnectionFactory
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer
+import org.springframework.data.redis.serializer.RedisSerializationContext
+import org.springframework.data.redis.serializer.StringRedisSerializer
+import java.time.Duration
+
+@Configuration
+@EnableCaching
+class CacheConfig {
+
+    @Bean
+    fun cacheManager(connectionFactory: RedisConnectionFactory): CacheManager {
+        val defaultConfig = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(10))
+            .serializeKeysWith(
+                RedisSerializationContext.SerializationPair
+                    .fromSerializer(StringRedisSerializer())
+            )
+            .serializeValuesWith(
+                RedisSerializationContext.SerializationPair
+                    .fromSerializer(GenericJackson2JsonRedisSerializer())
+            )
+            .disableCachingNullValues()
+
+        val cacheConfigs = mapOf(
+            "products" to defaultConfig.entryTtl(Duration.ofMinutes(30)),
+            "products-by-category" to defaultConfig.entryTtl(Duration.ofMinutes(15))
+        )
+
+        return RedisCacheManager.builder(connectionFactory)
+            .cacheDefaults(defaultConfig)
+            .withInitialCacheConfigurations(cacheConfigs)
+            .build()
+    }
+}
+```
+
+### ProductService.kt
+
+The heart of the exercise. Each annotation maps one of the cache-aside operations
+onto a method — no Redis client appears anywhere in this file.
+
+- `@Cacheable(value = ["products"], key = "#id")` is the read path from the
+  diagram above: check Redis under key `products::<id>`, return on hit, otherwise
+  run the body, store the result. The `"Cache MISS"` log line only fires when the
+  body actually runs — that's your hit/miss signal in the logs.
+- `key = "#id"` is a SpEL (Spring Expression Language) expression: `#id` refers to
+  the method's `id` parameter. The full Redis key becomes `cacheName::key`, e.g.
+  `products::1`.
+- Writes use `@Caching` to combine two effects: `@CachePut` always runs the method
+  and stores the fresh result (so the `products` cache stays warm and correct),
+  while `@CacheEvict(allEntries = true)` clears the entire `products-by-category`
+  cache — because a create or update could change which category list a product
+  belongs to, and there's no cheap way to know which keyed lists are now stale.
+- `@CachePut(key = "#result.id")` keys off the returned DTO's `id` (`#result` is
+  the method's return value), since on a create the id isn't known until after the
+  insert.
+- `deleteProduct` evicts the single `products::<id>` entry and flushes the category
+  cache. `getAllProducts` is deliberately uncached — the list endpoint is always
+  fresh.
+
+```kotlin title="src/main/kotlin/com/example/service/ProductService.kt" {22-23,30-31,37-40,55-58,72-75}
+package com.example.service
+
+import com.example.dto.CreateProductRequest
+import com.example.dto.ProductDTO
+import com.example.dto.UpdateProductRequest
+import com.example.model.Product
+import com.example.repository.ProductRepository
+import org.slf4j.LoggerFactory
+import org.springframework.cache.annotation.CacheEvict
+import org.springframework.cache.annotation.CachePut
+import org.springframework.cache.annotation.Cacheable
+import org.springframework.cache.annotation.Caching
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
+import java.time.Instant
+
+@Service
+class ProductService(private val productRepository: ProductRepository) {
+
+    private val logger = LoggerFactory.getLogger(javaClass)
+
+    @Cacheable(value = ["products"], key = "#id")
+    fun getProduct(id: Long): ProductDTO {
+        logger.info("Cache MISS — fetching product $id from database")
+        return productRepository.findById(id)
+            .orElseThrow { NoSuchElementException("Product $id not found") }
+            .toDTO()
+    }
+
+    @Cacheable(value = ["products-by-category"], key = "#category")
+    fun getProductsByCategory(category: String): List<ProductDTO> {
+        logger.info("Cache MISS — fetching products for category '$category' from database")
+        return productRepository.findByCategory(category).map { it.toDTO() }
+    }
+
+    @Transactional
+    @Caching(
+        put = [CachePut(value = ["products"], key = "#result.id")],
+        evict = [CacheEvict(value = ["products-by-category"], allEntries = true)]
+    )
+    fun createProduct(request: CreateProductRequest): ProductDTO {
+        val product = productRepository.save(
+            Product(
+                name = request.name,
+                description = request.description,
+                price = request.price,
+                category = request.category
+            )
+        )
+        logger.info("Created product ${product.id}")
+        return product.toDTO()
+    }
+
+    @Transactional
+    @Caching(
+        put = [CachePut(value = ["products"], key = "#id")],
+        evict = [CacheEvict(value = ["products-by-category"], allEntries = true)]
+    )
+    fun updateProduct(id: Long, request: UpdateProductRequest): ProductDTO {
+        val product = productRepository.findById(id)
+            .orElseThrow { NoSuchElementException("Product $id not found") }
+        product.name = request.name
+        product.description = request.description
+        product.price = request.price
+        product.category = request.category
+        product.inStock = request.inStock
+        product.updatedAt = Instant.now()
+        logger.info("Updated product $id")
+        return productRepository.save(product).toDTO()
+    }
+
+    @Caching(evict = [
+        CacheEvict(value = ["products"], key = "#id"),
+        CacheEvict(value = ["products-by-category"], allEntries = true)
+    ])
+    fun deleteProduct(id: Long) {
+        if (!productRepository.existsById(id)) {
+            throw NoSuchElementException("Product $id not found")
+        }
+        productRepository.deleteById(id)
+        logger.info("Deleted product $id")
+    }
+
+    // No caching — always fresh
+    fun getAllProducts(): List<ProductDTO> {
+        return productRepository.findAll().map { it.toDTO() }
+    }
+
+    private fun Product.toDTO() = ProductDTO(
+        id = id,
+        name = name,
+        description = description,
+        price = price,
+        category = category,
+        inStock = inStock,
+        createdAt = createdAt,
+        updatedAt = updatedAt
+    )
+}
+```
+
+:::note[Why evict the whole category cache?]
+A write only knows the product's id, but `products-by-category` is keyed by
+category name. After a create or update, any number of category lists could be
+stale (e.g. a product moved from `books` to `courses`). Rather than track which
+keys changed, `allEntries = true` flushes the cache and lets the next read
+repopulate it. The single-key `products` cache, by contrast, can be updated
+precisely with `@CachePut`.
+:::
+
+### ProductController.kt
+
+The controller is a thin pass-through to the service — it has no idea caching
+exists. That's the point: caching is a service-layer concern, invisible to the
+HTTP layer.
+
+```kotlin title="src/main/kotlin/com/example/controller/ProductController.kt"
+@RestController
+@RequestMapping("/api/products")
+class ProductController(private val productService: ProductService) {
+
+    @GetMapping
+    fun listAll(): List<ProductDTO> = productService.getAllProducts()
+
+    @GetMapping("/{id}")
+    fun getById(@PathVariable id: Long): ProductDTO = productService.getProduct(id)
+
+    @GetMapping("/category/{category}")
+    fun getByCategory(@PathVariable category: String): List<ProductDTO> =
+        productService.getProductsByCategory(category)
+
+    @PostMapping
+    fun create(@RequestBody request: CreateProductRequest): ResponseEntity<ProductDTO> {
+        val product = productService.createProduct(request)
+        return ResponseEntity.status(HttpStatus.CREATED).body(product)
+    }
+
+    @PutMapping("/{id}")
+    fun update(
+        @PathVariable id: Long,
+        @RequestBody request: UpdateProductRequest
+    ): ProductDTO = productService.updateProduct(id, request)
+
+    @DeleteMapping("/{id}")
+    fun delete(@PathVariable id: Long): ResponseEntity<Void> {
+        productService.deleteProduct(id)
+        return ResponseEntity.noContent().build()
+    }
+}
+```
+
+### application.yml
+
+Two blocks wire the cache: `spring.data.redis` points at the Redis instance, and
+`spring.cache.type: redis` tells Spring to back the cache abstraction with Redis.
+The app runs on port `8082`.
+
+```yaml title="src/main/resources/application.yml" {12-15,17-18}
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/kotlin_course
+    username: dev
+    password: dev
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        default_schema: mod11_redis
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  cache:
+    type: redis
+
+server:
+  port: 8082
+```
+
+## Run it
+
+You need both Postgres and Redis running first — they come from the course's
+`shared-infra` Docker Compose stack.
+
+<Steps>
+
+1. Start Postgres and Redis:
+
+   ```bash
+   cd shared-infra && docker compose up -d postgres redis
+   ```
+
+2. Run the app (Flyway applies `V1__create_products.sql` and seeds five products
+   on first boot):
+
+   ```bash
+   ./gradlew bootRun
+   ```
+
+</Steps>
+
+## Test the cache
+
+Watch the application logs for the `Cache MISS` line — it only prints when the
+service method body actually runs, so its absence on a repeat call is your proof
+of a cache hit.
+
+<Steps>
+
+1. First call — a cache miss. Check the logs for `Cache MISS`:
+
+   ```bash
+   curl http://localhost:8082/api/products/1
+   ```
+
+2. Second call — a cache hit. No `Cache MISS` log this time:
+
+   ```bash
+   curl http://localhost:8082/api/products/1
+   ```
+
+3. Update the product — `@CachePut` refreshes the cache in place:
+
+   ```bash
+   curl -X PUT http://localhost:8082/api/products/1 \
+     -H "Content-Type: application/json" \
+     -d '{"name":"Updated Book","description":"Updated desc","price":59.99,"category":"books","inStock":true}'
+   ```
+
+4. Read again — fresh data, still no `Cache MISS` (the cache was updated, not
+   invalidated):
+
+   ```bash
+   curl http://localhost:8082/api/products/1
+   ```
+
+5. Inspect Redis directly. Keys are stored as `cacheName::key`, so the product
+   with id 1 lives at `products::1`:
+
+   ```bash
+   redis-cli KEYS "*products*"
+   redis-cli GET "products::1"
+   redis-cli TTL "products::1"
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- Add a `/api/cache/clear` endpoint that evicts all caches.
+- Add cache metrics tracking — count hits and misses (wrap the cache manager or
+  use Micrometer's cache instrumentation).
+- Add a `@Cacheable` endpoint for product search by name.
+- Inspect each key's TTL with `redis-cli TTL` and confirm the per-cache values
+  (30 min for `products`, 15 min for `products-by-category`).
+:::

@@ -1,0 +1,548 @@
+---
+title: JWT Authentication for Task API
+description: Build a Spring Boot task API secured with stateless JWT auth, BCrypt password hashing, and role-based access control.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Security & Auth" href="/kotlin-backend/14-security-auth/" />
+
+## Goal
+
+Build a Spring Boot REST API for tasks, secured with **stateless JWT
+authentication**. Users register and log in over public endpoints, receive a
+signed token, and present it as a `Bearer` header on every protected request.
+Passwords are hashed with BCrypt and authorization is role-based.
+
+If you've done auth in Express with `jsonwebtoken` + middleware, or in Go with a
+hand-rolled `http.Handler` wrapper, this is the same idea — except Spring's
+filter chain and method-security annotations do most of the wiring for you.
+
+## Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/auth/register` | Public | Register a new user, get a JWT |
+| POST | `/api/auth/login` | Public | Log in, get a JWT |
+| GET | `/api/tasks` | Bearer JWT | List the current user's tasks |
+| POST | `/api/tasks` | Bearer JWT | Create a task |
+| DELETE | `/api/tasks/{id}` | Bearer JWT | Delete own task (or any if `ADMIN`) |
+
+## What you'll build
+
+<Steps>
+
+1. A `JwtService` that signs and verifies HMAC-SHA tokens with the JJWT library.
+2. A `SecurityConfig` that locks down `/api/**`, runs the API statelessly, and
+   plugs a custom filter into Spring Security's chain.
+3. A `JwtAuthenticationFilter` that reads the `Authorization` header, validates
+   the token, and populates the `SecurityContext`.
+4. An `AuthController` (register/login) and a `TaskController` whose routes are
+   protected — including a `@PreAuthorize` rule for owner-or-admin deletes.
+
+</Steps>
+
+## How a request flows
+
+The login call exchanges credentials for a token; every later call carries that
+token, which the filter turns back into an authenticated principal before your
+controller ever runs.
+
+<Mermaid title="Login then authenticated request" height={560} code={`
+sequenceDiagram
+  actor Client
+  participant Auth as AuthController
+  participant Sec as JwtAuthenticationFilter
+  participant Task as TaskController
+  Client->>Auth: POST /api/auth/login (email, password)
+  Auth->>Auth: BCrypt matches(password, hash)
+  Auth-->>Client: 200 { token }
+  Note over Client: store token
+  Client->>Sec: GET /api/tasks (Authorization: Bearer token)
+  Sec->>Sec: validate signature + expiry
+  Sec->>Sec: set Authentication in SecurityContext
+  Sec->>Task: forward request
+  Task->>Task: read authentication.principal (userId)
+  Task-->>Client: 200 [ tasks ]
+`} />
+
+## The worked solution
+
+A standard Spring Boot layout. The auth machinery lives in `service/` and
+`config/`; the HTTP surface in `controller/`; JPA entities and repositories
+round it out. H2 in-memory keeps it runnable with zero infra.
+
+<FileTree>
+- jwt-auth-api/
+  - build.gradle.kts Spring Boot, Security, JPA, JJWT deps
+  - src/main/
+    - kotlin/com/example/jwtauth/
+      - JwtAuthApplication.kt entry point
+      - service/
+        - **JwtService.kt** sign + verify tokens
+      - config/
+        - **SecurityConfig.kt** filter chain + access rules
+        - **JwtAuthenticationFilter.kt** validates bearer token per request
+      - controller/
+        - AuthController.kt register + login
+        - TaskController.kt protected task routes
+        - Dtos.kt request/response data classes
+      - model/
+        - AppUser.kt user entity
+        - Task.kt task entity
+      - repository/
+        - UserRepository.kt
+        - TaskRepository.kt
+    - resources/
+      - application.yml H2 + jwt secret config
+  - src/test/kotlin/com/example/jwtauth/
+    - AuthIntegrationTest.kt MockMvc end-to-end tests
+</FileTree>
+
+### build.gradle.kts
+
+Three Spring starters (`web`, `security`, `data-jpa`) plus the JJWT split into
+an `api` artifact at compile time and `impl`/`jackson` at runtime — the standard
+JJWT 0.12 packaging. `jackson-module-kotlin` lets Jackson construct Kotlin data
+classes without a no-arg constructor.
+
+```kotlin title="build.gradle.kts" {7-9}
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-security")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    implementation("org.springframework.boot:spring-boot-starter-validation")
+
+    // JWT
+    implementation("io.jsonwebtoken:jjwt-api:0.12.6")
+    runtimeOnly("io.jsonwebtoken:jjwt-impl:0.12.6")
+    runtimeOnly("io.jsonwebtoken:jjwt-jackson:0.12.6")
+
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+    runtimeOnly("com.h2database:h2")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("org.springframework.security:spring-security-test")
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
+}
+```
+
+### JwtService.kt
+
+The token codec. `generateToken` builds a signed JWT whose `subject` is the user
+id, with `email` and `roles` as extra claims and a 24-hour expiry. `validateToken`
+parses-and-verifies in one call — `parseSignedClaims` throws if the signature is
+wrong or the token has expired, so a successful return *is* the validation.
+
+The secret and expiry are injected from `application.yml`. Note the escaped
+`@Value("\${jwt.secret}")` — the backslash stops Kotlin from treating `${…}` as
+a string template so Spring sees the literal property placeholder.
+
+```kotlin title="src/main/kotlin/com/example/jwtauth/service/JwtService.kt" {16,22-29,33-37,43-44}
+@Service
+class JwtService(
+    @Value("\${jwt.secret}") private val secret: String,
+    @Value("\${jwt.expiration-ms}") private val expirationMs: Long,
+) {
+    private val key: SecretKey = Keys.hmacShaKeyFor(secret.toByteArray())
+
+    fun generateToken(userId: String, email: String, roles: List<String>): String {
+        val now = Date()
+        val expiry = Date(now.time + expirationMs)
+
+        return Jwts.builder()
+            .subject(userId)
+            .claim("email", email)
+            .claim("roles", roles)
+            .issuedAt(now)
+            .expiration(expiry)
+            .signWith(key)
+            .compact()
+    }
+
+    fun validateToken(token: String): Claims {
+        return Jwts.parser()
+            .verifyWith(key)
+            .build()
+            .parseSignedClaims(token)
+            .payload
+    }
+
+    fun getUserId(token: String): String = validateToken(token).subject
+
+    @Suppress("UNCHECKED_CAST")
+    fun getRoles(token: String): List<String> =
+        validateToken(token)["roles"] as? List<String> ?: emptyList()
+}
+```
+
+:::note[The roles cast]
+`claims["roles"]` comes back as `Any?` — JJWT deserializes a JSON array to a
+`List`, but the element type is erased. The `as? List<String>` is an unchecked
+cast (hence the `@Suppress`); the Elvis fallback `?: emptyList()` keeps it safe
+if the claim is missing or the wrong shape.
+:::
+
+### SecurityConfig.kt
+
+This is where Spring Security is told *how* to behave. The Kotlin DSL
+(`http { … }`) reads top-to-bottom: open the two auth endpoints and the H2
+console, require authentication for everything else under `/api/**`, deny the
+rest. `SessionCreationPolicy.STATELESS` is the JWT contract — no server-side
+session, the token carries identity on every request.
+
+The crucial line is `addFilterBefore`: it slots the custom JWT filter ahead of
+Spring's `UsernamePasswordAuthenticationFilter`, so by the time the authorization
+rules run, the request is already authenticated (or not).
+
+```kotlin title="src/main/kotlin/com/example/jwtauth/config/SecurityConfig.kt" {3,11-17,19-21,23}
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+class SecurityConfig(
+    private val jwtAuthFilter: JwtAuthenticationFilter,
+) {
+    @Bean
+    fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
+        http {
+            csrf { disable() }
+            cors { }
+
+            authorizeHttpRequests {
+                authorize(HttpMethod.POST, "/api/auth/register", permitAll)
+                authorize(HttpMethod.POST, "/api/auth/login", permitAll)
+                authorize("/h2-console/**", permitAll)
+                authorize("/api/**", authenticated)
+                authorize(anyRequest, denyAll)
+            }
+
+            sessionManagement {
+                sessionCreationPolicy = SessionCreationPolicy.STATELESS
+            }
+
+            addFilterBefore<UsernamePasswordAuthenticationFilter>(jwtAuthFilter)
+
+            exceptionHandling {
+                authenticationEntryPoint = HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)
+            }
+
+            headers {
+                frameOptions { sameOrigin() }  // For H2 console
+            }
+        }
+        return http.build()
+    }
+
+    @Bean
+    fun passwordEncoder(): PasswordEncoder = BCryptPasswordEncoder()
+
+    @Bean
+    fun authenticationManager(config: AuthenticationConfiguration): AuthenticationManager =
+        config.authenticationManager
+}
+```
+
+:::tip[Why `csrf { disable() }` is fine here]
+CSRF protection guards against cookie-based session forgery. A stateless
+bearer-token API doesn't use cookies for auth, so there's no CSRF surface to
+protect — disabling it is the correct call, not a shortcut. `@EnableMethodSecurity`
+is what unlocks the `@PreAuthorize` annotation used in the task controller.
+:::
+
+### JwtAuthenticationFilter.kt
+
+The bridge between "a token in a header" and "an authenticated user Spring
+understands." Extending `OncePerRequestFilter` guarantees it runs exactly once
+per request. It pulls the `Bearer` token, validates it via `JwtService`, maps
+each role to a `ROLE_`-prefixed `SimpleGrantedAuthority` (Spring's convention for
+`hasRole(...)`), and stores a `UsernamePasswordAuthenticationToken` in the
+`SecurityContextHolder`.
+
+If anything throws — bad signature, expired token, garbage header — the catch
+logs and moves on with *no* authentication set. The request still proceeds to the
+authorization rules, which then reject it with 401. That's the same pattern as a
+Go middleware that calls `next.ServeHTTP` either way and lets a later check fail
+the unauthenticated request.
+
+```kotlin title="src/main/kotlin/com/example/jwtauth/config/JwtAuthenticationFilter.kt" {9,11-12,14-19,21,31-33,38-40}
+@Component
+class JwtAuthenticationFilter(
+    private val jwtService: JwtService,
+) : OncePerRequestFilter() {
+
+    override fun doFilterInternal(
+        request: HttpServletRequest,
+        response: HttpServletResponse,
+        filterChain: FilterChain,
+    ) {
+        val token = extractToken(request)
+
+        if (token != null) {
+            try {
+                val claims = jwtService.validateToken(token)
+                val userId = claims.subject
+                val roles = jwtService.getRoles(token)
+
+                val authorities = roles.map { SimpleGrantedAuthority("ROLE_$it") }
+                val authentication = UsernamePasswordAuthenticationToken(
+                    userId,
+                    null,
+                    authorities,
+                )
+
+                SecurityContextHolder.getContext().authentication = authentication
+            } catch (e: Exception) {
+                logger.debug("Invalid JWT token: ${e.message}")
+            }
+        }
+
+        filterChain.doFilter(request, response)
+    }
+
+    private fun extractToken(request: HttpServletRequest): String? {
+        val header = request.getHeader("Authorization") ?: return null
+        return if (header.startsWith("Bearer ")) header.substring(7) else null
+    }
+}
+```
+
+### AuthController.kt
+
+The two public endpoints. `register` rejects duplicate emails with `409 CONFLICT`,
+hashes the password with `passwordEncoder.encode(...)`, persists the user, and
+hands back a fresh token. `login` looks the user up and calls
+`passwordEncoder.matches(raw, hash)` — BCrypt compares the plaintext against the
+stored hash in constant time. A missing user or a bad password both return
+`401`, deliberately indistinguishable so you don't leak which emails exist.
+
+```kotlin title="src/main/kotlin/com/example/jwtauth/controller/AuthController.kt" {8-9,10-12,16-20,38-42}
+@RestController
+@RequestMapping("/api/auth")
+class AuthController(
+    private val userRepository: UserRepository,
+    private val passwordEncoder: PasswordEncoder,
+    private val jwtService: JwtService,
+) {
+    @PostMapping("/register")
+    fun register(@RequestBody request: RegisterRequest): ResponseEntity<AuthResponse> {
+        if (userRepository.existsByEmail(request.email)) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).build()
+        }
+
+        val user = userRepository.save(
+            AppUser(
+                email = request.email,
+                passwordHash = passwordEncoder.encode(request.password),
+                name = request.name,
+                roles = listOf("USER"),
+            )
+        )
+
+        val token = jwtService.generateToken(
+            userId = user.id.toString(),
+            email = user.email,
+            roles = user.roles,
+        )
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(
+            AuthResponse(token = token, userId = user.id, email = user.email)
+        )
+    }
+
+    @PostMapping("/login")
+    fun login(@RequestBody request: LoginRequest): ResponseEntity<AuthResponse> {
+        val user = userRepository.findByEmail(request.email)
+            ?: return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build()
+
+        if (!passwordEncoder.matches(request.password, user.passwordHash)) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build()
+        }
+
+        val token = jwtService.generateToken(
+            userId = user.id.toString(),
+            email = user.email,
+            roles = user.roles,
+        )
+
+        return ResponseEntity.ok(
+            AuthResponse(token = token, userId = user.id, email = user.email)
+        )
+    }
+}
+```
+
+### TaskController.kt
+
+The protected routes. Because the filter already authenticated the request,
+Spring injects the `Authentication` object straight into the handler — its
+`principal` is the `userId` string we put in the token's subject. No header
+parsing in the controller; identity just arrives.
+
+The interesting line is the `@PreAuthorize` on delete: `hasRole('ADMIN') or
+@taskController.isOwner(#id, authentication.name)`. This is declarative
+authorization — Spring evaluates the SpEL expression before the method body runs,
+calling back into the bean's own `isOwner` to check ownership. Admins delete
+anything; everyone else only their own tasks.
+
+```kotlin title="src/main/kotlin/com/example/jwtauth/controller/TaskController.kt" {7-8,16,18,25-26,36-39}
+@RestController
+@RequestMapping("/api/tasks")
+class TaskController(
+    private val taskRepository: TaskRepository,
+) {
+    @GetMapping
+    fun getTasks(authentication: Authentication): List<TaskResponse> {
+        val userId = authentication.principal as String
+        return taskRepository.findByUserId(userId).map { it.toResponse() }
+    }
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    fun createTask(
+        @RequestBody request: CreateTaskRequest,
+        authentication: Authentication,
+    ): TaskResponse {
+        val userId = authentication.principal as String
+        val task = taskRepository.save(
+            Task(title = request.title, description = request.description, userId = userId)
+        )
+        return task.toResponse()
+    }
+
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN') or @taskController.isOwner(#id, authentication.name)")
+    fun deleteTask(@PathVariable id: Long, authentication: Authentication): ResponseEntity<Void> {
+        val task = taskRepository.findById(id)
+        if (task.isEmpty) {
+            return ResponseEntity.notFound().build()
+        }
+        taskRepository.deleteById(id)
+        return ResponseEntity.noContent().build()
+    }
+
+    fun isOwner(taskId: Long, userId: String): Boolean {
+        val task = taskRepository.findById(taskId).orElse(null) ?: return false
+        return task.userId == userId
+    }
+
+    private fun Task.toResponse() = TaskResponse(
+        id = id,
+        title = title,
+        description = description,
+        userId = userId,
+        createdAt = createdAt.toString(),
+    )
+}
+```
+
+### Entities and config
+
+`AppUser` stores the BCrypt `passwordHash` (never the raw password) and an
+`@ElementCollection` of role strings. `Task` carries the owning `userId`. The
+JWT secret and 24-hour expiry live in `application.yml`.
+
+```yaml title="src/main/resources/application.yml" {12-14}
+spring:
+  datasource:
+    url: jdbc:h2:mem:taskdb
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+jwt:
+  secret: "my-super-secret-key-that-is-at-least-256-bits-long-for-hs256-signing"
+  expiration-ms: 86400000  # 24 hours
+```
+
+:::caution[Don't ship that secret]
+The HS256 key is checked into `application.yml` purely so the exercise runs out
+of the box. In a real service the secret belongs in an environment variable or a
+secrets manager — and it must be at least 256 bits, or `Keys.hmacShaKeyFor`
+throws.
+:::
+
+## Run it
+
+<Steps>
+
+1. Start the server (H2 runs in-memory, so no external database needed):
+
+   ```bash
+   ./gradlew bootRun
+   ```
+
+2. Register a user — the response includes your token:
+
+   ```bash
+   curl -X POST http://localhost:8080/api/auth/register \
+     -H "Content-Type: application/json" \
+     -d '{"email":"user@example.com","password":"secret123","name":"Test User"}'
+   ```
+
+3. Log in (or reuse the register token) and capture it:
+
+   ```bash
+   TOKEN="paste-token-here"
+   ```
+
+4. Create and list tasks with the bearer token:
+
+   ```bash
+   curl -X POST http://localhost:8080/api/tasks \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"title":"Learn Spring Security","description":"Complete module 14"}'
+
+   curl http://localhost:8080/api/tasks \
+     -H "Authorization: Bearer $TOKEN"
+   ```
+
+</Steps>
+
+## Test it
+
+The `AuthIntegrationTest` drives the full stack through `MockMvc` — no real HTTP,
+but the entire security filter chain runs. It checks the 401-without-token,
+200-with-token, register/login happy paths, the 409 on duplicate email, the 401
+on a wrong password, and a create-then-list round trip.
+
+```bash
+./gradlew test
+```
+
+```kotlin title="src/test/kotlin/com/example/jwtauth/AuthIntegrationTest.kt" {7-12}
+@Test
+fun `unauthenticated request returns 401`() {
+    mockMvc.get("/api/tasks")
+        .andExpect { status { isUnauthorized() } }
+}
+
+@Test
+fun `authenticated request returns 200`() {
+    val token = jwtService.generateToken("1", "test@test.com", listOf("USER"))
+
+    mockMvc.get("/api/tasks") {
+        header("Authorization", "Bearer $token")
+    }.andExpect {
+        status { isOk() }
+    }
+}
+```
+
+:::tip[Stretch goals]
+- Add a refresh-token endpoint so clients can rotate short-lived access tokens
+  without re-entering credentials.
+- Seed an `ADMIN` user at startup and prove the `@PreAuthorize` rule lets them
+  delete another user's task while a `USER` gets `403`.
+- Return a structured JSON error body (code, message) from the entry point
+  instead of a bare 401 status.
+- Move the JWT secret to an environment variable and fail fast on boot if it's
+  missing or too short.
+:::

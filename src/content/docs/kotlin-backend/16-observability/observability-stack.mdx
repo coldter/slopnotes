@@ -1,0 +1,559 @@
+---
+title: Observability Stack
+description: Instrument a Spring Boot Task API with structured logging, Micrometer/Prometheus metrics, and health checks, then scrape and graph it with Prometheus + Grafana.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Observability" href="/kotlin-backend/16-observability/" />
+
+## Goal
+
+Take a plain Spring Boot Task API and make it *observable*: emit structured JSON
+logs, expose application and JVM metrics in Prometheus format, and add a custom
+health check. Then run Prometheus + Grafana with Docker Compose, scrape the app,
+and graph request rate, latency, and your own business metrics.
+
+If you've wired up `pino` + `prom-client` in Node, or `zerolog` +
+`promhttp.Handler()` in Go, this is the same three pillars — logs, metrics,
+health — but the Spring Actuator + Micrometer stack gives you most of it for free
+once the dependencies are on the classpath.
+
+## What you'll build
+
+<Steps>
+
+1. **Structured JSON logging** with `logstash-logback-encoder` so every log line
+   is a parseable JSON object (not a string a regex has to claw fields out of).
+2. **Custom business metrics** with Micrometer: a `tasks.created.total` counter
+   (tagged by priority), a `tasks.completed.total` counter, and a
+   `tasks.active.count` gauge.
+3. **A custom health indicator** that reports task statistics alongside `UP`/`DOWN`.
+4. **Request timing metrics** — Actuator's `http.server.requests` timer, configured
+   to publish histogram buckets and percentiles for latency queries.
+5. **Prometheus scraping** of the app's `/actuator/prometheus` endpoint, viewed in
+   **Grafana** with a pre-provisioned data source.
+6. **A Grafana dashboard** with panels for request rate, latency, and the custom
+   task metrics.
+
+</Steps>
+
+## The metrics pipeline
+
+The whole flow is pull-based: your app exposes a text endpoint, Prometheus scrapes
+it on a timer and stores time series, and Grafana queries Prometheus with PromQL.
+
+<Mermaid title="Metrics scrape pipeline" code={`
+flowchart LR
+  subgraph app["Task API :8087"]
+    M["Micrometer<br/>MeterRegistry"] --> E["/actuator/prometheus"]
+  end
+  subgraph stack["Docker Compose"]
+    P["Prometheus :9090<br/>scrape every 5s"]
+    G["Grafana :3000"]
+  end
+  E -->|"HTTP pull"| P
+  P -->|"PromQL"| G
+  G --> D["Dashboards"]
+`} height={360} />
+
+## The worked solution
+
+A standard Spring Boot project — the observability lives in three places: the
+`build.gradle.kts` dependencies, the metrics-instrumented `TaskService`, and the
+`config/` Docker Compose stack.
+
+<FileTree>
+- observability-stack/
+  - build.gradle.kts deps: actuator, micrometer-prometheus, logstash encoder
+  - settings.gradle.kts project name
+  - docker-compose.yml Prometheus + Grafana services
+  - config/
+    - prometheus.yml scrape config (targets the app)
+    - grafana/provisioning/datasources/prometheus.yml pre-wired data source
+  - src/main/
+    - kotlin/com/example/taskapi/
+      - Application.kt Spring Boot entrypoint
+      - **service/TaskService.kt** logging + custom metrics
+      - **metrics/TaskMetrics.kt** counters, gauge, timer
+      - controller/TaskController.kt REST endpoints
+      - health/TaskApiHealthIndicator.kt custom health check
+      - repository/TaskRepository.kt in-memory store
+      - model/Task.kt data class + `Priority` enum
+      - error/GlobalExceptionHandler.kt logs unhandled errors
+    - resources/
+      - application.yml Actuator + metrics config
+      - **logback-spring.xml** JSON log encoder
+</FileTree>
+
+### build.gradle.kts
+
+Three dependency groups turn this from "an app" into "an observable app":
+`spring-boot-starter-actuator` exposes the management endpoints,
+`micrometer-registry-prometheus` adds the Prometheus scrape format to Actuator, and
+`logstash-logback-encoder` swaps the default log layout for JSON.
+
+```kotlin title="build.gradle.kts" {12,15,18-19}
+plugins {
+    kotlin("jvm") version "2.0.21"
+    kotlin("plugin.spring") version "2.0.21"
+    id("org.springframework.boot") version "3.4.1"
+    id("io.spring.dependency-management") version "1.1.7"
+}
+
+group = "com.example"
+version = "1.0.0"
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+
+    // Metrics: Micrometer + Prometheus
+    implementation("io.micrometer:micrometer-registry-prometheus")
+
+    // Structured logging
+    implementation("net.logstash.logback:logstash-logback-encoder:8.0")
+    implementation("io.github.oshai:kotlin-logging-jvm:7.0.3")
+
+    // Jackson Kotlin support + reflection
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+    implementation("org.jetbrains.kotlin:kotlin-reflect")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+}
+```
+
+:::note[Micrometer is the metrics facade]
+Micrometer is to metrics what SLF4J is to logging — a vendor-neutral API. You
+instrument against `MeterRegistry`; dropping in `micrometer-registry-prometheus`
+decides the *backend*. Want Datadog or CloudWatch instead? Swap the registry
+dependency, leave your instrumentation code untouched. The Node analogue is coding
+to `prom-client`'s API; the difference is Spring auto-wires the registry for you.
+:::
+
+### application.yml
+
+Actuator hides most endpoints by default. This config exposes `health`, `info`,
+`prometheus`, and `metrics` over HTTP, then tells Micrometer to publish a
+histogram and the 50th/95th/99th percentiles for the `http.server.requests` timer
+— that's what makes `histogram_quantile(...)` queries possible in Prometheus.
+
+```yaml title="src/main/resources/application.yml" {6-8,15-19}
+server:
+  port: 8087
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: task-api
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5, 0.95, 0.99
+
+logging:
+  level:
+    root: INFO
+    com.example: DEBUG
+```
+
+### logback-spring.xml
+
+For structured logging, replace the default pattern layout with the logstash
+encoder. Now each log line is a JSON object — timestamp, level, logger, message,
+and any MDC fields — which a log aggregator (Loki, ELK, Datadog) can index without
+fragile regex parsing. This is the JVM equivalent of `pino`/`zerolog` JSON output.
+
+```xml title="src/main/resources/logback-spring.xml"
+<configuration>
+    <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="JSON"/>
+    </root>
+</configuration>
+```
+
+### TaskMetrics.kt
+
+Custom business metrics live in one `@Component` so the registration is in a single
+place. A `Counter` only goes up (tasks created/completed); a `Gauge` samples a live
+value on each scrape (here, the count of not-yet-completed tasks). Note the gauge
+takes a *lambda* — Micrometer calls it at scrape time, so it always reflects the
+current state without you having to push updates.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/metrics/TaskMetrics.kt" {12-17,19-22,24-29}
+package com.example.taskapi.metrics
+
+import com.example.taskapi.model.Priority
+import com.example.taskapi.repository.TaskRepository
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
+import org.springframework.stereotype.Component
+
+@Component
+class TaskMetrics(
+    private val registry: MeterRegistry,
+    taskRepository: TaskRepository
+) {
+    // Counter per priority — tagged so PromQL can break it down
+    fun taskCreated(priority: Priority) {
+        registry.counter("tasks.created.total", "priority", priority.name)
+            .increment()
+    }
+
+    // Plain counter — total tasks completed
+    fun taskCompleted() {
+        registry.counter("tasks.completed.total").increment()
+    }
+
+    init {
+        // Gauge sampled at scrape time: active = total - completed
+        registry.gauge("tasks.active.count", taskRepository) { repo ->
+            (repo.count() - repo.countCompleted()).toDouble()
+        }
+    }
+}
+```
+
+:::note[Metric naming: dots in, underscores out]
+You register `tasks.created.total` with dots — Micrometer's idiomatic naming. When
+Prometheus scrapes it, the dots become underscores: `tasks_created_total`. So you
+*query* `rate(tasks_created_total[1m])` in PromQL even though the code says dots.
+Don't let the mismatch surprise you.
+:::
+
+### TaskService.kt
+
+The service does the actual instrumenting: structured log lines (SLF4J's `{}`
+placeholders keep the message template separate from the values, which the JSON
+encoder preserves as fields) plus calls into `TaskMetrics` on each create/complete.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/service/TaskService.kt" {12,17,21,30}
+package com.example.taskapi.service
+
+import com.example.taskapi.metrics.TaskMetrics
+import com.example.taskapi.model.Priority
+import com.example.taskapi.model.Task
+import com.example.taskapi.repository.TaskRepository
+import org.slf4j.LoggerFactory
+import org.springframework.stereotype.Service
+
+@Service
+class TaskService(
+    private val taskRepository: TaskRepository,
+    private val taskMetrics: TaskMetrics
+) {
+    private val logger = LoggerFactory.getLogger(javaClass)
+
+    fun createTask(title: String, description: String, priority: Priority): Task {
+        logger.info("Creating task: title={}, priority={}", title, priority)
+
+        val task = taskRepository.save(
+            Task(title = title, description = description, priority = priority)
+        )
+        taskMetrics.taskCreated(priority)
+
+        logger.info("Task created: id={}", task.id)
+        return task
+    }
+
+    fun completeTask(id: String): Task? {
+        val task = taskRepository.findById(id) ?: return null
+        val completed = task.copy(completed = true)
+        taskRepository.save(completed)
+        taskMetrics.taskCompleted()
+
+        logger.info("Task completed: id={}", id)
+        return completed
+    }
+
+    fun getTask(id: String): Task? = taskRepository.findById(id)
+
+    fun getAllTasks(): List<Task> = taskRepository.findAll()
+
+    fun deleteTask(id: String): Boolean {
+        logger.info("Deleting task: id={}", id)
+        return taskRepository.delete(id)
+    }
+}
+```
+
+### TaskApiHealthIndicator.kt
+
+Implementing `HealthIndicator` registers a custom contributor that shows up under
+`/actuator/health`. Returning `Health.up()` with `withDetail(...)` surfaces live
+stats; wrapping it in a `try`/`catch` means a broken repository reports `DOWN`
+instead of throwing.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/health/TaskApiHealthIndicator.kt" {15,18-22}
+package com.example.taskapi.health
+
+import com.example.taskapi.repository.TaskRepository
+import org.springframework.boot.actuate.health.Health
+import org.springframework.boot.actuate.health.HealthIndicator
+import org.springframework.stereotype.Component
+
+@Component("taskApi")
+class TaskApiHealthIndicator(
+    private val taskRepository: TaskRepository
+) : HealthIndicator {
+
+    override fun health(): Health {
+        return try {
+            val count = taskRepository.count()
+            Health.up()
+                .withDetail("taskCount", count)
+                .withDetail("completedCount", taskRepository.countCompleted())
+                .build()
+        } catch (e: Exception) {
+            Health.down(e)
+                .withDetail("error", e.message)
+                .build()
+        }
+    }
+}
+```
+
+### TaskController.kt
+
+The REST surface. You don't instrument timing here — Actuator's
+`http.server.requests` timer wraps every controller method automatically, tagged by
+URI, method, and status. That's why you get latency metrics for free.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/controller/TaskController.kt" {13-17,19-28}
+package com.example.taskapi.controller
+
+import com.example.taskapi.model.Priority
+import com.example.taskapi.service.TaskService
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.annotation.*
+
+@RestController
+@RequestMapping("/api/tasks")
+class TaskController(private val taskService: TaskService) {
+
+    data class CreateTaskRequest(
+        val title: String,
+        val description: String = "",
+        val priority: String = "MEDIUM"
+    )
+
+    @PostMapping
+    fun createTask(@RequestBody request: CreateTaskRequest): ResponseEntity<Any> {
+        val priority = try {
+            Priority.valueOf(request.priority.uppercase())
+        } catch (e: IllegalArgumentException) {
+            Priority.MEDIUM
+        }
+        val task = taskService.createTask(request.title, request.description, priority)
+        return ResponseEntity.status(HttpStatus.CREATED).body(task)
+    }
+
+    @GetMapping
+    fun getAllTasks() = taskService.getAllTasks()
+
+    @PatchMapping("/{id}/complete")
+    fun completeTask(@PathVariable id: String): ResponseEntity<Any> {
+        val task = taskService.completeTask(id)
+        return if (task != null) ResponseEntity.ok(task)
+        else ResponseEntity.notFound().build()
+    }
+
+    @DeleteMapping("/{id}")
+    fun deleteTask(@PathVariable id: String): ResponseEntity<Void> {
+        return if (taskService.deleteTask(id)) ResponseEntity.noContent().build()
+        else ResponseEntity.notFound().build()
+    }
+}
+```
+
+The supporting `TaskRepository` (a `ConcurrentHashMap`-backed in-memory store), the
+`Task` data class with its `Priority` enum, and the `GlobalExceptionHandler`
+(`@RestControllerAdvice` that logs unhandled exceptions) round out the app but carry
+no observability logic.
+
+### docker-compose.yml
+
+The stack is two services: Prometheus (scrapes + stores) and Grafana (queries +
+graphs). Each mounts its config from `./config/`. Named volumes persist the metrics
+TSDB and Grafana state across restarts.
+
+```yaml title="docker-compose.yml" {2-3,13-14,22}
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:
+```
+
+### config/prometheus.yml
+
+The scrape config. Prometheus hits `/actuator/prometheus` on the app every 5
+seconds. The app runs on your host, not in the Compose network, so the target is
+`host.docker.internal:8087` — the magic DNS name that resolves to the host from
+inside a container. The `labels` block attaches `application` and `environment`
+to every series this job collects.
+
+```yaml title="config/prometheus.yml" {7-13}
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'task-api'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['host.docker.internal:8087']
+        labels:
+          application: 'task-api'
+          environment: 'docker'
+```
+
+:::caution[`host.docker.internal` on Linux]
+On macOS and Windows Docker Desktop this name just works. On native Linux you may
+need to add `extra_hosts: ["host.docker.internal:host-gateway"]` to the Prometheus
+service (or scrape `localhost` via host networking). If the target shows as `DOWN`
+on the Prometheus *Targets* page, that's the first thing to check.
+:::
+
+### config/grafana/provisioning/datasources/prometheus.yml
+
+Grafana is provisioned so there's nothing to click on first launch — the Prometheus
+data source is already wired and set as default. Inside the Compose network Grafana
+reaches Prometheus by service name at `http://prometheus:9090`.
+
+```yaml title="config/grafana/provisioning/datasources/prometheus.yml"
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+```
+
+## Run it
+
+<Steps>
+
+1. Start the observability stack (Prometheus + Grafana). Requires Docker with the
+   Compose plugin:
+
+   ```bash
+   docker compose up -d
+   ```
+
+2. Run the application:
+
+   ```bash
+   ./gradlew bootRun
+   ```
+
+3. Open the UIs:
+
+   | URL | What |
+   |---|---|
+   | `http://localhost:8087` | Task API |
+   | `http://localhost:8087/actuator/health` | Health check (custom details) |
+   | `http://localhost:8087/actuator/prometheus` | Raw metrics endpoint |
+   | `http://localhost:9090` | Prometheus UI |
+   | `http://localhost:3000` | Grafana UI (login `admin` / `admin`) |
+
+</Steps>
+
+## Test it
+
+<Steps>
+
+1. Create a few tasks to generate metrics:
+
+   ```bash
+   curl -X POST http://localhost:8087/api/tasks \
+     -H "Content-Type: application/json" \
+     -d '{"title": "Learn observability", "priority": "HIGH"}'
+
+   curl http://localhost:8087/api/tasks
+   ```
+
+2. Confirm your custom metrics are exposed:
+
+   ```bash
+   curl http://localhost:8087/actuator/prometheus | grep tasks
+   ```
+
+3. Check the health endpoint shows the custom task details:
+
+   ```bash
+   curl http://localhost:8087/actuator/health
+   ```
+
+4. In Grafana (`http://localhost:3000`), the Prometheus data source is
+   pre-configured — build a dashboard with these PromQL queries:
+
+   ```promql
+   # Request rate (requests per second)
+   rate(http_server_requests_seconds_count[5m])
+
+   # 95th percentile latency
+   histogram_quantile(0.95, rate(http_server_requests_seconds_bucket[5m]))
+
+   # Custom: tasks created per minute
+   rate(tasks_created_total[1m]) * 60
+
+   # JVM heap usage percentage
+   jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"}
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- Add a `task.creation.duration` **Timer** around `createTask` and graph its
+  percentiles next to the HTTP latency.
+- Add MDC context (a request ID) to your logs so the JSON lines can be correlated
+  across a single request.
+- Export the Grafana dashboard JSON and provision it under
+  `config/grafana/provisioning/dashboards/` so it loads automatically — no
+  click-ops on a fresh stack.
+- Add Prometheus alerting rules (e.g. fire when the p95 latency crosses a
+  threshold) and wire Alertmanager.
+:::

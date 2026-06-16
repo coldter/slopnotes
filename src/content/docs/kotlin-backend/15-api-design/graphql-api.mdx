@@ -1,0 +1,633 @@
+---
+title: GraphQL API with graphql-kotlin
+description: Build a code-first GraphQL API for a task manager using graphql-kotlin on Spring Boot — queries, mutations, enums, input types, and DataLoaders.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← API Design & Serialization"
+  href="/kotlin-backend/15-api-design/"
+/>
+
+## Goal
+
+Build a GraphQL API for a task-management system using
+[graphql-kotlin](https://opensource.expediagroup.com/graphql-kotlin/) (Expedia's
+code-first library). Instead of hand-writing an SDL schema and wiring resolvers to
+it, you write ordinary Kotlin classes and let the library *generate* the schema
+from your code — the inverse of the schema-first workflow you might know from
+Apollo Server in TypeScript or `gqlgen` in Go.
+
+## What you'll build
+
+- A `Query` class exposing `tasks` (paginated, filterable) and `task(id)`.
+- A `Mutation` class for `createTask`, `updateTaskStatus`, and `deleteTask`.
+- Kotlin `data class`es and `enum`s that map automatically to GraphQL object,
+  input, and enum types.
+- `DataLoader`s registered to batch nested lookups (users, comments) and avoid the
+  N+1 query problem.
+
+The mental model coming from TS/Go:
+
+- **Schema-first (Apollo / gqlgen):** you write the `.graphql` SDL, then implement
+  resolvers that must match it. The schema is the source of truth.
+- **Code-first (graphql-kotlin):** your Kotlin types *are* the source of truth. A
+  public function on a `Query` component becomes a root field; its parameters
+  become field arguments; its return type becomes the field type. The SDL is
+  generated for you and served at `/sdl`.
+
+## The worked solution
+
+A single Spring Boot module. graphql-kotlin's Spring Boot starter auto-discovers
+any `@Component` that implements `Query` or `Mutation` in the configured packages
+and assembles the schema at startup.
+
+<FileTree>
+- graphql-api/
+  - build.gradle.kts deps + build config
+  - settings.gradle.kts project name
+  - src/main/
+    - kotlin/com/example/graphql/
+      - GraphqlApiApplication.kt Spring Boot entrypoint
+      - model/
+        - **Models.kt** data classes, enums, input types
+      - query/
+        - **TaskQuery.kt** root query operations
+      - mutation/
+        - **TaskMutation.kt** root mutation operations
+      - service/
+        - TaskService.kt in-memory task, user, comment stores
+      - dataloader/
+        - **DataLoaderConfig.kt** batched loaders for nested fields
+    - resources/
+      - application.yml graphql packages, playground, sdl
+  - src/test/kotlin/com/example/graphql/
+    - GraphqlApiTest.kt MockMvc tests over the /graphql endpoint
+</FileTree>
+
+### build.gradle.kts
+
+The whole GraphQL stack arrives through one starter dependency:
+`graphql-kotlin-spring-boot-starter`. It pulls in the schema generator, the HTTP
+endpoint, the playground, and the SDL route. The `kotlin("plugin.spring")` plugin
+makes Spring's component classes `open` so they can be proxied.
+
+```kotlin title="build.gradle.kts" {3,26}
+plugins {
+    kotlin("jvm") version "2.1.0"
+    kotlin("plugin.spring") version "2.1.0"
+    id("org.springframework.boot") version "3.4.1"
+    id("io.spring.dependency-management") version "1.1.7"
+}
+
+group = "com.example"
+version = "1.0.0"
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+
+    // GraphQL - graphql-kotlin (Expedia)
+    implementation("com.expediagroup:graphql-kotlin-spring-boot-starter:8.2.1")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
+}
+```
+
+The starter is configured entirely from `application.yml` — most importantly the
+`graphql.packages` list, which tells the generator where to scan for `Query`,
+`Mutation`, and schema types:
+
+```yaml title="src/main/resources/application.yml"
+spring:
+  application:
+    name: graphql-api-demo
+
+graphql:
+  packages:
+    - "com.example.graphql"
+  playground:
+    enabled: true
+  sdl:
+    enabled: true
+  introspection:
+    enabled: true
+
+server:
+  port: 8080
+```
+
+### Models.kt — Kotlin types become GraphQL types
+
+This is where code-first really pays off. Each `data class` maps to a GraphQL
+object type, each `enum class` to a GraphQL enum, and a class used only as a
+function parameter (`CreateTaskInput`) becomes a GraphQL `input` type. Nullability
+crosses over directly: a non-null Kotlin field is a `Type!` in the schema; a
+nullable `String?` becomes a nullable `String`.
+
+A few annotations steer the generator:
+
+- `@GraphQLDescription("…")` becomes the doc string in the generated SDL and shows
+  up in the playground.
+- `@GraphQLIgnore` hides a property from the schema entirely — here `internalUserId`
+  stays a server-side field and never appears in the API.
+
+```kotlin title="src/main/kotlin/com/example/graphql/model/Models.kt" {7-12,20-32,50-55}
+package com.example.graphql.model
+
+import com.expediagroup.graphql.generator.annotations.GraphQLDescription
+import com.expediagroup.graphql.generator.annotations.GraphQLIgnore
+import java.time.Instant
+
+enum class TaskStatus {
+    OPEN,
+    IN_PROGRESS,
+    DONE,
+    CANCELLED,
+}
+
+enum class Priority {
+    LOW,
+    MEDIUM,
+    HIGH,
+}
+
+@GraphQLDescription("A task in the system")
+data class TaskDto(
+    val id: Long,
+    val title: String,
+    val description: String?,
+    val status: TaskStatus,
+    val priority: Priority,
+    val assigneeId: Long?,
+    val createdAt: String,
+
+    @GraphQLIgnore
+    val internalUserId: String? = null,
+)
+
+@GraphQLDescription("A user in the system")
+data class UserDto(
+    val id: Long,
+    val name: String,
+    val email: String,
+)
+
+@GraphQLDescription("A comment on a task")
+data class CommentDto(
+    val id: Long,
+    val taskId: Long,
+    val text: String,
+    val authorId: Long,
+    val createdAt: String,
+)
+
+data class CreateTaskInput(
+    val title: String,
+    val description: String? = null,
+    val priority: Priority = Priority.MEDIUM,
+    val assigneeId: Long? = null,
+)
+```
+
+:::note[Kotlin types → GraphQL types]
+`Long` and `Int` map to GraphQL scalars; `Instant` here is sidestepped by storing
+`createdAt` as a `String` (a custom scalar would be the alternative). A Kotlin
+default like `priority: Priority = Priority.MEDIUM` makes that input field optional
+with a default value in the generated schema — no extra wiring required.
+:::
+
+### TaskQuery.kt — root query fields
+
+A `@Component` implementing the marker interface `Query` is the entry point for
+read operations. Every public function on it becomes a root field. Function
+parameters become field arguments, and Kotlin defaults (`limit: Int = 20`) become
+optional arguments with defaults. The return type drives the field type:
+`List<TaskDto>` becomes `[Task!]!`, and the nullable `TaskDto?` on `task(id)`
+becomes a nullable `Task`.
+
+```kotlin title="src/main/kotlin/com/example/graphql/query/TaskQuery.kt" {11-13,15-22,24-27}
+package com.example.graphql.query
+
+import com.example.graphql.model.TaskDto
+import com.example.graphql.model.TaskStatus
+import com.example.graphql.service.TaskService
+import com.expediagroup.graphql.generator.annotations.GraphQLDescription
+import com.expediagroup.graphql.server.operations.Query
+import org.springframework.stereotype.Component
+
+@Component
+class TaskQuery(
+    private val taskService: TaskService,
+) : Query {
+
+    @GraphQLDescription("Get a paginated list of tasks, optionally filtered by status")
+    fun tasks(
+        status: TaskStatus? = null,
+        limit: Int = 20,
+        offset: Int = 0,
+    ): List<TaskDto> {
+        return taskService.findAll(status, limit, offset)
+    }
+
+    @GraphQLDescription("Get a single task by its ID")
+    fun task(id: Long): TaskDto? {
+        return taskService.findById(id)
+    }
+}
+```
+
+### TaskMutation.kt — root mutation fields
+
+Identical pattern, different marker interface: implement `Mutation`. `createTask`
+takes the `CreateTaskInput` type (which the generator exposes as a GraphQL
+`input`), and `deleteTask` returns a plain `Boolean`.
+
+```kotlin title="src/main/kotlin/com/example/graphql/mutation/TaskMutation.kt" {11-14,16-18,26-29}
+package com.example.graphql.mutation
+
+import com.example.graphql.model.CreateTaskInput
+import com.example.graphql.model.TaskDto
+import com.example.graphql.model.TaskStatus
+import com.example.graphql.service.TaskService
+import com.expediagroup.graphql.generator.annotations.GraphQLDescription
+import com.expediagroup.graphql.server.operations.Mutation
+import org.springframework.stereotype.Component
+
+@Component
+class TaskMutation(
+    private val taskService: TaskService,
+) : Mutation {
+
+    @GraphQLDescription("Create a new task")
+    fun createTask(input: CreateTaskInput): TaskDto {
+        return taskService.create(input)
+    }
+
+    @GraphQLDescription("Update the status of an existing task")
+    fun updateTaskStatus(id: Long, status: TaskStatus): TaskDto? {
+        return taskService.updateStatus(id, status)
+    }
+
+    @GraphQLDescription("Delete a task by ID. Returns true if the task was deleted.")
+    fun deleteTask(id: Long): Boolean {
+        return taskService.delete(id)
+    }
+}
+```
+
+### TaskService.kt — the backing stores
+
+The data layer is deliberately boring: in-memory `ConcurrentHashMap` and `listOf`
+stores so the focus stays on GraphQL. Note the three Spring `@Service` beans —
+`TaskService`, `UserService`, and `CommentService` — that the queries, mutations,
+and DataLoaders inject. `UserService.findByIds` and `CommentService.findByTaskIds`
+exist specifically so a `DataLoader` can fetch many keys in one call.
+
+```kotlin title="src/main/kotlin/com/example/graphql/service/TaskService.kt" {20-26,65-66,80-81}
+package com.example.graphql.service
+
+import com.example.graphql.model.*
+import org.springframework.stereotype.Service
+import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+
+@Service
+class TaskService {
+    private val tasks = ConcurrentHashMap<Long, TaskDto>()
+    private val idCounter = AtomicLong(0)
+
+    init {
+        create(CreateTaskInput("Learn Kotlin", "Complete the basics", Priority.HIGH, 1))
+        create(CreateTaskInput("Build GraphQL API", "Use graphql-kotlin", Priority.MEDIUM, 2))
+        create(CreateTaskInput("Write tests", "Unit and integration", Priority.LOW, 1))
+    }
+
+    fun findAll(status: TaskStatus? = null, limit: Int = 20, offset: Int = 0): List<TaskDto> {
+        return tasks.values
+            .filter { status == null || it.status == status }
+            .sortedByDescending { it.createdAt }
+            .drop(offset)
+            .take(limit)
+    }
+
+    fun findById(id: Long): TaskDto? = tasks[id]
+
+    fun create(input: CreateTaskInput): TaskDto {
+        val id = idCounter.incrementAndGet()
+        val task = TaskDto(
+            id = id,
+            title = input.title,
+            description = input.description,
+            status = TaskStatus.OPEN,
+            priority = input.priority,
+            assigneeId = input.assigneeId,
+            createdAt = Instant.now().toString(),
+        )
+        tasks[id] = task
+        return task
+    }
+
+    fun updateStatus(id: Long, status: TaskStatus): TaskDto? {
+        val existing = tasks[id] ?: return null
+        val updated = existing.copy(status = status)
+        tasks[id] = updated
+        return updated
+    }
+
+    fun delete(id: Long): Boolean = tasks.remove(id) != null
+}
+
+@Service
+class UserService {
+    private val users = mapOf(
+        1L to UserDto(1, "Alice Johnson", "alice@example.com"),
+        2L to UserDto(2, "Bob Smith", "bob@example.com"),
+        3L to UserDto(3, "Charlie Brown", "charlie@example.com"),
+    )
+
+    fun findById(id: Long): UserDto? = users[id]
+
+    fun findByIds(ids: List<Long>): List<UserDto> =
+        ids.mapNotNull { users[it] }
+}
+
+@Service
+class CommentService {
+    private val comments = listOf(
+        CommentDto(1, 1, "Great progress on this!", 2, Instant.now().toString()),
+        CommentDto(2, 1, "Let me know if you need help", 3, Instant.now().toString()),
+        CommentDto(3, 2, "Started working on this", 1, Instant.now().toString()),
+    )
+
+    fun findByTaskId(taskId: Long): List<CommentDto> =
+        comments.filter { it.taskId == taskId }
+
+    fun findByTaskIds(taskIds: List<Long>): List<CommentDto> =
+        comments.filter { it.taskId in taskIds }
+}
+```
+
+### DataLoaderConfig.kt — batching nested lookups
+
+The classic GraphQL trap is the **N+1 query**: resolving `assignee` for a list of
+50 tasks fires 50 separate user lookups. A `DataLoader` fixes this by *collecting*
+all the keys requested during one execution and dispatching them in a single batch
+call, then handing each caller back its slice.
+
+graphql-kotlin wires this up through a `KotlinDataLoaderRegistryFactory` bean. Each
+loader implements `KotlinDataLoader<K, V>` with a `dataLoaderName` and a batch
+function `(keys) -> CompletableFuture<List<V>>`. The contract is strict: the
+returned list must be the **same size and order** as the input keys.
+
+```kotlin title="src/main/kotlin/com/example/graphql/dataloader/DataLoaderConfig.kt" {20-26,28-38,40-52}
+package com.example.graphql.dataloader
+
+import com.example.graphql.model.CommentDto
+import com.example.graphql.model.UserDto
+import com.example.graphql.service.CommentService
+import com.example.graphql.service.UserService
+import com.expediagroup.graphql.dataloader.KotlinDataLoader
+import com.expediagroup.graphql.dataloader.KotlinDataLoaderRegistryFactory
+import graphql.GraphQLContext
+import org.dataloader.DataLoaderFactory
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import java.util.concurrent.CompletableFuture
+
+@Configuration
+class DataLoaderConfig(
+    private val userService: UserService,
+    private val commentService: CommentService,
+) {
+    @Bean
+    fun dataLoaderRegistryFactory(): KotlinDataLoaderRegistryFactory {
+        return KotlinDataLoaderRegistryFactory(
+            userDataLoader(),
+            commentsDataLoader(),
+        )
+    }
+
+    private fun userDataLoader() = object : KotlinDataLoader<Long, UserDto?> {
+        override val dataLoaderName = "userLoader"
+
+        override fun getDataLoader(graphQLContext: GraphQLContext) =
+            DataLoaderFactory.newDataLoader<Long, UserDto?> { ids ->
+                CompletableFuture.supplyAsync {
+                    val users = userService.findByIds(ids)
+                    ids.map { id -> users.find { it.id == id } }
+                }
+            }
+    }
+
+    private fun commentsDataLoader() = object : KotlinDataLoader<Long, List<CommentDto>> {
+        override val dataLoaderName = "commentsLoader"
+
+        override fun getDataLoader(graphQLContext: GraphQLContext) =
+            DataLoaderFactory.newDataLoader<Long, List<CommentDto>> { taskIds ->
+                CompletableFuture.supplyAsync {
+                    val allComments = commentService.findByTaskIds(taskIds)
+                    taskIds.map { taskId ->
+                        allComments.filter { it.taskId == taskId }
+                    }
+                }
+            }
+    }
+}
+```
+
+A few details worth pausing on:
+
+- The `userLoader` is keyed `Long -> UserDto?` and re-orders the service's result
+  back to match the requested `ids`, returning `null` for any id with no user.
+- The `commentsLoader` is keyed `Long -> List<CommentDto>` (one task can have many
+  comments). It fetches *all* comments for the batch of `taskIds` once, then
+  partitions them per task — one DB-style call instead of one per task.
+- Both wrap the work in `CompletableFuture.supplyAsync`, which is how the
+  underlying `java-dataloader` library expects a batch result.
+
+A nested resolver field then asks for its loader by name and returns the
+`CompletableFuture` — graphql-kotlin waits for all loaders to be dispatched before
+resolving, so the batches actually coalesce.
+
+## Querying the API
+
+Once running, the schema is fully introspectable. Some example operations:
+
+List all tasks:
+
+```graphql
+{
+  tasks {
+    id
+    title
+    status
+    priority
+  }
+}
+```
+
+Get one task with more detail:
+
+```graphql
+{
+  task(id: 1) {
+    id
+    title
+    description
+    status
+    createdAt
+  }
+}
+```
+
+Filter and paginate — note the enum value `OPEN` is unquoted, the GraphQL way:
+
+```graphql
+{
+  tasks(status: OPEN, limit: 10) {
+    id
+    title
+    status
+  }
+}
+```
+
+Create a task with an input object (`priority` defaults to `MEDIUM` if omitted):
+
+```graphql
+mutation {
+  createTask(input: {
+    title: "Learn GraphQL"
+    description: "Complete the graphql-kotlin exercise"
+    priority: HIGH
+  }) {
+    id
+    title
+    status
+    priority
+  }
+}
+```
+
+Update status and delete:
+
+```graphql
+mutation {
+  updateTaskStatus(id: 1, status: DONE) {
+    id
+    title
+    status
+  }
+}
+```
+
+```graphql
+mutation {
+  deleteTask(id: 1)
+}
+```
+
+## Run it
+
+<Steps>
+
+1. Start the server:
+
+   ```bash
+   ./gradlew bootRun
+   ```
+
+2. Open the interactive playground in a browser and run the example queries above:
+
+   ```text
+   http://localhost:8080/playground
+   ```
+
+3. Inspect the generated schema (SDL) — proof that the code *is* the schema:
+
+   ```text
+   http://localhost:8080/sdl
+   ```
+
+</Steps>
+
+## Test it
+
+The tests use Spring's `MockMvc` to POST GraphQL documents to `/graphql` and assert
+over the JSON response with `jsonPath`, the same way you'd integration-test a REST
+endpoint.
+
+<Steps>
+
+1. Run the suite:
+
+   ```bash
+   ./gradlew test
+   ```
+
+2. The tests cover querying all tasks, fetching one by id, filtering by status,
+   creating a task via mutation, and deleting a non-existent task (expecting
+   `false`).
+
+</Steps>
+
+```kotlin title="src/test/kotlin/com/example/graphql/GraphqlApiTest.kt" {17-34}
+@SpringBootTest
+@AutoConfigureMockMvc
+class GraphqlApiTest {
+
+    @Autowired lateinit var mockMvc: MockMvc
+
+    @Test
+    fun `query all tasks`() {
+        val query = """
+            {
+                "query": "{ tasks { id title status priority } }"
+            }
+        """.trimIndent()
+
+        mockMvc.post("/graphql") {
+            contentType = MediaType.APPLICATION_JSON
+            content = query
+        }.andExpect {
+            status { isOk() }
+            jsonPath("$.data.tasks") { isArray() }
+            jsonPath("$.data.tasks[0].id") { isNotEmpty() }
+            jsonPath("$.data.tasks[0].title") { isNotEmpty() }
+        }
+    }
+
+    // … create / filter / delete / sdl tests follow the same shape
+}
+```
+
+:::tip[Stretch goals]
+- Add nested resolver fields to `TaskDto` (e.g. `assignee` and `comments`) that
+  use the `userLoader` and `commentsLoader` so you can request a task and its
+  related data in one query — and watch the batching in action.
+- Introduce a custom scalar for `createdAt` so it's a real `DateTime` rather than a
+  `String`.
+- Add input validation (reject a blank `title`) and surface it as a GraphQL error.
+- Swap the in-memory stores for a real database (see the PostgreSQL module) and
+  confirm the DataLoaders collapse the N+1 into batched SQL.
+:::

@@ -1,0 +1,728 @@
+---
+title: "CI/CD Pipeline and Kubernetes Manifests"
+description: Build a GitHub Actions pipeline and Kubernetes manifests to test, build, push, and deploy a Spring Boot Kotlin app.
+sidebar:
+  order: 2
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Deployment & Production"
+  href="/kotlin-backend/18-deployment/"
+/>
+
+## Goal
+
+Wire up the whole road from `git push` to running pods: a GitHub Actions pipeline
+that tests, lints, builds, and pushes a Docker image, plus a complete set of
+Kubernetes manifests (Deployment, Service, ConfigMap, Secret, Ingress, HPA) that
+run a Spring Boot Kotlin service in production with proper JVM-aware health probes
+and auto-scaling.
+
+If you've shipped Node or Go services, the moving parts are familiar — a CI
+workflow, a container registry, a reverse proxy, an autoscaler. The twist here is
+making the manifests respect the JVM: the startup probe gives the JVM time to warm
+up, and `JAVA_OPTS` tells the heap to live inside the container's memory limit.
+
+## Requirements
+
+1. A GitHub Actions workflow that tests and lints on every push/PR, with a
+   PostgreSQL service container for integration tests.
+2. A release workflow that builds a fat JAR, pushes a Docker image to GHCR, and
+   deploys to Kubernetes on a `v*` git tag.
+3. Kubernetes manifests: `Deployment`, `Service`, `ConfigMap`, `Secret`,
+   `Ingress`, and an `HorizontalPodAutoscaler`.
+4. Health probes (`liveness` / `readiness` / `startup`) tuned for JVM startup time.
+5. Environment-based configuration through Spring profiles, with sensitive vs
+   non-sensitive config split between `Secret` and `ConfigMap`.
+
+## The worked solution
+
+The repo carries two GitHub Actions workflows and a folder of six Kubernetes
+manifests. The Spring Boot app itself is conventional (the build is the
+`bootJar`-producing `build.gradle.kts` below) — the interesting part is everything
+around the code.
+
+<FileTree>
+- cicd-k8s/
+  - .github/
+    - workflows/
+      - **ci.yml** test + lint on every push/PR
+      - **release.yml** build + push + deploy on a v* tag
+  - k8s/
+    - **deployment.yaml** the app Deployment, probes, JAVA_OPTS
+    - service.yaml ClusterIP service
+    - configmap.yaml non-sensitive config
+    - secret.yaml sensitive data (template)
+    - ingress.yaml nginx ingress + TLS
+    - hpa.yaml HorizontalPodAutoscaler
+  - build.gradle.kts Spring Boot build, produces app.jar
+  - settings.gradle.kts
+  - Dockerfile
+  - docker-compose.yml
+</FileTree>
+
+### The pipeline at a glance
+
+Two workflows, two triggers. `ci.yml` runs on every push and PR and guards
+correctness; `release.yml` only fires on a `v*` tag and is what actually ships.
+
+<Mermaid title="CI/CD pipeline" code={`
+flowchart LR
+  Dev["git push / PR"] --> CI
+  Tag["git tag v*"] --> REL
+  subgraph CI["ci.yml"]
+    direction TB
+    T["test job (+ Postgres service)"] --> B["build job (bootJar)"]
+  end
+  subgraph REL["release.yml"]
+    direction TB
+    J["build app.jar"] --> D["build + push image to GHCR"]
+    D --> K["kubectl set image -> rollout"]
+  end
+  K --> Cluster["Kubernetes cluster"]
+`} height={420} />
+
+### build.gradle.kts
+
+A standard Spring Boot + Kotlin build. Two details matter for deployment: the
+version is read from a Gradle property so the release workflow can stamp it
+(`-Pversion=...`), and `bootJar` is renamed to a stable `app.jar` so the
+`Dockerfile` and the JAR artifact upload don't have to track a version in the
+filename.
+
+```kotlin title="build.gradle.kts" {10,30-32,34-36}
+plugins {
+    id("org.springframework.boot") version "3.3.0"
+    id("io.spring.dependency-management") version "1.1.5"
+    kotlin("jvm") version "2.0.0"
+    kotlin("plugin.spring") version "2.0.0"
+    kotlin("plugin.jpa") version "2.0.0"
+}
+
+group = "com.example"
+version = project.findProperty("version")?.toString() ?: "0.0.1-SNAPSHOT"
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+    implementation("org.springframework.boot:spring-boot-starter-validation")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+    implementation("org.jetbrains.kotlin:kotlin-reflect")
+
+    runtimeOnly("org.postgresql:postgresql")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("com.h2database:h2")
+}
+
+tasks.bootJar {
+    archiveFileName.set("app.jar")
+}
+
+kotlin {
+    jvmToolchain(21)
+}
+```
+
+The `spring-boot-starter-actuator` dependency is load-bearing here — it's what
+exposes the `/actuator/health/liveness` and `/actuator/health/readiness`
+endpoints that the Kubernetes probes hit.
+
+### CI workflow — test and build
+
+On every push and PR this runs the `test` job. The `services:` block spins up a
+PostgreSQL container alongside the job (the GitHub Actions equivalent of a
+`docker compose` sidecar for tests) with a health check so the test step doesn't
+start until Postgres is ready. The `build` job `needs: test` and only runs on a
+`push`, not on PRs from forks.
+
+A note on the cache key: `cache-read-only` is set to the expression
+`${{ github.ref != 'refs/heads/main' }}`, so branch builds read the Gradle cache
+but only `main` is allowed to write to it — keeping the shared cache clean.
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Run tests
+        run: ./gradlew test
+        env:
+          DATABASE_URL: jdbc:postgresql://localhost:5432/testdb
+          DATABASE_USER: test
+          DATABASE_PASSWORD: test
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build/reports/tests/
+          retention-days: 7
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build JAR
+        run: ./gradlew bootJar
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: build/libs/app.jar
+          retention-days: 7
+```
+
+### Release workflow — build, push, deploy
+
+This is the deploy half. It triggers only on a `v*` tag and runs two jobs in
+sequence: `release` builds and publishes, then `deploy` rolls it out.
+
+- The tag is parsed into a `VERSION` env var (`${GITHUB_REF#refs/tags/v}`), which
+  is fed to Gradle as `-Pversion=...` so the artifact carries the release version.
+- `docker/metadata-action` generates image tags from the semver tag (full
+  version, `major.minor`, and a `sha` tag) so consumers can pin at the precision
+  they want.
+- The build-push step uses GitHub Actions' build cache (`cache-from: type=gha`,
+  `cache-to: type=gha,mode=max`) so Docker layers are reused across runs.
+- The `deploy` job uses a `production` environment (so you can gate it behind a
+  required reviewer) and ships with `kubectl set image` followed by a
+  `kubectl rollout status` that fails the job if the rollout doesn't complete in
+  300s.
+
+The registry login uses the built-in `${{ secrets.GITHUB_TOKEN }}` — no extra
+secret to manage for pushing to GHCR.
+
+```yaml title=".github/workflows/release.yml"
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Extract version from tag
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Build JAR with version
+        run: ./gradlew bootJar -Pversion=${{ env.VERSION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/libs/app.jar
+          generate_release_notes: true
+
+  deploy:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Set image tag
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "IMAGE_TAG=${VERSION}" >> $GITHUB_ENV
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl set image deployment/task-api \
+            app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            --namespace=production
+          kubectl rollout status deployment/task-api \
+            --namespace=production \
+            --timeout=300s
+```
+
+## The Kubernetes manifests
+
+Six objects make up the running service. Here's how they fit together: traffic
+enters through the `Ingress`, hits the `Service`, which load-balances across the
+`Deployment`'s pods; each pod's config comes from the `ConfigMap` and `Secret`,
+and the `HPA` adjusts the replica count based on load.
+
+<Mermaid title="Kubernetes topology" code={`
+flowchart TB
+  User["Client"] -->|"HTTPS task-api.example.com"| Ing["Ingress (nginx + TLS)"]
+  Ing -->|"port 80"| Svc["Service (ClusterIP)"]
+  Svc -->|"targetPort http 8080"| Dep
+  subgraph Dep["Deployment task-api"]
+    P1["Pod"]
+    P2["Pod"]
+  end
+  CM["ConfigMap"] -.->|"server-port, log-level"| Dep
+  Sec["Secret"] -.->|"db url / user / password"| Dep
+  HPA["HorizontalPodAutoscaler"] -.->|"scales 2..10 on CPU/mem"| Dep
+`} height={480} />
+
+### Deployment — the centerpiece
+
+The `Deployment` is where the JVM-specific care lives. A few things worth calling
+out:
+
+- **Rolling update with `maxUnavailable: 0`** keeps full capacity during a
+  rollout — new pods come up before old ones go down.
+- **Three probes, three jobs.** The `startupProbe` (lines 94-100) hits
+  `/actuator/health` and allows up to `30 × 5s = 150s` for the JVM to boot before
+  the liveness probe even starts — this is the JVM-specific bit Node/Go don't need.
+  `livenessProbe` restarts a wedged process; `readinessProbe` pulls a pod out of
+  the Service rotation when it can't serve traffic.
+- **`JAVA_OPTS` (lines 61-69)** make the heap container-aware:
+  `-XX:MaxRAMPercentage=75.0` and `-XX:+UseContainerSupport` size the heap from
+  the cgroup memory limit (not the host's RAM), and `-XX:+ExitOnOutOfMemoryError`
+  makes an OOM kill the process so Kubernetes restarts it cleanly.
+- **Secrets and config are injected as env vars** via `secretKeyRef` and
+  `configMapKeyRef` — Spring picks them up as `SPRING_DATASOURCE_*` and
+  `SERVER_PORT`.
+- A non-root `securityContext`, a writable `/tmp` `emptyDir` (so a read-only
+  rootfs still has a scratch dir for heap dumps), and a 60s
+  `terminationGracePeriodSeconds` round it out.
+
+```yaml title="k8s/deployment.yaml" {12-16,38-69,77-100}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task-api
+  labels:
+    app: task-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: task-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: task-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      serviceAccountName: task-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: app
+          image: ghcr.io/example/task-api:latest
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "prod"
+            - name: SPRING_DATASOURCE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: task-api-secrets
+                  key: database-url
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: task-api-secrets
+                  key: database-user
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: task-api-secrets
+                  key: database-password
+            - name: SERVER_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: task-api-config
+                  key: server-port
+            - name: JAVA_OPTS
+              value: >-
+                -XX:MaxRAMPercentage=75.0
+                -XX:InitialRAMPercentage=50.0
+                -XX:+UseContainerSupport
+                -XX:+UseG1GC
+                -XX:+ExitOnOutOfMemoryError
+                -XX:+HeapDumpOnOutOfMemoryError
+                -XX:HeapDumpPath=/tmp/heapdump.hprof
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          # Liveness: is the process alive?
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness: can it serve traffic?
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 3
+          # Startup: give JVM time to start
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 60
+```
+
+:::caution[Probe paths need the right starters]
+The split `/actuator/health/liveness` and `/actuator/health/readiness` groups are
+only exposed when Spring Boot's actuator detects a Kubernetes environment (or you
+set `management.endpoint.health.probes.enabled=true`). If those endpoints 404, the
+probes fail and the pod never becomes ready — check the actuator config before
+blaming the cluster.
+:::
+
+### Service and Ingress
+
+The `Service` is a plain `ClusterIP`: stable internal name `task-api`, listening
+on port 80, forwarding to the pods' named `http` port (8080). Using the port
+*name* `http` as `targetPort` means the Service keeps working even if you change
+the container port number later.
+
+```yaml title="k8s/service.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  name: task-api
+  labels:
+    app: task-api
+spec:
+  type: ClusterIP
+  selector:
+    app: task-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+```
+
+The `Ingress` is the public entrypoint: it terminates TLS (with a cert in
+`task-api-tls`), routes the host `task-api.example.com` to the Service, and tunes
+two nginx behaviours — a 10 MB body-size cap and a 60s read timeout.
+
+```yaml title="k8s/ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: task-api
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: task-api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: task-api
+                port:
+                  name: http
+  tls:
+    - hosts:
+        - task-api.example.com
+      secretName: task-api-tls
+```
+
+### ConfigMap and Secret
+
+The split is the whole point: non-sensitive knobs (`server-port`, `log-level`) go
+in a `ConfigMap`; credentials go in a `Secret`. Both are surfaced to the pod as
+env vars (see the Deployment above), so the app never reads a config file off disk.
+
+```yaml title="k8s/configmap.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: task-api-config
+data:
+  server-port: "8080"
+  log-level: "INFO"
+```
+
+The committed `Secret` is a *template* with base64-encoded example values only.
+Note that base64 is encoding, not encryption — anyone with read access to the
+Secret can decode it, so the real values should come from `kubectl create secret`
+or a proper secrets manager, never from a committed file.
+
+```yaml title="k8s/secret.yaml"
+# IMPORTANT: This is a template. In production, use:
+#   kubectl create secret generic task-api-secrets \
+#     --from-literal=database-url="jdbc:postgresql://db:5432/myapp" \
+#     --from-literal=database-user="app_user" \
+#     --from-literal=database-password="<real-password>"
+#
+# Or better: use External Secrets Operator, Sealed Secrets, or Vault.
+# Never commit real secrets to version control.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: task-api-secrets
+type: Opaque
+# These are base64-encoded EXAMPLE values only
+data:
+  database-url: amRiYzpwb3N0Z3Jlc3FsOi8vZGI6NTQzMi90YXNrZGI=
+  database-user: cG9zdGdyZXM=
+  database-password: cG9zdGdyZXM=
+```
+
+:::danger[Never commit real secrets]
+The values above are throwaway examples. Real credentials in a committed manifest
+are effectively public the moment they hit git history. Use a sealed/external
+secrets workflow.
+:::
+
+### HorizontalPodAutoscaler
+
+The `HPA` keeps between 2 and 10 replicas, scaling on both CPU (target 70%) and
+memory (target 80%) utilization. The `behavior` block makes scaling asymmetric —
+fast to scale up (add up to 2 pods/min after a 60s window) and slow to scale down
+(remove 1 pod every 2 min after a 5-min window) so a brief traffic dip doesn't
+churn pods.
+
+```yaml title="k8s/hpa.yaml" {10-11,25-37}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: task-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: task-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+```
+
+## Run and deploy
+
+Locally you can run the app with Docker Compose; in a cluster you apply the
+manifests and watch the rollout.
+
+<Steps>
+
+1. Run the app locally with its dependencies:
+
+   ```bash
+   docker compose up --build
+   ```
+
+2. Run the test suite (the same `./gradlew test` CI runs):
+
+   ```bash
+   ./gradlew test
+   ```
+
+3. Create a namespace and apply all the manifests:
+
+   ```bash
+   kubectl create namespace myapp
+   kubectl apply -f k8s/ -n myapp
+   ```
+
+4. Watch the rollout complete:
+
+   ```bash
+   kubectl rollout status deployment/task-api -n myapp
+   kubectl get pods -n myapp
+   ```
+
+5. Port-forward the Service to test it locally without the Ingress:
+
+   ```bash
+   kubectl port-forward svc/task-api 8080:80 -n myapp
+   ```
+
+</Steps>
+
+:::note[How a release actually ships]
+In the wired-up version you don't `kubectl apply` by hand — you push a `v1.2.3`
+tag, the release workflow builds and pushes `ghcr.io/<repo>:1.2.3`, and the
+`deploy` job runs `kubectl set image` against the `production` namespace. The
+manifests are applied once; tags drive ongoing deploys.
+:::
+
+:::tip[Stretch goals]
+- Add a `PodDisruptionBudget` so voluntary disruptions (node drains) never take
+  the service below one available replica.
+- Add a `NetworkPolicy` restricting which pods can reach the database.
+- Swap the env-var `Secret` for the External Secrets Operator backed by a real
+  vault, and remove the template `secret.yaml` from the repo entirely.
+- Add a smoke-test step to the `deploy` job that curls `/actuator/health` through
+  the Ingress and rolls back on failure.
+- Push to a staging namespace first and promote to `production` with a manual
+  approval gate.
+:::

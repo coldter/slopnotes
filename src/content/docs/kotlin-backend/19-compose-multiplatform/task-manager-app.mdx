@@ -1,0 +1,801 @@
+---
+title: Task Manager Desktop and Web App
+description: Build one Compose Multiplatform UI that runs as a native desktop app and in the browser, talking to your task REST API over Ktor.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard, Tabs, TabItem } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Compose Multiplatform"
+  href="/kotlin-backend/19-compose-multiplatform/"
+/>
+
+## Goal
+
+Write the UI **once** in `commonMain` and ship it as both a native desktop window
+and a WebAssembly browser app. The same Compose code drives both targets; only the
+tiny entry points differ. The app is a task manager that talks to the REST API you
+built back in Module 08/09 over a shared Ktor client.
+
+If you've used React, this is the payoff a TS dev recognizes: declarative UI,
+component functions, hoisted state, one render tree — except the same source
+compiles to a desktop binary *and* the web.
+
+## What you'll build
+
+A Material 3 task manager with:
+
+<Steps>
+
+1. **Task list** — every task shown with title, description, a priority badge, and
+   a completion checkbox.
+2. **Create task** — a dialog with title, description, and priority chips.
+3. **Toggle completion** — a checkbox that flips a task complete/incomplete.
+4. **Delete tasks** — a delete button on each card.
+5. **Refresh** — a button to reload from the API.
+6. **Error handling** — an error message with a Retry button when the API is down.
+7. **Theme** — Material 3 with a dark/light toggle.
+
+</Steps>
+
+:::note[Prerequisite]
+The task API from Module 08 or 09 must be running on `http://localhost:8080`. The
+app is just a client — with no server it will land in the error state (which is one
+of the things you're building, so that's fine to test against).
+:::
+
+## The worked solution
+
+Everything user-facing lives in `commonMain`. The two `Main.kt` files under
+`desktopMain` and `wasmJsMain` are each ~10 lines — they just hand a window to the
+shared `App()` composable.
+
+<FileTree>
+- task-manager-app/
+  - build.gradle.kts multiplatform + compose plugins
+  - settings.gradle.kts google + mavenCentral repos
+  - src/
+    - commonMain/kotlin/ shared code, runs on every target
+      - **App.kt** root composable, wires state to UI
+      - data/
+        - model/Task.kt serializable data models
+        - api/TaskApi.kt Ktor HTTP client
+        - viewmodel/TaskViewModel.kt StateFlow state holder
+      - ui/
+        - components/TaskCard.kt one task row
+        - screens/TaskListScreen.kt list + create dialog
+        - theme/AppTheme.kt Material 3 color schemes
+    - desktopMain/kotlin/Main.kt desktop entry point
+    - wasmJsMain/
+      - kotlin/Main.kt web entry point
+      - resources/index.html HTML host page
+</FileTree>
+
+### build.gradle.kts — one project, two targets
+
+The Kotlin Multiplatform plugin declares the targets (`jvm("desktop")` and
+`wasmJs`), and each target gets its own source set with target-specific
+dependencies. The shared `commonMain` depends only on the Compose runtime and a
+*platform-agnostic* Ktor client core; each platform supplies its own Ktor engine
+(`ktor-client-cio` on the JVM, `ktor-client-js` for the browser).
+
+```kotlin title="build.gradle.kts" {8-13,21-30,37,43}
+plugins {
+    kotlin("multiplatform") version "2.1.0"
+    kotlin("plugin.serialization") version "2.1.0"
+    id("org.jetbrains.compose") version "1.7.3"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.1.0"
+}
+
+kotlin {
+    jvm("desktop")
+
+    wasmJs {
+        browser()
+    }
+
+    sourceSets {
+        val commonMain by getting {
+            dependencies {
+                implementation(compose.runtime)
+                implementation(compose.foundation)
+                implementation(compose.material3)
+                implementation(compose.components.resources)
+
+                // Ktor client for API calls (engine-agnostic core)
+                implementation("io.ktor:ktor-client-core:3.0.3")
+                implementation("io.ktor:ktor-client-content-negotiation:3.0.3")
+                implementation("io.ktor:ktor-serialization-kotlinx-json:3.0.3")
+
+                // Coroutines
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+            }
+        }
+
+        val desktopMain by getting {
+            dependencies {
+                implementation(compose.desktop.currentOs)
+                implementation("io.ktor:ktor-client-cio:3.0.3")
+            }
+        }
+
+        val wasmJsMain by getting {
+            dependencies {
+                implementation("io.ktor:ktor-client-js:3.0.3")
+            }
+        }
+    }
+}
+
+compose.desktop {
+    application {
+        mainClass = "MainKt"
+    }
+}
+```
+
+### data/model/Task.kt — serializable models
+
+Plain Kotlin data classes with `@Serializable`. These double as the wire format
+(deserialized straight from the API JSON) and the UI model. `description` and
+`createdAt` are nullable (`String?`); defaults like `priority = Priority.MEDIUM`
+fill in fields the server omits. `CreateTaskRequest` and `UpdateTaskRequest` are the
+request bodies — note `UpdateTaskRequest` makes every field nullable so a PUT can
+send just the one field that changed (here, `completed`).
+
+```kotlin title="src/commonMain/kotlin/data/model/Task.kt"
+package data.model
+
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class Task(
+    val id: String,
+    val title: String,
+    val description: String? = null,
+    val priority: Priority = Priority.MEDIUM,
+    val completed: Boolean = false,
+    val createdAt: String? = null
+)
+
+@Serializable
+enum class Priority { LOW, MEDIUM, HIGH }
+
+@Serializable
+data class CreateTaskRequest(
+    val title: String,
+    val description: String? = null,
+    val priority: Priority = Priority.MEDIUM
+)
+
+@Serializable
+data class UpdateTaskRequest(
+    val title: String? = null,
+    val description: String? = null,
+    val priority: Priority? = null,
+    val completed: Boolean? = null
+)
+```
+
+### data/api/TaskApi.kt — the shared HTTP client
+
+A thin wrapper over Ktor's `HttpClient`. `ContentNegotiation` with the JSON
+serializer means every `suspend fun` returns typed Kotlin objects — `client.get(...).body()`
+infers `List<Task>` from the call site, the way `fetch().then(r => r.json())` would in
+TS but type-checked. This file is in `commonMain`, so the exact same client code runs
+on desktop and in the browser; only the underlying engine differs (configured in
+`build.gradle.kts`).
+
+```kotlin title="src/commonMain/kotlin/data/api/TaskApi.kt" {13-20,22-23}
+package data.api
+
+import data.model.*
+import io.ktor.client.*
+import io.ktor.client.call.*
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.client.request.*
+import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
+import kotlinx.serialization.json.Json
+
+class TaskApi(private val baseUrl: String = "http://localhost:8080") {
+    private val client = HttpClient {
+        install(ContentNegotiation) {
+            json(Json {
+                ignoreUnknownKeys = true
+                isLenient = true
+            })
+        }
+    }
+
+    suspend fun getTasks(): List<Task> =
+        client.get("$baseUrl/api/tasks").body()
+
+    suspend fun getTask(id: String): Task =
+        client.get("$baseUrl/api/tasks/$id").body()
+
+    suspend fun createTask(request: CreateTaskRequest): Task =
+        client.post("$baseUrl/api/tasks") {
+            contentType(ContentType.Application.Json)
+            setBody(request)
+        }.body()
+
+    suspend fun updateTask(id: String, request: UpdateTaskRequest): Task =
+        client.put("$baseUrl/api/tasks/$id") {
+            contentType(ContentType.Application.Json)
+            setBody(request)
+        }.body()
+
+    suspend fun deleteTask(id: String) {
+        client.delete("$baseUrl/api/tasks/$id")
+    }
+}
+```
+
+### data/viewmodel/TaskViewModel.kt — state as a StateFlow
+
+This is the state-hoisting heart of the app. Instead of scattering UI state across
+composables, the screen reads a single `StateFlow<TaskListState>` and the ViewModel
+owns all the mutations. `TaskListState` is a `sealed interface` with three cases —
+`Loading`, `Success(tasks)`, `Error(message)` — so the UI just exhaustively `when`s
+over it (no "is it loading AND has data AND has an error?" boolean soup).
+
+Each action (`loadTasks`, `createTask`, `toggleTask`, `deleteTask`) launches a
+coroutine on the ViewModel's own `CoroutineScope`, calls the suspend API, and pushes
+a new state. After a mutation it just calls `loadTasks()` again to re-sync from the
+server — the simplest correct strategy.
+
+```kotlin title="src/commonMain/kotlin/data/viewmodel/TaskViewModel.kt" {8-12,15-18,20-30}
+package data.viewmodel
+
+import data.api.TaskApi
+import data.model.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+
+sealed interface TaskListState {
+    data object Loading : TaskListState
+    data class Success(val tasks: List<Task>) : TaskListState
+    data class Error(val message: String) : TaskListState
+}
+
+class TaskViewModel(private val api: TaskApi) {
+    private val _state = MutableStateFlow<TaskListState>(TaskListState.Loading)
+    val state: StateFlow<TaskListState> = _state.asStateFlow()
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    fun loadTasks() {
+        scope.launch {
+            _state.value = TaskListState.Loading
+            try {
+                val tasks = api.getTasks()
+                _state.value = TaskListState.Success(tasks)
+            } catch (e: Exception) {
+                _state.value = TaskListState.Error(e.message ?: "Failed to load tasks")
+            }
+        }
+    }
+
+    fun createTask(request: CreateTaskRequest) {
+        scope.launch {
+            try {
+                api.createTask(request)
+                loadTasks()
+            } catch (e: Exception) {
+                _state.value = TaskListState.Error(e.message ?: "Failed to create task")
+            }
+        }
+    }
+
+    fun toggleTask(task: Task) {
+        scope.launch {
+            try {
+                api.updateTask(task.id, UpdateTaskRequest(completed = !task.completed))
+                loadTasks()
+            } catch (e: Exception) {
+                _state.value = TaskListState.Error(e.message ?: "Failed to update task")
+            }
+        }
+    }
+
+    fun deleteTask(id: String) {
+        scope.launch {
+            try {
+                api.deleteTask(id)
+                loadTasks()
+            } catch (e: Exception) {
+                _state.value = TaskListState.Error(e.message ?: "Failed to delete task")
+            }
+        }
+    }
+}
+```
+
+:::note[The exposed/private StateFlow pair]
+`_state` is a private `MutableStateFlow` (writable, internal); `state` is the public
+read-only `StateFlow` exposed via `asStateFlow()`. The UI can observe but never mutate
+it directly — mutations only happen through the ViewModel's functions. It's the
+encapsulation a Redux store gives you: one writer, many readers.
+:::
+
+### ui/theme/AppTheme.kt — Material 3 light and dark
+
+Two hard-coded `ColorScheme`s and a wrapper composable. The `darkTheme` boolean
+picks one and feeds it to `MaterialTheme`; everything below pulls colors from
+`MaterialTheme.colorScheme`, so a single boolean flips the whole UI.
+
+```kotlin title="src/commonMain/kotlin/ui/theme/AppTheme.kt" {29-38}
+package ui.theme
+
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
+
+private val LightColorScheme = lightColorScheme(
+    primary = Color(0xFF6750A4),
+    onPrimary = Color(0xFFFFFFFF),
+    primaryContainer = Color(0xFFEADDFF),
+    secondary = Color(0xFF625B71),
+    background = Color(0xFFFEF7FF),
+    surface = Color(0xFFFEF7FF),
+    surfaceVariant = Color(0xFFE7E0EC),
+    error = Color(0xFFB3261E),
+)
+
+private val DarkColorScheme = darkColorScheme(
+    primary = Color(0xFFD0BCFF),
+    onPrimary = Color(0xFF381E72),
+    primaryContainer = Color(0xFF4F378B),
+    secondary = Color(0xFFCCC2DC),
+    background = Color(0xFF1C1B1F),
+    surface = Color(0xFF1C1B1F),
+    surfaceVariant = Color(0xFF49454F),
+    error = Color(0xFFF2B8B5),
+)
+
+@Composable
+fun AppTheme(
+    darkTheme: Boolean = false,
+    content: @Composable () -> Unit
+) {
+    MaterialTheme(
+        colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme,
+        content = content
+    )
+}
+```
+
+### ui/components/TaskCard.kt — one row, fully presentational
+
+`TaskCard` is a pure UI function: it takes a `Task` and two callbacks
+(`onToggle: () -> Unit`, `onDelete: () -> Unit`) and owns no state. That's the
+React "controlled component" pattern — the parent decides what happens, the card
+just renders and reports clicks. Note the conditional styling: a completed task gets
+a faded container and a `TextDecoration.LineThrough` title. `task.description?.let { ... }`
+only renders the description block when it's non-null.
+
+```kotlin title="src/commonMain/kotlin/ui/components/TaskCard.kt" {16-21,42-43,45-51,65-66}
+package ui.components
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.dp
+import data.model.Priority
+import data.model.Task
+
+@Composable
+fun TaskCard(
+    task: Task,
+    onToggle: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (task.completed)
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+            else MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Checkbox(
+                checked = task.completed,
+                onCheckedChange = { onToggle() }
+            )
+            Column(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
+                Text(
+                    text = task.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    textDecoration = if (task.completed)
+                        TextDecoration.LineThrough else null
+                )
+                task.description?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                PriorityBadge(task.priority)
+            }
+            IconButton(onClick = onDelete) {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = "Delete",
+                    tint = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun PriorityBadge(priority: Priority) {
+    val (color, label) = when (priority) {
+        Priority.HIGH -> MaterialTheme.colorScheme.error to "High"
+        Priority.MEDIUM -> MaterialTheme.colorScheme.tertiary to "Medium"
+        Priority.LOW -> MaterialTheme.colorScheme.outline to "Low"
+    }
+
+    Surface(
+        color = color.copy(alpha = 0.1f),
+        shape = RoundedCornerShape(4.dp)
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = color
+        )
+    }
+}
+```
+
+### ui/screens/TaskListScreen.kt — the screen and the create dialog
+
+The screen reads state with `val state by viewModel.state.collectAsState()` — this
+subscribes the composable to the `StateFlow`, so any new state recomposes the UI
+automatically (no manual `setState`, no listeners to unregister). The `when (val s = state)`
+exhaustively renders the three states: a spinner for `Loading`, a message + Retry for
+`Error`, and the `LazyColumn` of `TaskCard`s for `Success` (with an empty-state
+fallback).
+
+Local UI-only state — whether the create dialog is open — stays in the composable
+via `var showCreateDialog by remember { mutableStateOf(false) }`. That's the rule of
+thumb: server data lives in the ViewModel; ephemeral view state lives in `remember`.
+
+```kotlin title="src/commonMain/kotlin/ui/screens/TaskListScreen.kt" {27-28,35-37,38-40,45-47,51,84-89}
+package ui.screens
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import data.model.CreateTaskRequest
+import data.model.Priority
+import data.model.Task
+import data.viewmodel.TaskListState
+import data.viewmodel.TaskViewModel
+import ui.components.TaskCard
+
+@Composable
+fun TaskListScreen(
+    viewModel: TaskViewModel,
+    darkTheme: Boolean,
+    onToggleTheme: () -> Unit
+) {
+    val state by viewModel.state.collectAsState()
+    var showCreateDialog by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Task Manager") },
+                actions = {
+                    IconButton(onClick = onToggleTheme) {
+                        Text(if (darkTheme) "Light" else "Dark")
+                    }
+                    IconButton(onClick = { viewModel.loadTasks() }) {
+                        Icon(Icons.Default.Refresh, "Refresh")
+                    }
+                }
+            )
+        },
+        floatingActionButton = {
+            FloatingActionButton(onClick = { showCreateDialog = true }) {
+                Icon(Icons.Default.Add, "Add task")
+            }
+        }
+    ) { padding ->
+        Box(modifier = Modifier.padding(padding).fillMaxSize()) {
+            when (val s = state) {
+                is TaskListState.Loading -> {
+                    CircularProgressIndicator(
+                        modifier = Modifier.align(Alignment.Center)
+                    )
+                }
+                is TaskListState.Error -> {
+                    Column(
+                        modifier = Modifier.align(Alignment.Center),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = s.message,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(onClick = { viewModel.loadTasks() }) {
+                            Text("Retry")
+                        }
+                    }
+                }
+                is TaskListState.Success -> {
+                    if (s.tasks.isEmpty()) {
+                        Text(
+                            text = "No tasks yet. Create one!",
+                            modifier = Modifier.align(Alignment.Center),
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    } else {
+                        LazyColumn(
+                            contentPadding = PaddingValues(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(s.tasks, key = { it.id }) { task ->
+                                TaskCard(
+                                    task = task,
+                                    onToggle = { viewModel.toggleTask(task) },
+                                    onDelete = { viewModel.deleteTask(task.id) }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showCreateDialog) {
+        CreateTaskDialog(
+            onDismiss = { showCreateDialog = false },
+            onCreate = { request ->
+                viewModel.createTask(request)
+                showCreateDialog = false
+            }
+        )
+    }
+}
+
+@Composable
+fun CreateTaskDialog(
+    onDismiss: () -> Unit,
+    onCreate: (CreateTaskRequest) -> Unit
+) {
+    var title by remember { mutableStateOf("") }
+    var description by remember { mutableStateOf("") }
+    var priority by remember { mutableStateOf(Priority.MEDIUM) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Create Task") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Title") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it },
+                    label = { Text("Description (optional)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2
+                )
+                Text("Priority", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Priority.entries.forEach { p ->
+                        FilterChip(
+                            selected = priority == p,
+                            onClick = { priority = p },
+                            label = {
+                                Text(p.name.lowercase().replaceFirstChar { it.uppercase() })
+                            }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onCreate(
+                        CreateTaskRequest(
+                            title = title.trim(),
+                            description = description.trim().ifBlank { null },
+                            priority = priority
+                        )
+                    )
+                },
+                enabled = title.isNotBlank()
+            ) {
+                Text("Create")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+```
+
+### App.kt — the root composable
+
+`App()` is the one composable every target mounts. It creates the `TaskApi` and
+`TaskViewModel` once with `remember` (so they survive recomposition), holds the
+`darkTheme` flag as state, kicks off the first load in a `LaunchedEffect(Unit)` (runs
+once when the composable enters), and wraps everything in `AppTheme`. The theme
+toggle is hoisted here and passed down as `onToggleTheme = { darkTheme = !darkTheme }`.
+
+```kotlin title="src/commonMain/kotlin/App.kt" {12-15,17-19,21-22}
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import data.api.TaskApi
+import data.viewmodel.TaskViewModel
+import ui.screens.TaskListScreen
+import ui.theme.AppTheme
+
+@Composable
+fun App() {
+    val api = remember { TaskApi() }
+    val viewModel = remember { TaskViewModel(api) }
+
+    var darkTheme by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        viewModel.loadTasks()
+    }
+
+    AppTheme(darkTheme = darkTheme) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background
+        ) {
+            TaskListScreen(
+                viewModel = viewModel,
+                darkTheme = darkTheme,
+                onToggleTheme = { darkTheme = !darkTheme }
+            )
+        }
+    }
+}
+```
+
+### The two entry points
+
+This is the only place the targets diverge — and it's tiny. Desktop opens a native
+OS `Window`; the web target mounts a `CanvasBasedWindow` onto the `<canvas>` element
+in `index.html`. Both call the identical `App()`.
+
+<Tabs syncKey="target">
+  <TabItem label="Desktop">
+
+```kotlin title="src/desktopMain/kotlin/Main.kt"
+import App
+import androidx.compose.ui.window.Window
+import androidx.compose.ui.window.application
+
+fun main() = application {
+    Window(
+        onCloseRequest = ::exitApplication,
+        title = "Task Manager"
+    ) {
+        App()
+    }
+}
+```
+
+  </TabItem>
+  <TabItem label="Web (wasmJs)">
+
+```kotlin title="src/wasmJsMain/kotlin/Main.kt"
+import App
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.window.CanvasBasedWindow
+
+@OptIn(ExperimentalComposeUiApi::class)
+fun main() {
+    CanvasBasedWindow(canvasElementId = "ComposeTarget", title = "Task Manager") {
+        App()
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+The web target needs an HTML host page. The `<canvas id="ComposeTarget">` matches the
+`canvasElementId` above, and the script tag loads the compiled output (named after the
+Gradle project, `task-manager-app.js`).
+
+```html title="src/wasmJsMain/resources/index.html"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Task Manager</title>
+    <style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="ComposeTarget"></canvas>
+    <script src="task-manager-app.js"></script>
+</body>
+</html>
+```
+
+## Run it
+
+Make sure the task API is running on `http://localhost:8080` first (see Module 08/09).
+
+<Steps>
+
+1. Launch the native desktop app:
+
+   ```bash
+   ./gradlew desktopRun
+   ```
+
+2. Or run the web app on a development server, then open the printed URL in a browser:
+
+   ```bash
+   ./gradlew wasmJsBrowserDevelopmentRun
+   ```
+
+3. To produce a deployable web bundle:
+
+   ```bash
+   ./gradlew wasmJsBrowserDistribution
+   # Output in build/dist/wasmJs/productionExecutable/
+   ```
+
+</Steps>
+
+Verify both targets: tasks load into the list, creating adds one, the checkbox
+toggles completion, delete removes a card, and stopping the API surfaces the error
+state with a working Retry button.
+
+:::tip[Stretch goals]
+- Edit an existing task (you already have `updateTask` and `UpdateTaskRequest` — wire up an edit dialog).
+- Filter/sort the list by priority or completion status.
+- Do optimistic updates: flip the checkbox in the UI immediately, then reconcile with the server instead of reloading the whole list.
+- Persist the dark/light preference (and add a third "follow system" option).
+- Add an Android target — `commonMain` already does all the work; you mostly add an `androidMain` entry point.
+:::

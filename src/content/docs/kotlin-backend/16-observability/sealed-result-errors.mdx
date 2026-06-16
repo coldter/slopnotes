@@ -1,0 +1,499 @@
+---
+title: Sealed Class Result Error Handling
+description: Model expected failures as data with a sealed Result type and a typed error hierarchy, then map them to HTTP responses with an exhaustive when.
+sidebar:
+  order: 2
+---
+
+import { Steps, FileTree, LinkCard, Tabs, TabItem } from "@astrojs/starlight/components";
+
+<LinkCard title="← Observability" href="/kotlin-backend/16-observability/" />
+
+## Goal
+
+Build a service layer that models expected failures (not found, validation,
+conflict, unauthorized) as **data** instead of throwing exceptions. A custom
+sealed `Result<out T>` type carries either a success value or a typed `AppError`,
+and the compiler forces every caller to handle both — no silently-swallowed
+errors, no stack traces for things you expected.
+
+## What you'll build
+
+A framework-free task API split into the layers you'd recognize from any backend:
+
+<Steps>
+
+1. An `AppError` sealed hierarchy with the variants `NotFound`, `Validation`,
+   `Conflict`, `Unauthorized`, and `Internal`.
+2. A custom `Result<out T>` sealed class with `Success` and `Failure`, plus
+   `map`, `flatMap`, `getOrElse`, `onSuccess`, and `onFailure`.
+3. A `TaskService` whose methods return `Result<Task>` instead of throwing.
+4. A `TaskController` that uses an exhaustive `when` to map each error to an
+   HTTP-like status code.
+5. Tests covering both the success and failure paths.
+
+</Steps>
+
+If you've used Go's `(T, error)` return pattern, TypeScript's
+[`neverthrow`](https://github.com/supermacro/neverthrow) `Result<T, E>`, or
+Rust's `Result<T, E>`, this is the same idea — but Kotlin's `sealed class` plus
+exhaustive `when` gives you compiler-enforced handling of every error variant
+for free.
+
+## The worked solution
+
+A single Gradle module, organized by layer. The two files under `error/` are the
+core of the exercise; the rest is a small domain to exercise them against.
+
+<FileTree>
+- sealed-result-errors/
+  - build.gradle.kts deps + build config
+  - settings.gradle.kts project name
+  - src/main/kotlin/com/example/taskapi/
+    - error/
+      - **AppError.kt** sealed error hierarchy
+      - **Result.kt** custom `Result<out T>` type
+    - model/
+      - Task.kt domain model
+    - repository/
+      - TaskRepository.kt in-memory storage
+    - service/
+      - TaskService.kt business logic returning `Result<Task>`
+    - controller/
+      - TaskController.kt maps `Result` to HTTP-like responses
+    - Main.kt demo entry point
+  - src/test/kotlin/com/example/taskapi/
+    - ResultTest.kt tests for the `Result` type
+    - TaskServiceTest.kt tests for the service layer
+</FileTree>
+
+### The error hierarchy
+
+Each failure mode is its own `data class`, so it can carry exactly the data that
+matters for that case — `NotFound` knows the resource and id, `Validation` knows
+the field. Because `AppError` is `sealed`, the compiler knows the complete set of
+subtypes, which is what makes the `when` in the controller exhaustive.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/error/AppError.kt"
+package com.example.taskapi.error
+
+/**
+ * Sealed class hierarchy for domain errors.
+ *
+ * Instead of throwing exceptions for expected failures (not found, validation, conflict),
+ * we model them as data. The compiler forces callers to handle every case.
+ *
+ * Compare to:
+ * - Go: error interface, fmt.Errorf, sentinel errors
+ * - TypeScript: neverthrow Result, custom Error subclasses
+ */
+sealed class AppError {
+    data class NotFound(val resource: String, val id: String) : AppError()
+    data class Validation(val field: String, val message: String) : AppError()
+    data class Conflict(val message: String) : AppError()
+    data class Unauthorized(val reason: String) : AppError()
+    data class Internal(val cause: Throwable) : AppError()
+}
+```
+
+### The Result type
+
+`Result<out T>` is the heart of the exercise. Two notes on the variance:
+
+- The class is declared `Result<out T>` (covariant), so a `Result<Cat>` is usable
+  where a `Result<Animal>` is expected.
+- `Failure` carries no success value, so it extends `Result<Nothing>`. Since
+  `Nothing` is a subtype of everything, a single `Failure` instance is assignable
+  to any `Result<T>` — which is why `map` and `flatMap` can return `this`
+  unchanged on the failure path.
+
+The operations are pure `when` expressions over the two variants. `map<R>`
+transforms the success value; `flatMap<R>` chains another fallible operation
+(returning its `Result` directly); `getOrElse` supplies a fallback. The
+`@UnsafeVariance` on `getOrElse` lets `T` appear in an `in` position despite the
+covariant declaration — a deliberate, safe escape hatch.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/error/Result.kt" {13-15,21-24,30-33,46-49}
+package com.example.taskapi.error
+
+/**
+ * A custom Result type that models success or failure explicitly.
+ *
+ * This is similar to:
+ * - Go's (T, error) return pattern
+ * - TypeScript's neverthrow Result<T, E>
+ * - Rust's Result<T, E>
+ */
+sealed class Result<out T> {
+    data class Success<T>(val value: T) : Result<T>()
+    data class Failure(val error: AppError) : Result<Nothing>()
+
+    /**
+     * Transform the success value.
+     * If this is a Failure, return it unchanged.
+     */
+    fun <R> map(transform: (T) -> R): Result<R> = when (this) {
+        is Success -> Success(transform(value))
+        is Failure -> this
+    }
+
+    /**
+     * Chain operations that may also fail.
+     * If this is a Failure, return it unchanged.
+     */
+    fun <R> flatMap(transform: (T) -> Result<R>): Result<R> = when (this) {
+        is Success -> transform(value)
+        is Failure -> this
+    }
+
+    /**
+     * Get the value or null.
+     */
+    fun getOrNull(): T? = when (this) {
+        is Success -> value
+        is Failure -> null
+    }
+
+    /**
+     * Get the value or a default.
+     */
+    fun getOrElse(default: () -> @UnsafeVariance T): T = when (this) {
+        is Success -> value
+        is Failure -> default()
+    }
+
+    /**
+     * Perform an action on success.
+     */
+    fun onSuccess(action: (T) -> Unit): Result<T> {
+        if (this is Success) action(value)
+        return this
+    }
+
+    /**
+     * Perform an action on failure.
+     */
+    fun onFailure(action: (AppError) -> Unit): Result<T> {
+        if (this is Failure) action(error)
+        return this
+    }
+
+    val isSuccess: Boolean get() = this is Success
+    val isFailure: Boolean get() = this is Failure
+}
+```
+
+:::note[Smart casts in `when`]
+Inside each `is Success ->` branch you can read `value` directly, and inside
+`is Failure ->` you can read `error`. Kotlin smart-casts `this` to the matched
+subtype, so no manual cast is needed — the same mechanism that makes
+`getOrNull()` and `onSuccess` so terse.
+:::
+
+### The domain: model and repository
+
+A plain `data class` and an in-memory map. Nothing here returns a `Result` — the
+repository deals in nullables (`findById` returns `Task?`), and it's the
+service's job to turn a `null` into a typed `AppError`.
+
+<Tabs syncKey="lang">
+  <TabItem label="Kotlin">
+
+```kotlin title="src/main/kotlin/com/example/taskapi/model/Task.kt"
+package com.example.taskapi.model
+
+import java.util.UUID
+
+data class Task(
+    val id: String = UUID.randomUUID().toString(),
+    val title: String,
+    val description: String = "",
+    val assignedTo: String? = null,
+    val completed: Boolean = false
+)
+```
+
+  </TabItem>
+</Tabs>
+
+```kotlin title="src/main/kotlin/com/example/taskapi/repository/TaskRepository.kt"
+package com.example.taskapi.repository
+
+import com.example.taskapi.model.Task
+
+class TaskRepository {
+    private val tasks = mutableMapOf<String, Task>()
+
+    fun save(task: Task): Task {
+        tasks[task.id] = task
+        return task
+    }
+
+    fun findById(id: String): Task? = tasks[id]
+
+    fun findAll(): List<Task> = tasks.values.toList()
+
+    fun delete(id: String): Boolean = tasks.remove(id) != null
+
+    fun existsByTitle(title: String): Boolean = tasks.values.any { it.title == title }
+}
+```
+
+### The service: failures as return values
+
+Every method's signature — `Result<Task>` — is the contract. The validation,
+conflict, and not-found checks each return a `Result.Failure` wrapping the
+appropriate `AppError` variant; the happy path returns `Result.Success`. Note how
+`findById(...) ?: return Result.Failure(...)` uses Kotlin's Elvis operator to
+turn the repository's nullable into an early-return failure — the equivalent of
+Go's `if t == nil { return nil, ErrNotFound }`.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/service/TaskService.kt" {16,19,27,36,45,49}
+package com.example.taskapi.service
+
+import com.example.taskapi.error.AppError
+import com.example.taskapi.error.Result
+import com.example.taskapi.model.Task
+import com.example.taskapi.repository.TaskRepository
+
+/**
+ * Service layer that returns Result<T> instead of throwing exceptions.
+ *
+ * Every method explicitly declares its failure modes through the return type.
+ * The compiler forces callers to handle both success and failure.
+ */
+class TaskService(private val repo: TaskRepository) {
+
+    fun createTask(title: String, description: String, assignedTo: String? = null): Result<Task> {
+        // Validate title
+        if (title.isBlank()) {
+            return Result.Failure(AppError.Validation("title", "Title is required"))
+        }
+        if (title.length > 200) {
+            return Result.Failure(AppError.Validation("title", "Title must be under 200 characters"))
+        }
+
+        // Check for duplicate titles
+        if (repo.existsByTitle(title)) {
+            return Result.Failure(AppError.Conflict("A task with title '$title' already exists"))
+        }
+
+        val task = repo.save(Task(title = title, description = description, assignedTo = assignedTo))
+        return Result.Success(task)
+    }
+
+    fun getTask(id: String): Result<Task> {
+        val task = repo.findById(id)
+            ?: return Result.Failure(AppError.NotFound("Task", id))
+        return Result.Success(task)
+    }
+
+    fun completeTask(taskId: String, userId: String): Result<Task> {
+        val task = repo.findById(taskId)
+            ?: return Result.Failure(AppError.NotFound("Task", taskId))
+
+        if (task.assignedTo != null && task.assignedTo != userId) {
+            return Result.Failure(AppError.Unauthorized("Only the assignee can complete this task"))
+        }
+
+        if (task.completed) {
+            return Result.Failure(AppError.Conflict("Task is already completed"))
+        }
+
+        val updated = repo.save(task.copy(completed = true))
+        return Result.Success(updated)
+    }
+
+    fun deleteTask(id: String): Result<Unit> {
+        if (repo.findById(id) == null) {
+            return Result.Failure(AppError.NotFound("Task", id))
+        }
+        repo.delete(id)
+        return Result.Success(Unit)
+    }
+}
+```
+
+### The controller: exhaustive mapping to HTTP
+
+Each endpoint unwraps the service's `Result` with `when (val result = ...)`,
+returning a success status on `Result.Success` and delegating to
+`error.toResponse()` on `Result.Failure`.
+
+The payoff is the `AppError.toResponse()` extension function at the bottom.
+Because `AppError` is sealed and used as a `when` expression (its result is
+returned), the `when` is **exhaustive** — there is no `else` branch. Add a sixth
+`AppError` variant tomorrow and this file stops compiling until you handle it.
+That's the whole point: the compiler keeps your error-to-status mapping complete.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/controller/TaskController.kt" {19-22,51-57}
+package com.example.taskapi.controller
+
+import com.example.taskapi.error.AppError
+import com.example.taskapi.error.Result
+import com.example.taskapi.service.TaskService
+
+/**
+ * Simulated HTTP controller that maps Result<T> to response codes.
+ *
+ * In a real Spring Boot app, this would return ResponseEntity<Any>.
+ * Here we simulate it with a simple Response data class to keep
+ * this exercise framework-free.
+ */
+data class Response(val status: Int, val body: Any?)
+
+class TaskController(private val taskService: TaskService) {
+
+    fun createTask(title: String, description: String, assignedTo: String? = null): Response {
+        return when (val result = taskService.createTask(title, description, assignedTo)) {
+            is Result.Success -> Response(201, result.value)
+            is Result.Failure -> result.error.toResponse()
+        }
+    }
+
+    fun getTask(id: String): Response {
+        return when (val result = taskService.getTask(id)) {
+            is Result.Success -> Response(200, result.value)
+            is Result.Failure -> result.error.toResponse()
+        }
+    }
+
+    fun completeTask(taskId: String, userId: String): Response {
+        return when (val result = taskService.completeTask(taskId, userId)) {
+            is Result.Success -> Response(200, result.value)
+            is Result.Failure -> result.error.toResponse()
+        }
+    }
+
+    fun deleteTask(id: String): Response {
+        return when (val result = taskService.deleteTask(id)) {
+            is Result.Success -> Response(204, null)
+            is Result.Failure -> result.error.toResponse()
+        }
+    }
+}
+
+/**
+ * Extension function that maps each AppError variant to an HTTP-like response.
+ * The exhaustive `when` ensures every error type is handled.
+ */
+fun AppError.toResponse(): Response = when (this) {
+    is AppError.NotFound -> Response(404, mapOf("error" to "NOT_FOUND", "message" to "$resource with id $id not found"))
+    is AppError.Validation -> Response(400, mapOf("error" to "VALIDATION_ERROR", "message" to "$field: $message"))
+    is AppError.Conflict -> Response(409, mapOf("error" to "CONFLICT", "message" to message))
+    is AppError.Unauthorized -> Response(403, mapOf("error" to "UNAUTHORIZED", "message" to reason))
+    is AppError.Internal -> Response(500, mapOf("error" to "INTERNAL_ERROR", "message" to "An internal error occurred"))
+}
+```
+
+### Tying it together
+
+`Main.kt` wires repository → service → controller and walks through one success
+and several failure paths, printing the status and body each time — a quick way
+to see the whole pipeline in action.
+
+```kotlin title="src/main/kotlin/com/example/taskapi/Main.kt"
+package com.example.taskapi
+
+import com.example.taskapi.controller.TaskController
+import com.example.taskapi.repository.TaskRepository
+import com.example.taskapi.service.TaskService
+
+fun main() {
+    println("=== Sealed Result Error Handling Demo ===\n")
+
+    val repo = TaskRepository()
+    val service = TaskService(repo)
+    val controller = TaskController(service)
+
+    // Success: Create a task
+    println("--- Create task ---")
+    val createResponse = controller.createTask("Learn sealed classes", "Kotlin error handling patterns", "user-1")
+    println("Status: ${createResponse.status}, Body: ${createResponse.body}")
+
+    // Success: Get a task
+    val taskId = (createResponse.body as? com.example.taskapi.model.Task)?.id ?: ""
+    println("\n--- Get task ---")
+    val getResponse = controller.getTask(taskId)
+    println("Status: ${getResponse.status}, Body: ${getResponse.body}")
+
+    // Failure: Validation error (blank title)
+    println("\n--- Create task with blank title ---")
+    val validationResponse = controller.createTask("", "No title")
+    println("Status: ${validationResponse.status}, Body: ${validationResponse.body}")
+
+    // Failure: Conflict (duplicate title)
+    println("\n--- Create task with duplicate title ---")
+    val conflictResponse = controller.createTask("Learn sealed classes", "Duplicate")
+    println("Status: ${conflictResponse.status}, Body: ${conflictResponse.body}")
+
+    // Failure: Not found
+    println("\n--- Get non-existent task ---")
+    val notFoundResponse = controller.getTask("non-existent-id")
+    println("Status: ${notFoundResponse.status}, Body: ${notFoundResponse.body}")
+
+    // Failure: Unauthorized (wrong user trying to complete)
+    println("\n--- Complete task as wrong user ---")
+    val unauthorizedResponse = controller.completeTask(taskId, "user-2")
+    println("Status: ${unauthorizedResponse.status}, Body: ${unauthorizedResponse.body}")
+
+    // Success: Complete task as correct user
+    println("\n--- Complete task as assigned user ---")
+    val completeResponse = controller.completeTask(taskId, "user-1")
+    println("Status: ${completeResponse.status}, Body: ${completeResponse.body}")
+
+    // Failure: Already completed
+    println("\n--- Complete already-completed task ---")
+    val alreadyCompletedResponse = controller.completeTask(taskId, "user-1")
+    println("Status: ${alreadyCompletedResponse.status}, Body: ${alreadyCompletedResponse.body}")
+
+    println("\n=== Demo complete ===")
+}
+```
+
+## Run and test
+
+<Steps>
+
+1. Run the demo to watch each success and failure flow through the layers:
+
+   ```bash
+   ./gradlew run
+   ```
+
+2. Run the test suite, which asserts both the success and failure paths of the
+   service:
+
+   ```bash
+   ./gradlew test
+   ```
+
+</Steps>
+
+The service tests read naturally because of Kotlin's backtick test names and the
+`isSuccess`/`isFailure` helpers — for example, asserting that a blank title
+yields an `AppError.Validation`:
+
+```kotlin title="src/test/kotlin/com/example/taskapi/TaskServiceTest.kt"
+@Test
+fun `createTask fails with blank title`() {
+    val service = createService()
+    val result = service.createTask("", "Description")
+
+    assertTrue(result.isFailure)
+    val error = (result as Result.Failure).error
+    assertTrue(error is AppError.Validation)
+    assertEquals("title", (error as AppError.Validation).field)
+}
+```
+
+:::tip[Stretch goals]
+- Add a `combine` helper that takes two `Result<T>` values and returns a
+  `Result` of a pair, short-circuiting on the first failure.
+- Add a `mapError` operation to transform an `AppError` into a different error
+  variant without touching the success path.
+- Wire this into a real Ktor or Spring Boot controller, turning `toResponse()`
+  into a `ResponseEntity<Any>` or Ktor `call.respond(...)`.
+- Add the `Internal` error path by wrapping a thrown exception in
+  `AppError.Internal` at the service boundary.
+:::

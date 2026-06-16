@@ -1,0 +1,564 @@
+---
+title: "Dockerized Task API with Multi-Stage Build and GraalVM"
+description: Containerize a Spring Boot Kotlin REST API two ways — a layered JVM multi-stage build and a GraalVM native image — with Compose, health checks, and non-root users.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Deployment & Production"
+  href="/kotlin-backend/18-deployment/"
+/>
+
+## Goal
+
+Take a working Spring Boot Kotlin REST API and ship it as a production-grade
+container — twice. First as a layered, multi-stage JVM image (the everyday
+default), then as a GraalVM native image that boots in roughly a tenth of a
+second. Along the way you wire up Docker Compose for local dev, JVM
+container-aware flags, health checks, graceful shutdown, and a non-root user.
+
+## What you'll build
+
+A complete Dockerized task API with:
+
+1. A multi-stage `Dockerfile` with layer-caching optimization (JVM mode).
+2. Container-aware JVM flags (`MaxRAMPercentage`, `UseContainerSupport`).
+3. A `docker-compose.yml` for local development (app + Postgres).
+4. A GraalVM native-image `Dockerfile.native` variant.
+5. Health checks, graceful shutdown, and a non-root user in both images.
+
+If you've Dockerized a Node or Go service, the multi-stage pattern is the same
+idea you already use: a fat "build" stage that pulls in the whole toolchain, and
+a slim "runtime" stage that copies out only the artifact. The JVM twist is that
+"the artifact" is a layered fat JAR, and the slim image still needs a JRE — which
+is exactly the problem GraalVM removes.
+
+## The application
+
+The thing we're containerizing is a small CRUD task API: a Spring Boot
+`@RestController`, a JPA entity, and a `JpaRepository` backed by Postgres. The
+app code itself is not the focus here, but you need to see its shape because the
+Dockerfiles reference its build artifact (`dockerized-app.jar`) and its health
+endpoint (`/actuator/health`).
+
+<FileTree>
+- dockerized-app/
+  - build.gradle.kts Spring Boot + Kotlin plugins, bootJar config
+  - settings.gradle.kts project name (`dockerized-app`)
+  - **Dockerfile** multi-stage JVM build (production default)
+  - **Dockerfile.native** GraalVM native image build
+  - docker-compose.yml local dev (app + Postgres)
+  - .dockerignore keep the build context small
+  - src/
+    - main/
+      - kotlin/com/example/
+        - Application.kt Spring Boot entry point
+        - TaskController.kt REST endpoints
+        - Task.kt entity + request/response DTOs
+        - TaskRepository.kt JPA repository
+      - resources/
+        - application.yml datasource, actuator, graceful shutdown
+    - test/kotlin/com/example/
+      - TaskControllerTest.kt MockMvc endpoint tests
+</FileTree>
+
+The endpoints (`GET`/`POST`/`PUT`/`DELETE /api/tasks`) are a thin controller over
+a repository. The one line that matters for deployment is the bean wiring in
+`Application.kt`:
+
+```kotlin title="src/main/kotlin/com/example/Application.kt"
+package com.example
+
+import org.springframework.boot.autoconfigure.SpringBootApplication
+import org.springframework.boot.runApplication
+
+@SpringBootApplication
+class Application
+
+fun main(args: Array<String>) {
+    runApplication<Application>(*args)
+}
+```
+
+The controller is ordinary Spring MVC — note the Kotlin nullability flowing
+straight into HTTP semantics: `findById(id).orElse(null) ?: return
+ResponseEntity.notFound().build()` turns a missing row into a `404` in one line.
+
+```kotlin title="src/main/kotlin/com/example/TaskController.kt" {18-22,25-30}
+@RestController
+@RequestMapping("/api/tasks")
+class TaskController(private val taskRepository: TaskRepository) {
+
+    @GetMapping
+    fun listTasks(): List<TaskResponse> =
+        taskRepository.findAll().map { TaskResponse.from(it) }
+
+    @GetMapping("/{id}")
+    fun getTask(@PathVariable id: Long): ResponseEntity<TaskResponse> {
+        val task = taskRepository.findById(id).orElse(null)
+            ?: return ResponseEntity.notFound().build()
+        return ResponseEntity.ok(TaskResponse.from(task))
+    }
+
+    @PostMapping
+    fun createTask(@Valid @RequestBody request: CreateTaskRequest): ResponseEntity<TaskResponse> {
+        val task = taskRepository.save(
+            Task(title = request.title, description = request.description)
+        )
+        return ResponseEntity.status(HttpStatus.CREATED).body(TaskResponse.from(task))
+    }
+
+    // PUT /{id} and DELETE /{id} follow the same find-or-404 pattern …
+}
+```
+
+Two deployment-relevant settings live in `application.yml`: graceful shutdown and
+the actuator health probes that the Docker `HEALTHCHECK` calls.
+
+```yaml title="src/main/resources/application.yml" {6-9,13-15}
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful           # drain in-flight requests on SIGTERM
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true          # exposes /actuator/health/liveness + /readiness
+```
+
+Every datasource value is an env override with a sane default
+(`${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/taskdb}`), so the same
+image runs locally and in Compose with nothing baked in.
+
+## Build config
+
+The Gradle build is a standard Spring Boot setup. The one line that the Dockerfile
+depends on is `archiveFileName.set("dockerized-app.jar")` — it pins the JAR name
+so the `COPY` and `layertools` steps don't have to guess a version-stamped
+filename.
+
+```kotlin title="build.gradle.kts" {2,30-32}
+plugins {
+    id("org.springframework.boot") version "3.3.0"
+    id("io.spring.dependency-management") version "1.1.5"
+    kotlin("jvm") version "2.0.0"
+    kotlin("plugin.spring") version "2.0.0"
+    kotlin("plugin.jpa") version "2.0.0"
+}
+
+group = "com.example"
+version = "1.0.0"
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+    implementation("org.springframework.boot:spring-boot-starter-validation")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+    implementation("org.jetbrains.kotlin:kotlin-reflect")
+
+    runtimeOnly("org.postgresql:postgresql")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("com.h2database:h2")
+}
+
+tasks.bootJar {
+    archiveFileName.set("dockerized-app.jar")
+}
+
+kotlin {
+    jvmToolchain(21)
+}
+```
+
+:::note
+The `kotlin-reflect` dependency and the `plugin.spring` / `plugin.jpa` compiler
+plugins are not optional Spring-on-Kotlin garnish — Spring proxies and JPA need
+to open Kotlin's `final`-by-default classes and generate no-arg constructors.
+Without those plugins the app compiles but blows up at runtime.
+:::
+
+## The JVM Dockerfile (multi-stage, layered)
+
+This is the production default. It has two ideas working together:
+
+- **Two stages** — a `builder` stage on the full JDK that compiles and packages,
+  and a tiny `jre-alpine` runtime stage that carries only what's needed to *run*.
+  The JDK, Gradle caches, and source never reach the final image.
+- **Spring Boot layer extraction** — instead of copying one monolithic fat JAR,
+  the build runs `layertools extract` to split it into four layers ordered by how
+  often they change (third-party dependencies → loader → snapshot deps → your
+  application classes). Copying them in that order means a code-only change
+  re-uses the cached dependency layers, so rebuilds and image pushes move only a
+  few kilobytes.
+
+<Mermaid title="Multi-stage JVM build" height={420} code={`
+flowchart TB
+  subgraph S1["Stage 1: builder (eclipse-temurin:21-jdk)"]
+    direction TB
+    A["COPY gradle wrapper"] --> B["COPY build.gradle.kts + settings"]
+    B --> C["gradlew dependencies (cached layer)"]
+    C --> D["COPY src/"]
+    D --> E["gradlew bootJar"]
+    E --> F["layertools extract → /app/extracted"]
+  end
+  subgraph S2["Stage 2: runtime (eclipse-temurin:21-jre-alpine)"]
+    direction TB
+    G["addgroup/adduser (non-root)"] --> H["COPY --from=builder extracted layers"]
+    H --> I["ENV JAVA_OPTS (container flags)"]
+    I --> J["HEALTHCHECK /actuator/health"]
+    J --> K["ENTRYPOINT JarLauncher"]
+  end
+  F -->|"4 ordered layers"| H
+`} />
+
+```dockerfile title="Dockerfile" {6,19,28,31,42-45,48-56}
+# --- Stage 1: Build ---
+FROM eclipse-temurin:21-jdk AS builder
+WORKDIR /app
+
+# Layer 1: Gradle wrapper (changes very rarely)
+COPY gradle/ gradle/
+COPY gradlew gradlew.bat ./
+RUN chmod +x gradlew
+
+# Layer 2: Build configuration (changes occasionally)
+COPY build.gradle.kts settings.gradle.kts ./
+COPY gradle.properties* ./
+
+# Layer 3: Download dependencies (expensive, cached unless build files change)
+RUN ./gradlew dependencies --no-daemon || true
+
+# Layer 4: Copy source (changes frequently)
+COPY src/ src/
+
+# Layer 5: Build the fat JAR
+RUN ./gradlew bootJar --no-daemon
+
+# Extract Spring Boot layers for optimal Docker caching
+RUN java -Djarmode=layertools -jar build/libs/dockerized-app.jar extract --destination extracted
+
+# --- Stage 2: Runtime ---
+FROM eclipse-temurin:21-jre-alpine
+
+LABEL maintainer="course@example.com"
+LABEL description="Task API - Spring Boot Kotlin Application"
+
+WORKDIR /app
+
+# Create non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Copy Spring Boot layers (least to most frequently changing)
+COPY --from=builder /app/extracted/dependencies/ ./
+COPY --from=builder /app/extracted/spring-boot-loader/ ./
+COPY --from=builder /app/extracted/snapshot-dependencies/ ./
+COPY --from=builder /app/extracted/application/ ./
+
+# JVM container flags
+ENV JAVA_OPTS="\
+    -XX:MaxRAMPercentage=75.0 \
+    -XX:InitialRAMPercentage=50.0 \
+    -XX:+UseContainerSupport \
+    -XX:+UseG1GC \
+    -XX:+ExitOnOutOfMemoryError \
+    -XX:+HeapDumpOnOutOfMemoryError \
+    -XX:HeapDumpPath=/tmp/heapdump.hprof \
+    -Djava.security.egd=file:/dev/./urandom"
+
+EXPOSE 8080
+
+USER appuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD wget -qO- http://localhost:8080/actuator/health || exit 1
+
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+A few details worth calling out:
+
+- **`dependencies --no-daemon || true`** (line 19) warms the dependency cache as
+  its own layer. The `|| true` keeps the build going even if that task reports a
+  non-zero status — the goal is purely to populate the cache, not to gate the
+  build.
+- **Container-aware JVM flags** (lines 48-56) are the difference between a JVM
+  that respects its cgroup limit and one that sees the host's full RAM and gets
+  OOM-killed. `UseContainerSupport` reads the container limit;
+  `MaxRAMPercentage=75.0` tells the heap to claim 75% of *that* limit rather than
+  a fixed `-Xmx`. This is the JVM equivalent of `GOMEMLIMIT` for a Go service.
+- **`JarLauncher`** is the layered entry point — because we exploded the JAR into
+  layers, we launch via the Spring Boot loader class rather than `java -jar`.
+
+:::caution[Run as non-root]
+`USER appuser` (after the `COPY` steps, which need root) drops the container to an
+unprivileged user. If you flip the order and put `USER appuser` before the
+`COPY`s, the copies fail with permission errors. Root-by-default is the single
+most common container security finding — set the user.
+:::
+
+## Docker Compose for local dev
+
+Compose wires the app to a Postgres container and, crucially, waits for the
+database to be *healthy* (not merely started) before launching the app via
+`depends_on: condition: service_healthy`. Everything the app needs is injected as
+environment variables — the same overrides `application.yml` reads.
+
+```yaml title="docker-compose.yml" {7-8,18-20,34-38}
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: task-api
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=dev
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://db:5432/taskdb
+      - SPRING_DATASOURCE_USERNAME=postgres
+      - SPRING_DATASOURCE_PASSWORD=postgres
+      - SPRING_JPA_HIBERNATE_DDL_AUTO=update
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    container_name: task-db
+    environment:
+      POSTGRES_DB: taskdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+```
+
+The `.dockerignore` keeps the build context lean so `COPY src/ src/` doesn't drag
+in `.gradle/`, `build/`, IDE folders, or the Compose files themselves:
+
+```text title=".dockerignore"
+.git
+.github
+.idea
+.gradle
+build
+out
+*.md
+!README.md
+docker-compose*.yml
+.env
+.env.*
+**/*.log
+**/node_modules
+```
+
+## The GraalVM native Dockerfile
+
+The native variant produces a standalone executable with no JRE at all. The
+trade-off is stark and worth internalizing: you pay a long, memory-hungry build
+(`nativeCompile` ahead-of-time-compiles the whole app and its reachable
+dependencies, roughly 5-10 minutes) to get a binary that starts in around 100ms
+with a much smaller memory footprint. It's the JVM finally behaving like a Go
+binary.
+
+```dockerfile title="Dockerfile.native" {8,12,26,29,41,48-49,51}
+# --- Stage 1: Build native image ---
+FROM ghcr.io/graalvm/graalvm-community:21 AS builder
+WORKDIR /app
+
+# Install native-image component
+RUN gu install native-image
+
+# Copy Gradle wrapper
+COPY gradle/ gradle/
+COPY gradlew gradlew.bat ./
+RUN chmod +x gradlew
+
+# Copy build files and download dependencies
+COPY build.gradle.kts settings.gradle.kts ./
+COPY gradle.properties* ./
+RUN ./gradlew dependencies --no-daemon || true
+
+# Copy source and build native image
+COPY src/ src/
+RUN ./gradlew nativeCompile --no-daemon
+
+# --- Stage 2: Minimal runtime ---
+FROM debian:bookworm-slim
+
+LABEL maintainer="course@example.com"
+LABEL description="Task API - GraalVM Native Image"
+
+WORKDIR /app
+
+# Create non-root user
+RUN addgroup --system appgroup && \
+    adduser --system --ingroup appgroup appuser
+
+# Copy the native binary (no JRE needed!)
+COPY --from=builder /app/build/native/nativeCompile/dockerized-app ./app
+
+EXPOSE 8080
+
+USER appuser
+
+# Native images start fast -- shorter health check intervals
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget -qO- http://localhost:8080/actuator/health || exit 1
+
+ENTRYPOINT ["./app"]
+```
+
+Contrast it with the JVM Dockerfile:
+
+- The runtime base is `debian:bookworm-slim`, not a JRE image — there is no Java
+  in the final layer at all. The single artifact copied in is the
+  `dockerized-app` binary.
+- No `JAVA_OPTS`: heap sizing for a native image is handled at build time and via
+  the binary's own flags, not the JVM ergonomics above.
+- The `HEALTHCHECK` uses a much shorter `start-period` (10s vs 60s) because the
+  binary is serving traffic almost immediately, so there's no point waiting a
+  minute for a JVM to warm up.
+
+### When to reach for which
+
+| Aspect | JVM multi-stage | GraalVM native |
+| --- | --- | --- |
+| Final base | `eclipse-temurin:21-jre-alpine` | `debian:bookworm-slim` (no JRE) |
+| Image size | Smaller than a full JDK image; carries JRE + layered JAR | Smallest — just the binary + libc |
+| Build time | Fast (seconds–minutes) | Slow (~5-10 min, memory-hungry) |
+| Startup | ~seconds (JVM warmup) | ~100ms |
+| Peak throughput | Higher after JIT warms up | Flat (AOT-compiled, no JIT) |
+| Reflection / proxies | "Just works" | Needs reachability metadata / hints |
+| Best for | Long-running services, dev iteration | Serverless, scale-to-zero, fast cold starts |
+
+:::tip[Honest take]
+Default to the JVM multi-stage image. Reach for GraalVM native only when cold
+start or memory genuinely hurts you (functions, scale-to-zero, dense
+multi-tenancy). Native builds are slow and Spring's reflection-heavy world needs
+AOT hints to compile cleanly — it's real work, not a free flag flip.
+:::
+
+## Run it
+
+<Steps>
+
+1. Start the full stack (app + Postgres) with Compose — this builds the JVM image
+   and waits for the database to be healthy:
+
+   ```bash
+   docker compose up --build
+   ```
+
+2. Or build and run just the JVM image by hand:
+
+   ```bash
+   ./gradlew bootJar
+   docker build -t task-api:jvm .
+   docker run -p 8080:8080 task-api:jvm
+   ```
+
+3. Build and run the GraalVM native image (allow several minutes for the first
+   build):
+
+   ```bash
+   docker build -f Dockerfile.native -t task-api:native .
+   docker run -p 8080:8080 task-api:native
+   ```
+
+</Steps>
+
+## Test the API
+
+Hit the running container with `curl`:
+
+```bash
+# Health check
+curl http://localhost:8080/actuator/health
+
+# Create a task
+curl -X POST http://localhost:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Learn Docker","description":"Dockerize a Kotlin app"}'
+
+# List tasks
+curl http://localhost:8080/api/tasks
+
+# Get a task by ID
+curl http://localhost:8080/api/tasks/1
+
+# Update a task
+curl -X PUT http://localhost:8080/api/tasks/1 \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Learn Docker","description":"Done!","completed":true}'
+
+# Delete a task
+curl -X DELETE http://localhost:8080/api/tasks/1
+```
+
+The controller tests use `MockMvc` and an in-memory H2 database, so they verify
+the endpoints without a running Postgres or container:
+
+```kotlin title="src/test/kotlin/com/example/TaskControllerTest.kt" {35-45}
+@Test
+fun `POST creates a new task`() {
+    mockMvc.perform(
+        post("/api/tasks")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("""{"title":"Test Task","description":"A test task"}""")
+    )
+        .andExpect(status().isCreated)
+        .andExpect(jsonPath("$.title").value("Test Task"))
+        .andExpect(jsonPath("$.completed").value(false))
+}
+
+@Test
+fun `POST rejects task without title`() {
+    mockMvc.perform(
+        post("/api/tasks")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("""{"title":"","description":"No title"}""")
+    )
+        .andExpect(status().isBadRequest)
+}
+```
+
+:::tip[Stretch goals]
+- Add a `.github/workflows` pipeline that builds the image and pushes it to a
+  registry on every tag.
+- Add Kubernetes manifests that map the actuator liveness/readiness probes to
+  `livenessProbe` and `readinessProbe`.
+- Generate GraalVM reachability metadata (`./gradlew processAot`) so the native
+  image compiles without manual reflection hints.
+- Pin a non-`latest` base-image digest and scan the image with `trivy` or
+  `docker scout` as part of the build.
+:::
