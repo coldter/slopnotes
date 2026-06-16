@@ -1,0 +1,690 @@
+---
+title: Pointers, Values & Memory
+description: Go's value semantics, pointers, and the slice/map/string internals — headers, aliasing, append growth, nil-vs-empty, and escape analysis — that bite newcomers.
+sidebar:
+  order: 4
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+Go has no hidden references and no manual memory management, but it does have a precise model of *what gets copied when*. Getting that model right is the difference between code that's fast and correct and code that mysteriously aliases, leaks, or corrupts data. We'll build the model from the ground up — value semantics, then the "reference-like" header types (slices, maps, strings) — using a real distributed-systems codebase, **multigres** ("Vitess for Postgres"), whose SQL lexer, parser, and wire codec lean hard on these details for performance.
+
+If you haven't met defined types and value-vs-pointer receivers yet, [Types, Structs & Methods](/go-guide/language/02-types-structs-methods/) covers them. New to the repo? Start at the [orientation](/go-guide/orientation/).
+
+## Value semantics: every assignment is a copy
+
+Go has no hidden references. Every assignment and every function argument is a **copy of the value**. For a `struct`, "the value" is all its fields laid out contiguously — so copying a struct copies every field.
+
+```go title="value-semantics.go"
+type Point struct{ X, Y int }
+
+func move(p Point) { p.X = 99 } // mutates a COPY
+
+func main() {
+	a := Point{1, 2}
+	b := a   // b is an independent copy
+	b.X = 5  // a.X is still 1
+	move(a)  // a.X is still 1
+}
+```
+
+This is the same model as C structs or C# `struct` — not Java/Python objects, where a variable holds a reference. To mutate the caller's value, or to avoid copying a large struct, you pass a **pointer**.
+
+```go title="value-semantics.go"
+func move(p *Point) { p.X = 99 } // p.X is shorthand for (*p).X
+
+a := Point{1, 2}
+move(&a) // a.X is now 99
+```
+
+:::tip[Idiom]
+Go auto-dereferences through pointers for field/method access: `p.X` works whether `p` is a `Point` or a `*Point`. You almost never write `(*p).X` by hand.
+:::
+
+### Why this matters for receivers
+
+A method's receiver follows the same rules. A **value receiver** operates on a copy; a **pointer receiver** operates on the original. The codebase makes this distinction deliberately. In its `sqltypes` package, `Value` (a small 3-word slice header — more below) uses value receivers, while `Result`/`Row` (larger structs that also need nil-checking) use pointer receivers:
+
+```go title="go/common/sqltypes/sqltypes.go"
+// Value represents a nullable column value.
+// nil means NULL, []byte{} means empty string.
+type Value []byte
+
+func (v Value) IsNull() bool {
+	return v == nil
+}
+```
+
+```go title="go/common/sqltypes/sqltypes.go"
+func (r *Result) ToProto() *query.QueryResult { if r == nil { return nil } /* ... */ }
+func (r *Row) ToProto() *query.Row            { if r == nil { return nil } /* ... */ }
+```
+
+`Value` is a value receiver because copying it is cheap (it copies the *header*, not the bytes) and because a `Value` is meant to behave like a primitive. `*Result` and `*Row` are pointer receivers because (1) they are larger structs you don't want to copy on every call, and (2) the methods need to handle a `nil` receiver gracefully — `if r == nil { return nil }` is a legal pointer-receiver pattern (see [Errors](/go-guide/language/05-errors/) for nil-receiver methods). You can't nil-check a value receiver the same way; a value can't be the nil pointer.
+
+:::caution[Gotcha]
+Don't mix receiver kinds on the same type. If any method needs a pointer receiver, give them all pointer receivers, so the method set is consistent and the type satisfies interfaces predictably. Covered in [Types, Structs & Methods](/go-guide/language/02-types-structs-methods/).
+:::
+
+## What is "reference-like"? slices, maps, channels, strings
+
+Some built-in types are **headers** — small structs that *contain* a pointer to backing storage. Copying the header copies the pointer, so the copy shares the backing data. These are slices, maps, channels, and strings. They're still copied by value (the header is), but the thing they point at is shared.
+
+This is the single most important mental model in this chapter: **a slice variable is not the array; it is a `(ptr, len, cap)` triple that points at an array.**
+
+```go title="header-aliasing.go"
+s := []int{1, 2, 3}
+t := s    // copies the 3-word header; t and s share the same backing array
+t[0] = 99 // s[0] is now 99 too
+```
+
+Contrast with arrays, which are genuine values (covered later).
+
+## Slice internals: ptr, len, cap
+
+A slice header is three machine words pointing into a separate backing array:
+
+<Mermaid title="A slice header points into a backing array" height={360} code={`
+flowchart LR
+  subgraph Header["slice header (3 words)"]
+    ptr["ptr"]
+    len["len = 3"]
+    cap["cap = 5"]
+  end
+  subgraph Array["backing array (len 5)"]
+    a0["[0]"]
+    a1["[1]"]
+    a2["[2]"]
+    a3["[3] (unused, within cap)"]
+    a4["[4] (unused, within cap)"]
+  end
+  ptr --> a0
+`} />
+
+- **ptr** — points at the first element of the backing array.
+- **len** — number of elements you can index (`s[0]` .. `s[len-1]`).
+- **cap** — number of elements from `ptr` to the end of the backing array.
+
+Subslicing creates a *new header* that points into the *same* backing array:
+
+```go title="subslice-aliasing.go"
+s := []byte("hello world")
+sub := s[6:11] // sub == "world", shares s's backing array
+sub[0] = 'W'   // s is now "hello World" — aliasing!
+```
+
+`len(sub)` is 5; `cap(sub)` is 5 (from offset 6 to the end of the 11-byte array). No bytes were copied — `sub`'s `ptr` is just `&s[6]`.
+
+### The real high-perf user: the lexer's scan buffer
+
+The SQL lexer scans by indexing and subslicing a single backing buffer, never copying per-token. Its `ParseContext` holds the source as a `[]byte` built once from the input string:
+
+```go title="go/common/parser/context.go"
+scanBuf    []byte // the string being scanned (for lexer)
+// ...
+scanBuf:    []byte(input),
+scanBufLen: len(input),
+```
+
+The lexer then reads `scanBuf[pos]` by index and takes subslices like `scanBuf[startPos:scanPos]` to identify tokens. Because subslicing is just header arithmetic (no copy), the whole hot path stays allocation-free. The query path is latency-sensitive, so this matters (see [Parser, Lexer, AST & Codegen](/go-guide/project/06-parser-lexer-ast-codegen/)).
+
+### Subslice aliasing in the wire codec — the gotcha that bites
+
+`RowFromProto` decodes a protobuf row whose values are concatenated into one big `[]byte` (`pr.Values`) plus a `Lengths` array. It carves each column out as a subslice of that one buffer:
+
+```go title="go/common/sqltypes/sqltypes.go" {11}
+func RowFromProto(pr *query.Row) *Row {
+	if pr == nil {
+		return nil
+	}
+	values := make([]Value, len(pr.Lengths))
+	offset := 0
+	for i, length := range pr.Lengths {
+		switch length {
+		case -1:
+			values[i] = nil // NULL
+		case 0:
+			values[i] = []byte{} // empty string, not NULL
+		default:
+			values[i] = pr.Values[offset : offset+int(length)]
+			offset += int(length)
+		}
+	}
+	return &Row{Values: values}
+}
+```
+
+The same pattern shows up when decoding bind parameters. Two consequences follow directly from slice internals:
+
+1. **Every `Value` here aliases the one `pr.Values` backing array.** Mutating the bytes of one column would corrupt its neighbors. Retaining one tiny `Value` keeps the *entire* `pr.Values` buffer alive — the garbage collector frees the backing array only when *no* slice references it. That's a classic memory-retention trap.
+2. **It is fast on purpose.** Decoding a row of N columns does one `make([]Value, N)` and zero per-column byte copies.
+
+:::caution[Gotcha]
+A subslice keeps its whole backing array alive. If you slice 8 bytes out of an 8 MB buffer and keep the 8-byte slice forever, the 8 MB can't be collected. When you need to retain a small piece of a large buffer long-term, copy it out (next section).
+:::
+
+### The defensive copy: "return copy for safety"
+
+When the lexer *exposes* its internal buffer to outside callers, it must not hand out an aliasing slice — a caller could mutate the lexer's state through it. So it does an explicit `make`+`copy`:
+
+```go title="go/common/parser/context.go"
+func (ctx *ParseContext) GetScanBuf() []byte {
+	// Return copy for safety
+	buf := make([]byte, len(ctx.scanBuf))
+	copy(buf, ctx.scanBuf)
+	return buf
+}
+```
+
+If this returned `ctx.scanBuf` directly, a caller writing `buf[0] = 'x'` would scribble on the lexer's live scan buffer mid-parse. Returning a copy breaks the aliasing.
+
+:::tip[Idiom]
+Returning an internal slice exposes your backing array to mutation. Either document that the result is read-only, or `make`+`copy` to hand out an independent slice. This codebase chose the copy at API boundaries and aliasing inside the hot loop — the right trade-off in each place.
+:::
+
+## append: growth, reallocation, and predictable aliasing
+
+`append` adds elements to a slice. If `len < cap`, it writes into the existing backing array and returns a header with a longer `len` — **mutating shared storage in place**. If `len == cap`, it allocates a *new, larger* backing array, copies the old elements, and returns a header pointing at the new array — at which point the old aliases stop seeing your new writes.
+
+```go title="append-aliasing.go"
+a := make([]int, 2, 4) // len 2, cap 4
+b := append(a, 7)      // fits in cap: b shares a's array, b[2]==7
+a = a[:3]              // a now also sees the 7 — same backing array
+
+c := append(b, 1, 2, 3) // overflows cap 4: c gets a NEW array
+c[0] = 99               // a/b are UNAFFECTED — different backing array now
+```
+
+:::caution[Gotcha]
+Because `append` *may or may not* reallocate, never assume the returned slice shares (or doesn't share) storage with the input. Always assign back: `s = append(s, x)`. And never hold two append-growing slices over the same array expecting both to see each other's appends — only the one that didn't reallocate will.
+:::
+
+### Preallocate with make to avoid growth churn
+
+`ToProto` knows the exact final size up front, so it allocates once with `make([]byte, 0, totalLen)` — **length 0, capacity totalLen** — then appends without ever reallocating:
+
+```go title="go/common/sqltypes/sqltypes.go" {12}
+lengths := make([]int64, len(r.Values))
+var totalLen int
+for i, v := range r.Values {
+	if v == nil {
+		lengths[i] = -1
+	} else {
+		lengths[i] = int64(len(v))
+		totalLen += len(v)
+	}
+}
+
+values := make([]byte, 0, totalLen)
+for _, v := range r.Values {
+	if v != nil {
+		values = append(values, v...) // spread one slice into another
+	}
+}
+```
+
+Two things to read carefully:
+
+- `make([]byte, 0, totalLen)` — the third arg is capacity. The slice is *empty* (`len 0`) but has room for `totalLen` bytes, so the append loop never grows the array. Without the cap hint, append would reallocate roughly `log₂(N)` times, copying old data each time.
+- `append(values, v...)` — the `...` *spreads* the elements of `v` as individual arguments. `append(values, v)` (no dots) would be a type error here, since `v` is a `[]byte` and `values` wants `byte` elements.
+
+Note the two `make` shapes side by side: `make([]int64, len(r.Values))` (`len == N`, for index assignment `lengths[i] = ...`) versus `make([]byte, 0, totalLen)` (`len 0`, cap N, for append). Pick the shape by how you'll fill it — index-assign needs length; append needs capacity.
+
+When the exact size isn't known, the lexer uses cap as an *upper-bound estimate* — decoding a Unicode escape can't produce more bytes than the input:
+
+```go title="go/common/parser/lexer.go"
+result := make([]byte, 0, len(input))
+// ...
+result = append(result, []byte(string(cp))...) // rune -> string -> []byte (UTF-8)
+```
+
+`string(cp)` where `cp` is a `rune` produces the UTF-8 encoding of that codepoint as a string; `[]byte(...)` of it gives the bytes; `...` spreads them. (More on rune-to-string below.)
+
+## copy() and the deep-clone idiom
+
+`copy(dst, src)` copies `min(len(dst), len(src))` elements and returns that count. It does **not** grow `dst`. To clone a slice into independent storage you `make` the destination to the right length, then `copy`:
+
+```go title="clone.go"
+src := []int{1, 2, 3}
+dst := make([]int, len(src))
+copy(dst, src) // dst is independent; mutating dst won't touch src
+```
+
+The generated AST cloner shows this in its purest form, preserving the nil/non-nil distinction (see nil-vs-empty below):
+
+```go title="go/common/parser/ast/ast_clone.go"
+func CloneSliceOfOid(n []Oid) []Oid {
+	if n == nil {
+		return nil
+	}
+	res := make([]Oid, len(n))
+	copy(res, n)
+	return res
+}
+```
+
+`copy` does a **shallow** copy — for `[]Oid` (a slice of values) that's a full deep copy, because the values *are* the data. But for a slice of *pointers*, `copy` would duplicate the pointers, leaving both slices pointing at the same elements. The cloner handles that case with a per-element deep clone instead:
+
+```go title="go/common/parser/ast/ast_clone.go" {6-7}
+func CloneSliceOfRefOfDefElem(n []*DefElem) []*DefElem {
+	if n == nil {
+		return nil
+	}
+	res := make([]*DefElem, len(n))
+	for i, x := range n {
+		res[i] = CloneRefOfDefElem(x) // recurse into each pointed-at node
+	}
+	return res
+}
+```
+
+:::note
+`ast_clone.go` is generated (it carries a `// Code generated` header) — you regenerate it after changing AST types rather than editing it by hand. It's cited here only as a crisp illustration of the `make`+`copy` (shallow) vs per-element (deep) idiom. See [Parser, Lexer, AST & Codegen](/go-guide/project/06-parser-lexer-ast-codegen/).
+:::
+
+:::caution[Gotcha]
+`copy` stops at the shorter length. `dst := make([]int, 2); copy(dst, src)` from a 5-element `src` copies only 2 elements and silently drops the rest. If you wanted all of `src`, size `dst` to `len(src)`.
+:::
+
+## nil slice vs empty slice — load-bearing here
+
+A `nil` slice (`var s []byte` or `[]byte(nil)`) has `ptr == nil`, `len == 0`, `cap == 0`. An empty slice (`[]byte{}` or `make([]byte, 0)`) has a non-nil `ptr`, `len == 0`, `cap == 0`. Both have length zero, so ranging over either does nothing and `append` works on either — for *most* code the difference is invisible.
+
+In `sqltypes` the difference is **semantic and must be preserved**: a `nil` `Value` is SQL `NULL`; an empty `Value` (`[]byte{}`) is the empty string `''`. Look back at `RowFromProto` — the `-1` and `0` cases are kept distinct on purpose:
+
+```go title="go/common/sqltypes/sqltypes.go"
+case -1:
+	values[i] = nil      // NULL
+case 0:
+	values[i] = []byte{} // empty string, not NULL
+```
+
+`Value.IsNull()` is literally `v == nil`. If you "helpfully normalized" a nil slice to `[]byte{}` anywhere in this path, you'd turn every SQL `NULL` into an empty string — a correctness bug.
+
+:::caution[Gotcha]
+Protobuf flattens both nil and empty *repeated* fields to "absent" on the wire, so the distinction is lost across gRPC. The codebase restores it with an explicit boolean flag — a `HasFields` field that lets the decoder tell "no fields" from "empty fields list": `if pr.HasFields && fields == nil { fields = []*query.Field{} }`. When a serialization format can't carry nil-vs-empty, you must carry it yourself.
+:::
+
+:::tip[Idiom]
+For a function's *return* value, prefer returning `nil` over `[]byte{}` for "nothing" unless the empty-but-non-nil distinction is meaningful (as it is here). Callers can range/append over nil just fine.
+:::
+
+## Maps: reference-like, must be made, comma-ok, no order
+
+A map value is a pointer to a runtime hash table. Copying a map variable copies the pointer — both names see the same table. The zero value of a map is `nil`, and a nil map is **readable** (every lookup returns the zero value) but **not writable** (a write panics).
+
+```go title="nil-map.go"
+var m map[string]int // nil map
+_ = m["missing"]     // ok: returns 0 (zero value), no panic
+m["x"] = 1           // PANIC: assignment to entry in nil map
+
+m = make(map[string]int) // now writable
+m["x"] = 1               // ok
+```
+
+The codebase builds its keyword lookup table in an `init()` using `make` with a **capacity hint**:
+
+```go title="go/common/parser/keywords.go"
+var keywordLookupMap map[string]*KeywordInfo
+// ...
+func init() {
+	keywordLookupMap = make(map[string]*KeywordInfo, len(Keywords))
+	for i := range Keywords {
+		keywordLookupMap[Keywords[i].Name] = &Keywords[i]
+	}
+}
+```
+
+The `len(Keywords)` second argument tells the runtime how many entries to expect, so it can size the buckets once instead of rehashing as the map grows. It's a hint, not a cap — the map can still grow past it.
+
+### Taking the address of a slice element, not a loop variable
+
+Notice `&Keywords[i]` — the address of element `i` in the slice's backing array. This is deliberate. The tempting alternative is wrong in spirit:
+
+```go title="loop-var-address.go"
+// WRONG mental model:
+for _, k := range Keywords {
+	keywordLookupMap[k.Name] = &k // address of the loop copy, not of Keywords[i]
+}
+```
+
+`k` is a *copy* of each element, so `&k` takes the address of that copy. (Pre-Go-1.22 the same `k` variable was reused across iterations, so *every* stored pointer aliased the *last* value — a notorious bug. Go 1.22+ makes `k` per-iteration, so this specific form is no longer the last-value bug, but `&k` still points at a copy, not at `Keywords[i]`.) Using `&Keywords[i]` gets a stable pointer *into the slice's storage*, so the map holds pointers to the real keyword records — exactly what you want when value identity matters.
+
+:::tip[Idiom]
+When you need a pointer to a collection element, index it (`&s[i]`); don't take the address of a `range` value. With Go 1.25 loop-var capture is per-iteration, but `&s[i]` is still the correct, intention-revealing form. See the same theme in [Concurrency](/go-guide/language/07-concurrency/) (capturing loop vars in goroutines).
+:::
+
+### The comma-ok lookup
+
+Because a missing key returns the zero value, you can't distinguish "absent" from "present but zero" by the value alone. The two-result form does:
+
+```go title="comma-ok.go"
+v, ok := m["k"] // ok is false if absent
+```
+
+A settings cache uses it, combining the lookup with pointer identity for deduplication:
+
+```go title="go/services/multipooler/internal/connstate/settings_cache.go"
+if elem, ok := c.cache[key]; ok {
+	// Move to front (most recently used)
+	c.lru.MoveToFront(elem)
+	c.hits++
+	return elem.Value.(*cacheEntry).settings
+}
+```
+
+Its `GetOrCreate` returns the *same* `*Settings` pointer for identical inputs — that's a documented contract. It only works because maps are reference-like and pointers carry identity: two callers with the same inputs get pointer-equal results.
+
+:::caution[Gotcha]
+Map values are **not addressable**. You can't write `&m[k]`, or `m[k].Field = x` when the value is a struct. To mutate a struct stored in a map, either store a *pointer* (`map[K]*V`, then `m[k].Field = x` works through the pointer), or read-modify-write the whole value (`v := m[k]; v.Field = x; m[k] = v`). This is why `keywordLookupMap` stores `*KeywordInfo`, not `KeywordInfo`.
+:::
+
+:::caution[Gotcha]
+Map iteration order is **randomized** by the runtime, by design (it changes run to run). Never rely on it. If you need order, collect the keys into a slice and `sort` them.
+:::
+
+## Strings vs []byte: immutability and conversion cost
+
+A Go `string` is a 2-word header (ptr, len) over **immutable** bytes; a `[]byte` is the 3-word mutable slice you already know:
+
+<Mermaid title="string header vs []byte header" height={360} code={`
+flowchart LR
+  subgraph S["string header (2 words)"]
+    sptr["ptr"]
+    slen["len"]
+  end
+  subgraph B["[]byte header (3 words)"]
+    bptr["ptr"]
+    blen["len"]
+    bcap["cap"]
+  end
+  imm["immutable bytes"]
+  mut["mutable backing array"]
+  sptr --> imm
+  bptr --> mut
+`} />
+
+Because one is immutable and the other mutable, converting between them **allocates a new backing array and copies the bytes** in the general case:
+
+```go title="string-bytes-conversion.go"
+s := "hello"
+b := []byte(s)  // allocates len(s) bytes, copies them (b is mutable, independent)
+s2 := string(b) // allocates again, copies back
+```
+
+The lexer pays this conversion **exactly once** — `scanBuf: []byte(input)` at setup — and then scans by index over the mutable buffer. That's the right place to pay: one copy at setup, zero in the hot loop.
+
+`GetCurrentText` does the reverse at a controlled point — subslice (cheap, aliases) then convert to string (one copy, makes the result safe to retain):
+
+```go title="go/common/parser/context.go"
+func (ctx *ParseContext) GetCurrentText(startPos int) string {
+	if startPos < 0 || startPos > ctx.scanPos {
+		return ""
+	}
+	return string(ctx.scanBuf[startPos:ctx.scanPos])
+}
+```
+
+The subslice aliases the live buffer (no copy), but `string(...)` copies those bytes into a fresh immutable string — so the returned token text is independent of the lexer and safe to keep even as scanning overwrites that buffer region.
+
+### The zero-allocation `string(b) == "literal"` optimization
+
+There's one important exception to "conversion allocates." The Go compiler recognizes the pattern `string(byteSlice) == stringValue` and lowers it to a direct byte comparison (memcmp) **with no allocation** — the temporary string is never materialized on the heap. The lexer documents and relies on this in its hot scanning loop:
+
+```go title="go/common/parser/context.go" {8}
+// HasPrefixAtScanPos reports whether scanBuf at the current scan position
+// starts with needle. needle is taken as a string so callers don't have to
+// allocate a []byte: `string(byteSlice) == stringLit` lowers to a direct
+// memcmp in the Go compiler with no heap allocation.
+func (ctx *ParseContext) HasPrefixAtScanPos(needle string) bool {
+	pos := ctx.scanPos
+	if len(ctx.scanBuf)-pos < len(needle) {
+		return false
+	}
+	return string(ctx.scanBuf[pos:pos+len(needle)]) == needle
+}
+```
+
+:::caution[Gotcha]
+This optimization only fires when the conversion is *consumed directly* by the comparison. Hoist it into a variable — `s := string(ctx.scanBuf[...]); return s == needle` — and the compiler must materialize `s`, forcing the heap allocation back. In a hot loop, keep the `string(b) == ...` form inline. (Other zero-alloc forms exist, e.g. `for range string(b)` and `string(b)` used directly as a map index, but the comparison case is the one this code leans on.)
+:::
+
+### Avoid the conversion entirely when nothing changes
+
+`normalizeKeywordCase` lowercases a keyword for lookup, but most keywords are already lowercase. It scans first and returns the *original* string untouched if there's nothing to change — paying zero allocations on the common path — and only allocates when it must rewrite bytes:
+
+```go title="go/common/parser/keywords.go" {10}
+func normalizeKeywordCase(s string) string {
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			hasUpper = true
+			break
+		}
+	}
+	// If no uppercase, return original string (avoid allocation)
+	if !hasUpper {
+		return s
+	}
+	// Need to convert case - create new string
+	result := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch >= 'A' && ch <= 'Z' {
+			ch += 'a' - 'A' // PostgreSQL ASCII-only conversion
+		}
+		result[i] = ch
+	}
+	return string(result)
+}
+```
+
+The allocation avoided on the fast path is the `make([]byte, len(s))` plus the final `string(result)` copy. Returning `s` directly costs nothing because a string is immutable — handing back the same header is safe.
+
+### byte vs rune
+
+Indexing a string (`s[i]`) gives a **byte** (`uint8`), not a character. Ranging over a string (`for i, r := range s`) decodes **runes** (`int32` Unicode codepoints), and `i` is the *byte* offset of each rune. A multi-byte UTF-8 character is several bytes but one rune. `string(someRune)` UTF-8-encodes that codepoint (used in the lexer's `[]byte(string(cp))` above); `string(someByteSlice)` reinterprets bytes as a string. `string(65)` is `"A"` (the codepoint) — not `"65"`.
+
+:::caution[Gotcha]
+`len(s)` is the byte count, not the character count. For ASCII (like SQL keywords) they coincide, which is why `normalizeKeywordCase` can iterate bytes safely. For arbitrary UTF-8 text, iterate with `range` to get runes, or use `utf8.RuneCountInString`.
+:::
+
+## strings.Builder: cheap incremental building, never copy it
+
+Concatenating with `+` in a loop reallocates every iteration (strings are immutable). `strings.Builder` accumulates into an internal growable buffer and produces the final string once with `.String()`:
+
+```go title="builder.go"
+var b strings.Builder
+for i := 0; i < 3; i++ {
+	b.WriteString("x")
+}
+return b.String() // "xxx", one final allocation
+```
+
+The SQL-rendering code threads a `*strings.Builder` through helper functions so writes accumulate in the caller's builder:
+
+```go title="go/common/parser/ast/json_parse_nodes.go"
+func appendJsonReturning(b *strings.Builder, output *JsonOutput) {
+	// ...
+	b.WriteString(" RETURNING ")
+	// ...
+}
+```
+
+The parameter is `*strings.Builder` (pointer), not `strings.Builder` (value), for two reasons: passing a value would (1) write into a *copy* the caller never sees, losing the output, and (2) **trip `go vet`'s copylocks check** — `strings.Builder` contains a `noCopy` marker precisely to forbid copying after first use.
+
+For the same reason, `ParseContext` embeds a `strings.Builder` **as a value field**, which is exactly why `ParseContext` is *only ever* used as `*ParseContext` (every method is `func (ctx *ParseContext) ...`):
+
+```go title="go/common/parser/context.go"
+literalBuf    strings.Builder // accumulates literal values
+```
+
+If `ParseContext` were ever copied by value, it would copy `literalBuf` — corrupting the builder and tripping copylocks. Using it only via pointer guarantees no copy ever happens.
+
+:::caution[Gotcha — copylocks]
+A `sync.Mutex`, `sync.WaitGroup`, `strings.Builder`, or similar must not be copied after first use — copying duplicates the lock/buffer state, which is a bug. `go vet` flags it. When such a value lives as a **struct field**, the enclosing struct inherits the no-copy constraint and must be passed by pointer only: a `store` struct holding `sync.Mutex` fields is therefore only ever used as `*store`. (Mutexes also appear as **package-level vars**, where copying isn't a concern.) See [Sync & Memory Model](/go-guide/language/09-sync-and-memory-model/).
+:::
+
+## Arrays vs slices
+
+An **array** has a fixed length that's part of its type: `[3]int` and `[4]int` are different, incompatible types. Arrays are genuine **values** — assigning or passing one copies all elements.
+
+```go title="array-vs-slice.go"
+var a [3]int
+b := a    // copies all 3 ints
+b[0] = 9  // a[0] is still 0
+
+// A slice over an array does NOT copy:
+s := a[:] // s is a slice header pointing into a's storage
+s[0] = 9  // a[0] is now 9
+```
+
+You'll rarely declare arrays directly here; slices are the workhorse. The relevant connection: `[]byte(input)` builds a **slice over a fresh backing array** (that's the allocation), and a `string` is an immutable byte sequence, conceptually array-backed — which is why mutating one requires the `[]byte` copy.
+
+:::note
+Arrays show up implicitly. Fixed-size things like `[16]byte` for a hash digest, or a backing array the compiler creates for a composite literal, are arrays. But the API you touch is almost always the slice.
+:::
+
+## make vs new
+
+Two allocation builtins, easy to confuse:
+
+- `make(T, ...)` — **only** for slices, maps, and channels. It initializes the internal structure (slice header + backing array; map buckets; channel buffer) and returns an initialized **value** of type `T`.
+- `new(T)` — for any type. It allocates a zeroed `T` and returns a `*T` pointing at it.
+
+```go title="make-vs-new.go"
+s := make([]int, 0, 8)    // a usable, empty slice with cap 8
+m := make(map[string]int) // a usable, writable map
+p := new(int)             // p is *int, *p == 0
+```
+
+`make` is everywhere in this chapter's examples. `new` is rare for reference types and usually a mistake there:
+
+```go title="make-vs-new.go"
+bad := new([]byte)     // bad is *[]byte pointing at a NIL slice — almost never useful
+*bad = append(*bad, 1) // works, but you wanted `b := make([]byte, 0, n)` instead
+```
+
+:::tip[Idiom]
+Reach for `make` for slices/maps/channels. For a zeroed struct you'll fill in, prefer the composite literal `&T{}` over `new(T)` — both give a `*T`, but `&T{...}` lets you set fields inline. `new` is mostly seen for primitive pointers (`new(int)`).
+:::
+
+## Escape analysis: stack vs heap
+
+Go decides *automatically* whether each value lives on the stack (cheap, freed when the function returns) or the heap (managed by the GC). The compiler's **escape analysis** asks: can this value's lifetime exceed the function? If a value's address can be reached after the function returns, it must **escape to the heap**.
+
+Common things that force a heap escape:
+
+- **Returning a pointer to a local:** `func f() *T { var x T; return &x }` — `x` outlives `f`, so it heap-allocates. (Unlike C, this is *safe* in Go — no dangling pointer — but it's still a heap allocation.)
+- **Storing a value in an interface** (interface boxing): assigning a concrete value to an `any` or any interface variable typically moves it to the heap, because the interface must hold a pointer. See [Interfaces & Composition](/go-guide/language/03-interfaces-composition/).
+- **Closures capturing a variable by reference:** if a closure outlives the function and mutates a captured local, that local escapes.
+- **Slices/maps whose size isn't known at compile time** (`make([]T, n)` with dynamic `n`) generally heap-allocate the backing array.
+
+The alloc-avoidance code you saw earlier — `normalizeKeywordCase` returning the original string, `HasPrefixAtScanPos` keeping `string(b) == ...` inline — is written *against this model*: the goal is to keep the hot path from producing heap garbage that the GC must later collect.
+
+You **cannot tell from reading source** whether a given value escapes — it depends on the compiler. You observe it by asking the compiler to print its decisions:
+
+```bash title="observe escape decisions"
+go build -gcflags=-m ./go/common/parser/...
+```
+
+This prints lines like `([]byte)(input) escapes to heap` and `moved to heap: x`, each tagged with the source position. Higher verbosity (`-gcflags='-m -m'`) explains *why*. For allocation *counts* in benchmarks, `go test -bench=. -benchmem` reports `allocs/op`. See [Debugging & Profiling](/go-guide/tooling/05-debugging-profiling/).
+
+:::note
+Don't micro-optimize for the stack blindly. Escape analysis is an optimization, not a contract — its decisions can change across Go versions. Write clear code; use `-gcflags=-m` and `-benchmem` to *verify* a real hot path before contorting it. The places this codebase optimizes (the lexer, the wire codec) are exactly the latency-sensitive query path.
+:::
+
+## Defined types vs aliases (memory-relevant recap)
+
+One more distinction that interacts with everything above. `type Value []byte` defines a **new named type** with its own method set — it *is not* `[]byte` for method/interface purposes, even though it has the same memory layout. `type TokenType = int` (note the `=`) is a pure **alias**: `TokenType` and `int` are the *same* type, fully interchangeable, sharing one identity and one method set.
+
+```go title="go/common/parser/tokens.go"
+// This is now just an alias for int to maintain compatibility during transition
+type TokenType = int
+```
+
+```go title="go/common/sqltypes/sqltypes.go"
+type Value []byte
+```
+
+You can pass a `TokenType` anywhere an `int` is wanted and vice versa (same type). You **cannot** pass a plain `[]byte` where a method expects a `Value` receiver, nor call `Value`'s methods on a bare `[]byte`, without an explicit conversion — they're distinct types. The alias is a refactoring shim; the named type is a real abstraction carrying behavior (`IsNull`, `SQLLiteral`). Full treatment in [Types, Structs & Methods](/go-guide/language/02-types-structs-methods/).
+
+## Checkpoints
+
+1. After `RowFromProto` returns, you keep a single 4-byte `Value` from a result whose `pr.Values` was 2 MB. How much memory stays reachable, and why?
+   <details><summary>Answer</summary>All 2 MB. The 4-byte `Value` is a subslice (`pr.Values[offset:offset+4]`) whose `ptr` points into the 2 MB backing array; the GC keeps the entire backing array alive as long as any slice references it. To release the rest, copy the 4 bytes out with `make`+`copy`.</details>
+
+2. Why does `Value` use value receivers while `Result` and `Row` use pointer receivers?
+   <details><summary>Answer</summary><code>Value</code> is a 3-word slice header — cheap to copy — and behaves like a primitive, so value receivers are fine. <code>Result</code>/<code>Row</code> are larger structs that are also nil-checked (`if r == nil { return nil }`), which only works on a pointer receiver, and pointer receivers avoid copying the struct on every call.</details>
+
+3. Why is `string(ctx.scanBuf[pos:pos+len(needle)]) == needle` allocation-free, but `s := string(ctx.scanBuf[...]); return s == needle` is not?
+   <details><summary>Answer</summary>The compiler special-cases `string(b) == stringValue` consumed directly by a comparison and lowers it to a memcmp without materializing the temporary string. Assigning the conversion to a variable forces the string to actually exist on the heap, defeating the optimization.</details>
+
+4. You write `var m map[string]int` then `m["x"] = 1`. What happens, and what's the fix?
+   <details><summary>Answer</summary>It panics: "assignment to entry in nil map." A nil map is readable (lookups return the zero value) but not writable. Initialize it first with `m = make(map[string]int)` (optionally with a capacity hint).</details>
+
+## Exercises
+
+1. In `go/common/sqltypes/sqltypes.go`, trace one byte from `RowFromProto` back to where `pr.Values` originates (look at `Row.ToProto`). List every `[]byte`/`Value` that aliases the same backing array after `RowFromProto` returns, and argue whether retaining one small `Value` keeps the whole buffer alive.
+
+2. Grep `go/common/parser/context.go` for `Return copy for safety` (two hits). For each method, write the concrete aliasing bug that would occur if it returned `ctx.scanBuf` (or `ctx.scanBuf[ctx.scanPos:]`) directly instead of a `make`+`copy`.
+
+3. In `keywords.go`'s `init()`, explain why `&Keywords[i]` is used rather than `&k` from `for _, k := range Keywords`. What capacity does the `make(...)` request, and what does the runtime do differently because of it?
+
+4. Pick any three `CloneSliceOf*` functions in `go/common/parser/ast/ast_clone.go`. Classify each as a shallow `make`+`copy` (slice of values) or a per-element deep clone (slice of pointers), and explain why slices of pointers need the per-element form to fully break aliasing.
+
+5. Read `normalizeKeywordCase` and `HasPrefixAtScanPos`. For each, name the exact allocation a naive implementation would incur and the precise source construct that avoids it.
+
+## Next
+
+<LinkCard
+  title="Errors"
+  description="Error values, wrapping, errors.Is/As, and nil-pointer-receiver error methods — building on the nil-receiver pattern from this chapter."
+  href="/go-guide/language/05-errors/"
+/>
+
+## See also
+
+<CardGrid>
+  <LinkCard
+    title="Types, Structs & Methods"
+    description="Defined types vs aliases, value vs pointer receivers, method sets."
+    href="/go-guide/language/02-types-structs-methods/"
+  />
+  <LinkCard
+    title="Interfaces & Composition"
+    description="Interface boxing as a heap-escape trigger; embedding."
+    href="/go-guide/language/03-interfaces-composition/"
+  />
+  <LinkCard
+    title="Sync & Memory Model"
+    description="Why copying a struct with an embedded sync.Mutex/strings.Builder is a bug (go vet copylocks)."
+    href="/go-guide/language/09-sync-and-memory-model/"
+  />
+  <LinkCard
+    title="Parser, Lexer, AST & Codegen"
+    description="The lexer/ParseContext scanBuf as the real high-perf slice/string user."
+    href="/go-guide/project/06-parser-lexer-ast-codegen/"
+  />
+  <LinkCard
+    title="PG Wire & sqltypes"
+    description="Value/Row/Result wire packing and nil vs empty across gRPC."
+    href="/go-guide/project/07-pg-wire-and-sqltypes/"
+  />
+  <LinkCard
+    title="Debugging & Profiling"
+    description="Observing escape analysis with -gcflags=-m and allocation profiling."
+    href="/go-guide/tooling/05-debugging-profiling/"
+  />
+  <LinkCard
+    title="Idioms & Gotchas"
+    description="Slice aliasing, nil-map write panic, []byte to string cost."
+    href="/go-guide/reference/idioms-and-gotchas/"
+  />
+  <LinkCard
+    title="Glossary"
+    description="Slice header, backing array, escape analysis, named type vs alias."
+    href="/go-guide/reference/glossary/"
+  />
+</CardGrid>

@@ -1,0 +1,576 @@
+---
+title: Generics
+description: Type parameters, constraints, inference, and explicit instantiation in Go — and where a real codebase reaches for generics versus interfaces or codegen.
+sidebar:
+  order: 6
+---
+
+import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+Go added generics in 1.18, and they are deliberately narrow compared to C++ templates, Rust traits, or C# generics: no specialization, no method-level type parameters, no variance, and the only thing a constraint can express is a *type set*. If you come from one of those languages, your instinct will be slightly wrong in two or three specific places — and this chapter points right at them.
+
+We'll learn by reading real code. The **multigres** codebase ("Vitess for Postgres") uses generics in a focused way — type-safe containers, "same algorithm over many element types" helpers, and config plumbing — so the examples are small and dissectable. Builds on [Types, Structs & Methods](/go-guide/language/02-types-structs-methods/) (methods, receivers, zero values), [Interfaces & Composition](/go-guide/language/03-interfaces-composition/) (interfaces as method sets), and [Errors](/go-guide/language/05-errors/) (the `(T, error)` return shape).
+
+## Type parameters on functions, and inference
+
+A generic function declares its type parameters in square brackets after the name, before the ordinary parameter list. Each type parameter has a *constraint* — here `any`, which means "no constraint at all."
+
+```go title="Teaching example — not from the repo"
+func First[T any](s []T) (T, bool) {
+	if len(s) == 0 {
+		var zero T // can't write `return nil` or `return 0` — T is unknown
+		return zero, false
+	}
+	return s[0], true
+}
+
+// Caller writes no type arguments; T is inferred from the slice's element type.
+x, ok := First([]int{1, 2, 3}) // T = int
+```
+
+Two things to absorb immediately. First, `T any` is the same as `T interface{}` — `any` is just the predeclared alias. Second, that `var zero T` line: inside a generic function you don't know whether `T` is a pointer, a number, or a struct, so you can't spell its "empty" value literally. `var zero T` gives you the zero value for whatever `T` turns out to be — `nil` for pointers/interfaces/maps/slices, `0` for numbers, `false` for bool, the all-fields-zeroed value for a struct. This is *the* idiom newcomers stumble on, and you'll see it everywhere below.
+
+### Real usage: a connection-pool retry helper
+
+The hot query path `multigateway -> multipooler -> postgres` wraps every backend operation in a generic helper, so retry-on-connection-error logic is written once and reused across operations that return wildly different result types.
+
+```go title="go/services/multipooler/internal/pools/regular/regular_conn.go" {6-7,9-11}
+// retryOnConnectionError executes op with automatic retry on connection error.
+func retryOnConnectionError[T any](c *Conn, ctx context.Context, op func() (T, error)) (T, error) {
+	for attempt := 1; attempt <= constants.MaxConnPoolRetryAttempts; attempt++ {
+		val, err := execOnce(c, ctx, op)
+		switch {
+		case err == nil:
+			return val, nil
+		case !mterrors.IsConnectionError(err):
+			var zero T
+			return zero, err
+		case attempt == constants.MaxConnPoolRetryAttempts:
+			c.conn.Close()
+			var zero T
+			return zero, err
+		}
+		// ... backoff + reconnect ...
+	}
+	panic("unreachable")
+}
+```
+
+The companion `execWithContextCancel[T any]` and `execOnce[T any]` in the same file have an identical shape: they take `op func() (T, error)`, run it on a goroutine, and `select` on context cancellation versus completion. Every error path returns `var zero T, err`.
+
+Why generics here and not `interface{}`? Without generics the helper would have to return `(interface{}, error)`, and every caller would type-assert the result — paying a boxing allocation and a runtime cast that can panic. With `[T any]` the return type is the *exact* type the caller wants, checked at compile time.
+
+Now look at inference at the call sites. The caller writes **no** type arguments; `T` is deduced from the return type of the function literal passed as `op`:
+
+```go title="Call sites in the same file"
+// T = []*sqltypes.Result
+return execWithContextCancel(c, ctx, func() ([]*sqltypes.Result, error) {
+	return c.conn.Query(ctx, sql)
+})
+
+// T = bool
+return execWithContextCancel(c, ctx, func() (bool, error) {
+	return c.conn.BindAndExecute(ctx, /* ... */)
+})
+
+// T = struct{}  — the op has no meaningful return value
+_, err := execWithContextCancel(c, ctx, func() (struct{}, error) {
+	return struct{}{}, c.conn.QueryStreaming(ctx, sql, callback)
+})
+```
+
+The `struct{}` cases are an idiom worth naming: when an operation is "fire and check the error" with no payload, the author still has to give `T` *some* type, so they pick the empty struct (zero bytes, allocates nothing) and discard the value with `_,`.
+
+:::note
+Inference flows from the types of the *value arguments*, not from the return type the caller expects. `T` appears in `op func() (T, error)`, an argument, so it's inferable. If `T` appeared *only* in a function's return and never in any parameter, inference would be impossible and the caller would have to instantiate explicitly (see below).
+:::
+
+:::caution[Gotcha]
+`var zero T` is not optional decoration. Returning `nil` from `retryOnConnectionError` would not compile, because when `T = bool` there is no `nil`. The single idiom `var zero T; return zero, err` is the only way to produce the empty value uniformly across all instantiations.
+:::
+
+## Type parameters on types
+
+A type can carry its own type parameters. They're in scope on every field and every method of that type.
+
+```go title="Teaching example"
+type Box[T any] struct {
+	value T
+}
+
+func (b *Box[T]) Get() T  { return b.value }   // method reuses the receiver's T
+func (b *Box[T]) Set(v T) { b.value = v }
+```
+
+Note the receiver is written `(b *Box[T])`, not `(b *Box)`. You repeat the type parameter name so the body can refer to `T`. The method does **not** re-declare `T` as new — it reuses the one bound when the value was created. (Methods cannot introduce *their own* type parameters; that surprises everyone, so it gets its own section below.)
+
+### Real usage: a two-parameter store
+
+One of the services keeps an in-memory, clone-on-access store of protobuf health/topology state. It's generic over both the key and the value:
+
+```go title="go/services/multiorch/store/store.go" {1,11}
+type ProtoStore[K comparable, V proto.Message] struct {
+	mu    sync.Mutex
+	items map[K]V
+}
+
+func (s *ProtoStore[K, V]) Get(key K) (V, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	v, ok := s.items[key]
+	if !ok {
+		var zero V
+		return zero, false
+	}
+	cloned := proto.Clone(v).(V) // legal because V is constrained to proto.Message
+	return cloned, true
+}
+```
+
+Two constraints carry real weight here:
+
+- `K comparable` — `K` is used as a **map key** (`items map[K]V`). Map keys must support `==`, and `comparable` is exactly the constraint that promises that. You couldn't write `items map[K]V` if `K` were merely `any`.
+- `V proto.Message` — constraining `V` to the third-party interface `proto.Message` lets the body call `proto.Clone(v)`. `proto.Clone` returns `proto.Message`, so `.(V)` asserts it back to the concrete value type. Because every `V` satisfies `proto.Message`, this assertion always succeeds for values that actually came out of this store.
+
+Every method — `Get`, `Set`, `Range`, `DoUpdate`, `Delete`, `Len`, `Clear` — is written `func (s *ProtoStore[K, V]) ...`, reusing the receiver's `K` and `V`. The author chose a custom struct over `sync.Map` deliberately: the recovery engine is write-heavy, which defeats `sync.Map`'s read-optimized design.
+
+:::caution[Gotcha — the boxing comparison trick]
+`DoUpdate` needs to ask "did the callback return the zero value?" but it can't write `newValue == zero` directly: `V` is `proto.Message`, a non-comparable interface constraint (pointers to messages with slice fields aren't `==`-comparable in general). The code instead boxes both sides to `any` and compares interface headers:
+
+```go
+var zero V
+if newValue := fn(v); any(newValue) != any(zero) {
+	s.items[key] = newValue
+}
+```
+
+This compares the `(type, value)` pair of the boxed interface. For pointer-shaped proto messages the comparison is on the pointer, so `nil != someptr` works as intended. It's a subtle pattern — it works *here* because `V` is always a pointer type — and you should not copy it blindly to value types.
+:::
+
+## The constraint taxonomy
+
+A constraint is an interface used as a *type set* — the set of types a type parameter is allowed to be instantiated with. There are four shapes you'll meet in this codebase.
+
+### `any` — no constraint
+
+Already seen: `[T any]`. No operations on `T` are permitted except those valid for *every* type (assignment, passing around, `var zero T`).
+
+### `comparable` — supports `==`, `!=`, and map keys
+
+A built-in constraint, required whenever `T` is a map key or you use `==`/`!=` on it. The gateway uses it to model PostgreSQL `SET` / `SET LOCAL` / `SAVEPOINT` semantics for a single session variable:
+
+```go title="go/services/multigateway/handler/gateway_managed_variable.go"
+type GatewayManagedVariable[T comparable] struct {
+	defaultValue T
+	currentValue T
+	isSet        bool
+	localValue   T
+	isLocalSet   bool
+	snapshots    []gmvSnapshot[T]
+}
+```
+
+`T` is `comparable` so the handler can compare config values, and the methods use `var zero T` to clear them.
+
+:::caution[Gotcha]
+`comparable` does **not** include slices, maps, or functions — and a struct that *contains* a slice/map/func field is itself not comparable. So `GatewayManagedVariable[T]` is only instantiable for genuinely comparable `T` (string, bool, int, comparable structs). Attempting `GatewayManagedVariable[[]byte]` is a compile error, not a runtime one.
+:::
+
+### `cmp.Ordered` — supports `<`, `<=`, `>`, `>=`
+
+From the standard-library `cmp` package (Go 1.21+). This is the constraint you need when you want to *sort* or *order*, which `comparable` alone cannot do.
+
+The cleanest teaching pair in the repo lives in a small `sortedmaps` package, which exists so map iteration produces deterministic output (Go randomizes `range` over maps). `Keys` constrains to `cmp.Ordered` so it can call `slices.Sort`:
+
+```go title="go/tools/sortedmaps/sortedmaps.go"
+func Keys[K cmp.Ordered, V any](m map[K]V) []K {
+	keys := make([]K, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys) // needs <, hence cmp.Ordered, not just comparable
+	return keys
+}
+```
+
+Right below it, `ByStr` handles the case where the key is comparable but *not* orderable:
+
+```go title="go/tools/sortedmaps/sortedmaps.go"
+// ByStr ... Use this when K is comparable but not cmp.Ordered ...
+func ByStr[K comparable, V any](m map[K]V) iter.Seq2[K, V] {
+	keys := make([]K, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b K) int {
+		return strings.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
+	})
+	// ... yield in that order ...
+}
+```
+
+This is an in-repo demonstration of *why you pick one constraint over the other*: `Keys`/`Values`/`All` need ordering and accept the stronger `cmp.Ordered`; `ByStr` only promises `comparable` and falls back to comparing the `fmt.Sprintf("%v", ...)` string form. (`All` returns `iter.Seq2[K, V]`, a Go 1.23 range-over-func iterator — covered in the stdlib chapter.)
+
+:::caution[Gotcha — `comparable` and `cmp.Ordered` are different type sets]
+`comparable` guarantees only `==`/`!=`; it does **not** give you `<`. If you write `a < b` on a `comparable` type parameter, it won't compile. You must either widen the constraint to `cmp.Ordered` or sort with an explicit comparison function (`slices.SortFunc`). That single distinction is the entire reason `ByStr` exists.
+:::
+
+### Union / type-set constraints (`|`)
+
+An interface can list concrete types separated by `|`. A type parameter constrained by it may be any one of those types.
+
+```go title="Teaching example"
+type SignedSmall interface {
+	int8 | int16 | int32 | int64
+}
+func Abs[T SignedSmall](x T) T { if x < 0 { return -x }; return x }
+```
+
+The only union constraints in the codebase are *inline exact-type unions* in the config plumbing, which cast viper's wide getters down to narrow numeric types:
+
+```go title="go/tools/viperutil/get_func.go"
+func getCastedInt[T int8 | int16]() func(v *viper.Viper) func(key string) T {
+	return func(v *viper.Viper) func(key string) T {
+		return func(key string) T {
+			return T(v.GetInt(key)) // legal: every member of the set is convertible from int
+		}
+	}
+}
+
+func getCastedUint[T uint8 | uint16]() func(v *viper.Viper) func(key string) T { /* ... */ }
+func getComplex[T complex64 | complex128](bitSize int) func(v *viper.Viper) func(key string) T { /* ... */ }
+```
+
+:::caution[Gotcha — exact types vs `~` (approximation)]
+`getCastedInt[T int8 | int16]` accepts **only** `int8` or `int16`. A named type such as `type myByte int8` would **not** satisfy it, because its *type* is `myByte`, not `int8`. To accept "any type whose underlying type is `int8`", you write `~int8`:
+
+```go
+type ByteLike interface { ~int8 | ~uint8 } // ~ = "underlying type is"
+```
+
+This codebase uses **only exact-type unions** — there's no `~` anywhere in it, and it doesn't import `golang.org/x/exp/constraints`; the one standard constraints package it uses is `cmp` (for `cmp.Ordered`). So `~` is good to know generically, but don't expect to see it here.
+:::
+
+:::caution[Gotcha — constraint-only interfaces]
+An interface that embeds `comparable` or contains a `|` type-set union can be used **only as a constraint**, never as an ordinary variable type. You cannot declare `var x SignedSmall`. That's why the `cachekey` interface (next section) cannot be used as a regular interface value.
+:::
+
+## Custom interfaces as constraints — interfaces wear two hats
+
+This is the key conceptual link to [interfaces](/go-guide/language/03-interfaces-composition/): an interface is *both* a runtime value type (dynamic dispatch) *and* a compile-time constraint (a type set). The connection pool uses one interface for both jobs.
+
+It first defines an ordinary method-set interface:
+
+```go title="go/services/multipooler/internal/pools/connpool/interfaces.go"
+type Connection interface {
+	Settings() *connstate.Settings
+	IsClosed() bool
+	Close() error
+	ApplySettings(ctx context.Context, desired *connstate.Settings) error
+	ResetAllSettings(ctx context.Context) error
+}
+```
+
+Then it uses that same interface as a *generic constraint*:
+
+```go title="go/services/multipooler/internal/pools/connpool/pool.go"
+type Connector[C Connection] func(ctx context.Context, poolCtx context.Context) (C, error)
+
+type Pool[C Connection] struct {
+	clean  connStack[C]
+	states [stackMask + 1]connStack[C] // array of generic-typed stacks
+	wait   waitlist[C]
+	// ...
+}
+```
+
+Why constrain `C` to `Connection` instead of using `Connection` directly as the field type? Two reasons. First, a `Pool[*regularConn]` stores and hands back `*regularConn` values with *no* interface boxing and *no* type assertions — the pool is monomorphized to the concrete connection type at compile time. Second, the constraint still guarantees the pool can call `c.Close()`, `c.Settings()`, etc., because every `C` is a `Connection`. You get interface-level guarantees with concrete-type performance — exactly the trade generics exist to make on a latency-sensitive path.
+
+### A constraint mixing `comparable` with methods
+
+A constraint can embed `comparable` *and* require methods. A cache does this for its key type:
+
+```go title="go/common/cache/theine/store.go"
+type cachekey interface {
+	comparable
+	Hash() uint64
+	Hash2() (uint64, uint64)
+}
+
+type cacheval interface {
+	CachedSize(alloc bool) int64
+}
+
+type Store[K cachekey, V cacheval] struct {
+	// ...
+	shards []*Shard[K, V]
+}
+```
+
+The two concrete key types that satisfy `cachekey` live in the same file: a `[32]byte` hash key and a `string` key, each providing `Hash`/`Hash2`. `cachekey` embeds `comparable` because `K` is used as a map key inside each shard (`hashmap map[K]*Entry[K, V]`). It *also* requires the hash methods because the sharding and bloom-filter logic call `key.Hash()`. Drop the embedded `comparable` and the `map[K]...` field stops compiling; drop the methods and the sharding code stops compiling.
+
+:::tip[Idiom]
+When you see `comparable` *embedded inside* a custom constraint interface, read it as "I need this as a map key **and** I need these methods." It's the union of a built-in capability and a behavioral contract.
+:::
+
+## Explicit instantiation — when inference cannot help
+
+Generic *functions* can usually infer their type arguments. Generic *types* never can — there's nothing to infer *from* when you name a type, so you must always supply the arguments in brackets.
+
+```go title="Teaching example"
+// Generic type — explicit args are mandatory, there's no value to infer from:
+b := Box[int]{value: 7}
+
+// Generic function — args usually inferred, but you may write them when needed:
+x, _ := First[string](nil) // explicit because nil gives no element type to infer
+```
+
+### Real usage: `Options[T]` literals
+
+Config call sites instantiate the generic `Options[T]` struct explicitly, then let `Configure[T any]` infer `T` from that argument:
+
+```go title="go/services/multigateway/buffer/config.go"
+Enabled: viperutil.Configure(reg, "buffer-enabled", viperutil.Options[bool]{
+	Default: false, FlagName: "buffer-enabled", EnvVars: []string{"MT_BUFFER_ENABLED"},
+}),
+Window: viperutil.Configure(reg, "buffer-window", viperutil.Options[time.Duration]{
+	Default: 10 * time.Second, /* ... */
+}),
+Size: viperutil.Configure(reg, "buffer-size", viperutil.Options[int]{ Default: 1000, /* ... */ }),
+```
+
+The `Options[bool]{...}` part *must* be written explicitly — it's a generic type literal. But `viperutil.Configure(reg, key, opts)` does **not** need `[bool]` written: its signature `Configure[T any](reg *Registry, key string, opts Options[T]) Value[T]` infers `T` from the `Options[T]` argument's type. So you get a mix on a single line: explicit on the type, inferred on the function.
+
+The other explicit-instantiation flavor lives inside `GetFuncForType[T any]`, which switches on `reflect.Kind` and instantiates the small-numeric helpers by hand, because there's no value to infer from in a `reflect` switch:
+
+```go title="go/tools/viperutil/get_func.go"
+case reflect.Int8:
+	f = getCastedInt[int8]()
+case reflect.Int16:
+	f = getCastedInt[int16]()
+// ...
+case reflect.Uint8:
+	f = getCastedUint[uint8]()
+```
+
+:::caution[Gotcha]
+Every place that names a generic *type* needs explicit arguments: `Options[bool]{}`, `list.List[waiter[C]]`, `deque.Deque[*Entry[K, V]]`. Only generic *functions* get to lean on inference — and only when the type parameter appears in a value argument.
+:::
+
+### Generic interfaces and the satisfaction-assertion idiom
+
+Interfaces can be generic too:
+
+```go title="go/tools/viperutil/value.go"
+type Value[T any] interface {
+	value.Registerable // embedded non-generic interface
+	Get() T
+	Set(v T)
+	Default() T
+}
+```
+
+Just above it is a compile-time interface-satisfaction check, written with explicit instantiation:
+
+```go title="go/tools/viperutil/value.go"
+var (
+	_ Value[int] = (*value.Static[int])(nil)
+	_ Value[int] = (*value.Dynamic[int])(nil)
+)
+```
+
+The pattern `var _ Iface = (*Impl)(nil)` asserts at compile time that `*Impl` satisfies `Iface`, with zero runtime cost (the value is the blank identifier). With generics you simply instantiate both sides at a concrete type (`int` here) to perform the check. If `value.Static[int]` ever stopped implementing `Value[int]`, the build would fail at this line rather than at some distant call site.
+
+### Nested instantiation
+
+A generic type can be parameterized by another generic type. The waitlist stacks generics two deep:
+
+```go title="go/services/multipooler/internal/pools/connpool/waitlist.go"
+type waitlist[C Connection] struct {
+	nodes sync.Pool
+	mu    sync.Mutex
+	list  list.List[waiter[C]] // List instantiated at element type waiter[C]
+}
+```
+
+Here `waiter[C]` is itself a generic type, used as the type argument to `list.List[...]`. Inside the methods you get values of type `*list.Element[waiter[C]]`:
+
+```go title="go/services/multipooler/internal/pools/connpool/waitlist.go"
+elem := wl.nodes.Get().(*list.Element[waiter[C]])
+```
+
+`C` flows from the enclosing `waitlist`'s own type parameter all the way into `List` and `Element`. This is ordinary, but it reads densely the first time; the key is that `[C]` is just a name being threaded through.
+
+## Third-party generic types
+
+External generic libraries are consumed the same way as the codebase's own. The cache's per-shard recency queue is a `github.com/gammazero/deque`:
+
+```go title="go/common/cache/theine/store.go"
+import "github.com/gammazero/deque"
+
+type Shard[K cachekey, V any] struct {
+	// ...
+	deque *deque.Deque[*Entry[K, V]] // element type is the generic *Entry[K,V]
+}
+
+// inside NewShard:
+deque: &deque.Deque[*Entry[K, V]]{},
+```
+
+When `Store` is instantiated as, say, `Store[StringKey, *someval]`, the deque's element type becomes `*Entry[StringKey, *someval]`. The cache then calls `shard.deque.PushFront(entry)` and `shard.deque.PopBack()`. Both are fully type-checked: `PushFront` accepts only `*Entry[K, V]`, and `PopBack` returns `*Entry[K, V]` with **no** cast and **no** `interface{}` boxing. That type safety with zero assertions is the entire payoff of the library being generic rather than a `container/list`-style `interface{}` container.
+
+### A first-party generic container
+
+The codebase also keeps a generics fork of `container/list`. Its package doc states the motive plainly:
+
+```go title="go/tools/list/list.go"
+// Package list is the standard library's 'container/list', but using Generics
+// for performance.
+
+type Element[T any] struct {
+	next, prev *Element[T]
+	list       *List[T]
+	Value      T
+}
+
+type List[T any] struct {
+	root Element[T]
+	len  atomic.Int64
+}
+
+func New[T any]() *List[T] { return new(List[T]).Init() }
+func (l *List[T]) Front() *Element[T] { /* ... */ }
+```
+
+The stdlib `container/list` stores `interface{}` in `Element.Value`; this fork stores `T`. For the connection pool's waitlist, that means no boxing of `waiter[C]` values on a per-borrow basis — relevant because the pool sits on the latency-sensitive query path.
+
+## The rule that bites everyone: methods can't have their own type parameters
+
+In C#, Rust, and TypeScript you can put a type parameter on an individual method. **Go forbids this.** A method may *reuse* the receiver's type parameters but may not introduce new ones.
+
+```go title="Teaching example — does NOT compile in Go"
+func (b *Box[T]) Map[U any](f func(T) U) U { // error: methods cannot have type parameters
+	return f(b.value)
+}
+```
+
+The language designers excluded method type parameters partly because they'd interact badly with interface satisfaction — an interface method set with open type parameters has no finite shape. Concretely: you couldn't add `func (s *ProtoStore[K, V]) GetAs[U any](key K) U` to `ProtoStore`; the compiler rejects the `[U any]` on the method outright.
+
+The workaround the codebase uses everywhere is to make the operation a **top-level generic function** instead of a method:
+
+- `sortedmaps.Keys[K cmp.Ordered, V any](m map[K]V)` — a free function, not a method on some map wrapper.
+- `prototest.RequireElementsMatch[T proto.Message](t *testing.T, expected, actual []T, ...)` — a free generic test helper, not a method.
+- The connpool retry helpers `retryOnConnectionError[T any]` / `execWithContextCancel[T any]` take the `*Conn` as an ordinary first argument, precisely so each call can pick its own `T`.
+
+```go title="go/tools/prototest/prototest.go"
+func RequireElementsMatch[T proto.Message](t *testing.T, expected, actual []T, msgAndArgs ...any) {
+	t.Helper()
+	if len(expected) != len(actual) { /* ... */ }
+	// ... order-insensitive proto.Equal comparison ...
+}
+```
+
+:::caution[Gotcha]
+If you find yourself wanting `obj.DoSomething[U](...)`, stop — Go won't allow it. Rewrite as `DoSomething[U](obj, ...)`. This is *the* most surprising generics rule for newcomers from other typed languages, and it's why this codebase's generic helpers are free functions that take the receiver-like object as their first parameter.
+:::
+
+## Generics vs interfaces vs codegen
+
+These three tools overlap, and a real system uses all of them — each where it fits.
+
+| Use | Reach for it when | What you get |
+|---|---|---|
+| **Generics** | You want a type-safe container or one algorithm over many element types, with no runtime polymorphism | No `interface{}` boxing, no casts; everything monomorphized at compile time. `Pool[C]`, `ProtoStore[K, V]`, `retryOnConnectionError[T]`. |
+| **Interfaces** | You need *runtime* polymorphism — heterogeneous values dispatched through one method set, concrete type genuinely varying at runtime | Dynamic dispatch. `Connection` plays this role as a *value* type. (The clever bit: one interface can serve as a constraint too.) |
+| **Codegen** | The transformation can't be expressed as "the same code over different types" at all | Generated code per concrete type. Whole-AST clone/rewrite, generated protobuf message types. |
+
+The codegen line is worth dwelling on. Walking every concrete node type in an AST to clone or rewrite it can't be a generic: there's no single type parameter that captures "for each field of each of these many unrelated struct types, recurse appropriately." So the parser's helper tool generates the clone/rewrite code by reflecting over the *set* of AST node structs, and `protoc` generates the message types. See [Parser, Lexer, AST & Codegen](/go-guide/project/06-parser-lexer-ast-codegen/).
+
+:::note[Each instantiation is a distinct type — and there's no variance]
+`Pool[*regularConn]` and `Pool[*otherConn]` are unrelated types: you can't assign one to the other, and you can't pass a `[]Pool[*regularConn]` where `[]Pool[Connection]` is wanted. Go generics have *no covariance*. If you need to treat differently-instantiated values uniformly at runtime, that's the signal to use an interface, not a generic.
+:::
+
+## Checkpoints
+
+1. Inside `retryOnConnectionError[T any]`, why can't the error paths just `return nil, err`, and what do they write instead?
+   <details><summary>Answer</summary>Because `T` is unknown at definition time and not every `T` has a `nil` (e.g. `T = bool`). Every error path declares `var zero T` and returns `zero, err`. <code>var zero T</code> yields the correct empty value for whatever `T` is at the instantiation site.</details>
+
+2. `sortedmaps.Keys` is constrained to `cmp.Ordered` but `ByStr` only to `comparable`. What capability does the stronger constraint buy, and how does `ByStr` cope without it?
+   <details><summary>Answer</summary><code>cmp.Ordered</code> adds `<`/`<=`/`>`/`>=`, which `slices.Sort` needs. `comparable` only promises `==`/`!=`, so `ByStr` can't call `slices.Sort`; it uses `slices.SortFunc` comparing `fmt.Sprintf("%v", key)` string forms instead.</details>
+
+3. Why is `var _ Value[int] = (*value.Static[int])(nil)` written in `viperutil/value.go`, and what does it cost at runtime?
+   <details><summary>Answer</summary>It's a compile-time assertion that `*value.Static[int]` satisfies the generic interface `Value[int]`. The value is assigned to the blank identifier, so it costs nothing at runtime; if the implementation ever stopped satisfying the interface, the build would fail at this line.</details>
+
+4. You want to add `func (s *ProtoStore[K, V]) Decode[U any](key K) U`. Will it compile? What's the idiomatic fix?
+   <details><summary>Answer</summary>No — Go forbids methods from declaring their own type parameters (`[U any]` on a method is illegal). The fix is a top-level generic function that takes the store as its first argument, e.g. `func Decode[K comparable, V proto.Message, U any](s *ProtoStore[K, V], key K) U`, mirroring how `prototest.RequireElementsMatch` and the connpool retry helpers are free functions.</details>
+
+## Exercises
+
+1. In `go/services/multipooler/internal/pools/regular/regular_conn.go`, list every distinct concrete type that `T` is inferred as at the `execWithContextCancel` call sites. For the two that use `struct{}`, explain what that signals about the underlying operation.
+
+2. Open `go/tools/sortedmaps/sortedmaps.go`. In your own words, justify why `Keys`/`Values`/`All` take `cmp.Ordered` while `ByStr` takes `comparable`. Then find a type used as a map key elsewhere that's `comparable` but **not** `cmp.Ordered` (hint: look at the cache's key types), and argue which helper you'd use to iterate a map keyed by it.
+
+3. Find every occurrence of `var zero T` / `var zero V` in the multiorch store and the connpool regular-conn file. For each, state the concrete zero value produced when the parameter is (a) a pointer, (b) `bool`, (c) a struct.
+
+4. Locate the `cachekey` constraint and the two concrete types that satisfy it. Explain why `cachekey` embeds the built-in `comparable` *in addition to* its `Hash`/`Hash2` methods, and name the exact field declaration that would stop compiling if the `comparable` embedding were removed.
+
+5. Trace one instantiation of the third-party deque. Starting from `deque *deque.Deque[*Entry[K, V]]`, work out the element type when `Store` is instantiated as `Store[StringKey, *someval]`. Find the `PushFront` and `PopBack` calls and confirm there are no type assertions on the way in or out.
+
+## Next
+
+<LinkCard
+  title="Concurrency"
+  description="Goroutines, channels, and select — the execOnce / execWithContextCancel helpers here are generic and concurrent, which is the next chapter's territory."
+  href="/go-guide/language/07-concurrency/"
+/>
+
+## See also
+
+<CardGrid>
+  <LinkCard
+    title="Types, Structs & Methods"
+    description="Methods reuse receiver type parameters; zero values feed the var zero T idiom."
+    href="/go-guide/language/02-types-structs-methods/"
+  />
+  <LinkCard
+    title="Interfaces & Composition"
+    description="Interfaces as method sets and as generic constraints; the Connection example is shared."
+    href="/go-guide/language/03-interfaces-composition/"
+  />
+  <LinkCard
+    title="Errors"
+    description="The (T, error) return shape and var zero T on error paths."
+    href="/go-guide/language/05-errors/"
+  />
+  <LinkCard
+    title="Stdlib & Idioms"
+    description="cmp.Ordered, slices.Sort, and the iter.Seq2 range-over-func used by sortedmaps."
+    href="/go-guide/language/10-stdlib-and-idioms/"
+  />
+  <LinkCard
+    title="Config & viperutil"
+    description="The deep dive on Configure[T] / Options[T] / Value[T]."
+    href="/go-guide/project/03-config-viperutil/"
+  />
+  <LinkCard
+    title="gRPC & Protobuf"
+    description="The proto.Message constraint and proto.Clone in ProtoStore."
+    href="/go-guide/project/04-grpc-and-protobuf/"
+  />
+  <LinkCard
+    title="Parser, Lexer, AST & Codegen"
+    description="When codegen beats generics — whole-AST clone and rewrite."
+    href="/go-guide/project/06-parser-lexer-ast-codegen/"
+  />
+  <LinkCard
+    title="Idioms & Gotchas"
+    description="var zero T, methods-can't-have-type-params, comparable vs cmp.Ordered."
+    href="/go-guide/reference/idioms-and-gotchas/"
+  />
+  <LinkCard
+    title="Glossary"
+    description="Type parameter, constraint, type set, instantiation, type inference."
+    href="/go-guide/reference/glossary/"
+  />
+</CardGrid>

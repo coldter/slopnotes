@@ -1,0 +1,736 @@
+---
+title: "Concurrency: Goroutines & Channels"
+description: Goroutines, channels, select, fan-out/fan-in, WaitGroup, errgroup, and how to give every goroutine an exit path.
+sidebar:
+  order: 7
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+**What you will learn:** Go's concurrency primitives — goroutines, channels, `select`, `sync.WaitGroup`, and `errgroup` — and the fan-out/fan-in, signal-coalescing, watchdog, and worker-loop patterns that show up across a real distributed system. We'll read the routing, consensus, and pooling code of **multigres** ("Vitess for Postgres") to see each pattern in production.
+
+**Prerequisites:** [pointers, values & memory](/go-guide/language/04-pointers-values-memory/) (channels carry pointers and structs by value), [errors](/go-guide/language/05-errors/) (`errgroup` propagates the first error), and ideally [interfaces](/go-guide/language/03-interfaces-composition/). Cancellation is covered in depth in [context](/go-guide/language/08-context/); locks and the memory model in [sync & the memory model](/go-guide/language/09-sync-and-memory-model/). This page leans on both — read them next or alongside.
+
+:::note[Two language versions that matter here]
+The code we read targets **Go 1.25**. Two features show up repeatedly: per-iteration loop variables (Go 1.22+) make `go func(){ use(p) }()` inside a `for ... range` loop safe without the old `p := p` shadow, and `sync.WaitGroup.Go` (Go 1.25) collapses the `Add(1)` / `go` / `defer Done()` boilerplate. You'll see both, sometimes side by side in the same package.
+:::
+
+---
+
+## Goroutines and the `go` statement
+
+A goroutine is a function executing concurrently with other goroutines in the same address space. You start one by prefixing a call with `go`. The statement returns immediately; the goroutine runs independently and **its return value is discarded**.
+
+```go title="Starting goroutines"
+func work(id int) int { return id * 2 }
+
+go work(1)            // launched; the returned int is thrown away
+go func() {           // common form: an anonymous closure
+    fmt.Println("hi")
+}()
+fmt.Println("main continues immediately")
+```
+
+There is no handle, no "thread object," no join. If you want the result, a goroutine's completion, or an error back, *you* must arrange a channel, a `WaitGroup`, or a context — the language gives you nothing automatic.
+
+### The cost model
+
+A goroutine is **not** an OS thread. It starts with a tiny (a few KB) stack that grows and shrinks on demand, and the Go runtime multiplexes many goroutines onto a small pool of OS threads (`GOMAXPROCS` of them by default). Creating, parking, and waking a goroutine is cheap — orders of magnitude cheaper than a thread. That's why the patterns below spawn **one goroutine per cohort member** or **one per RPC** without a second thought: a failover involving a dozen poolers launches a dozen goroutines, and that's entirely normal.
+
+The flip side: cheap to spawn does not mean free to *leak*. A goroutine blocked forever on a channel that nobody will ever send to (or close) sits in memory until the process exits. Most of this page is really about giving every goroutine a guaranteed exit path.
+
+### Loop-variable capture (Go 1.22+)
+
+In multigres's consensus code, one goroutine is launched per cohort member, and the closure captures the loop variable `p` directly:
+
+```go title="consensus/rule_change.go — dispatchRecruit"
+recruited := make(chan recruitResult, len(cohort))
+for _, p := range cohort {
+    go func() {
+        recruited <- recruitResult{pooler: p, cs: r.recruit(ctx, p, revocation)}
+    }()
+}
+return recruited
+```
+
+Each goroutine references `p` — and gets the *right* `p`, because since Go 1.22 each iteration of a `for ... range` (and three-clause `for`) creates a fresh loop variable. Before 1.22, all goroutines would have captured the *same* shared `p` and most would observe the final cohort member; you had to write `p := p` inside the loop to shadow it.
+
+:::caution[Gotcha — don't "fix" missing shadows]
+Tutorials, blog posts, and pre-1.22 code still show `for _, p := range xs { p := p; go ... }`. On Go 1.25 that shadow is harmless but unnecessary. Don't "fix" code that omits it, and don't assume an old StackOverflow snippet is buggy just because it lacks the shadow — check the module's Go version first.
+:::
+
+:::note[Passing by argument is still correct]
+The same service also passes the value as an argument in the pre-1.22 style — `go func(problems []types.Problem){ ... }(shardProblems)` — and that's *also* correct. Passing-by-argument was the bulletproof old idiom; capturing-by-closure is the new one. Both are fine on 1.25 — pick one per package for consistency rather than mechanically rewriting.
+:::
+
+---
+
+## Channels
+
+A channel is a typed, thread-safe conduit. `chan T` carries values of type `T`. Sends (`ch <- v`) and receives (`v := <-ch`) synchronize the two goroutines and — crucially — establish a happens-before relationship, so data written before a send is visible after the matching receive (see [sync & the memory model](/go-guide/language/09-sync-and-memory-model/)).
+
+### Unbuffered vs buffered
+
+```go title="Channel capacity"
+unbuf := make(chan int)      // capacity 0: send blocks until a receiver is ready
+buf   := make(chan int, 3)   // capacity 3: send blocks only when 3 are queued
+```
+
+An **unbuffered** channel is a synchronous rendezvous: the sender blocks until a receiver takes the value, and vice versa. A **buffered** channel lets the sender deposit up to `cap` values without a waiting receiver; it blocks only when full, and a receive blocks only when empty.
+
+The single most important sizing decision in this codebase: **buffer a results channel to the number of producers** so producers never block on send, even if the collector stops reading early.
+
+```go title="consensus/rule_change.go"
+recruited := make(chan recruitResult, len(cohort))
+```
+
+Why `len(cohort)` and not `0` or some fixed number? The collector reads results in a loop and may **return early** the moment it can build a valid proposal:
+
+```go title="consensus/rule_change.go — collectRecruitsAndBuildProposal" {7-9}
+for range len(cohort) {
+    rr := <-recruited
+    if rr.cs == nil {
+        continue
+    }
+    statuses = append(statuses, rr.cs)
+    p, err = r.tryBuildProposal(revocation, statuses)
+    if err == nil {
+        return propReq, leaderKey, nil   // <-- early return, stops reading
+    }
+}
+```
+
+If `recruited` were unbuffered, the recruit goroutines whose results are never read would block forever on `` recruited <- ... `` and leak. Because the buffer holds exactly `len(cohort)` slots, **every** producer can deposit its result and exit even if the collector walked away after the third one. The slots are reclaimed by GC when the channel becomes unreachable.
+
+:::caution[Gotcha — buffer for a reason, not for speed]
+"Size the buffer to the producer count" is specific to fire-and-forget fan-out where the consumer may abandon the channel. It is *not* a general license to add buffers — an over-buffered pipeline hides backpressure and can mask a slow consumer. Buffer to decouple a known-bounded burst or guarantee producer non-blocking, not to go faster.
+:::
+
+### Channel direction
+
+A channel type can be restricted to send-only (`chan<- T`) or receive-only (`<-chan T`) in a function signature. The arrow points the way data flows. This is documentation enforced by the compiler: a function that only consumes a watch stream takes `<-chan Event` and physically *cannot* send or close it.
+
+```go title="Directional channel parameters"
+func consume(in <-chan int)  { for v := range in { _ = v } }  // can only receive
+func produce(out chan<- int) { out <- 1; close(out) }         // can only send/close
+```
+
+The codebase exposes topology watch results this way: `conn.WatchRecursive` returns `(initial, changes, err)` where `changes` is a receive channel the watcher loops over — see the `` case event, ok := <-changes `` example below.
+
+### The empty-struct signal channel
+
+`struct{}` is the zero-width type: it occupies no memory. A `chan struct{}` is the idiomatic Go "signal" channel — it carries no data, only the *event* of a send or a close. The codebase uses it for stop signals and wakeups:
+
+```go title="buffer/timeout_thread.go"
+type timeoutThread struct {
+    buf      *Buffer
+    notifyCh chan struct{} // signaled when the queue changes (enqueue or eviction)
+    stopCh   chan struct{} // closed to stop the goroutine
+}
+```
+
+`` notifyCh <- struct{}{} `` means "something changed, wake up"; `close(stopCh)` means "stop." No bytes cross the channel — the synchronization *is* the message.
+
+### Closing a channel
+
+`close(ch)` marks a channel done. Three behaviors follow, and all three are load-bearing here:
+
+1. A receive on a closed channel returns immediately with the zero value, **forever**. This makes `close` a **one-shot broadcast**: close `stopCh` once and every goroutine blocked on `<-stopCh` unblocks at once.
+2. The two-value receive `v, ok := <-ch` reports `ok == false` when the channel is closed and drained, so you can tell a real zero value from "closed."
+3. `for v := range ch` receives until the channel is closed and drained, then ends the loop.
+
+```go title="close as broadcast"
+done := make(chan struct{})
+go func() {
+    <-done            // blocks until close(done); zero value, ignored
+    fmt.Println("stopped")
+}()
+close(done)           // broadcasts to every receiver waiting on done
+```
+
+:::caution[Gotcha — only the owner closes, exactly once]
+Closing is for the **sender/owner**, never the receiver, and the rules are unforgiving: closing an already-closed channel **panics**, and sending on a closed channel **panics**. So exactly one goroutine should own the close. In `timeout_thread.go`, `stop()` is the *only* place `stopCh` is ever closed:
+
+```go title="buffer/timeout_thread.go — stop"
+func (tt *timeoutThread) stop() {
+    close(tt.stopCh)
+}
+```
+
+If `stop()` could be called twice, this would panic — so the buffer's lifecycle guarantees a single call.
+:::
+
+### The nil channel
+
+A `nil` channel (the zero value of `chan T`) blocks **forever** on both send and receive. Inside a `select`, a case on a nil channel is effectively *disabled* — never selected. This is occasionally a deliberate tool (set a channel variable to `nil` to switch off one branch of a `select`), but far more often a nil channel is an accidental silent deadlock: you forgot to `make` it, so the goroutine parks and never wakes. If a goroutine seems stuck on a channel op, check whether the channel was actually initialized.
+
+---
+
+## `select`: multiplexing channel operations
+
+`select` waits on multiple channel operations at once and proceeds with whichever is ready. If several are ready, it picks one at random (preventing starvation). With a `default` clause, `select` becomes non-blocking: if no case is ready, `default` runs immediately.
+
+```go title="select with a non-blocking default"
+select {
+case v := <-ch1:
+    use(v)
+case ch2 <- x:
+    // sent
+case <-ctx.Done():
+    return ctx.Err()
+default:
+    // nothing ready right now — don't block
+}
+```
+
+### The watch loop: ctx + a closed-detection receive
+
+A discovery loop selects over the context (for shutdown) and a topology watch stream, using the two-value receive to notice when the upstream watch closes:
+
+```go title="multigateway/discovery.go"
+for {
+    select {
+    case <-gd.ctx.Done():
+        return
+    case event, ok := <-changes:
+        if !ok {
+            gd.logger.Info("Cell watch channel closed, will reconnect")
+            return
+        }
+        gd.processCellChange(event)
+    }
+}
+```
+
+Two exit paths, both clean: the owner cancels `gd.ctx` (graceful shutdown), or the upstream watch closes `changes` (`ok == false`, time to reconnect). There is no third path where this goroutine blocks indefinitely — that's what makes it leak-free. The cancellation half of this pattern is the universal contract described in [context](/go-guide/language/08-context/).
+
+### The non-blocking "try-send" wakeup, and coalescing
+
+The most reusable concurrency idiom in this codebase is a **buffered(1) channel plus a non-blocking send** to wake a worker *at most once* and coalesce a burst of events into a single wakeup:
+
+```go title="buffer/timeout_thread.go — notify"
+// notify signals the timeout thread to re-check the queue head.
+// Non-blocking: if a notification is already pending, this is a no-op.
+func (tt *timeoutThread) notify() {
+    select {
+    case tt.notifyCh <- struct{}{}:
+    default:
+    }
+}
+```
+
+`notifyCh` has capacity 1. The first `notify()` deposits a token (send succeeds). A second `notify()` before the worker has drained finds the buffer full, so the send is not ready, so `default` runs and the call returns immediately. The result: *N* notifications collapse into *one* pending wakeup. The worker only needs to know "something changed since I last looked" — it re-reads the actual queue under a lock — so dropping the redundant signals is correct, not lossy.
+
+:::caution[Gotcha — a non-blocking send silently drops]
+A non-blocking send **silently drops** the value when the buffer is full. That's exactly right for an "at least one pending wake" signal, but it's a *bug* if every value matters. The pattern is only safe when the receiver derives the real state from somewhere else (a queue, a counter, a snapshot) and the channel is a pure "go look again" nudge.
+:::
+
+Discovery uses the identical idiom with a separate notification queue held under a mutex — so a dropped signal is harmless because the data lives in the queue, not the channel:
+
+```go title="multigateway/discovery.go — queueNotification" {7-10}
+func (gd *GlobalPoolerDiscovery) queueNotification(notif poolerNotification) {
+    gd.notificationsMu.Lock()
+    gd.notifications = append(gd.notifications, notif)
+    gd.notificationsMu.Unlock()
+
+    // Wake up processor (non-blocking - buffered channel)
+    select {
+    case gd.notifySignal <- struct{}{}:
+    default: // already signaled, processor will drain buffer
+    }
+}
+```
+
+The matching consumer waits on the signal, then *drains the whole queue* in a loop, so one wakeup can process many enqueued notifications (see "Worker / event-loop serialization" below).
+
+### Timeouts with `time.Timer` and the reset dance
+
+Selecting on a timer's channel gives you a timeout branch. `time.NewTimer(d)` returns a `*time.Timer` whose `C` field is a `<-chan time.Time` that fires once after `d`. The timeout thread waits for the head entry's deadline, a notification, or a stop, all at once:
+
+```go title="buffer/timeout_thread.go"
+select {
+case <-timer.C:
+    // head entry's deadline reached — evict it
+    tt.evictHead()
+case <-tt.notifyCh:
+    // queue changed — re-check head
+    continue
+case <-tt.stopCh:
+    return
+}
+```
+
+The subtle part is **reusing** a timer across loop iterations. You cannot simply call `Reset` on a timer that has already fired (or might fire concurrently) — a stale tick can be sitting in `timer.C` and would fire spuriously the next time around. The canonical Stop-then-drain dance handles it:
+
+```go title="buffer/timeout_thread.go — timer reset"
+// Reset the timer. We drain it first to avoid races.
+if !timer.Stop() {
+    select {
+    case <-timer.C:
+    default:
+    }
+}
+timer.Reset(delay)
+```
+
+`Stop()` returns `false` if the timer had already fired (or was already stopped). In that case there may be a pending value in `timer.C`, so the inner non-blocking receive drains it — `default` covers the case where nothing is buffered (someone else already consumed it). Only after the channel is known-empty is `Reset` safe.
+
+:::caution[Gotcha — keep the drain dance even on Go 1.23+]
+Go 1.23 changed `Timer`/`Ticker` so that `Stop`/`Reset` are less prone to stale ticks. But the explicit drain dance above is still the **portable, race-detector-clean** pattern, and it's what the codebase standardizes on — it appears verbatim in both the timeout thread and the health-stream watchdog below. When you reuse a timer, copy this dance rather than reasoning about runtime-version subtleties.
+:::
+
+:::tip[Stop the timer on the way out]
+`defer timer.Stop()` releases the timer's runtime resources when the goroutine exits. A timer left armed isn't a catastrophe — it just holds a runtime entry until it fires — but stopping it on the way out is tidy and standard.
+:::
+
+---
+
+## Fan-out / fan-in
+
+**Fan-out** spawns N goroutines to do work in parallel; **fan-in** collects their N results back into one place. The two variants in this codebase differ in *how the collector knows it is done*.
+
+<Mermaid title="Fan-out / fan-in" height={360} code={`
+flowchart LR
+  C["Caller"] --> D{"fan-out"}
+  D --> W1["goroutine 1"]
+  D --> W2["goroutine 2"]
+  D --> W3["goroutine N"]
+  W1 -->|send| R[("results channel")]
+  W2 -->|send| R
+  W3 -->|send| R
+  R --> F{"fan-in / collect"}
+  F --> C
+`} />
+
+### Variant A: count the results (no closer goroutine)
+
+When the producer count is known up front, the collector simply reads exactly that many times. This is the recruit/promote dispatch in consensus:
+
+```go title="consensus/rule_change.go"
+// dispatch: one goroutine per cohort member, buffered to len(cohort)
+recruited := make(chan recruitResult, len(cohort))
+for _, p := range cohort {
+    go func() {
+        recruited <- recruitResult{pooler: p, cs: r.recruit(ctx, p, revocation)}
+    }()
+}
+
+// collect: read exactly len(cohort) results
+for range len(cohort) {
+    rr := <-recruited
+    // ...
+}
+```
+
+No `close` is needed and no `WaitGroup` is needed: the collector reads precisely `len(cohort)` values, the buffer guarantees no producer blocks, and the channel is never closed (closing is unnecessary when the consumer counts). `for range len(cohort)` is the Go 1.22 "range over an int" form — it iterates `len(cohort)` times.
+
+### Variant B: drain until close (the closer goroutine)
+
+When the consumer wants to `range` the channel — or doesn't know in advance how many values arrive — *someone* must `close` the channel so `range`/the final receive terminates. But no single producer can close it (a producer doesn't know it's the last one, and double-close panics). The fix is a dedicated **closer goroutine** that waits for all producers via a `WaitGroup`, then closes:
+
+<Mermaid title="Closer goroutine drains the WaitGroup" height={360} code={`
+flowchart LR
+  subgraph Producers
+    G1["go fn()"]
+    G2["go fn()"]
+    G3["go fn()"]
+  end
+  G1 -->|wg.Done| WG[("WaitGroup")]
+  G2 -->|wg.Done| WG
+  G3 -->|wg.Done| WG
+  G1 -.->|err only| EC[("errCh (buffered)")]
+  G2 -.->|err only| EC
+  G3 -.->|err only| EC
+  WG -->|wg.Wait| CL["closer goroutine"]
+  CL -->|close| EC
+  EC --> RX["return &lt;-errCh"]
+`} />
+
+```go title="tools/event/hooks.go — ErrorHooks.Fire" {12-15}
+errCh := make(chan error, len(h.funcs))
+var wg sync.WaitGroup
+
+for _, f := range h.funcs {
+    wg.Add(1)
+    go func(fn func() error) {
+        defer wg.Done()
+        if err := fn(); err != nil {
+            errCh <- err
+        }
+    }(f)
+}
+
+// Close the channel once every goroutine completes.
+go func() {
+    wg.Wait()
+    close(errCh)
+}()
+
+// Return the first error, or nil if the channel closes without one.
+return <-errCh
+```
+
+This is fail-fast fan-in: the single `<-errCh` either returns the first error pushed by a failing func, or — if every func succeeded so nobody sent — blocks until the closer goroutine runs `close(errCh)`, at which point the receive yields the zero value (`nil`). The closer goroutine is the linchpin: without it, the `<-errCh` in the all-succeed case would block forever (nobody sends, nobody closes) and leak.
+
+:::caution[Gotcha — buffer the error channel too]
+`errCh` is buffered to `len(h.funcs)` for the *same* reason as Variant A: the caller reads `errCh` exactly once and then returns, so the second-and-later failing goroutines must be able to deposit their errors and exit without a reader. If `errCh` were unbuffered, only the first failing send would succeed (it pairs with `<-errCh`); every other failing goroutine would block on send forever. The buffer turns those extra sends into no-wait deposits that GC reclaims.
+:::
+
+**Why does `hooks.go` need a closer goroutine but `rule_change.go` doesn't?** Because `rule_change.go` *counts* (`for range len(cohort)`) — it always reads exactly as many values as it sent, so the channel never needs to signal "done." `hooks.go` instead wants a *single* receive that resolves to "first error or nil-on-completion," and the only way a single `<-errCh` can mean "everyone finished with no error" is for the channel to be closed — hence the `wg.Wait(); close(errCh)` goroutine. Different termination contracts, different machinery.
+
+:::note[The no-error variant is even simpler]
+The sibling `Hooks.Fire()` in the same file uses the Go 1.25 `WaitGroup.Go` form and no channel at all:
+
+```go title="tools/event/hooks.go — Hooks.Fire"
+wg := sync.WaitGroup{}
+for _, f := range h.funcs {
+    wg.Go(f)
+}
+wg.Wait()
+```
+:::
+
+---
+
+## `sync.WaitGroup` and the Go 1.25 `Go` method
+
+A `WaitGroup` is a counter: `Add(n)` increments, `Done()` decrements (usually `defer`-ed), and `Wait()` blocks until the count returns to zero. It's the standard way to **join** a set of goroutines.
+
+The pre-1.25 form (still everywhere in the codebase) is the three-line ritual:
+
+```go title="recovery/recovery_loop.go"
+var wg sync.WaitGroup
+for _, shardProblems := range problemsByShard {
+    wg.Add(1)
+    go func(problems []types.Problem) {
+        defer wg.Done()
+        re.processShardProblems(ctx, problems[0].ShardKey, problems)
+    }(shardProblems)
+}
+wg.Wait()
+```
+
+Go 1.25 added `WaitGroup.Go`, which does the `Add(1)` / `go` / `defer Done()` for you in one call. It still launches a goroutine — it is not synchronous. A shard-status fan-out uses it:
+
+```go title="consensus/rule_change_certified.go"
+var (
+    mu sync.Mutex
+    wg sync.WaitGroup
+)
+for _, p := range poolers {
+    wg.Go(func() {
+        rpcCtx, cancel := context.WithTimeout(ctx, timeouts.RemoteOperationTimeout)
+        defer cancel()
+        resp, err := c.rpcClient.Status(rpcCtx, p, &multipoolermanagerdatapb.StatusRequest{})
+        // ... guarded by mu when writing shared results
+    })
+}
+```
+
+`wg.Go(fn)` is exactly `` wg.Add(1); go func(){ defer wg.Done(); fn() }() ``. You can also pass a method value directly — discovery does `gd.wg.Go(gd.processNotifications)`, launching the method as a goroutine.
+
+:::caution[Gotcha — WaitGroup joins, it doesn't share data]
+`WaitGroup` is for **joining**, not for sharing data. The goroutines above coordinate writes through a `sync.Mutex` (`mu`) and a per-call timeout context — the `WaitGroup` only tells you *when they're all done*. Reading shared results without that mutex would be a data race even though `Wait()` establishes happens-before for the *final* read after `Wait()` returns. See [sync & the memory model](/go-guide/language/09-sync-and-memory-model/).
+:::
+
+---
+
+## `errgroup`: fan-out with first-error propagation
+
+`golang.org/x/sync/errgroup` is a `WaitGroup` that also collects errors and (optionally) cancels a shared context on the first failure. `g.Go(func() error {...})` runs a task; `g.Wait()` blocks until all return and yields the **first** non-nil error (or nil). `errgroup.WithContext(parent)` derives a child context that is cancelled the instant any task errors, so siblings can bail out.
+
+A state manager fans the same state-change event out to every component and stops at the first failure:
+
+```go title="multipooler/internal/manager/state_manager.go" {1}
+g, ctx := errgroup.WithContext(ctx)
+for _, c := range ssm.components {
+    g.Go(func() error {
+        return c.OnStateChange(ctx, poolerType, servingStatus)
+    })
+}
+if err := g.Wait(); err != nil {
+    return err
+}
+```
+
+Note that the first line *shadows* `ctx` with the derived one, then passes that derived `ctx` into each `OnStateChange`. So if component A fails, the derived `ctx` is cancelled and components B and C — *if they honor `ctx`* — abort their in-flight work promptly. That last clause is the whole point:
+
+:::caution[Gotcha — errgroup cancellation only helps cooperative tasks]
+`errgroup`'s cancellation only helps if your task functions actually watch the context they're handed. `g.Go(func() error { return c.OnStateChange(ctx, ...) })` only short-circuits if `OnStateChange` selects on `ctx.Done()` somewhere. A task that ignores `ctx` and runs to completion gets no benefit — `Wait()` still returns the first error, but the siblings ran fully anyway. Also: `Wait()` returns *only* the first error; the rest are discarded. If you need every error, collect them yourself (e.g. into a mutex-guarded slice).
+:::
+
+Sometimes you want `errgroup`'s parallel-with-combined-error behavior but don't need the cancellation context. A topology client's `Close()` discards the derived context with `_`:
+
+```go title="common/topoclient/store.go — Close" {1}
+g, _ := errgroup.WithContext(context.TODO())
+
+g.Go(func() error {
+    if ts.globalTopo != nil {
+        if err := ts.globalTopo.Close(); err != nil {
+            return fmt.Errorf("failed to close global topo: %w", err)
+        }
+        ts.globalTopo = nil
+    }
+    return nil
+})
+
+g.Go(func() error {
+    // ... close all cell connections ...
+    return nil
+})
+err := g.Wait()
+```
+
+Discarding the context (`g, _ :=`) is reasonable here because closing topology connections is short, must run *to completion regardless* (you want every connection closed even if one errors), and there's no in-flight operation worth cancelling. Cancelling siblings would be actively wrong — a global-topo close failure should not *prevent* the cell connections from closing. The `context.TODO()` is a placeholder signaling "no real context applies." (Errors are still wrapped with `%w`; see [errors](/go-guide/language/05-errors/).)
+
+---
+
+## Goroutine lifecycle and leak avoidance
+
+Every long-lived goroutine needs an **owner** and an **exit path**. The contract this codebase follows: a long-lived goroutine selects on a cancellable context (or a stop channel), and the owner, on shutdown, cancels *and then waits*. Cancelling alone tells the goroutine to stop; only `Wait()` confirms it actually has.
+
+A `HealthStream` is the textbook example. It owns a parent context, its cancel function, and a `WaitGroup`:
+
+```go title="recovery/health_stream.go"
+mu      sync.Mutex
+streams map[topoclient.ComponentID]*streamEntry
+
+// Parent context; cancelled by Stop().
+ctx    context.Context
+cancel context.CancelFunc
+wg     sync.WaitGroup
+```
+
+`Start` launches one goroutine per pooler with `wg.Go`, and the goroutine removes its own map entry via `defer` before returning:
+
+```go title="recovery/health_stream.go — Start"
+ctx, cancel := context.WithCancel(hs.ctx)   // per-pooler child context
+entry := &streamEntry{cancel: cancel}
+hs.streams[poolerID] = entry
+
+hs.wg.Go(func() {
+    defer func() {
+        hs.mu.Lock()
+        delete(hs.streams, poolerID)
+        hs.mu.Unlock()
+    }()
+    hs.runStream(ctx, poolerID, entry)
+})
+```
+
+Two layers of context: a *parent* `hs.ctx` (cancelled to stop everything) and a *per-pooler child* (cancelled to stop just one stream). The defer-driven self-deletion means the goroutine cleans up its own bookkeeping no matter how it exits, under the same mutex that `Stop()` uses — so there's no window where a dead goroutine's entry lingers.
+
+Shutdown is the canonical cancel-then-wait:
+
+```go title="recovery/health_stream.go — Shutdown"
+func (hs *HealthStream) Shutdown() {
+    hs.cancel()
+    hs.wg.Wait()
+}
+```
+
+:::caution[Gotcha — cancel requests, Wait confirms]
+`hs.cancel()` *requests* stop; `hs.wg.Wait()` *confirms* it. If `Shutdown` returned after only `cancel()`, the caller might tear down resources (close connections, free the store) while a stream goroutine is still mid-`runStream`, racing with the cleanup. The `Wait()` is what makes shutdown safe. This cancel-then-wait pair is *the* shutdown idiom here — every owner of background goroutines does it. The cancellation mechanics are detailed in [context](/go-guide/language/08-context/); how services wire start/shutdown lifecycles is in [service anatomy](/go-guide/project/05-service-anatomy/).
+:::
+
+:::caution[Gotcha — delete from exactly one place]
+The self-deleting `defer ... delete(hs.streams, ...)` must hold the *same* `hs.mu` that `Stop()` and `Start()` use, and there must be exactly one place that deletes a given entry. `Stop()` deliberately does *not* delete — it only calls `entry.cancel()` and lets the goroutine's defer remove the map entry. Deleting from two places would be a logic race (double-delete, or deleting a freshly-restarted stream's entry). Confine the delete to one owner.
+:::
+
+### A self-contained watchdog goroutine
+
+Inside `runStream`, an inner goroutine implements a **staleness watchdog**: if no health message arrives within a timeout, it cancels the stream's context, which makes the blocking `stream.Recv()` return an error and triggers a reconnect. It combines everything above — a buffered(1) reset channel, the timer drain dance, and a three-way `select`:
+
+```go title="recovery/health_stream.go — watchdog"
+resetCh := make(chan time.Duration, 1)
+go func() {
+    current := initialStaleness
+    timer := time.NewTimer(current)
+    defer timer.Stop()
+    for {
+        select {
+        case d := <-resetCh:
+            current = d
+            if !timer.Stop() {
+                select {
+                case <-timer.C:
+                default:
+                }
+            }
+            timer.Reset(current)
+        case <-timer.C:
+            hs.logger.WarnContext(ctx, "health stream stale", "pooler_id", poolerID)
+            cancelWatchdog()
+            return
+        case <-watchdogCtx.Done():
+            return
+        }
+    }
+}()
+```
+
+Three branches: a reset (rearm the timer with the new staleness value), a fire (no message in time → cancel the watchdog context, which kills the gRPC stream → `return`), or the watchdog context being cancelled externally (the stream ended for another reason → `return`). The recv loop feeds it via the same non-blocking buffered(1) send you saw earlier — *resetting the watchdog cannot block the recv loop*:
+
+```go title="recovery/health_stream.go — feed the watchdog"
+select {
+case resetCh <- timeout:
+default:
+    // a reset is already pending; the watchdog will pick it up
+}
+```
+
+The "cancel a context to unblock a blocking `Recv`" trick is worth internalizing: many blocking I/O calls in Go (gRPC streams, DB queries, HTTP requests) take a context, and cancelling it is how you interrupt them from another goroutine. That's how this watchdog converts "no data for 90s" into "terminate the stream cleanly."
+
+---
+
+## Worker / event-loop serialization: synchronization by communication
+
+A classic alternative to "share state under a mutex" is "give the state to one goroutine and send it requests over a channel." Go's motto: *do not communicate by sharing memory; share memory by communicating.* A LISTEN/NOTIFY `Listener` is built this way — one reader goroutine and one event-loop writer share a single TCP connection without locking the connection, because only the event loop ever touches it:
+
+<Mermaid title="One owner serializes a shared resource" height={360} code={`
+flowchart LR
+  C1["caller A"] -->|request + done| RQ[("requests channel")]
+  C2["caller B"] -->|request + done| RQ
+  RQ --> EL["event-loop goroutine<br/>(sole owner)"]
+  EL -->|exclusive access| RES["TCP conn + subscription state"]
+  EL -.->|close(req.done)| C1
+  EL -.->|close(req.done)| C2
+`} />
+
+```go title="multipooler/internal/pubsub/listener.go"
+type request struct {
+    typ     requestType
+    channel string
+    subCh   chan *sqltypes.Notification
+    done    chan struct{} // closed when the request is processed
+}
+```
+
+Callers submit a `request` on the serialized `requests` channel and then block on its `done` channel until the single event-loop goroutine has processed it:
+
+```go title="multipooler/internal/pubsub/listener.go — Unsubscribe"
+req := request{typ: reqUnsubscribe, channel: channel, subCh: subCh, done: make(chan struct{})}
+select {
+case l.requests <- req:
+    <-req.done            // wait for the event loop to process & close(req.done)
+case <-l.stopped:         // listener is shutting down — give up
+}
+```
+
+The `done chan struct{}` is a **per-request completion signal**: the event loop runs `close(req.done)` after applying the command, which unblocks this caller. The outer `select` against `l.stopped` ensures the caller never blocks forever if the listener has shut down — a second clean exit path. State (subscription refcounts, the connection) lives entirely inside the event-loop goroutine, so there's no mutex around it: the channel handoff *is* the synchronization. Use this pattern when a single resource (a connection, a file, a piece of mutable state) needs serialized access and a lock would force every caller to reason about lock ordering.
+
+---
+
+## Bounding concurrency: `semaphore.Weighted` vs a buffered channel
+
+A buffered channel of capacity N is the simplest counting semaphore (acquire = send, release = receive). This codebase uses the more explicit `golang.org/x/sync/semaphore.Weighted` when it wants a *global resource limit* with a non-blocking try-acquire on a hot path. The buffer service caps total in-flight buffered requests this way:
+
+```go title="buffer/buffer.go"
+// bufferSizeSema limits the total number of buffered requests globally.
+bufferSizeSema *semaphore.Weighted
+// ...
+bufferSizeSema: semaphore.NewWeighted(int64(config.Size.Get())),
+```
+
+On the latency-sensitive admit path it uses `TryAcquire`, which returns `false` immediately instead of blocking when full (so it can evict the oldest entry to make room rather than stalling the caller):
+
+```go title="buffer/buffer.go — admit path"
+if !b.bufferSizeSema.TryAcquire(1) {
+    // Buffer is full. Evict the oldest entry globally to make room.
+    // ...
+}
+```
+
+Slots are returned with `b.bufferSizeSema.Release(1)` when an entry drains or is evicted. `Weighted` also supports `Acquire(ctx, n)` (blocking, context-aware) and *weighted* acquisitions (`n > 1`), which a plain buffered channel can't express cleanly.
+
+:::tip[Channel vs semaphore]
+Reach for a buffered channel when the "permits" are simple and you're already passing values through a channel anyway. Reach for `semaphore.Weighted` when you want `TryAcquire` semantics, weighted permits, context-aware blocking acquisition, or when the limiter is conceptually separate from any data flow (a pure capacity gate). See [sync & the memory model](/go-guide/language/09-sync-and-memory-model/).
+:::
+
+---
+
+## Capstone: a channel hand-off race (the connection-pool waitlist)
+
+The connection pool's waitlist is the advanced case — it shows why a naive timeout path can *lose a connection*. A waiter blocks in a `select` over three things: the pool closing, its context expiring, and an unbuffered channel on which a returner will hand it a connection:
+
+```go title="connpool/waitlist.go — waiter"
+select {
+case <-closeChan:
+    // ... try to remove ourselves from the list ...
+    if removed {
+        return nil, ErrPoolClosed
+    }
+    // if we couldn't remove ourselves, another goroutine is handing us a connection
+    return <-elem.Value.conn, nil
+
+case <-ctx.Done():
+    // ... try to remove ourselves from the list ...
+    if removed {
+        return nil, context.Cause(ctx)
+    }
+    // another goroutine is handing us a connection
+    return <-elem.Value.conn, nil
+
+case conn := <-elem.Value.conn:
+    return conn, nil
+}
+```
+
+The race: a waiter's context can expire at the *same instant* a returner picks this waiter and sends a connection on `elem.Value.conn`. The waiter wakes on `ctx.Done()` and tries to remove itself from the waitlist. If it succeeds, no returner committed to it — return the timeout error. But if it *fails* to remove itself (`removed == false`), a returner has already pulled this element off the list and is about to send (or has sent) a connection on the waiter's channel. The returner's send:
+
+```go title="connpool/waitlist.go — returner"
+target.Value.conn <- conn
+runtime.Gosched()
+```
+
+is on an **unbuffered** channel, so it blocks until someone receives. If the timed-out waiter just returned an error and walked away, that returner would block forever (leak) *and* the connection would be lost (never returned to the pool). So the waiter must `` return <-elem.Value.conn `` — receive the in-flight connection it's being handed, even though it timed out. The `runtime.Gosched()` after the send yields the returner's goroutine to the scheduler, giving the just-woken waiter a chance to run and complete the receive promptly.
+
+:::caution[Gotcha — always give every send a receiver]
+The signal here is "did I successfully remove myself from the shared list?" — decided under `wl.mu`. That single mutex-protected check is what arbitrates the race between "I timed out" and "I'm being handed a connection." If you *don't* receive on the channel in the `removed == false` branch, you leak the returner goroutine and lose a pooled connection. An orphaned unbuffered send is a permanent block. (The waitlist also recycles list nodes — whose `conn` channels are reused — through a `sync.Pool`; see [sync & the memory model](/go-guide/language/09-sync-and-memory-model/).)
+:::
+
+---
+
+## Checkpoints
+
+<details><summary>Why is the results channel in <code>dispatchRecruit</code> created as <code>make(chan recruitResult, len(cohort))</code> rather than unbuffered?</summary>
+The collector can return early as soon as it builds a valid proposal, abandoning the channel. With a buffer sized to the number of producers, every recruit goroutine can deposit its result and exit without a waiting receiver. An unbuffered channel would block — and thus leak — every producer whose result is never read.</details>
+
+<details><summary>After calling <code>close(stopCh)</code>, what happens to ten goroutines all blocked on a receive from it, and why must <code>stop()</code> be the only caller of <code>close(stopCh)</code>?</summary>
+All ten unblock at once — a receive on a closed channel returns the zero value immediately and forever, so <code>close</code> is a one-shot broadcast. <code>stop()</code> must be the sole closer because closing an already-closed channel panics; the buffer's lifecycle guarantees <code>stop()</code> runs once.</details>
+
+<details><summary><code>HealthStream.Shutdown()</code> calls <code>hs.cancel()</code> then <code>hs.wg.Wait()</code>. Why isn't <code>cancel()</code> alone enough?</summary>
+<code>cancel()</code> only *requests* that the stream goroutines stop; it returns immediately while they may still be mid-execution. <code>wg.Wait()</code> blocks until they have actually exited, so the caller can safely tear down shared resources without racing live goroutines.</details>
+
+<details><summary>Why does <code>ErrorHooks.Fire()</code> need a <code>wg.Wait(); close(errCh)</code> goroutine, but <code>collectRecruitsAndBuildProposal</code> does not?</summary>
+<code>Fire()</code> resolves to a single receive on <code>errCh</code> that must mean "first error, or nil when everyone finished." The only way one receive can detect "all done, no error" is for the channel to be closed — and no individual producer can close it (double-close panics), so a closer goroutine waits on the <code>WaitGroup</code> and closes. <code>collectRecruits...</code> instead *counts* (<code>for range len(cohort)</code>), reading exactly as many values as it sent, so the channel never needs a close signal.</details>
+
+---
+
+## Exercises
+
+1. In `timeout_thread.go`, trace every way `run()` can return or block, and confirm there is no path where it parks forever with no possible producer/closer. Then explain precisely why `notifyCh` is `make(chan struct{}, 1)` — capacity 1, not 0 and not 10.
+
+2. Grep for the Go 1.25 `wg.Go(` and `.Go(func` method across the services. List at least four non-test call sites and, for each, name (a) what cancels the goroutine (which context or stop channel) and (b) where it is joined (which `Wait()`). Flag any site whose owner does *not* wait for it.
+
+3. Compare the fan-in in `tools/event/hooks.go` (`ErrorHooks.Fire`: `errCh` + closer goroutine + single receive) with `consensus/rule_change.go` (`collectRecruitsAndBuildProposal`: buffered channel + `for range len(cohort)`). Write a paragraph explaining why one needs the closer goroutine and the other does not, in terms of each consumer's termination contract.
+
+4. In `connpool/waitlist.go`, explain the race that makes `` return <-elem.Value.conn `` necessary in *both* the `closeChan` and `ctx.Done()` `select` cases. What two bad things happen if you returned an error there instead, given that the returner sends on an *unbuffered* channel?
+
+5. Grep for `errgroup.WithContext` across the codebase. For each call site, state whether the derived context is kept (`g, ctx :=`) or discarded (`g, _ :=`), and justify why discarding it is acceptable in `topoclient/store.go`'s `Close()`.
+
+---
+
+## Next
+
+Continue to [context](/go-guide/language/08-context/) — cancellation, deadlines, `ctx.Done()` in `select`, and the `WithCancel`/`WithTimeout` patterns that every long-lived goroutine on this page relies on.
+
+## See also
+
+- [sync & the memory model](/go-guide/language/09-sync-and-memory-model/) — `sync.WaitGroup`, `sync.Mutex`, `sync.Pool`, `semaphore.Weighted`, `runtime.Gosched`, and the happens-before guarantees channels provide.
+- [errors](/go-guide/language/05-errors/) — `errgroup` first-error propagation and `fmt.Errorf("...: %w", err)` wrapping inside `g.Go` closures.
+- [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/) — `time.Timer`/`Ticker`, the `chan struct{}` signal idiom, and `select`/`default`.
+- [consensus & failover](/go-guide/project/08-consensus-and-failover/) — the `multiorch` recovery engine, `rule_change` fan-out, and `HealthStream` in their real failover context.
+- [service anatomy](/go-guide/project/05-service-anatomy/) — how services own background goroutines and wire start/shutdown lifecycles.
+- [idioms & gotchas](/go-guide/reference/idioms-and-gotchas/) — distilled goroutine-leak and timer-reset gotchas.
+- [orientation](/go-guide/orientation/) — repo map for locating `go/services` and `go/common`.

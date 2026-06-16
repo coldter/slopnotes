@@ -1,0 +1,216 @@
+---
+title: Cheatsheet
+description: A one-page lookup for everyday Go syntax and idioms, plus the build, test, and CLI commands of a real Go codebase.
+sidebar:
+  order: 1
+---
+
+import { FileTree } from "@astrojs/starlight/components";
+
+Fast one-page lookup: everyday Go syntax and idioms up top, then the verified build/test/CLI commands and directory layout of a real Go system — **multigres** ("Vitess for Postgres") — below. Each row links into the [language](/go-guide/language/01-packages-modules-imports/) and [project](/go-guide/project/01-architecture-request-flow/) tracks for depth.
+
+## Go syntax
+
+### Declarations
+
+| Form | Example | Notes |
+|---|---|---|
+| `var` | `var n int` | zero value (`0`, `""`, `nil`) |
+| `:=` | `n := 42` | short, function-scope only |
+| `const` | `const Max = 1 << 20` | compile-time |
+| `iota` | `const ( A = iota; B; C )` | `0,1,2` enum counter |
+| multi | `a, b := 1, 2` | tuple assign / swap `a, b = b, a` |
+
+### Slices
+
+```go
+s := make([]int, 0, 8)   // len 0, cap 8
+s = append(s, 1, 2)      // grow (may realloc)
+n := copy(dst, src)      // n = min(len(dst), len(src))
+s = s[2:5]               // sub-slice (shares backing array)
+clear(s)                 // zero all elements (Go 1.21+)
+```
+
+A sub-slice shares the backing array — appending into it can clobber the parent. See [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/).
+
+### Maps
+
+```go
+v, ok := m[k]    // comma-ok: ok=false if absent
+delete(m, k)     // no-op if absent
+for k, v := range m { ... }   // unordered
+clear(m)         // remove all keys
+```
+
+### Error pattern
+
+```go
+if err != nil {
+    return nil, fmt.Errorf("doing X: %w", err)  // wrap with %w
+}
+```
+
+`errors.Is(err, target)` / `errors.As(err, &t)` to inspect. Depth: [errors](/go-guide/language/05-errors/). In this codebase, errors at RPC/service boundaries use `mterrors`, not bare `fmt.Errorf` — see the [mterrors](#errors--mterrors) section below.
+
+### Goroutine / channel / select
+
+```go
+go work()                       // fire-and-forget goroutine
+ch := make(chan int, 4)         // buffered (cap 4); unbuffered if no cap
+ch <- v        // send
+v, ok := <-ch  // receive; ok=false when closed and drained
+close(ch)      // sender closes, never the receiver
+
+select {
+case v := <-ch:   ...
+case ch2 <- x:    ...
+case <-ctx.Done():  return ctx.Err()   // cancellation
+default:          ...                  // non-blocking
+}
+```
+
+Depth: [concurrency](/go-guide/language/07-concurrency/).
+
+### Context
+
+```go
+func Do(ctx context.Context, ...) error {   // ctx is always the FIRST param
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()                           // always defer cancel
+    ...
+}
+```
+
+Depth: [context](/go-guide/language/08-context/).
+
+### Struct tags
+
+```go
+type Config struct {
+    Name string `json:"name"`
+    Port int    `json:"port,omitempty"`
+}
+```
+
+Backtick-quoted `key:"value"` metadata read by reflection (encoding, validation). Depth: [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/).
+
+### Generics
+
+```go
+func Map[T, U any](s []T, f func(T) U) []U { ... }
+type Group[K comparable, V any] struct { ... }   // K must be comparable
+```
+
+`any` = `interface{}`; `comparable` = usable with `==`. A real example: `func NewGroup[K comparable, V any]() *Group[K, V]` in the codebase's `singleflight` cache. Depth: [generics](/go-guide/language/06-generics/).
+
+### defer / recover
+
+```go
+defer f()              // runs at function return, LIFO order
+defer func() {
+    if r := recover(); r != nil { ... }   // recover only inside a deferred func
+}()
+```
+
+Deferred args are evaluated when `defer` runs, not when the function returns.
+
+## Real-world commands
+
+The examples below come from multigres: Go 1.25, a single module `github.com/multigres/multigres`, all code under `go/`. The build is Makefile-driven; `make help` auto-generates the target list from `##` comments — a tidy pattern worth borrowing.
+
+### Make targets
+
+| Target | Does |
+|---|---|
+| `make tools` | Install protobuf + build tools |
+| `make build` | Build all 7 binaries into `bin/` (debug, with symbols) |
+| `make build-release` | Static, stripped release binaries (`CGO_ENABLED=0`) |
+| `make build-all` | `proto` + `parser` + `metrics` + `build` |
+| `make proto` | Regenerate protobuf into `go/pb` |
+| `make parser` | `go generate` the SQL parser: goyacc and asthelpergen |
+| `make metrics` | Generate the Prometheus metric catalog |
+| `make generate` | Alias for `parser` + `metrics` (NOT proto) |
+| `make install` | Install binaries to `GOPATH/bin` |
+| `make test` | Run all tests (starts the port-pool server) |
+| `make test-short` | Short tests only |
+| `make test-race` | Tests with the race detector |
+| `make test-coverage` | Comprehensive coverage |
+| `make clean` / `make clean-all` | Remove build artifacts / + deps |
+| `make validate-generated-files` | CI check: regenerate everything and diff |
+| `make pgregress` / `pgexternal` / `pgproto` | PostgreSQL regression / external-ext / wire-protocol suites |
+
+The 7 binaries are `multigateway`, `multipooler`, `pgctld`, `multiorch`, `multigres`, `multiadmin`, and `portpoolserver`, each built via `go build -o bin/$cmd ./go/cmd/$cmd`.
+
+:::caution[Gotcha]
+After adding AST node types, run `make build-all` (not just `make parser`) so the AST code generator regenerates `ast_clone.go`/`ast_rewrite.go` — otherwise the `validate-generated-files` CI job fails. Depth: [build & make](/go-guide/tooling/01-build-and-make/), [modules, deps & codegen](/go-guide/tooling/04-modules-deps-codegen/).
+:::
+
+### Running tests
+
+This codebase runs its tests through a dev wrapper rather than calling `go test` directly — integration runs need a shared port pool, or they collide flakily. The wrapper expands to ordinary `go test` invocations:
+
+| Invocation | Expands to |
+|---|---|
+| `unit all` | `go test -short ./go/...` |
+| `unit <pkg> [TestName]` | `go test [-run TestName] <pkg>` |
+| `integration all` | `make build && go test ./go/test/endtoend/...` |
+| `integration <pkg> [TestName]` | `make build` + start port pool + `go test [-run TestName] ./go/test/endtoend/<pkg>/...` |
+
+Integration `<pkg>` values: `all`, `multipooler`, `multiorch`, `queryserving`, `localprovisioner`, `shardsetup`, `pgregresstest`. Common flags: `-v -race -cover -count=N -short -timeout`.
+
+:::note
+Plain `go test ./go/...` also traverses `go/test/endtoend/...`; use `-short` for unit-only runs. Depth: [testing workflow](/go-guide/tooling/02-testing-workflow/).
+:::
+
+### multigres CLI (local cluster)
+
+The `multigres` binary doubles as the cluster-management CLI:
+
+| Command | Does |
+|---|---|
+| `./bin/multigres cluster init` | Initialize cluster config |
+| `./bin/multigres cluster start` | Start local cluster components |
+| `./bin/multigres cluster stop [--clean]` | Stop (`--clean` wipes state) |
+| `./bin/multigres cluster status` | Show component status |
+| `./bin/multigres getpoolers` | List registered poolers |
+| `./bin/multigres getpoolerstatus --cell <cell> --service-id <id>` | Status of one pooler |
+
+Depth: [cmd & cobra](/go-guide/project/02-cmd-and-cobra/).
+
+<a id="errors--mterrors"></a>
+### Errors — mterrors
+
+Project error constructors (where `code` is a protobuf RPC code):
+
+```go
+mterrors.New(code, message)
+mterrors.Errorf(code, format, args...)
+mterrors.Wrap(err, message)
+mterrors.Wrapf(err, format, args...)
+mterrors.NewPgError(...)   // Postgres wire errors
+```
+
+Use these at RPC/service boundaries; reserve stdlib `fmt.Errorf("...: %w", err)` for internal wrapping. Depth: [mterrors & observability](/go-guide/project/09-mterrors-and-observability/).
+
+### Key directories
+
+<FileTree>
+- go/
+  - cmd/ entrypoints for the 7 binaries
+  - services/ service impls: multiadmin, multigateway, multiorch, multipooler, pgctld
+  - common/ shared libs: mterrors, parser, pgprotocol, sqltypes, consensus, servenv, ...
+  - pb/ generated protobuf (output of `make proto`)
+  - observability/ generated metric catalog (output of `make metrics`)
+  - test/endtoend/ integration tests
+- proto/ proto source files
+</FileTree>
+
+## See also
+
+- [Orientation](/go-guide/orientation/)
+- [Glossary](/go-guide/reference/glossary/) — terms
+- [Idioms and gotchas](/go-guide/reference/idioms-and-gotchas/)
+- [Further reading](/go-guide/reference/further-reading/)
+- Language: [errors](/go-guide/language/05-errors/), [generics](/go-guide/language/06-generics/), [concurrency](/go-guide/language/07-concurrency/), [context](/go-guide/language/08-context/), [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/)
+- Project: [cmd & cobra](/go-guide/project/02-cmd-and-cobra/), [grpc & protobuf](/go-guide/project/04-grpc-and-protobuf/), [mterrors & observability](/go-guide/project/09-mterrors-and-observability/)
+- Tooling: [build & make](/go-guide/tooling/01-build-and-make/), [testing workflow](/go-guide/tooling/02-testing-workflow/), [modules, deps & codegen](/go-guide/tooling/04-modules-deps-codegen/)

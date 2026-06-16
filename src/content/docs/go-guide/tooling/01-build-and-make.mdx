@@ -1,0 +1,403 @@
+---
+title: Building with Make
+description: How a real Go project uses a Makefile to compile binaries, regenerate code, and gate generated files in CI.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { FileTree, Steps } from "@astrojs/starlight/components";
+
+Plenty of Go projects get by on `go build ./...`. Larger ones don't — they have external tools to install, code to regenerate, and a meaningful difference between a debug binary you can attach a debugger to and a stripped static binary that ships in a container. Multigres is one of those: its root `Makefile` is the single source of build truth.
+
+This page walks through every build- and development-section target — what each does, when to run it, and the one rule that will bite you if you touch the SQL parser's AST.
+
+---
+
+## The variables that drive every loop
+
+The top of the Makefile defines the values every recipe expands:
+
+```makefile
+SHELL := /bin/bash
+MTROOT := $(shell pwd)
+export MTROOT
+PROTOC_VER = 25.1
+# ...
+CMDS = multigateway multipooler pgctld multiorch multigres multiadmin portpoolserver
+BIN_DIR = bin
+```
+
+- `SHELL := /bin/bash` — recipes use bash features (loops, `$$()`), not POSIX `sh`.
+- `MTROOT := $(shell pwd)` is **exported**, so child scripts (notably the build-tools setup script) see the repo root.
+- `CMDS` is the list of seven service/CLI commands. Almost every build, install, and clean target is a `for cmd in $(CMDS)` loop over `./go/cmd/$$cmd`. These map one-to-one to the services in the [architecture overview](/go-guide/project/01-architecture-request-flow/): `multigateway`, `multipooler`, `pgctld`, `multiorch`, plus `multigres` (the CLI), `multiadmin`, and `portpoolserver`.
+- `BIN_DIR = bin` — every service binary lands here.
+
+`make help` prints only targets that carry a `## ` description, via an awk one-liner. Targets without one (`build-coverage`, `pb`, `images`) are real and runnable but **hidden** from the listing — a small but useful convention to know about when you're reading someone else's Makefile.
+
+---
+
+## What to run when
+
+If you remember nothing else, remember this table. The rule of thumb: you only regenerate the thing whose *input* you changed.
+
+| You changed... | Run | Why |
+| --- | --- | --- |
+| Fresh clone, nothing built yet | `make tools` then `make build` | Download external tools, then compile |
+| Only Go source under `go/` | `make build` | Recompile the seven binaries |
+| A `.proto` file in `proto/` | `make proto` | Regenerate `go/pb/*` |
+| `postgres.y` / parser grammar | `make parser` | Regenerate `postgres.go` |
+| **AST node types** in `go/common/parser/ast/` | `make build-all` | Regenerate `ast_clone.go` / `ast_rewrite.go` (see [the AST rule](#the-ast-rule-the-one-that-bites)) |
+| OpenTelemetry instrument definitions | `make metrics` | Regenerate the metric catalog |
+| Anything generated, want to check it | `make validate-generated-files` | Mirror the CI gate locally |
+| Need a shippable static binary | `make build-release` | Stripped, CGO-disabled |
+| Need coverage-instrumented binaries | `make build-coverage` | For end-to-end coverage runs |
+
+---
+
+## `make tools` — the one-time bootstrap
+
+```makefile
+tools: ## Install protobuf and build tools.
+	echo $$(date): Installing build tools
+	mkdir -p "$$(git rev-parse --git-dir)/hooks"
+	ln -sf "$(MTROOT)/misc/git/pre-commit" "$$(git rev-parse --git-dir)/hooks/pre-commit"
+	ln -sf "$(MTROOT)/misc/git/commit-msg" "$$(git rev-parse --git-dir)/hooks/commit-msg"
+	./tools/setup_build_tools.sh
+```
+
+It does two jobs:
+
+1. **Git hooks** — symlinks `misc/git/pre-commit` and `misc/git/commit-msg` into `.git/hooks/`. After this, commits run the project's pre-commit checks and conventional-commit message validation. See [lint and format](/go-guide/tooling/03-lint-and-format/).
+2. **`./tools/setup_build_tools.sh`** — the heavy lifter. Its `install_all()` downloads, builds, and installs:
+   - `protoc`, pinned to `PROTOC_VER = 25.1`, into `dist/protoc-25.1/`
+   - `etcd` / `etcdctl`, `pgbackrest`, `sqllogictest` — prebuilt downloads into `dist/`
+   - `pgproto` — **built from source** from the pgpool-II release tarball
+   - Go plugins via `GOBIN=$MTROOT/bin go install`: `protoc-gen-go`, `protoc-gen-go-grpc`, and `protoc-gen-grpc-gateway`
+   - `addlicense`, also go-installed
+
+Run it **once per clone** (and again after `make clean-all`). It needs network access.
+
+:::note[`goyacc` is not downloaded]
+The parser generator is vendored Go source at `go/common/parser/goyacc/goyacc.go` and invoked with `go run ./goyacc` from the parser's `go:generate` directives. Don't go looking for it in `dist/` or `bin/`. More on the parser machinery in [parser, lexer, AST, codegen](/go-guide/project/06-parser-lexer-ast-codegen/).
+:::
+
+---
+
+## `make proto` — regenerate `go/pb/`
+
+```makefile
+proto: tools $(PROTO_GO_OUTS) ## Generate protobuf files.
+```
+
+`proto` depends on `tools` (so the pinned `protoc` and the `protoc-gen-*` plugins exist) and on the `pb` target, which does the actual work:
+
+```makefile
+pb: $(PROTO_SRCS)
+	$(MTROOT)/dist/protoc-$(PROTOC_VER)/bin/protoc \
+	--plugin=$(MTROOT)/bin/protoc-gen-go --go_out=. \
+	... \
+	--proto_path=proto $(PROTO_SRCS) && \
+	mkdir -p go/pb && \
+	cp -Rf github.com/multigres/multigres/go/pb/* go/pb/ && \
+	rm -rf github.com/ google.golang.org/
+```
+
+It runs the **pinned** `protoc` from `dist/` with the **local** plugins from `bin/`, emits into a temporary `github.com/multigres/multigres/go/pb/...` tree, copies that into `go/pb/`, then deletes the scratch `github.com/` and `google.golang.org/` directories. Run it after editing any file under `proto/`. The generated client/server code itself is dissected in [gRPC and protobuf](/go-guide/project/04-grpc-and-protobuf/).
+
+---
+
+## `make parser` — regenerate the SQL parser and AST helpers
+
+```makefile
+parser: ## Generate PostgreSQL parser from grammar.
+	@echo "$$(date): Generating PostgreSQL parser from grammar and AST helpers"
+	go generate ./go/common/parser/...
+	@echo "Parser and ast helpers generation completed"
+```
+
+This is a single `go generate ./go/common/parser/...` — a **recursive** pattern that fires every `go:generate` directive under that package tree:
+
+- `go/common/parser/generate.go` — goyacc on `postgres.y` → `postgres.go`, then `goimports -w` and `gofumpt -w` on it:
+  ```go
+  //go:generate go run ./goyacc -f -o postgres.go postgres.y
+  //go:generate go tool goimports -w postgres.go
+  //go:generate go tool gofumpt -w postgres.go
+  ```
+- `go/common/parser/ast/generate.go` — asthelpergen, which produces `ast_clone.go` and `ast_rewrite.go`:
+  ```go
+  //go:generate go run ../../../tools/asthelpergen/main --in . --iface github.com/multigres/multigres/go/common/parser/ast.Node
+  ```
+- `go/common/parser/replparser/generate.go` — the same goyacc dance for the replication grammar (`grammar.y` → `grammar.go`).
+
+Each generated file is formatted with goimports and gofumpt (via `go tool ...`) so it survives the lint gate. See [lint and format](/go-guide/tooling/03-lint-and-format/).
+
+:::caution[Gotcha — `make parser` is not enough after AST changes]
+`make parser` covers the grammar, but the convention this project follows is to run `make build-all` after AST changes, because that is what CI is built around. The why is in [the AST rule](#the-ast-rule-the-one-that-bites) below — don't shortcut it.
+:::
+
+---
+
+## `make metrics` — regenerate the metric catalog
+
+```makefile
+metrics: ## Generate the Prometheus metric catalog/keep-list.
+	@echo "$$(date): Generating metric catalog"
+	go run ./go/tools/metricsgen/main
+	@echo "Metric catalog generation completed"
+```
+
+`metricsgen` scans `./go/...` for OpenTelemetry instrument definitions and writes `go/observability/metriccatalog/catalog_generated.go`. The same command has a `-verify` mode that fails instead of writing if the on-disk catalog is stale:
+
+```bash
+go run ./go/tools/metricsgen/main          # write the catalog
+go run ./go/tools/metricsgen/main -verify  # fail if it is stale
+```
+
+Run it after adding or changing a metric instrument. Background on what the catalog is for: [mterrors and observability](/go-guide/project/09-mterrors-and-observability/).
+
+### `make generate` — alias
+
+```makefile
+generate: parser metrics ## Alias for parser and metrics catalog.
+```
+
+Just `parser` + `metrics`. Note what it does **not** include: `proto`.
+
+---
+
+## The three build flavors
+
+All three loop over `$(CMDS)` and build `./go/cmd/$$cmd`. They differ only in the `go build` flags — which is a clean illustration of how much the flags alone change the artifact.
+
+### `make build` — debug (default)
+
+```makefile
+build: ## Build Go binaries (debug, with symbols).
+	mkdir -p $(BIN_DIR)
+	@for cmd in $(CMDS); do \
+		echo "Building $$cmd (debug)"; \
+		go build -o $(BIN_DIR)/$$cmd ./go/cmd/$$cmd; \
+	done
+```
+
+Plain `go build` with the symbol table and DWARF debug info intact — this is the one to build when you want to attach a debugger. `all: build` makes this the default target, so a bare `make` runs it. It does **not** regenerate proto/parser/metrics; it compiles whatever sources are already on disk.
+
+### `make build-coverage` — coverage-instrumented
+
+```makefile
+build-coverage:
+	mkdir -p bin/cov/
+	@for cmd in $(CMDS); do \
+		echo "Building $$cmd (coverage)"; \
+		go build -cover -covermode=atomic -coverpkg=./... -o $(BIN_DIR)/cov/$$cmd ./go/cmd/$$cmd; \
+	done
+```
+
+Binaries built with `-cover -covermode=atomic -coverpkg=./...` land in `bin/cov/<cmd>` (not `bin/<cmd>`), so they don't clobber your normal builds. Used for end-to-end coverage of running services. Hidden from `make help`. See [testing workflow](/go-guide/tooling/02-testing-workflow/).
+
+### `make build-release` — release (static, stripped)
+
+```makefile
+build-release: ## Build Go binaries (release, static, stripped).
+	mkdir -p $(BIN_DIR)
+	@for cmd in $(CMDS); do \
+		echo "Building $$cmd (release)"; \
+		CGO_ENABLED=0 go build -ldflags="-w -s" -o $(BIN_DIR)/$$cmd ./go/cmd/$$cmd; \
+	done
+```
+
+- `CGO_ENABLED=0` → a fully static binary with no libc dependency, so it runs in a scratch or alpine container.
+- `-ldflags="-w -s"` → strips DWARF (`-w`) and the symbol table (`-s`), shrinking the binary.
+
+This is what the production image builds — the `Dockerfile` builder stage (`golang:1.25-alpine`) runs `make build-release`. Because release binaries are stripped, they are **not** debugger-friendly; use `make build` (debug) when you need to attach a debugger. See [debugging and profiling](/go-guide/tooling/05-debugging-profiling/).
+
+---
+
+## `make build-all` — the full regenerate-and-compile path
+
+```makefile
+build-all: proto parser metrics build ## Build everything (proto + parser + metrics + binaries).
+```
+
+`build-all` regenerates everything (`proto` → `parser` → `metrics`), then compiles (`build`). Because it pulls in `proto`, it transitively depends on `tools` — so on a clean checkout it needs the external tools installed, or network access to fetch them. Reach for it when you've touched generated inputs and want a guaranteed-consistent tree, and specifically after AST changes.
+
+That transitive dependency is the part people trip over on a fresh clone. Drawn out, the chain looks like this:
+
+<Mermaid title="build-all dependency chain" height={360} code={`
+flowchart LR
+  BA["make build-all"] --> PROTO["proto"]
+  BA --> PARSER["parser"]
+  BA --> METRICS["metrics"]
+  BA --> BUILD["build"]
+  PROTO --> TOOLS["tools (network)"]
+`} />
+
+So `make build` on its own never needs the network, but `make build-all` does on a clean clone — because `proto` insists `tools` ran first.
+
+---
+
+## The AST rule (the one that bites)
+
+This codebase has one build rule worth memorizing, because forgetting it fails CI rather than your local build:
+
+> Run `make build-all` after adding or removing AST node types in `go/common/parser/ast/`. The asthelpergen tool walks the AST types and regenerates `ast_clone.go` and `ast_rewrite.go` — they must be committed alongside the new types, or the `validate-generated-files` check will fail.
+
+So the loop is: change an AST node type → `make build-all` → `git add` the regenerated `ast_clone.go` and `ast_rewrite.go` → commit them with your change. Forget it and the gate (next section) catches you. The directive doing this work is `go/common/parser/ast/generate.go`. More on the AST machinery: [parser, lexer, AST, codegen](/go-guide/project/06-parser-lexer-ast-codegen/).
+
+---
+
+## `make validate-generated-files` — the CI gate, runnable locally
+
+```makefile
+validate-generated-files: clean build-all ## Validate that generated files match source.
+	go mod tidy
+	echo ""
+	echo "Checking files modified during build..."
+	MODIFIED_FILES=$$(git status --porcelain | grep "^ M" | awk '{print $$2}') ; \
+	if [ -n "$$MODIFIED_FILES" ]; then \
+		echo "Modified files found:"; \
+		...
+		echo "Please run 'make build-all && go mod tidy' and commit the changes"; \
+		exit 1; \
+	else \
+		echo "Generated files are up-to-date."; \
+	fi
+```
+
+In order, it: runs `clean` (wiping the service binaries), then `build-all` (full regen plus compile), then `go mod tidy`, and finally checks `git status --porcelain` for modified tracked files. If anything changed, it prints the offending files and exits 1. The same target runs in CI, so you can reproduce a red CI run locally with one command.
+
+:::caution[Gotcha — a stale `go.mod` can fail this gate too]
+Because the target also runs `go mod tidy`, a stale `go.mod`/`go.sum` fails the job just like stale generated code does. The fix message is literal: run `make build-all && go mod tidy` and commit. See [modules, deps, codegen](/go-guide/tooling/04-modules-deps-codegen/).
+:::
+
+:::note[The check only flags *tracked* files]
+It greps for `^ M` (modified tracked files). A brand-new generated file you haven't `git add`ed yet (say, a new `pb` output) is **untracked** and won't be flagged — so commit new generated files explicitly.
+:::
+
+---
+
+## `make install` and `make images`
+
+```makefile
+install: ## Install binaries to GOPATH/bin.
+	@for cmd in $(CMDS); do \
+		echo "Installing $$cmd"; \
+		go install ./go/cmd/$$cmd; \
+	done
+```
+
+`install` runs `go install` for each command, so binaries land in `$GOPATH/bin` (or `$GOBIN`) rather than the repo's `bin/`. It does **not** depend on `tools` and does no codegen.
+
+```makefile
+images:
+	docker build -t multigres/multigres:latest .
+	docker build -f Dockerfile.pgctld -t multigres/pgctld-postgres:latest .
+	docker build -t multigres/multiadmin-web:latest web/multiadmin
+```
+
+`images` builds three Docker images (`multigres`, `pgctld-postgres`, `multiadmin-web`). The main image's builder stage runs `make build-release`. It's a convenience target and is hidden from `make help`.
+
+---
+
+## Cleaning
+
+```makefile
+clean: ## Remove build artifacts and temp files.
+	go clean -i ./go/...
+	@for cmd in $(CMDS); do \
+		echo "Removing $(BIN_DIR)/$$cmd"; \
+		rm -f $(BIN_DIR)/$$cmd; \
+	done
+```
+
+`clean` runs `go clean -i ./go/...` and removes each `bin/<cmd>`. It leaves `dist/` and the downloaded tools alone.
+
+```makefile
+clean-all: clean ## Remove build dependencies and distribution files.
+	echo "Removing build dependencies..."
+	rm -rf $(MTROOT)/dist $(MTROOT)/bin
+	echo "Build dependencies removed. Run 'make tools' to reinstall."
+```
+
+`clean-all` does `clean` plus `rm -rf dist/ bin/`, **wiping the downloaded and built external tools** (protoc, etcd, pgbackrest, sqllogictest, pgproto) along with the `protoc-gen-*` plugins. After `clean-all` you must re-run `make tools` before `make proto` or `make build-all` will work again.
+
+---
+
+## `bin/` layout
+
+`bin/` and `dist/*` are **gitignored** — built binaries and downloaded tools are never committed. Here's what each directory holds once everything has run:
+
+<FileTree>
+- bin/
+  - **multigateway** service binary (`make build` / `build-release`)
+  - multipooler
+  - pgctld
+  - multiorch
+  - multigres
+  - multiadmin
+  - portpoolserver
+  - protoc-gen-go go-installed by `make tools`
+  - protoc-gen-go-grpc
+  - protoc-gen-grpc-gateway
+  - cov/ from `make build-coverage`
+    - … coverage-instrumented binaries
+</FileTree>
+
+<FileTree>
+- dist/ downloaded by `make tools` (gitignored)
+  - protoc-25.1/
+  - etcd/
+  - pgbackrest/
+  - sqllogictest-v0.29.1/
+  - pgproto-4.6.6/ built from source
+</FileTree>
+
+The seven service binaries go to `bin/<cmd>` — release and debug builds both write there and overwrite each other, while coverage builds go to `bin/cov/<cmd>` instead. `make tools` go-installs the `protoc-gen-*` plugins into `bin/` (via `GOBIN=$MTROOT/bin`) and downloads the heavier tooling under `dist/`.
+
+---
+
+## Checkpoints
+
+You understand this page if you can answer:
+
+- What's the difference between `make build` and `make build-release`, and what do `CGO_ENABLED=0` and `-ldflags="-w -s"` buy you? Which one can you attach a debugger to?
+- Why does `make build-all` (and not `make build`) implicitly require `make tools` / network on a clean clone?
+- After adding an AST node type, which two files must you regenerate and commit, and which target regenerates them?
+- What three things does `make validate-generated-files` do, in order, and why can a stale `go.mod` fail it?
+- Where does `goyacc` come from — `dist/`, `bin/`, or somewhere else?
+
+---
+
+## Exercises
+
+<Steps>
+
+1. **Predict the help output.** Read the `make help` awk one-liner and predict which build-section targets appear. Confirm that `build-coverage`, `pb`, and `images` are hidden because they carry no `## ` description.
+
+2. **Trace the dependency graph.** Follow `make build-all` → `proto` → `tools`. On a fresh clone with no network, which step fails first, and why?
+
+3. **Write out the build invocations.** For the `multigateway` command, write the exact `go build` line each of `build`, `build-coverage`, and `build-release` emits (substitute `$$cmd`). Explain why the output paths differ.
+
+4. **Read the generate directives.** Open `go/common/parser/ast/generate.go` and `go/common/parser/generate.go`. Name the files each `go:generate` directive produces, and explain why the AST rule says to run `make build-all` rather than `make parser`.
+
+5. **Classify the bootstrap tools.** Read `install_all()` in the build-tools setup script. Enumerate every tool it installs and classify each as downloaded-prebuilt, go-installed, or built-from-source — only one falls in the last bucket.
+
+</Steps>
+
+---
+
+## Next
+
+Continue to [testing workflow](/go-guide/tooling/02-testing-workflow/) — `make test`, `test-short`, `test-race`, and `test-coverage`, plus how a large project wraps `go test` behind a dev workflow.
+
+---
+
+## See also
+
+- [Orientation](/go-guide/orientation/) — the service and command map behind `CMDS`.
+- [Architecture and request flow](/go-guide/project/01-architecture-request-flow/) — what each `go/cmd/<cmd>` binary does.
+- [Parser, lexer, AST, codegen](/go-guide/project/06-parser-lexer-ast-codegen/) — goyacc, asthelpergen, and the `postgres.go` / `ast_clone.go` / `ast_rewrite.go` outputs.
+- [gRPC and protobuf](/go-guide/project/04-grpc-and-protobuf/) — what `make proto` drives.
+- [mterrors and observability](/go-guide/project/09-mterrors-and-observability/) — the metric catalog `make metrics` regenerates.
+- [Glossary](/go-guide/reference/glossary/) — terms used here.

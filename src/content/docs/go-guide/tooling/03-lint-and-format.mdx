@@ -1,0 +1,460 @@
+---
+title: Linting & Formatting
+description: How a large Go project gates formatting and static analysis through git hooks and CI — gofumpt, goimports, golangci-lint, protolint, and codespell.
+sidebar:
+  order: 3
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { FileTree, Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+**What you will learn:** how a production Go codebase enforces formatting and static analysis — not as a `make` chore you remember to run, but as two independent layers (local git hooks and CI) wired around `gofumpt`, `goimports`, `golangci-lint`, `protolint`, and `codespell`. Multigres is the running example; the patterns are general.
+
+The first surprise, if you come from other ecosystems, is what's *missing*. There is no `make lint` and no `make fmt` target here. Formatting and linting aren't on-demand chores — they're enforced by two separate gates:
+
+<Steps>
+
+1. **Local git pre-commit hooks** auto-format your staged files (and re-stage them), then run `golangci-lint` on the changed packages — all before the commit lands. They're installed once, by `make tools`.
+
+2. **CI gates** run a pinned `golangci-lint` action, a `super-linter` pass for non-Go files, a job that checks generated code is fresh, and a Conventional-Commits PR-title check.
+
+</Steps>
+
+The two layers use overlapping-but-not-identical tooling and versions, so a clean local commit can still fail CI. This page walks both, file by file, so you know exactly what each gate checks and when to run it.
+
+---
+
+## The big picture: two layers, no Makefile target
+
+Editing a `.go`, `.proto`, or `.yml` file kicks off a chain. The local pre-commit hook runs a series of small executables in lexical order; the auto-format ones re-stage your files, the lint ones fail the commit. Once the commit lands and you push, GitHub Actions runs its own, broader set of checks.
+
+<Mermaid title="Two gates: local hooks and CI" height={520} code={`
+flowchart TB
+  edit["edit .go / .proto / .yml"] --> commit["git commit"]
+  commit --> hook["pre-commit hook"]
+  subgraph Local["Local (installed by make tools)"]
+    hook --> fmt["goimports · gofumpt · check-license"]
+    fmt --> lint["golangci-lint · protolint · prettier · shfmt"]
+  end
+  lint -->|"auto-format hooks re-stage; lint hooks fail the commit"| lands["commit lands"]
+  lands --> push["git push / open PR"]
+  push --> CI["GitHub Actions"]
+  subgraph Remote["CI"]
+    CI --> gl["golangci-lint (pinned v2.6.1)"]
+    CI --> sl["super-linter + validate-generated-files"]
+    CI --> pr["Conventional-Commits PR title"]
+  end
+`} />
+
+The hooks are installed by `make tools`, which symlinks them into the repo's git hooks directory:
+
+```makefile title="Makefile"
+tools: ## Install protobuf and build tools.
+	mkdir -p "$$(git rev-parse --git-dir)/hooks"
+	ln -sf "$(MTROOT)/misc/git/pre-commit" "$$(git rev-parse --git-dir)/hooks/pre-commit"
+	ln -sf "$(MTROOT)/misc/git/commit-msg" "$$(git rev-parse --git-dir)/hooks/commit-msg"
+	./tools/setup_build_tools.sh
+```
+
+:::caution[Gotcha — a fresh clone is not ready to lint]
+If you clone the repo and *don't* run `make tools`, no hooks are wired up. Your editor won't auto-format and you won't run `golangci-lint` before pushing — you'll discover failures only in CI. Run `make tools` once per clone, and once per new git worktree, since hooks live in the worktree's own git directory.
+:::
+
+### What to run when
+
+The mapping from "what you changed" to "what catches it" is worth keeping in your head:
+
+| You changed… | Local gate (after `make tools`) | Check it manually | CI job |
+| --- | --- | --- | --- |
+| `.go` files | `goimports`, `gofumpt`, `golangci-lint`, `check-license` hooks | `go tool goimports -l ./...`, `go tool gofumpt -l ./...`, `golangci-lint run ./...` | `golangci-lint.yml` |
+| `.proto` files | `protolint` hook (auto `-fix`) | `go tool protolint <file>.proto` | super-linter |
+| Generated files (`go/pb/`, parser, AST) | not formatted by hooks | `make build-all && go mod tidy && git status` | `validate-generated-files` |
+| `.sh` / `.yml` / `.md` / `.css` / `.ts` | `shfmt`, `prettier` hooks (auto-skip if tool missing) | `tools/run_super_linter.sh` (Docker) | super-linter |
+| Spelling (any text) | — (`codespell` is CI-only) | `tools/run_super_linter.sh` | super-linter |
+| Commit / PR title | `commit-msg` hook | — | `lint-pr-title.yml` |
+
+---
+
+## Where the tools come from: `go tool`, not `go install`
+
+Go 1.24+ lets a module register executable dependencies in `go.mod` under a `tool (...)` block; you then run them with `go tool <name>` — no separate install step. This codebase uses that for most of its lint and format tooling:
+
+```go title="go.mod"
+tool (
+	github.com/mfridman/tparse
+	github.com/quasilyte/go-ruleguard/cmd/ruleguard
+	github.com/wadey/gocovmerge
+	github.com/yoheimuta/protolint/cmd/protolint
+	golang.org/x/tools/cmd/goimports
+	google.golang.org/grpc/cmd/protoc-gen-go-grpc
+	google.golang.org/protobuf/cmd/protoc-gen-go
+	mvdan.cc/gofumpt
+)
+```
+
+So `gofumpt`, `goimports`, `protolint`, and `ruleguard` are all available via `go tool` with no install — which is exactly how the hooks invoke them. See [Modules, Deps & Codegen](/go-guide/tooling/04-modules-deps-codegen/) for the `tool` directive mechanics.
+
+:::note[The exception: `golangci-lint` is not a `go tool` dep]
+The `golangci-lint` hook `go install`s it on demand if it isn't already on your `PATH` (more below). And `setup_build_tools.sh` installs the *build* toolchain — protoc, etcd, pgbackrest, addlicense — **not** the Go formatters or linters. Don't expect `make tools` to put `gofumpt` on your `PATH`; it doesn't, because the hooks reach it through `go tool`.
+:::
+
+---
+
+## The pre-commit hook chain
+
+The pre-commit script itself is intentionally tiny — it runs every executable in `misc/hooks/` in lexical order and stops on the first failure:
+
+```bash title="misc/git/pre-commit"
+set -e
+REPO_ROOT=$(git rev-parse --show-toplevel)
+for hook in "$REPO_ROOT"/misc/hooks/*; do
+  if [ -x "$hook" ]; then
+    $hook
+  fi
+done
+```
+
+Lexical order matters: `01-goimports` and `02-gofumpt` run *first*, so code is formatted before `golangci-lint` inspects it. Here is what each one does.
+
+### `01-goimports` and `02-gofumpt` — format and re-stage
+
+Both operate only on staged `.go` files and skip generated protobuf under `go/pb/`. They format in place and re-add the file to the index, so the formatted version is what gets committed:
+
+```bash title="misc/hooks/01-goimports"
+gofiles=$(git diff --cached --name-only --diff-filter=ACM | grep '\.go$' | grep -v '^go/pb/')
+unformatted=$(go tool goimports -l $gofiles 2>&1)
+# ... go tool goimports -w "$f"; git add "$f"
+```
+
+`02-gofumpt` has the same shape with `go tool gofumpt`. The division of labour: `gofumpt` is a stricter superset of `gofmt`, and `goimports` additionally manages the import block. The import grouping is governed by a **local-prefixes** setting, so first-party imports under `github.com/multigres` group separately from third-party ones. That setting lives in `.golangci.yml`, not in the hook — see the formatters section below. Stated plainly, the policy is: gofumpt + goimports, with a local prefix of `` `github.com/multigres` ``.
+
+### `check-license` — an Apache header on every file
+
+Enforces a single-line Apache-2.0 copyright header, auto-adding it via `addlicense` and bumping the copyright year on new files. A new file without a header gets one added and re-staged.
+
+### `golangci-lint` — the big static-analysis gate
+
+This is the only hook that does *not* use `go tool`. It pins a **minimum** version and self-installs if missing:
+
+```bash title="misc/hooks/golangci-lint"
+REQUIRED_VERSION="v2.6.0"
+if ! command -v golangci-lint >/dev/null 2>&1; then
+  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$REQUIRED_VERSION
+fi
+golangci-lint config verify     # catch invalid config keys that `run` would silently ignore
+golangci-lint run $gopackages   # only the packages containing changed files
+```
+
+Two things to note. `config verify` validates `.golangci.yml` against the schema, so a misspelled key is caught rather than silently ignored. And `run` is scoped to just the directories of your staged files — fast, but it means a change can pass locally yet break a *different* package that imports it. CI runs the whole tree.
+
+:::note[A path quirk that turns out not to matter]
+The `golangci-lint` hook excludes `^pb/`, while the format hooks exclude `^go/pb/`. Generated Go actually lives under `go/pb/`, but golangci-lint's own `exclusions.generated: lax` skips `// Code generated` files regardless — so generated code is covered either way.
+:::
+
+### `protolint`, `prettier`, `shfmt` — the rest
+
+- **`protolint`** runs `go tool protolint -fix` on staged `.proto` files, then re-checks. Config in `.protolint.yaml` (below).
+- **`prettier`** formats `yml`/`yaml`/`md`/`mdx`/`html`/`css`/`ts`/`tsx` — but **only if `prettier` is installed**; otherwise it silently skips.
+- **`shfmt`** formats shell files — likewise **silently skips if `shfmt` isn't installed**.
+
+:::caution[Gotcha — silent skips are a "passes locally, fails CI" trap]
+`prettier` and `shfmt` are not enforced locally unless you happen to have the binaries. CI's super-linter *does* enforce them. So YAML, Markdown, and shell formatting can pass your commit and still fail CI if you rely solely on the hooks.
+:::
+
+---
+
+## Walking `.golangci.yml`
+
+This is a **golangci-lint v2** config (`version: "2"`), which splits *linters* and *formatters* into separate top-level blocks. The run sets a 10-minute timeout and, critically, a `ruleguard` build tag:
+
+```yaml title=".golangci.yml"
+version: "2"
+run:
+  timeout: 10m
+  build-tags:
+    - ruleguard          # required for the custom gocritic ruleguard rules to compile/run
+```
+
+### Enabled linters
+
+`linters.default: none` means *nothing* runs unless explicitly enabled. The enabled set covers the usual correctness checks plus several leak- and performance-oriented ones:
+
+```text
+bodyclose · copyloopvar · depguard · errcheck · errorlint · forbidigo · gocritic
+gosec · govet · ineffassign · mirror · misspell · modernize · nilerr · nolintlint
+nosprintfhostport · perfsprint · sloglint · sqlclosecheck · staticcheck · unconvert
+unused · whitespace
+```
+
+:::note[Two linters are deliberately off]
+`goconst` is disabled because it "reports different results in CI vs local," so developers can't validate it locally — don't expect it to fire. `noctx` (which flags places a `context` should be threaded through) needs roughly 170 fixes before it can be turned on.
+:::
+
+`modernize` is on — it suggests Go-version-appropriate idioms — and `sloglint` is set to `context: scope`, meaning structured logging must carry a context where one is in scope. See [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/) and [context](/go-guide/language/08-context/).
+
+### `forbidigo` — banning `os.Exit`
+
+```yaml title=".golangci.yml"
+forbidigo:
+  forbid:
+    - pattern: ^os\.Exit$
+      msg: "os.Exit() prevents cleanup hooks from firing. Return an error instead. Only allowed in main() or TestMain() with //nolint:forbidigo. In init(), use panic() instead."
+```
+
+`os.Exit` terminates the process immediately, so deferred cleanup — closing pools, flushing telemetry, releasing locks — never runs. The Go-idiomatic fix is to return an error up to `main` and let `main` decide. The rare legitimate exits (`main()`, `TestMain()`) are allowed with an inline `//nolint:forbidigo`. This dovetails with the error-handling philosophy in [errors](/go-guide/language/05-errors/).
+
+### `depguard` — architectural isolation as a lint rule
+
+This is the most codebase-specific part, and the most instructive. `depguard` encodes architectural dependency rules — services can't depend on `cmd/` or on each other, `tools/` can't depend on repo code, the parser must stand alone — as mechanical checks. A few of the rules:
+
+- **`tools-isolation`** — files under `go/tools/**` may import only the standard library and other `go/tools` packages. Generic helpers stay generic.
+- **`parser-isolation`** — `go/common/parser/**` may depend only on itself within `go/common`, so the parser is usable as a standalone library.
+- **per-service isolation** — each service (`multiadmin`, `pgctld`, `multigateway`, `multiorch`, `multipooler`) enforces that it "can only be imported by its own package and cmd."
+
+The per-service rules use an **inverted-glob** trick worth understanding (the `multipooler` rule shown):
+
+```yaml title=".golangci.yml"
+multipooler-isolation:
+  files:
+    - "!**/go/services/multipooler/*.go"
+    - "!**/go/services/multipooler/**/*.go"
+    - "!**/go/cmd/multipooler/*.go"
+    - "!**/go/cmd/multipooler/**/*.go"
+    - "**/*.go"
+  list-mode: lax
+  deny:
+    - pkg: "github.com/multigres/multigres/go/services/multipooler"
+      desc: "multipooler can only be imported by its own package and cmd"
+```
+
+Read it as: *apply this rule to every `.go` file except multipooler's own service and cmd packages; in those files, deny importing the multipooler service.* The leading `!` negations carve out the legal importers; the positive `**/*.go` glob is everything else; the `deny` then blocks the cross-service import. This is how the architecture rule "services cannot depend on other services" (see [architecture & request flow](/go-guide/project/01-architecture-request-flow/)) becomes enforceable.
+
+One more `depguard` rule bans an entire package outright:
+
+```yaml title=".golangci.yml"
+use_modern_packages:
+  list-mode: lax
+  deny:
+    - pkg: "math/rand$"
+      desc: "Please use math/rand/v2"
+```
+
+### `gocritic` → ruleguard: a custom rule engine
+
+`gocritic` has *every* default check disabled and *only* `ruleguard` enabled:
+
+```yaml title=".golangci.yml"
+gocritic:
+  disable-all: true
+  enabled-checks:
+    - ruleguard
+  settings:
+    ruleguard:
+      rules: "go/tools/ruleguard/rules.go"
+```
+
+The rules themselves are written in the [go-ruleguard](https://github.com/quasilyte/go-ruleguard) DSL — Go code guarded by `//go:build ruleguard` in package `gorules`. That build tag is exactly why the config sets `run.build-tags: [ruleguard]`; without it the rules wouldn't compile into the lint run. Editing one file, `go/tools/ruleguard/rules.go`, changes lint behaviour repo-wide.
+
+What makes this powerful is *what* the rules encode: concrete, project-specific invariants a human reviewer would otherwise have to remember.
+
+| Rule | What it enforces |
+| --- | --- |
+| `disallowUnderscoreInFlags` | flag names use dashes, not underscores |
+| `requireGrpcCommonNewClient` | use `grpccommon.NewClient()`, not `grpc.NewClient()`, so telemetry is attached |
+| `disallowDirectExecCommandContext` / `disallowDirectProcessTermination` | use the process wrapper, not raw `exec.CommandContext` or signals |
+| `requireContextBackgroundJustification` | `context.Background()` needs a justification; prefer `TODO()` or an explicit detach |
+| `disallowOtelMeterOutsideMetricsFiles` / `disallowMetricsConstructorArgs` | `otel.Meter` only in metrics files; the metrics constructor takes no args |
+| `requireSortedMapIteration` / `disallowGoroutinesInConsensus` / `disallowWallClockInConsensus` | determinism in the consensus package — no map-order, goroutines, or wall-clock |
+| `disallowMultiPoolerTypeForRouting` | derive leader identity from explicit state, not a topology label |
+
+### `govet` and `staticcheck` — tuned, not default
+
+`govet` runs an *explicit* analyzer list rather than the default set; two are notably commented out — `fieldalignment` (struct field reordering for memory) and `shadow` (variable shadowing). So vet won't nag about field order or shadowed vars here.
+
+`staticcheck` runs `all` minus a curated disable list — style checks `ST1000`/`ST1003`/`ST1005`/`ST1016`/`ST1020-22` and the `QF1001`/`QF1005`/`QF1008` quick-fixes are off.
+
+### Exclusions — where the rules relax
+
+Several presets (`comments`, `common-false-positives`, `legacy`, `std-error-handling`) are on, plus targeted relaxations:
+
+- **`gosec`** is globally off for a handful of checks (`G115` unsafe int casts, `G404` non-crypto `math/rand`, `G306` file perms, `G204` subprocess with variables) — patterns that are pervasive and intentional here.
+- **`errcheck`** is skipped under `proto/`; **`unused`** is skipped in the parser, the PG-protocol code, and ruleguard.
+- **`errorlint`** is relaxed in `go/common/mterrors/`, which does intentional direct error comparisons (see [mterrors & observability](/go-guide/project/09-mterrors-and-observability/)).
+- **`unconvert`** is relaxed in the generated parser, which has many redundant conversions.
+
+### Formatters block
+
+In the v2 schema, formatters live in their own block, separate from `linters`. This is the single source of truth for the import-grouping the format hooks apply:
+
+```yaml title=".golangci.yml"
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/multigres
+```
+
+That `local-prefixes` value of `` `github.com/multigres` `` is what makes first-party imports group into their own block, separate from the standard library and third-party dependencies.
+
+---
+
+## Non-Go linting
+
+The Go pipeline is only half the story. A separate set of tools — driven mostly by configuration files at the repo root — covers everything else.
+
+The directory layout of these config files is flat and predictable:
+
+<FileTree>
+- multigres/
+  - **.golangci.yml** Go linters + formatters (covered above)
+  - **.protolint.yaml** proto linting tweaks
+  - **.codespellrc** spell-checking config
+  - .editorconfig editor defaults (shell indent)
+  - go.mod the `tool` block that supplies most linters
+  - misc/
+    - git/ pre-commit and commit-msg entry points
+    - hooks/ the numbered hook executables
+  - tools/
+    - run_super_linter.sh run CI's non-Go linters locally
+</FileTree>
+
+### `.editorconfig`
+
+Minimal — the only rule present is two-space indentation for shell files. It's consumed by editors and the shell formatters.
+
+```ini title=".editorconfig"
+[[shell]]
+indent_style = space
+indent_size = 2
+```
+
+### `.protolint.yaml`
+
+Tweaks Google-style proto linting: it removes two enum-naming rules and sets a 120-character line limit.
+
+```yaml title=".protolint.yaml"
+lint:
+  rules:
+    remove:
+      - ENUM_FIELD_NAMES_PREFIX
+      - ENUM_FIELD_NAMES_ZERO_VALUE_END_WITH
+  rules_option:
+    max_line_length:
+      max_chars: 120
+```
+
+The `protolint` hook auto-`-fix`es proto files on commit; CI's super-linter re-checks them. See [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/).
+
+### `.codespellrc`
+
+Spell-checking for text, with skip globs (the generated parser, lockfiles, SVGs, patches) and an allow-list for intentional "misspellings":
+
+```ini title=".codespellrc"
+[codespell]
+skip = */go/common/parser/*,go.sum,**/pnpm-lock.yaml,dist,*.tsbuildinfo,*.svg,*.patch
+ignore-words-list = copys,usera,anull,atleast
+```
+
+`codespell` is **CI-only**, run via super-linter — there is no local codespell hook.
+
+### Running CI's non-Go linters locally
+
+super-linter is the umbrella that runs protolint, codespell, shfmt/shellcheck, prettier, markdownlint, and more in CI. To reproduce it locally, a helper script runs the same container against your working tree:
+
+```bash title="tools/run_super_linter.sh"
+docker run --platform linux/x86_64 \
+  $TTY_FLAGS \
+  --env-file ".github/super-linter.env" \
+  --env-file ".github/local-super-linter.env" \
+  -v "$PWD:/tmp/lint" \
+  ghcr.io/super-linter/super-linter:latest
+```
+
+The shared `super-linter.env` sets `DEFAULT_BRANCH=main`, an exclude filter (skipping `external/`, `*.pb.go`, `go.sum`, SVGs), and turns Go validation *off* (`VALIDATE_GO=false`) since golangci-lint handles that separately. The local overlay layers on `RUN_LOCAL=true` and autofix flags, so a local run *fixes* instead of merely reporting. Run it before pushing if you've touched YAML, Markdown, shell, or proto and want to skip a CI round-trip.
+
+---
+
+## What CI enforces, and how it can disagree with you
+
+Three workflows guard a pull request:
+
+| Workflow | What it does |
+| --- | --- |
+| `golangci-lint.yml` | runs `golangci-lint` **pinned to v2.6.1** on the whole module |
+| `lint.yml` | super-linter for non-Go files; a check that Actions are SHA-pinned; `validate-generated-files` |
+| `lint-pr-title.yml` | enforces a Conventional-Commits PR title |
+
+**`validate-generated-files`** runs a clean `build-all` then `go mod tidy`, and fails if `git status` reports any modified tracked file — i.e. if committed generated code (`go/pb/`, the parser, the AST helpers) is stale. The format hooks deliberately skip generated files; *this* job is what guards them. Regenerate and commit per [Modules, Deps & Codegen](/go-guide/tooling/04-modules-deps-codegen/).
+
+**The PR-title check** requires titles to match `feat|fix|docs|test|refactor|chore|build|ci|perf`, e.g. `fix(multipooler): handle nil pointer in health check`.
+
+### Why a clean local commit can still fail CI
+
+This is the practical payoff of understanding the two layers — the seams between them are exactly where surprises live:
+
+- **Version drift.** The local hook requires `golangci-lint >= v2.6.0`; CI pins *exactly* v2.6.1. A check tightened between versions can pass locally and fail in CI, or vice versa.
+- **Scope.** The local hook lints only the packages of your *changed* files; CI lints the whole module, so a change that breaks a consumer of your package surfaces only in CI.
+- **`goconst`** is disabled precisely because of CI-vs-local divergence — a built-in reminder that environment differences are real here.
+- **Cache lag.** The CI cache key excludes `.golangci.yml` and the linter version, so config or version changes may not take effect until the cache expires.
+- **Silent local skips.** The `prettier` and `shfmt` hooks no-op if those binaries aren't installed, but super-linter enforces them in CI.
+
+---
+
+## Checkpoints
+
+<details><summary>Why is there no <code>make lint</code> or <code>make fmt</code>, and what single command wires up local formatting?</summary>
+Formatting and linting are enforced by git pre-commit hooks (auto-format + `golangci-lint` on changed packages) and by CI, not by on-demand Makefile targets. `make tools` symlinks the hooks into the git hooks directory; without it, nothing runs locally.</details>
+
+<details><summary>Which lint/format tools come from <code>go tool</code>, and which one is <code>go install</code>ed by a hook?</summary>
+`gofumpt`, `goimports`, `protolint`, and `ruleguard` are registered in the `go.mod` `tool` block and run via `go tool`. `golangci-lint` is the exception: it is not a `go tool` dep, so its hook `go install`s it on demand if it's missing from your `PATH`.</details>
+
+<details><summary>What does the inverted-glob pattern in the per-service <code>depguard</code> rules express?</summary>
+It applies the rule to every `.go` file except the service's own service and cmd packages (the leading <code>!</code> negations carve those out), then denies importing that service from everywhere else — enforcing "this service can only be imported by its own package and cmd."</details>
+
+<details><summary>Why is <code>os.Exit</code> forbidden, and where is it still allowed?</summary>
+`os.Exit` terminates the process immediately, so deferred cleanup (pools, telemetry, locks) never runs; the idiomatic fix is to return an error up to `main`. It's allowed only in `main()` and `TestMain()` with an inline `//nolint:forbidigo`.</details>
+
+<details><summary>Name three reasons a clean local commit can still fail CI.</summary>
+Version drift (local requires `>= v2.6.0`, CI pins exactly v2.6.1); scope (local lints only changed packages, CI lints the whole module); and silent local skips (`prettier`/`shfmt` no-op without the binaries, but super-linter enforces them). Cache lag and the deliberately-disabled `goconst` are further examples.</details>
+
+---
+
+## Exercises
+
+<Steps>
+
+1. **Read the inverted globs.** Open the `multipooler-isolation` rule in `.golangci.yml` and explain, in your own words, how the negated globs enforce "multipooler can only be imported by its own package and cmd." List the exempt directories.
+
+2. **Trace format-on-commit.** Starting from the `tools` target in the Makefile, list the files symlinked into the git hooks directory, then the order the `misc/hooks/*` executables run. Which hooks auto-skip when their tool is missing?
+
+3. **Map the ruleguard rules.** Open `go/tools/ruleguard/rules.go` and match each custom rule to the concept it enforces (use the table above as an answer key). Which `build-tags` entry in `.golangci.yml` makes these rules run at all?
+
+4. **Construct a version-drift failure.** Compare the version the local `golangci-lint` hook requires against the version pinned in `golangci-lint.yml`. Describe a scenario where local passes but CI fails.
+
+5. **Build an exclude-paths table.** Collect the excluded paths across three layers — the format hooks (`go/pb/`), `.codespellrc` (`skip = ...`), and super-linter's exclude filter. Where do they overlap, and where does each cover something the others don't?
+
+</Steps>
+
+---
+
+## Next
+
+Continue to [Modules, Deps & Codegen](/go-guide/tooling/04-modules-deps-codegen/) — the `go.mod` `tool` block in depth, and how `validate-generated-files` guards generated code.
+
+---
+
+## See also
+
+<CardGrid>
+  <LinkCard title="Build & Make" description="make tools, make build-all, and the targets these gates sit alongside." href="/go-guide/tooling/01-build-and-make/" />
+  <LinkCard title="Testing Workflow" description="The test gates that run alongside these lint gates." href="/go-guide/tooling/02-testing-workflow/" />
+  <LinkCard title="Modules, Deps & Codegen" description="The go.mod tool block and how generated code is kept fresh." href="/go-guide/tooling/04-modules-deps-codegen/" />
+  <LinkCard title="Errors" description="Why os.Exit is banned in favor of returning errors to main." href="/go-guide/language/05-errors/" />
+  <LinkCard title="Context" description="Background for the sloglint and context-justification rules." href="/go-guide/language/08-context/" />
+  <LinkCard title="Stdlib & idioms" description="What the modernize linter nudges you toward." href="/go-guide/language/10-stdlib-and-idioms/" />
+  <LinkCard title="Architecture & request flow" description="The service-isolation rules depguard turns into checks." href="/go-guide/project/01-architecture-request-flow/" />
+  <LinkCard title="gRPC & protobuf" description="The proto layer protolint and the grpccommon rule guard." href="/go-guide/project/04-grpc-and-protobuf/" />
+</CardGrid>

@@ -1,0 +1,615 @@
+---
+title: "The SQL Parser: Lexer, goyacc & AST Codegen"
+description: How SQL text becomes a typed AST through a hand-written lexer, a generated grammar, and code that writes its own boilerplate.
+sidebar:
+  order: 6
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { FileTree } from "@astrojs/starlight/components";
+
+**What you will learn:** how a real system turns SQL text into a typed AST — a hand-written lexer, a goyacc-generated LALR parser, an `ast.Node` type system built on struct embedding, and a code generator that writes the clone/rewrite boilerplate so nobody has to maintain it by hand.
+
+**Prerequisites:** [interfaces & composition](/go-guide/language/03-interfaces-composition/) (the `Node` interface, `BaseNode` embedding, type switches), [types, structs & methods](/go-guide/language/02-types-structs-methods/) (struct embedding, the `New*` constructor idiom), [packages & `go:generate`](/go-guide/language/01-packages-modules-imports/), [generics](/go-guide/language/06-generics/) (to see why this code uses codegen *instead*), and [sync & the memory model](/go-guide/language/09-sync-and-memory-model/) (`sync.Pool`).
+
+This is the most advanced Go in the multigres codebase. It lives under `go/common/parser/` and is a direct, file-by-file port of PostgreSQL's own scanner and grammar, glued together with three layers of code generation. Once you understand the pipeline you can navigate roughly 2 MB of generated code with confidence, because you will know which *source* file each generated artifact came from.
+
+---
+
+## The pipeline at a glance
+
+A query goes through four stages: raw text becomes tokens, tokens drive a grammar, the grammar builds an AST, and a separate generator produces the helpers that walk that AST. Here is the front half — text to tree:
+
+<Mermaid title="SQL text to AST" height={520} code={`
+flowchart TB
+  SQL(["SQL string"])
+  Lexer["NewLexer(input)<br/>lexer.go"]
+  Token["*Token { Type, Value, Position, Text }<br/>tokens.go"]
+  Parse["yyParse loop (LALR tables)<br/>postgres.go — generated from postgres.y"]
+  AST(["[]ast.Stmt — the AST<br/>ast/*.go"])
+  SQL --> Lexer
+  Lexer -->|"l.NextToken()"| Token
+  Token -->|"Lexer.Lex copies token to yySymType"| Parse
+  Parse -->|"grammar actions build nodes"| AST
+`} />
+
+Two more files are generated *from the AST itself* — the deep-copy and the tree-rewriter:
+
+<Mermaid title="AST helpers, generated from the AST" height={360} code={`
+flowchart LR
+  Nodes["ast/*.go<br/>(Node implementations)"]
+  Gen["asthelpergen<br/>(reads the Node interface<br/>by type-checking)"]
+  Clone["ast_clone.go<br/>deep copy"]
+  Rewrite["ast_rewrite.go<br/>visitor / tree rewriter"]
+  Nodes --> Gen
+  Gen --> Clone
+  Gen --> Rewrite
+`} />
+
+:::note[Several generators, one directory]
+`postgres.go` comes from a vendored **goyacc** tool. `ast_clone.go` and `ast_rewrite.go` come from a second generator, **asthelpergen**. The proto layer ([gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/)) is a third, separate generator. All of them stamp their output with `// Code generated ... DO NOT EDIT.` and all of them must be committed to the repo.
+:::
+
+The public entry point is `ParseSQL`. It lives in the generated `postgres.go` because it is copied verbatim from the grammar file's preamble:
+
+```go title="go/common/parser/postgres.go"
+func ParseSQL(input string) ([]ast.Stmt, error) {
+	lexer := NewLexer(input)
+	parser := parserPool.Get().(yyParser)
+	parser.Parse(lexer)
+	parserPool.Put(parser)
+
+	if lexer.HasErrors() {
+		return nil, lexer.GetErrors()[0]
+	}
+
+	return lexer.GetParseTree(), nil
+}
+```
+
+Note the `sync.Pool` of parsers. Parser state tables are large and reusable, so pooling avoids re-allocating them per query on the hot query path. The pool stores `yyParser` values produced by the generated `yyNewParser()`. See [sync & the memory model](/go-guide/language/09-sync-and-memory-model/) for `sync.Pool` semantics — anything in a pool can be garbage-collected or handed to another goroutine, so it must be reset on `Parse`.
+
+---
+
+## Layer 1 — the hand-written lexer
+
+The lexer is *not* generated. It is a manual port of PostgreSQL's `scan.l` and `parser.c`, spread across `lexer.go`, `tokens.go`, `keywords.go`, and `charclass.go`.
+
+### Tokens
+
+```go title="go/common/parser/tokens.go"
+type TokenValue struct {
+	Ival    int    // integer literals (ICONST, PARAM)
+	Str     string // identifiers and non-integer literals
+	Keyword string // canonical spelling of keywords
+}
+
+type Token struct {
+	Type     int        // parser-generated token constant
+	Value    TokenValue // the token's value (a "union")
+	Position int        // byte offset from start of input
+	Text     string     // raw text that produced this token
+}
+```
+
+`TokenValue` is Go's answer to a C union: a struct where only one field is meaningful at a time, by convention. The lexer fills `Ival` for `ICONST`, `Str` for identifiers and strings, and `Keyword` for keywords.
+
+:::caution[Gotcha — there is no hand-written enum of all token types]
+`TokenType` is a type *alias*, not a defined type:
+
+```go title="go/common/parser/tokens.go"
+type TokenType = int
+```
+
+The only constants this file defines are the lexer-internal specials:
+
+```go title="go/common/parser/tokens.go"
+const (
+	INVALID = -1 // Invalid token
+	EOF     = 0  // End of file (aligns with yacc EOF expectation)
+)
+```
+
+Every *real* token constant — `SELECT`, `IDENT`, `ICONST`, `FROM`, and so on — is emitted into `postgres.go` by goyacc. So if you grep for `SELECT` expecting a `const`, you will find it in the generated file, not in `tokens.go`. ASCII characters 32 to 126 are their own token value (`(` is token `40`). And `EOF == 0` is deliberate: that is exactly what the generated `yyParse` loop treats as end-of-input.
+:::
+
+### `NextToken` and PostgreSQL's two-phase lex
+
+```go title="go/common/parser/lexer.go"
+type Lexer struct {
+	context   *ParseContext // unified parse context (input, position, errors)
+	parseTree []ast.Stmt    // parse result, filled by grammar actions
+}
+```
+
+`NextToken` runs two phases, mirroring PostgreSQL's `base_yylex`:
+
+```go title="go/common/parser/lexer.go"
+func (l *Lexer) NextToken() *Token {
+	token, err := l.nextTokenInternal()
+	if err != nil {
+		l.RecordError(err)
+		return NewToken(INVALID, l.context.CurrentPosition(), "")
+	}
+	// keyword lookahead (WITH_LA, etc.) + Unicode conversion (UIDENT->IDENT, USCONST->SCONST)
+	return l.applyTokenFilter(token)
+}
+```
+
+`applyTokenFilter` is the *filter* phase. Some PostgreSQL keywords change meaning based on the *next* token — for example `WITH` followed by `ORDINALITY` versus `WITH` opening a CTE. The filter peeks ahead for `FORMAT`, `NOT`, `NULLS_P`, `WITH`, and `WITHOUT` and rewrites the token type, and it converts the Unicode-escape token forms `UIDENT`/`USCONST` into plain `IDENT`/`SCONST`. This is how a single `NextToken` can do lookahead without the grammar needing to.
+
+### Keywords
+
+```go title="go/common/parser/keywords.go"
+type KeywordInfo struct {
+	Name         string          // lowercase keyword name
+	TokenType    int             // token constant (from postgres.go)
+	Category     KeywordCategory // Unreserved / ColName / TypeFuncName / Reserved
+	CanBareLabel bool
+}
+
+// the ~491-entry flat table
+var Keywords = []KeywordInfo{
+	{"abort", ABORT_P, UnreservedKeyword, true},
+	// ... hundreds more
+}
+```
+
+The four `KeywordCategory` values mirror PostgreSQL's reservation classes and decide whether a keyword may double as a column or function name. `LookupKeyword` does an ASCII-only lowercase, then a map lookup. The token constant in each row (`ABORT_P`, `SELECT`, and the rest) again comes from the generated `postgres.go`.
+
+---
+
+## Layer 2 — the goyacc grammar
+
+### The grammar source: `postgres.y`
+
+`postgres.y` is a large yacc grammar with three parts: a Go preamble (`%{ ... %}`), declarations (`%union`/`%struct`, `%token`), and BNF rules whose actions build AST nodes. Here is the rule that builds a table reference:
+
+```text title="go/common/parser/postgres.y"
+qualified_name:
+		ColId
+		{
+			$$ = &ast.RangeVar{
+				RelName: $1,
+				Inh:     true, // inheritance enabled by default
+			}
+		}
+	|	ColId indirection
+		{ ... builds schema-qualified RangeVar from $1.$2 ... }
+	;
+```
+
+In yacc-speak `$$` is the value this rule produces, and `$1`, `$2` are the values of the symbols on the right-hand side. So `qualified_name` becomes a `*ast.RangeVar` whose `RelName` is the identifier text. The grammar action is *literally Go code* spliced into the generated parser.
+
+:::caution[Gotcha — one node type, several construction sites]
+`RangeVar` is built here with `Inh: true`, but `extended_relation_expr` (a sub-rule of `relation_expr`) re-sets `rangeVar.Inh = false` when the query says `ONLY foo`. Don't assume a node is always built one canonical way. If you care about every field, grep the grammar for all `` `&ast.RangeVar{` `` and `.Inh =` sites.
+:::
+
+### The generated parser: `postgres.go`
+
+goyacc compiles the grammar into the giant LALR tables (`yyAct`, `yyExca`, and friends) plus the `yyParse` driver loop. You will essentially never read this file top to bottom — but you do need to know how it talks to the lexer.
+
+### The lexer-to-parser contract
+
+goyacc emits an interface the lexer must satisfy:
+
+```go title="go/common/parser/postgres.go"
+type yyLexer interface {
+	Lex(lval *yySymType) int
+	Error(s string)
+}
+```
+
+This is the classic Go idiom of *the consumer defining the interface* (see [interfaces & composition](/go-guide/language/03-interfaces-composition/)). The hand-written `Lexer` satisfies it via two methods that live in the grammar preamble, and so end up in `postgres.go`:
+
+```go title="go/common/parser/postgres.go"
+func (l *Lexer) Lex(lval *yySymType) int {
+	token := l.NextToken()
+	if token == nil {
+		return EOF // EOF = 0, exactly what yacc expects
+	}
+	lval.location = token.Position
+	lval.str = token.Value.Str
+	lval.ival = token.Value.Ival
+	return token.Type
+}
+
+func (l *Lexer) Error(s string) {
+	l.RecordError(fmt.Errorf("parse error at position %d: %s", l.GetPosition(), s))
+}
+```
+
+`yyParse` calls `Lex` repeatedly to pull tokens, copying each token's value into the parser's semantic-value struct `yySymType`, and calls `Error` on a syntax error. The grammar actions then assemble nodes and stash the final tree in `l.parseTree`, which `ParseSQL` returns via `GetParseTree()`.
+
+:::note[The generator is vendored]
+The goyacc generator lives inside the repo (at `go/common/parser/goyacc/`, derived from the Inferno/Vitess yacc) rather than being the upstream `golang.org/x/tools` binary, so its flags and behavior follow that variant. There is also a *second*, smaller goyacc grammar under `go/common/parser/replparser/` for replication commands — out of scope here, but worth knowing it exists.
+:::
+
+---
+
+## Layer 3 — the AST package
+
+`go/common/parser/ast/` is around 30 `.go` files split by statement category, plus the two generated helper files:
+
+<FileTree>
+- go/common/parser/ast/
+  - nodes.go **the `Node` interface, `BaseNode`, `NodeTag`**
+  - statements.go core statements (`RangeVar` lives here)
+  - ddl_statements.go DDL nodes
+  - expressions.go expression nodes
+  - utility_statements.go utility nodes
+  - … more category files
+  - ast_clone.go generated — deep copy
+  - ast_rewrite.go generated — visitor / rewriter
+</FileTree>
+
+At its core is one interface.
+
+### The `Node` interface and `BaseNode`
+
+```go title="go/common/parser/ast/nodes.go"
+type Node interface {
+	NodeTag() NodeTag      // type tag (mirrors PG's NodeTag enum)
+	Location() int         // byte offset in source, or -1
+	SetLocation(location int)
+	String() string        // debug representation
+	SqlString() string     // SQL deparse — enables SQL -> AST -> SQL round-trip
+}
+```
+
+You almost never implement these five methods by hand. Instead every concrete node *embeds* `BaseNode`, which implements four of them for free:
+
+```go title="go/common/parser/ast/nodes.go"
+type BaseNode struct {
+	Tag NodeTag // node type tag
+	Loc int     // source location in bytes
+}
+
+func (n *BaseNode) NodeTag() NodeTag    { return n.Tag }
+func (n *BaseNode) Location() int       { return n.Loc }
+func (n *BaseNode) SetLocation(loc int) { n.Loc = loc }
+func (n *BaseNode) String() string      { return fmt.Sprintf("%s@%d", n.Tag, n.Loc) }
+```
+
+This is Go struct embedding doing interface satisfaction — see [interfaces & composition](/go-guide/language/03-interfaces-composition/) and [types & methods](/go-guide/language/02-types-structs-methods/). By embedding `BaseNode`, a struct *promotes* those methods and so already implements four-fifths of `Node` with zero code.
+
+The fifth method, `SqlString()`, is intentionally *not* usable from `BaseNode`:
+
+```go title="go/common/parser/ast/nodes.go"
+func (n *BaseNode) SqlString() string {
+	if n.Tag == T_Invalid {
+		return "<INVALID>"
+	}
+	panic(fmt.Sprintf("SqlString() not implemented for node type %s ...", n.Tag))
+}
+```
+
+:::caution[Gotcha — forgetting `SqlString()` is a runtime panic, not a compile error]
+Because `BaseNode` *technically* provides a `SqlString()`, a new node still satisfies `Node` and compiles fine. But the first time anything deparses it, that default panics. The design forces every node to override `SqlString()` — it just does so at runtime rather than at compile time. Always write `SqlString()` when you add a node.
+:::
+
+### `NodeTag` — the type enum
+
+```go title="go/common/parser/ast/nodes.go"
+type NodeTag int
+
+const (
+	T_Invalid NodeTag = iota
+	T_Node
+	T_Query
+	T_SelectStmt
+	// ... 200+ more, mirroring postgres nodes.h
+	// (T_RangeVar, T_Alias, ... appear further down the same block)
+)
+```
+
+`NodeTag` is an `int` enum built with `iota` (the standard idiom — see [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/)), one tag per node type, mirroring PostgreSQL's `NodeTag` from `nodes.h`. Each concrete node sets its tag in its `New*` constructor. `NodeTag` also has a `String()` method so tags print readably in debug output.
+
+### A concrete node, start to finish
+
+```go title="go/common/parser/ast/statements.go"
+type RangeVar struct {
+	BaseNode
+	CatalogName    string // database name, or empty
+	SchemaName     string // schema name, or empty
+	RelName        string // relation/sequence name
+	Inh            bool   // expand by inheritance?
+	RelPersistence rune
+	Alias          *Alias // table alias & optional column aliases
+}
+
+// the New* constructor sets the tag
+func NewRangeVar(relName string, schemaName, catalogName string) *RangeVar {
+	return &RangeVar{
+		BaseNode:    BaseNode{Tag: T_RangeVar},
+		RelName:     relName,
+		SchemaName:  schemaName,
+		CatalogName: catalogName,
+		Inh:         true,
+	}
+}
+
+// SqlString deparses (note the ONLY / alias logic)
+func (r *RangeVar) SqlString() string {
+	result := FormatFullyQualifiedName(r.CatalogName, r.SchemaName, r.RelName)
+	if !r.Inh {
+		result = "ONLY " + result
+	}
+	if r.Alias != nil {
+		if aliasStr := r.Alias.SqlString(); aliasStr != "" {
+			result += " " + aliasStr
+		}
+	}
+	return result
+}
+```
+
+Notice the field shapes, because they determine what the generated code does:
+
+- `CatalogName`, `SchemaName`, `RelName` (string), `Inh` (bool), `RelPersistence` (rune) — **basic types**.
+- `Alias *Alias` — a **pointer to another `Node`-implementing type**.
+
+These two categories are treated very differently by codegen, which is the whole point of the next section.
+
+---
+
+## Layer 4 — the codegen: asthelpergen
+
+With more than 200 node types, hand-writing a deep-clone and a tree-rewriter for each would be roughly 10,000 lines of error-prone boilerplate. Instead, the codebase generates them.
+
+:::note[Why codegen and not generics?]
+Go generics ([generics](/go-guide/language/06-generics/)) can write *one* function that works over many types — but only for behavior the type system can express uniformly. Here, each node has *different fields* needing *different recursive treatment*, decided by reflecting over struct shape. A generic `Clone[T any]` would have to fall back to runtime reflection (slow, on a latency-sensitive path) and couldn't emit a readable, debuggable `CloneRefOfRangeVar`. Codegen does the "reflection" *once, at build time*, and emits straight-line Go. It's the same trade-off the proto layer makes — compare [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/).
+:::
+
+### The trigger
+
+```go title="go/common/parser/ast/generate.go"
+//go:generate go run ../../../tools/asthelpergen/main --in . --iface github.com/multigres/multigres/go/common/parser/ast.Node
+```
+
+The flags: `--in` is the package(s) to scan, `--iface` is the (required) fully-qualified root interface, plus `--clone_exclude` and `--verify`.
+
+### How the tool discovers node types
+
+It does *not* parse comments or maintain a list. It loads the package with `golang.org/x/tools/go/packages`, gets the type-checker's view, and asks the compiler "who implements `Node`?":
+
+```go title="go/tools/asthelpergen/asthelpergen.go"
+func findImplementations(scope *types.Scope, iff *types.Interface, impl func(types.Type) error) error {
+	for _, name := range scope.Names() {
+		obj := scope.Lookup(name)
+		if _, ok := obj.(*types.TypeName); !ok {
+			continue
+		}
+		baseType := obj.Type()
+		if types.Implements(baseType, iff) {          // value type implements?
+			if err := impl(baseType); err != nil { return err }
+			continue
+		}
+		pointerT := types.NewPointer(baseType)         // or *T implements?
+		if types.Implements(pointerT, iff) {
+			if err := impl(pointerT); err != nil { return err }
+			continue
+		}
+	}
+	return nil
+}
+```
+
+:::caution[Gotcha — if it doesn't implement `Node`, it gets nothing]
+Codegen support is gated entirely on `types.Implements(..., Node)`. A struct that forgets to embed `BaseNode` (or otherwise fails to provide all five methods) silently gets *no* `CloneRefOfX` and *no* `rewriteRefOfX`, and you won't find out until something tries to clone or rewrite it.
+:::
+
+From each discovered type the tool walks the *fields*, and any field type it sees (`*Alias`, `[]Node`, and so on) is added to a todo queue, so the full transitive set of types is generated. `readValueOfType` in `clone_gen.go` calls `spi.addType(t)` for non-basic field types and emits a `CloneRefOf<T>(...)` call; basic types are returned as-is (just copied).
+
+### How it emits Go: dave/jennifer
+
+The tool builds Go source programmatically with the `jen` package (dave/jennifer). For example:
+
+```go title="go/tools/asthelpergen/clone_gen.go"
+func newCloneGen(pkgname string, options *CloneOptions) *cloneGen {
+	file := jen.NewFile(pkgname)
+	addLicenseHeader(file)
+	file.Comment("Code generated by asthelpergen. DO NOT EDIT.")
+	return &cloneGen{exclude: options.Exclude, file: file}
+}
+
+// names the output file
+func (c *cloneGen) genFile(_ generatorSPI) (string, *jen.File) {
+	return "ast_clone.go", c.file
+}
+```
+
+Builders in the `jen.Func().Id(...).Call(...).Block(...)` style construct each function; the result is rendered to `ast_clone.go` and `ast_rewrite.go` (the rewrite half lives in `rewrite_gen.go`).
+
+### Generated clone — `ast_clone.go`
+
+```go title="go/common/parser/ast/ast_clone.go"
+func CloneNode(in Node) Node {
+	if in == nil {
+		return nil
+	}
+	switch in := in.(type) {
+	case *A_ArrayExpr:
+		return CloneRefOfA_ArrayExpr(in)
+	case *A_Const:
+		// ... one case per node type
+	}
+}
+```
+
+`CloneNode` is a big **type switch** ([interfaces & composition](/go-guide/language/03-interfaces-composition/)) dispatching to a per-type function. Here is the one for our `RangeVar`:
+
+```go title="go/common/parser/ast/ast_clone.go" {5-7}
+func CloneRefOfRangeVar(n *RangeVar) *RangeVar {
+	if n == nil {
+		return nil
+	}
+	out := *n                              // shallow struct copy — copies ALL basic fields
+	out.BaseNode = CloneBaseNode(n.BaseNode)
+	out.Alias = CloneRefOfAlias(n.Alias)   // deep-clone the pointer field
+	return &out
+}
+```
+
+Map every line back to the struct:
+
+- `out := *n` copies the whole struct by value, so `CatalogName`, `SchemaName`, `RelName`, `Inh`, and `RelPersistence` are deep-copied automatically (strings, bools, and runes are value types — see [pointers, values & memory](/go-guide/language/04-pointers-values-memory/)).
+- `out.Alias = CloneRefOfAlias(n.Alias)` overwrites the *pointer* field with a fresh deep clone, because the struct copy only copied the pointer, not the pointee. `CloneRefOfAlias` is nil-safe, so a `nil` alias stays `nil`.
+
+That is the entire rule: basic fields ride along on `out := *n`; pointer, slice, and interface fields get a recursive `CloneRefOf...`/`CloneSliceOf...` call.
+
+### Generated rewrite — `ast_rewrite.go` (the visitor)
+
+The public API is hand-written in `rewriter_api.go`; the per-type walkers are generated. You call:
+
+```go title="go/common/parser/ast/rewriter_api.go"
+func Rewrite(node Node, pre, post ApplyFunc) (result Node) {
+	parent := &RootNode{node}
+	replacer := func(newNode Node, _ Node) { parent.Node = newNode }
+	a := &application{pre: pre, post: post}
+	a.rewriteNode(parent, node, replacer)
+	return parent.Node
+}
+```
+
+`pre` runs before a node's children (return `false` to prune them); `post` runs after (return `false` to abort). The callback receives a `*Cursor`:
+
+```go title="go/common/parser/ast/rewriter_api.go"
+type Cursor struct { parent, node Node; replacer replacerFunc; revisit bool }
+func (c *Cursor) Node() Node   { return c.node }
+func (c *Cursor) Parent() Node { return c.parent }
+func (c *Cursor) Replace(newNode Node)           { c.replacer(newNode, c.parent); c.node = newNode }
+func (c *Cursor) ReplaceAndRevisit(newNode Node) { /* replace, then re-walk the new node */ }
+```
+
+The generated per-type walker for `RangeVar` shows the clever part — the **replacer closure**:
+
+```go title="go/common/parser/ast/ast_rewrite.go" {13-15}
+func (a *application) rewriteRefOfRangeVar(parent Node, node *RangeVar, replacer replacerFunc) bool {
+	if node == nil {
+		return true
+	}
+	if a.pre != nil {
+		a.cur.replacer = replacer
+		a.cur.parent = parent
+		a.cur.node = node
+		kontinue := !a.pre(&a.cur)
+		if a.cur.revisit { a.cur.revisit = false; return a.rewriteNode(parent, a.cur.node, replacer) }
+		if kontinue { return true }
+	}
+	if !a.rewriteRefOfAlias(node, node.Alias, func(newNode, parent Node) {
+		parent.(*RangeVar).Alias = newNode.(*Alias)   // typed write-back into the parent
+	}) {
+		return false
+	}
+	if a.post != nil { /* call a.post(&a.cur) */ }
+	return true
+}
+```
+
+When you `Replace` the `Alias` child, the visitor needs to write the new node back into *its parent's correct field*. It can't do that generically, so the generator emits a closure capturing the exact field and the exact concrete types:
+
+```go title="go/common/parser/ast/ast_rewrite.go"
+parent.(*RangeVar).Alias = newNode.(*Alias)
+```
+
+:::caution[Gotcha — `Replace` does unchecked type assertions]
+That closure asserts `newNode.(*Alias)`. If you `Replace` a node's child with the *wrong* concrete type, this panics. `Cursor.Replace`'s own doc warns: "the caller needs to make sure to not replace the object with something of the wrong type, or the visitor will panic."
+:::
+
+---
+
+## How to add a new AST node type
+
+Walking the full loop is the fastest way to see how the four layers fit together. The exact files to touch, in order:
+
+1. **Define the struct** in an `ast/*.go` file, embedding `BaseNode`:
+   ```go title="go/common/parser/ast/your_file.go"
+   type MyNewStmt struct {
+       BaseNode
+       Target  *RangeVar
+       Verbose bool
+   }
+   ```
+2. **Add a tag** to the `NodeTag` enum in `ast/nodes.go` (for example `T_MyNewStmt`) and a `case` in the `NodeTag.String()` switch so debug output is readable.
+3. **Write a `New*` constructor** that sets `BaseNode{Tag: T_MyNewStmt}` (follow `NewRangeVar`).
+4. **Implement `SqlString()`** — or deparsing this node will panic at runtime (see the `BaseNode.SqlString()` gotcha above).
+5. **Add grammar rule(s)** in `postgres.y` whose action builds `` `&ast.MyNewStmt{...}` ``.
+6. **Regenerate and commit.** Run the build, then commit the regenerated `postgres.go`, `ast_clone.go`, and `ast_rewrite.go`.
+
+After step 6 you will see brand-new `CloneRefOfMyNewStmt` and `rewriteRefOfMyNewStmt` functions appear — because `findImplementations` now sees your type implementing `Node`.
+
+### The regen workflow
+
+This is a large project, so it wraps codegen and the build behind make targets rather than asking you to invoke each generator by hand:
+
+```bash title="regenerating and verifying"
+make parser      # go generate over the parser package: runs goyacc AND asthelpergen
+make build-all   # proto + parser + metrics + build (the complete command)
+make validate-generated-files   # what CI runs: clean build-all, then fail if git is dirty
+```
+
+The CI gate is real — it rebuilds everything from source and fails if anything regenerated differently from what's committed:
+
+```make title="Makefile"
+validate-generated-files: clean build-all ## Validate that generated files match source.
+	go mod tidy
+	MODIFIED_FILES=$$(git status --porcelain | grep "^ M" | awk '{print $$2}') ; \
+	if [ -n "$$MODIFIED_FILES" ]; then ... exit 1; fi
+```
+
+A `go:generate` directive on the parser package only runs goyacc, which can mislead you into thinking AST helpers aren't regenerated. They are: `make parser` runs `go generate` *recursively*, so it also hits the AST package's directive and runs asthelpergen. Either way, prefer `make build-all` — it's the complete command and it's exactly what `validate-generated-files` runs, so it's the one that guarantees CI will pass. (The generator's `--verify` mode regenerates in memory and byte-compares against the on-disk files, which is how CI detects an un-regenerated AST change.)
+
+:::caution[Gotcha — never hand-edit the generated trio]
+`postgres.go`, `ast_clone.go`, and `ast_rewrite.go` all say `DO NOT EDIT`. Trace bugs to their *sources*: a wrong token goes to `lexer.go`/`keywords.go`; a wrong parse goes to `postgres.y`; a missing clone field goes to the struct in `ast/*.go` plus the generator in `go/tools/asthelpergen/`. Editing the generated file is wasted work — the next build erases it.
+:::
+
+---
+
+## Checkpoints
+
+<details><summary>Where is the token constant <code>SELECT</code> actually defined, and why isn't it in <code>tokens.go</code>?</summary>
+In the generated `go/common/parser/postgres.go`, emitted by goyacc from `postgres.y`'s `%token` declarations. `tokens.go` only defines `INVALID = -1` and `EOF = 0` plus the `type TokenType = int` alias, because the authoritative token constants are owned by the parser, not the lexer. ASCII chars 32 to 126 are their own values.</details>
+
+<details><summary>In <code>CloneRefOfRangeVar</code>, why does <code>Alias</code> get a recursive <code>CloneRefOfAlias</code> call but <code>RelName</code> does not?</summary>
+`out := *n` is a shallow struct copy. For value-typed fields like `RelName` (string), `Inh` (bool), `RelPersistence` (rune) that copy *is* a deep copy. But `Alias` is a `*Alias` pointer; the struct copy only duplicates the pointer, still aimed at the original `Alias`. To make the clone independent, the generator overwrites it with `CloneRefOfAlias(n.Alias)`, which is nil-safe.</details>
+
+<details><summary>You add a new node struct but forget to embed <code>BaseNode</code>. What happens, and when do you find out?</summary>
+The type won't satisfy the five-method `Node` interface, so `findImplementations` (via `types.Implements`) won't pick it up and no `CloneRefOf`/`rewriteRefOf` is generated for it. It may still compile if nothing references it as a `Node`, but it gets zero clone/rewrite support — a silent gap discovered only when something tries to clone or walk it.</details>
+
+<details><summary>Which command should you run after changing AST node types, and what CI job enforces it?</summary>
+`make build-all`, then commit the regenerated `postgres.go`, `ast_clone.go`, and `ast_rewrite.go`. The `validate-generated-files` job runs `clean build-all` and fails if `git status` shows any modified files — that is, if you forgot to regenerate or commit.</details>
+
+---
+
+## Exercises
+
+1. **Trace one query through the files.** Take the SQL `SELECT 1 FROM only foo.bar`. Starting at `ParseSQL`, follow it into `Lexer.Lex`/`NextToken` producing tokens (use `keywords.go` to find the `SELECT`/`FROM`/`ONLY` token types), then into the grammar rules `qualified_name` (builds the base `*ast.RangeVar` with `SchemaName="foo"`, `RelName="bar"`) and `extended_relation_expr`'s `ONLY` form (which flips `Inh=false`). Write down which file performed each transformation, and confirm the resulting `RangeVar.SqlString()` reproduces the `ONLY foo.bar` form.
+
+2. **Read the two generated halves side by side.** Open `CloneRefOfRangeVar` (`ast_clone.go`) and `rewriteRefOfRangeVar` (`ast_rewrite.go`) next to the `RangeVar` struct (`statements.go`). Map every line of each function to a struct field, and explain in one sentence why only `Alias` needs special handling in *both* generated functions.
+
+3. **Round-trip an AST.** Pick a query from `go/common/parser/testdata/select_cases.json`, call `ParseSQL` on it (model it on `parse_test.go`), call `SqlString()` on the result, then `ParseSQL` the deparsed string again. Identify which node's `SqlString()` controls the formatting of one clause (for example the `FROM` clause). For clone-independence, see `clone_test.go` (`TestCloneDeepCopy`): modify a clone and assert the original is unchanged.
+
+4. **Follow type discovery in the generator.** In `go/tools/asthelpergen/clone_gen.go`, read `readValueOfType` and explain how a struct field of type `*SomeNode` causes `SomeNode` to be enqueued via `spi.addType(t)` and a `CloneRefOfSomeNode(...)` call to be emitted — that is, how the generator reaches the full transitive set of node types starting from just the `Node` interface.
+
+---
+
+## Next
+
+[The PostgreSQL wire protocol & sqltypes](/go-guide/project/07-pg-wire-and-sqltypes/) — where parsed queries and their results meet the wire format on the way back to the client.
+
+---
+
+## See also
+
+- [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/) — the *other* big "generated, DO NOT EDIT, must be committed" subsystem; compare protoc to goyacc/asthelpergen.
+- [Service anatomy](/go-guide/project/05-service-anatomy/) — where parsed queries flow next in the gateway/pooler query path.
+- [Interfaces & composition](/go-guide/language/03-interfaces-composition/) — the `Node` interface, `BaseNode` embedding, type switches in `CloneNode`, and the interface-satisfaction that asthelpergen relies on.
+- [Types, structs & methods](/go-guide/language/02-types-structs-methods/) — struct embedding, method promotion, the `New*` constructor idiom.
+- [Generics](/go-guide/language/06-generics/) — the contrast: this code uses codegen instead of generics; the "Why codegen" note above explains why.
+- [Sync & the memory model](/go-guide/language/09-sync-and-memory-model/) — the `sync.Pool` of parsers in `ParseSQL`.
+- [Testing](/go-guide/language/11-testing/) — `clone_test.go` and `parse_test.go` table-driven JSON-fixture patterns.
+- [Modules, deps & codegen](/go-guide/tooling/04-modules-deps-codegen/) — `make parser` / `make build-all` / `validate-generated-files`.
+- [Glossary](/go-guide/reference/glossary/) — lexer, token, goyacc/LALR, AST, NodeTag, visitor/Rewrite, deparse.
+- [Idioms & gotchas](/go-guide/reference/idioms-and-gotchas/) — DO-NOT-EDIT generated files; commit-regenerated-output rule.
+- [Orientation](/go-guide/orientation/) — where the parser sits in the overall map.

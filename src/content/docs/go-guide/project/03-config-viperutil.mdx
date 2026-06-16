@@ -1,0 +1,621 @@
+---
+title: "Configuration: viper & viperutil"
+description: A type-safe, live-reloadable config layer built on viper using Go generics, reflection, and fsnotify.
+sidebar:
+  order: 3
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+**What you will learn:** how a real system layers a type-safe, live-reloadable configuration system on top of `spf13/viper` — using Go generics for the typed API, reflection to bridge to viper's dynamically-typed getters, and `fsnotify` to react to file edits at runtime. By the end you'll be able to read the whole flow from a `Configure` call to a `.Get()` that picks up a live edit.
+
+**Prerequisites:** this page leans on [generics](/go-guide/language/06-generics/) (the typed `Value[T]` API), [interfaces & composition](/go-guide/language/03-interfaces-composition/) (the small interfaces that decouple it), [concurrency](/go-guide/language/07-concurrency/) and [sync & the memory model](/go-guide/language/09-sync-and-memory-model/) (the live-reload machinery), plus [errors](/go-guide/language/05-errors/) and [context](/go-guide/language/08-context/). It also assumes you've seen [cmd & cobra](/go-guide/project/02-cmd-and-cobra/).
+
+---
+
+## The problem: four sources of truth
+
+Every binary in this system needs configuration that arrives from four places at once: hard-coded defaults, a YAML/JSON file, environment variables, and CLI flags. The package `go/tools/viperutil` is the answer. It does **not** reinvent config parsing — it's a thin, opinionated layer over `github.com/spf13/viper` that adds three things viper doesn't give you cleanly:
+
+1. **Type-safe access via generics** — a `Value[T]` with a `Get() T`, instead of `viper.GetInt("some.key")` strings scattered everywhere.
+2. **Per-service isolated registries** — each binary (or each component inside a binary) gets its own viper pair, no global state.
+3. **Threadsafe live reload** — a `sync.Viper` wrapper that watches the config file with `fsnotify` and lets selected values change at runtime.
+
+Crucially, the *precedence* between those four layers is **inherited** from viper, not redefined here:
+
+<Mermaid title="Config precedence (highest wins)" height={360} code={`
+flowchart LR
+  Flag["CLI flag<br/>--grpc-port"] --> Env["env var<br/>MT_GRPC_PORT"]
+  Env --> File["config file<br/>grpc-port:"]
+  File --> Default["compiled default"]
+  classDef win fill:#1f6f43,stroke:#0d3,color:#fff
+  class Flag win
+`} />
+
+Read it left-to-right as "if set, this wins": an explicit `Set` beats a flag, a flag beats an env var, an env var beats the config file, and the file beats the compiled default. viperutil's job is to *wire* those layers and put a typed face on them.
+
+:::note[Two unrelated `LoadConfig`s]
+`viperutil.ViperConfig.LoadConfig` (this page) loads the *process* config. A separate `LoadConfig` elsewhere loads a cluster topology file. They are different things — don't conflate them.
+:::
+
+---
+
+## Why a wrapper at all?
+
+Raw viper is dynamically typed and globally stateful. You call `viper.GetInt("grpc.port")` from anywhere, and if you typo the key or the type, you find out at runtime. viper also defaults to one process-global instance, which is painful when a single binary embeds several components that all want a `--grpc-port`.
+
+viperutil fixes both. You declare a value once with a Go type, get back a `Value[T]`, and read it with `.Get()`. Registration is scoped to a `*Registry` you create explicitly.
+
+One design constraint is worth calling out, because it explains a lot of the structure: code under `go/tools/...` must not import the rest of the repo. That's why `ViperConfig.RegisterFlags` is *called by* the service-environment layer rather than self-registering through a hook — self-registration would create an import cycle.
+
+:::note[Upstream leftovers in the doc comments]
+The package is Vitess-derived (Apache 2.0). Some doc comments still mention `vtgate`/`vttablet` and a `doc/viper/` directory that don't exist here. Trust the code, not those comments.
+:::
+
+---
+
+## The surface: `Value[T]`, `Options[T]`, `Configure`
+
+These three identifiers are 95% of what a service author touches.
+
+### `Value[T]` — the typed handle
+
+```go title="go/tools/viperutil/value.go"
+type Value[T any] interface {
+	value.Registerable
+
+	// Get returns the current value. Static values never change after the
+	// initial load; dynamic values may change over the process lifetime.
+	Get() T
+	Set(v T)
+	Default() T
+}
+```
+
+`T` is the *actual* Go type — `int`, `string`, `time.Duration`, `[]string`, `bool`, `uint64`, and so on. Reading config becomes `c.cell.Get()` returning a `string`, with no casting and no string key at the call site. This is a textbook use of [generics](/go-guide/language/06-generics/): the type parameter collapses a family of near-identical accessors into one. The embedded `value.Registerable` is plumbing for flag binding (below); a normal caller only uses `Get`, `Set`, `Default`.
+
+### `Options[T]` — declarative knobs
+
+```go title="go/tools/viperutil/viper.go"
+type Options[T any] struct {
+	Aliases  []string // additional keys (e.g. deprecated names)
+	FlagName string   // bind a pflag of this name
+	EnvVars  []string // bind these env vars
+	Default  T        // default; zero value of T if omitted
+	Dynamic  bool     // false = static, true = live-reloadable
+	GetFunc  func(v *viper.Viper) func(key string) T // override the default getter
+}
+```
+
+This is the idiomatic **options-struct** pattern — a struct of fields, *not* functional options (see [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/)). It's declarative: each value's behavior reads top to bottom.
+
+:::caution[Gotcha — `Default` is the zero value of `T` if omitted]
+For a pointer type that means `nil`, *not* a zeroed struct. Be deliberate when `T` is a pointer or a slice.
+:::
+
+### `Configure` — the entry point
+
+```go title="go/tools/viperutil/viper.go"
+func Configure[T any](reg *Registry, key string, opts Options[T]) (v Value[T]) {
+	getfunc := opts.GetFunc
+	if getfunc == nil {
+		getfunc = GetFuncForType[T]()
+	}
+
+	base := &value.Base[T]{
+		KeyName: key, DefaultVal: opts.Default, GetFunc: getfunc,
+		Aliases: opts.Aliases, FlagName: opts.FlagName, EnvVars: opts.EnvVars,
+	}
+
+	switch {
+	case opts.Dynamic:
+		v = value.NewDynamic(reg.dynamic, base)
+	default:
+		v = value.NewStatic(reg.static, base)
+	}
+	return v
+}
+```
+
+Three things happen: (1) pick a getter — default by reflection, or your override; (2) build a `value.Base[T]`; (3) bind it to either the static or the dynamic registry based on `opts.Dynamic`.
+
+:::caution[Gotcha — don't call `.Get()` too early]
+A value is only *partially* ready after `Configure`: env vars and defaults work, but **file** config needs `LoadConfig` and **flag** config needs `BindFlags` plus a flag parse. Services therefore *store* the `Value[T]` and call `.Get()` lazily at use-time. Calling `.Get()` in a constructor and caching the result gives you only the default/env value.
+:::
+
+There's also a `KeyPrefixFunc(prefix)` helper to build dotted keys like `schema.watch_interval` without repeating the prefix everywhere.
+
+---
+
+## Generics meet reflection: `GetFuncForType[T]`
+
+Here's the puzzle: how does `Configure[int]` know to call `viper.GetInt`, and `Configure[time.Duration]` to call `viper.GetDuration`? This is the cleverest part of the package, and where generics meet reflection.
+
+A "getter" has the curried type `func(v *viper.Viper) func(key string) T` — a function that takes a viper and **returns a function** that takes a key and returns a `T`. The two-stage shape lets the getter be bound once to a specific viper (static or live) and then called repeatedly with just a key.
+
+`GetFuncForType` switches on the *reflected kind* of the zero value of `T`:
+
+```go title="go/tools/viperutil/get_func.go"
+func GetFuncForType[T any]() func(v *viper.Viper) func(key string) T {
+	var t T
+	var f any
+	typ := reflect.TypeOf(t)
+	switch typ.Kind() {
+	case reflect.Bool:
+		f = func(v *viper.Viper) func(key string) bool { return v.GetBool }
+	case reflect.Int:
+		f = func(v *viper.Viper) func(key string) int { return v.GetInt }
+	// ...
+	}
+```
+
+The `int64` case is the interesting one, because `time.Duration` *is* an `int64`:
+
+```go title="go/tools/viperutil/get_func.go"
+case reflect.Int64:
+	switch typ {
+	case reflect.TypeFor[time.Duration]():
+		f = func(v *viper.Viper) func(key string) time.Duration { return v.GetDuration }
+	default:
+		f = func(v *viper.Viper) func(key string) int64 { return v.GetInt64 }
+	}
+```
+
+So `Options[time.Duration]` resolves to `v.GetDuration` (which parses `"5s"`), while a plain `int64` resolves to `v.GetInt64`. Structs and `*struct` route through an unmarshal func that calls viper's `UnmarshalKey`. The pattern is worth internalizing: generics give the *caller* a typed API, and reflection bridges to viper's dynamically-typed `Get*` family.
+
+:::caution[Gotcha — unsupported kinds panic at startup, not at use]
+`chan`, `func`, `interface`, `array`, and `uintptr` hit `panic` branches. Because this runs inside `Configure`, the panic fires at *process init*, not on the first `.Get()`. For exotic types you must supply a custom `GetFunc`.
+:::
+
+:::note[`mapstructure`, not `encoding/json`]
+Struct config values unmarshal via `UnmarshalKey`, which uses `mitchellh/mapstructure` (a transitive viper dependency). Field mapping follows mapstructure tags/conventions, not json tags.
+:::
+
+When the default dispatch isn't right, you supply your own getter. Here a `$PATH`-style colon-separated list is split into a slice:
+
+```go title="go/tools/viperutil/funcs/get.go"
+func GetPath(v *viper.Viper) func(key string) []string {
+	return func(key string) (paths []string) {
+		for _, val := range v.GetStringSlice(key) {
+			if val != "" {
+				paths = append(paths, strings.Split(val, ":")...)
+			}
+		}
+		return paths
+	}
+}
+```
+
+---
+
+## The Registry: isolation and the static/dynamic split
+
+The registry is just a pair of vipers:
+
+```go title="go/tools/viperutil/registry.go"
+type Registry struct {
+	static  *viper.Viper
+	dynamic *sync.Viper
+}
+
+func NewRegistry() *Registry {
+	return &Registry{static: viper.New(), dynamic: sync.New()}
+}
+```
+
+This "replaces the global registry pattern, allowing each service/command to have its own isolated configuration registry." Two vipers, two roles:
+
+- **`static`** — a plain `*viper.Viper`, read once during `LoadConfig`. Static values read from it and **never change** after load.
+- **`dynamic`** — a `*sync.Viper` (a threadsafe wrapper, covered below). Dynamic values read from it and reflect live file edits.
+
+A `Combined()` method merges both into a throwaway viper for debug/dump surfaces.
+
+### Static vs dynamic values
+
+Both kinds embed a shared `Base[T]`:
+
+```go title="go/tools/viperutil/internal/value/value.go"
+type Base[T any] struct {
+	KeyName      string
+	DefaultVal   T
+	GetFunc      func(v *viper.Viper) func(key string) T
+	BoundGetFunc func(key string) T
+	Aliases      []string
+	FlagName     string
+	EnvVars      []string
+}
+
+func (val *Base[T]) Get() T { return val.BoundGetFunc(val.Key()) }
+```
+
+The entire static-vs-dynamic difference is *which viper `BoundGetFunc` is bound to*, fixed once at construction:
+
+```go title="go/tools/viperutil/internal/value/value.go" {3,8}
+func NewStatic[T any](staticReg *viper.Viper, base *Base[T]) *Static[T] {
+	base.bind(staticReg)
+	base.BoundGetFunc = base.GetFunc(staticReg)      // bound to the static viper
+	// ...
+}
+
+func NewDynamic[T any](dynamicReg *sync.Viper, base *Base[T]) *Dynamic[T] {
+	base.bind(dynamicReg)
+	base.BoundGetFunc = sync.AdaptGetter(base.Key(), base.GetFunc, dynamicReg) // per-key locking
+	// ...
+}
+```
+
+A static value's getter closes over the static viper, loaded once. A dynamic value's getter is wrapped by `sync.AdaptGetter`, which adds a per-key mutex around a read of the *live* viper.
+
+:::caution[Gotcha — static vs dynamic is per-value and effectively irreversible]
+A `Dynamic:false` value's `Get()` will **never** see a config-file edit, even while the file is being watched, because it reads the static viper that was loaded once. Only `Dynamic:true` values track live edits.
+:::
+
+`Base[T]` is shared by embedding — `*Base[T]` sits inside both `Static[T]` and `Dynamic[T]`. See [interfaces & composition](/go-guide/language/03-interfaces-composition/) for why Go favors composition here.
+
+---
+
+## Wiring the layers via `bind()`
+
+viperutil delegates *precedence* to viper but is responsible for *registering* each layer. The defaults, aliases, and env layers are wired in `Base.bind`:
+
+```go title="go/tools/viperutil/internal/value/value.go"
+func (val *Base[T]) bind(v registry.Bindable) {
+	v.SetDefault(val.Key(), val.DefaultVal)        // default layer
+
+	for _, alias := range val.Aliases {
+		v.RegisterAlias(alias, val.Key())          // alias resolution
+	}
+
+	if len(val.EnvVars) > 0 {
+		vars := append([]string{val.Key()}, val.EnvVars...)
+		_ = v.BindEnv(vars...)                      // env layer
+	}
+}
+```
+
+The **flag** layer is bound separately by `BindFlags`, which calls `BindPFlag` and auto-registers an alias when the flag name differs from the key:
+
+```go title="go/tools/viperutil/internal/value/value.go" {7-9}
+func BindFlags(fs *pflag.FlagSet, values ...Registerable) {
+	for _, val := range values {
+		flag, err := val.Flag(fs)
+		// ... handle err / nil flag ...
+		_ = val.Registry().BindPFlag(val.Key(), flag)
+		if flag.Name != val.Key() {
+			val.Registry().RegisterAlias(flag.Name, val.Key())
+		}
+	}
+}
+```
+
+The **file** layer is filled later by `LoadConfig`.
+
+:::caution[Gotcha — keys use dots, flags use dashes]
+A viper key is dotted (`config.persistence.min_interval`); the matching pflag uses dashes and no dots (`--config-persistence-min-interval`). When `FlagName` differs from the key, an alias is auto-registered so both resolve. A lint rule **hard-fails CI** if a `FlagName` contains an underscore — use dashes.
+:::
+
+### The two interfaces that decouple it
+
+Two small interfaces make the heterogeneous binding work:
+
+- `value.Registerable` exposes `Key() / Registry() / Flag()`. It exists because Go generics **cannot** express "a variadic of `Value[T]` with varying `T`"; `BindFlags` takes `...Registerable` so it can accept values of different `T`s in one call.
+- `registry.Bindable` exposes `BindEnv / BindPFlag / RegisterAlias / SetDefault`. It's satisfied by **both** `*viper.Viper` and `*sync.Viper`, with a compile-time proof:
+
+```go title="go/tools/viperutil/internal/registry/registry.go"
+var (
+	_ Bindable = (*viper.Viper)(nil)
+	_ Bindable = (*sync.Viper)(nil)
+)
+```
+
+This is how a `sync.Viper` "masquerades" as a viper for registration — `bind()` calls the same methods on either. See [interfaces & composition](/go-guide/language/03-interfaces-composition/) for the `var _ I = (*T)(nil)` assertion idiom.
+
+---
+
+## Discovery and loading: `ViperConfig` and `LoadConfig`
+
+Even the meta-configuration — where to find the file, what to do if it's missing — is itself built out of viperutil values:
+
+```go title="go/tools/viperutil/config.go"
+type ViperConfig struct {
+	configPaths                  Value[[]string]
+	configType                   Value[string]
+	configName                   Value[string]
+	configFile                   Value[string]
+	configFileNotFoundHandling   Value[ConfigFileNotFoundHandling]
+	configPersistenceMinInterval Value[time.Duration]
+}
+```
+
+These are configured with flags like `--config-path`, `--config-type`, `--config-name` (default `mtconfig`), `--config-file`, and `--config-persistence-min-interval`, plus env vars. The default search directory is `$MTDATAROOT`, falling back to a `multigres_local` directory under the working directory.
+
+`LoadConfig` does discovery, read, the not-found policy, and then starts the dynamic watch:
+
+```go title="go/tools/viperutil/config.go" {16}
+func (vc *ViperConfig) LoadConfig(reg *Registry) (context.CancelFunc, error) {
+	var err error
+	switch file := vc.configFile.Get(); file {
+	case "":
+		if name := vc.configName.Get(); name != "" {
+			reg.static.SetConfigName(name)
+			for _, path := range vc.configPaths.Get() {
+				reg.static.AddConfigPath(path)
+			}
+			err = reg.static.ReadInConfig()
+		}
+	default:
+		reg.static.SetConfigFile(file)
+		err = reg.static.ReadInConfig()
+	}
+	// ... not-found handling ...
+	return reg.dynamic.Watch(context.TODO(), reg.static, vc.configPersistenceMinInterval.Get())
+}
+```
+
+An explicit `--config-file` wins; otherwise it searches the `--config-path` dirs for `<config-name>` plus a supported extension. The returned `context.CancelFunc` stops the live-reload goroutine — hold onto it.
+
+### One enum, two parsers
+
+`ConfigFileNotFoundHandling` is an `int`-based enum — `ignore` / `warn` / `error` / `exit` — that is *both* a CLI flag value and a config-file-unmarshalable value:
+
+- It implements `pflag.Value` (via `Set` / `String` / `Type`), so `--config-file-not-found-handling=warn` works.
+- It has a custom getter that wires a mapstructure decode hook, so the same key can be parsed from an int **or** a string in a YAML file.
+
+It's a clean real example of one enum serving two parsers at once. The not-found error itself is detected with `errors.As` / `errors.Is`:
+
+```go title="go/tools/viperutil/config.go"
+func isConfigFileNotFoundError(err error) bool {
+	if errors.As(err, &viper.ConfigFileNotFoundError{}) {
+		return true
+	}
+	return errors.Is(err, os.ErrNotExist)
+}
+```
+
+See [errors](/go-guide/language/05-errors/) for `errors.As` / `errors.Is`.
+
+---
+
+## Live reload: `sync.Viper` plus fsnotify
+
+The dynamic engine holds **two** vipers: `disk` (does the `fsnotify` watch and reload) and `live` (what dynamic values read), plus a per-key mutex map.
+
+```go title="go/tools/viperutil/internal/sync/sync.go"
+type Viper struct {
+	m    sync.Mutex // guards the live/disk swap vs AllSettings
+	disk *viper.Viper
+	live *viper.Viper
+	keys map[string]*sync.Mutex
+
+	subscribers    []chan<- struct{}
+	watchingConfig bool
+	// ...
+}
+```
+
+This is where the [sync & memory-model](/go-guide/language/09-sync-and-memory-model/) and [concurrency](/go-guide/language/07-concurrency/) story lives: a global mutex guards the live/disk swap, per-key mutexes guard reads, and subscriber notification is non-blocking. Here's the whole reload cycle at a glance:
+
+<Mermaid title="Live reload cycle" height={460} code={`
+flowchart TB
+  Event["fsnotify event"] --> Read["disk.ReadInConfig<br/>(whole file)"]
+  Read --> Load["loadFromDisk()"]
+  Load --> LockAll["lock every per-key mutex<br/>+ global m"]
+  LockAll --> Swap["live = viper.New()<br/>merge disk.AllSettings()"]
+  Swap --> Notify["non-blocking notify<br/>subscribers"]
+  Get["Dynamic Value.Get()"] --> Adapt["AdaptGetter closure"]
+  Adapt --> LockKey["lock keys[key]"]
+  LockKey --> ReadLive["read live"]
+  Swap -.->|new live| ReadLive
+`} />
+
+### Reading
+
+`AdaptGetter` registers a per-key mutex and returns a getter that locks that key before reading `live`:
+
+```go title="go/tools/viperutil/internal/sync/sync.go"
+func AdaptGetter[T any](key string, getter func(v *viper.Viper) func(key string) T, v *Viper) func(key string) T {
+	// ... panics if already watching, or if key already adapted ...
+	var m sync.Mutex
+	v.keys[key] = &m
+
+	return func(key string) T {
+		m.Lock()
+		defer m.Unlock()
+		return getter(v.live)(key)
+	}
+}
+```
+
+### Reloading on file change
+
+`Watch` reads the file once, then registers `OnConfigChange`. On every change it locks *every* per-key mutex, rebuilds `live` from `disk`, then non-blocking-notifies subscribers:
+
+```go title="go/tools/viperutil/internal/sync/sync.go"
+v.disk.OnConfigChange(func(in fsnotify.Event) {
+	for _, m := range v.keys {
+		m.Lock()
+		defer m.Unlock()
+	}
+	v.loadFromDisk()
+	for _, ch := range v.subscribers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+})
+v.disk.WatchConfig()
+```
+
+`loadFromDisk` atomically swaps in a fresh `live` viper from `disk.AllSettings()`.
+
+### Write-back and persistence
+
+In-memory `Set` calls (say, from a `/debug/env` endpoint) update **only `live`, not `disk`** — deliberately — and signal a buffered channel:
+
+```go title="go/tools/viperutil/internal/sync/sync.go"
+func (v *Viper) Set(key string, value any) {
+	// We must not update v.disk here; explicit Set calls supersede future reloads.
+	v.live.Set(key, value)
+	select {
+	case v.setCh <- struct{}{}:
+	default:
+	}
+}
+```
+
+A background `persistChanges` goroutine writes `live` back to disk no more often than `--config-persistence-min-interval`.
+
+:::note[Why not write `disk` directly?]
+viper reloads the *whole* file on change, not a diff. If you edited an unrelated key in the file while an in-memory override hadn't been persisted, the next reload would clobber the override. Persisting `live` back to disk keeps manual overrides alive across reloads. Persistence is best-effort and logs on failure.
+:::
+
+:::caution[Gotcha — one watch, and ordering matters]
+Only **one** config file per `sync.Viper` — a second `Watch` returns `ErrDuplicateWatch`. `NotifyConfigReload` and `AdaptGetter` **panic** if called *after* a watch starts, so subscribe before you load. And the `cancel` returned by `LoadConfig`/`Watch` **must** be retained and called on shutdown, or the `persistChanges` goroutine leaks.
+:::
+
+---
+
+## How a real service uses it
+
+### A mostly-static service
+
+The pattern is one registry, many `Configure` calls, then the *same* registry shared into every component:
+
+```go title="go/services/multipooler/init.go" {1,11-13}
+reg := viperutil.NewRegistry()
+mp := &MultiPooler{
+	pgctldAddr: viperutil.Configure(reg, "pgctld-addr", viperutil.Options[string]{
+		Default:  "localhost:15200",
+		FlagName: "pgctld-addr",
+		Dynamic:  false,
+	}),
+	// ... ~14 more values, some with EnvVars like MT_CELL, MT_SERVICE_ID ...
+	grpcServer:     servenv.NewGrpcServer(reg),
+	senv:           servenv.NewServEnvWithConfig(reg, /* ... */),
+	topoConfig:     topoclient.NewTopoConfig(reg),
+	connPoolConfig: connpoolmanager.NewConfig(reg),
+}
+```
+
+Then `RegisterFlags` defines the pflags, calls `viperutil.BindFlags(...)`, and fans out to each component's own `RegisterFlags`.
+
+:::note[Why share one registry?]
+A single binary embeds several components, several of which want `--grpc-port`. If each component called `NewRegistry()` and registered `--grpc-port` on the same `*pflag.FlagSet`, pflag would panic on the duplicate flag. One shared `reg` means one binding per key — which is why the service-environment constructor *takes* the existing `reg` rather than creating its own.
+:::
+
+### The dynamic payoff
+
+A different service declares `Dynamic:true` values — tuning knobs you can change at runtime:
+
+```go title="go/services/multiorch/config/config.go"
+recoveryCycleInterval: viperutil.Configure(reg, "recovery-cycle-interval", viperutil.Options[time.Duration]{
+	Default:  1 * time.Second,
+	FlagName: "recovery-cycle-interval",
+	Dynamic:  true,
+	EnvVars:  []string{"MT_RECOVERY_CYCLE_INTERVAL"},
+}),
+```
+
+The getter is a trivial lazy read, and — this is the point — the consumer **re-reads it every loop iteration**, so a live edit takes effect:
+
+```go title="go/services/multiorch/recovery/recovery_loop.go"
+// Re-read every iteration so a live config edit applies.
+newInterval := re.config.GetRecoveryCycleInterval()
+re.recoveryRunner.UpdateInterval(newInterval)
+```
+
+If `recoveryCycleInterval` were `Dynamic:false`, this loop would forever see the value loaded at startup, because it would be bound to the static viper.
+
+### The cobra glue
+
+The connector that ties config to the running service registers a reload subscriber, loads the config, then wires shutdown:
+
+```go title="go/common/servenv/servenv.go" {3,7,11}
+func (sv *ServEnv) CobraPreRunE(cmd *cobra.Command) error {
+	ch := make(chan struct{})
+	viperutil.NotifyConfigReload(sv.reg, ch)   // subscribe BEFORE LoadConfig
+	go func() {
+		for range ch { /* log "Change in configuration" */ }
+	}()
+
+	watchCancel, err := sv.vc.LoadConfig(sv.reg)
+	if err != nil {
+		return fmt.Errorf("%s: failed to read in config: %w", cmd.Name(), err)
+	}
+	sv.OnTerm(watchCancel)                       // cancel the persist goroutine at shutdown
+	sv.OnTerm(func() { close(ch) })
+	return nil
+}
+```
+
+The ordering is deliberate: subscribe to reloads **before** `LoadConfig` (because subscribing panics after the watch starts), then register `watchCancel` via `OnTerm` so the persist goroutine is cancelled at shutdown. See [cmd & cobra](/go-guide/project/02-cmd-and-cobra/) for the PreRunE lifecycle and [service anatomy](/go-guide/project/05-service-anatomy/) for how `reg` threads through a service.
+
+---
+
+## Debug surface, testing, and sample configs
+
+**Debug / dump.** The merged config is exposed via `Registry.Combined()`:
+
+```go title="go/common/servenv/viperdebug/debug.go"
+func AllSettings(reg *viperutil.Registry) map[string]any {
+	return reg.Combined().AllSettings()
+}
+```
+
+**Testing.** `vipertest.Stub` swaps a value's `BoundGetFunc` to read from a test-provided viper and returns an undo func — so you can inject config without touching real registries. It type-switches on `*value.Static[T]` / `*value.Dynamic[T]` to reach the embedded `Base`. See [testing](/go-guide/language/11-testing/).
+
+**Sample configs.** A config file's keys match the flag names:
+
+```yaml title="config/multipooler.yaml"
+grpc-port: "15100"
+pgctld-addr: "localhost:15200"
+log-level: "info"
+```
+
+Note that not everything in `config/` is viper-managed — the same directory also `go:embed`s PostgreSQL/pgbackrest *templates*, which are unrelated to viperutil.
+
+:::caution[Gotcha — documented env prefixes can be stale]
+A config README may document prefixes like `MULTIGATEWAY_*` / `PGCTLD_*`, but the actual code binds explicit `EnvVars` like `MT_CELL`, `MT_SERVICE_ID`, `VT_CONFIG_PATH`. Treat any prefix table as aspirational and **verify against the `EnvVars` in code**.
+:::
+
+---
+
+## Checkpoints
+
+<details><summary>You write <code>Configure[time.Duration](reg, "x", Options[time.Duration]{})</code>. Which viper getter ends up being called, and where is that decided?</summary>
+`v.GetDuration`. `GetFuncForType[time.Duration]` reflects the kind as `Int64`, then special-cases `reflect.TypeFor[time.Duration]()` to return `v.GetDuration` rather than `v.GetInt64`.</details>
+
+<details><summary>A value is configured with <code>Dynamic:false</code>. Someone edits the watched file and changes that key. Does <code>.Get()</code> reflect the change? Why?</summary>
+No. A static value's `BoundGetFunc` is bound to `reg.static`, which is read once in `LoadConfig`. Only `Dynamic:true` values read from the `sync.Viper`'s `live` instance that `loadFromDisk` rebuilds on change.</details>
+
+<details><summary>Why does <code>BindFlags</code> take <code>...Registerable</code> instead of <code>...Value[T]</code>?</summary>
+Go generics can't express a variadic of values with *different* type parameters. `Registerable` is the non-generic subset (`Key`/`Registry`/`Flag`) that lets `BindFlags` accept a heterogeneous mix of values in one call.</details>
+
+<details><summary>Why does <code>sync.Viper.Set</code> deliberately update only <code>live</code> and not <code>disk</code>?</summary>
+viper reloads the *entire* file on change, not a diff. If an unrelated key were edited and an in-memory override hadn't been persisted, the reload would clobber it. Keeping the override in `live` (and persisting `live` to disk via `persistChanges`) protects it.</details>
+
+---
+
+## Next
+
+Continue to [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/) to see the transport layer these config flags (TLS, gRPC dial options) feed into.
+
+---
+
+## See also
+
+<CardGrid>
+  <LinkCard title="Generics" description="Value[T], Options[T], Configure[T], GetFuncForType[T]." href="/go-guide/language/06-generics/" />
+  <LinkCard title="Interfaces & composition" description="Registerable / Bindable, Base[T] embedding, the var _ I = (*T)(nil) assertion." href="/go-guide/language/03-interfaces-composition/" />
+  <LinkCard title="Concurrency" description="The fsnotify watch goroutine and the live/disk swap." href="/go-guide/language/07-concurrency/" />
+  <LinkCard title="Sync & the memory model" description="Per-key mutexes and the global swap lock." href="/go-guide/language/09-sync-and-memory-model/" />
+  <LinkCard title="Context" description="LoadConfig/Watch returning a CancelFunc; OnTerm cancellation." href="/go-guide/language/08-context/" />
+  <LinkCard title="Errors" description="errors.As / errors.Is, ErrDuplicateWatch." href="/go-guide/language/05-errors/" />
+  <LinkCard title="Stdlib & idioms" description="The options-struct pattern, reflect-driven dispatch, go:embed, mapstructure." href="/go-guide/language/10-stdlib-and-idioms/" />
+  <LinkCard title="Testing" description="vipertest.Stub for injecting config." href="/go-guide/language/11-testing/" />
+  <LinkCard title="cmd & cobra" description="The PreRunE lifecycle this config hooks into." href="/go-guide/project/02-cmd-and-cobra/" />
+  <LinkCard title="Service anatomy" description="How reg composes into a full service's Init lifecycle." href="/go-guide/project/05-service-anatomy/" />
+  <LinkCard title="Architecture & request flow" description="The services these config flags configure." href="/go-guide/project/01-architecture-request-flow/" />
+</CardGrid>

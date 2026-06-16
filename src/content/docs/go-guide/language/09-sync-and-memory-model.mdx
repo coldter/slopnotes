@@ -1,0 +1,513 @@
+---
+title: Synchronization & the Memory Model
+description: Protect shared state with mutexes, atomics, Once and WaitGroup, and reason about happens-before so a correct program is distinguishable from one that merely "works on my machine."
+sidebar:
+  order: 9
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+Go gives you two ways to coordinate goroutines: **channels** (hand off ownership of data) and **shared memory protected by synchronization** (mutexes, atomics). Unlike Java or C#, Go has no `synchronized` keyword, no implicit per-object monitor, and no lock-by-default. Nothing protects a field unless you write the protection yourself.
+
+The flip side is that the rules for *when a write becomes visible* are precise and worth internalizing early — getting them wrong is undefined behavior, not just a stale read. Throughout we'll point at a real distributed-systems codebase, **multigres** ("Vitess for Postgres"), where every one of these primitives shows up in production code.
+
+This chapter builds on [concurrency](/go-guide/language/07-concurrency/) (goroutines and channels) and [pointers, values & memory](/go-guide/language/04-pointers-values-memory/) (why these types travel by pointer).
+
+## The data race, and why it is undefined behavior
+
+A **data race** is: two goroutines access the same memory location, at least one of them writes, and there is no synchronization ordering the accesses. That is the whole definition. It does not require the accesses to be "at the same time" in any wall-clock sense.
+
+```go title="A data race"
+// RACE: two goroutines, one writes, no synchronization.
+var counter int
+go func() { counter++ }() // read-modify-write
+go func() { counter++ }() // read-modify-write
+```
+
+It is tempting to think the worst case is "we lose an increment." In Go a data race is **undefined behavior**. The compiler and CPU are allowed to reorder, cache, and *tear* a write — split a multi-word write so another goroutine sees half-old, half-new bytes. A racing program can observe values that no sequential interleaving could ever produce, or crash outright. So do not reason about racy code as "eventually consistent" — reason about it as "broken."
+
+:::caution[Gotcha]
+Even a single `bool` flag read in one goroutine and written in another is a race. There is no "small enough to be safe" access in the Go memory model. If two goroutines touch it and one writes, you need a synchronization edge.
+:::
+
+The practical tool is the **race detector**, run via the test toolchain:
+
+```bash title="Run tests with race detection"
+go test -short -v -race ./...
+```
+
+`-race` instruments every memory access and reports the two stacks involved when an unsynchronized access pair occurs. It only catches races on code paths that actually execute, so it is necessary but not sufficient — it cannot prove the *absence* of races. Run it under realistic concurrency. How to read its output lives in [tooling/debugging & profiling](/go-guide/tooling/05-debugging-profiling/) and [tooling/testing workflow](/go-guide/tooling/02-testing-workflow/).
+
+## Happens-before: the only thing the memory model guarantees
+
+The memory model is a set of "happens-before" edges. A write `W` is guaranteed visible to a read `R` only if there is a chain of happens-before edges from `W` to `R`. The edges you will use in practice:
+
+| Primitive | The edge it creates |
+|---|---|
+| **Mutex** | An `Unlock` happens-before any subsequent `Lock` of the same mutex. |
+| **Atomics** | An atomic `Store` happens-before any atomic `Load` that *observes* that stored value. |
+| **Channels** | A send happens-before the corresponding receive completes; a close happens-before a receive that returns zero because the channel is closed. |
+| **Once** | The function passed to `once.Do(f)` completes happens-before any `once.Do(...)` call *returns*. |
+| **WaitGroup** | The `Done` calls happen-before the `Wait` that they release. |
+| **Goroutine start** | The `go` statement happens-before the goroutine begins. |
+
+Everything else is unordered. Two writes with no connecting edge can be seen in either order, or not at all. This is why you cannot "just" set a flag in one goroutine and spin-read it in another — without an edge, the reader may never see the new value.
+
+Concretely, a mutex hands a write across goroutines like this: the unlock on the writer is what makes its store visible to whoever locks next.
+
+<Mermaid title="A mutex creates a happens-before edge" code={`
+sequenceDiagram
+  participant W as Writer goroutine
+  participant M as sync.Mutex
+  participant R as Reader goroutine
+  W->>M: Lock()
+  W->>W: counter = 42
+  W->>M: Unlock()
+  Note over M: Unlock happens-before<br/>the next Lock
+  R->>M: Lock()
+  R->>R: read counter (sees 42)
+  R->>M: Unlock()
+`} height={360} />
+
+Every primitive in this chapter exists to create one of these edges. The [glossary](/go-guide/reference/glossary/) has the formal phrasings of happens-before, data race, and CAS.
+
+## `sync.Mutex`: embed it, protect named fields
+
+The dominant pattern in Go is: put an **unexported** `mu sync.Mutex` as a field, document exactly which fields it guards, and have every method `Lock`/`defer Unlock` around them. The zero value of a `Mutex` is an unlocked, ready-to-use mutex — there is no constructor and no initialization step.
+
+```go title="A counter safe for concurrent use"
+type Counter struct {
+	mu sync.Mutex // guards n
+	n  int
+}
+
+func (c *Counter) Inc()       { c.mu.Lock(); defer c.mu.Unlock(); c.n++ }
+func (c *Counter) Value() int { c.mu.Lock(); defer c.mu.Unlock(); return c.n }
+```
+
+`defer c.mu.Unlock()` immediately after `Lock()` is the idiom: the unlock survives early returns and panics, so you cannot accidentally leave the mutex held. Note the receiver is `*Counter`, not `Counter` — a method on a value receiver would lock a *copy* of the mutex, protecting nothing (more on copying below).
+
+### The real thing
+
+A connection-state struct in the codebase is the clean whole-file case study. It leads with the mutex and a one-line contract, then every accessor follows the same shape:
+
+```go title="connection_state.go"
+// All methods are thread-safe.
+type ConnectionState struct {
+	// mu protects all mutable fields in this struct.
+	mu sync.Mutex
+
+	User               string
+	Settings           *Settings
+	PreparedStatements map[string]*query.PreparedStatement
+}
+
+func (s *ConnectionState) GetUser() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.User
+}
+```
+
+Three things to absorb:
+
+1. **The comment names what `mu` guards.** "mu protects all mutable fields in this struct" is not decoration — it is the contract that tells a future reader that touching `User`, `Settings`, or `PreparedStatements` without holding `mu` is a bug. The pairing of lock and data is the only thing keeping the invariant; Go will not check it for you.
+
+2. **The nil-receiver guard comes *before* the lock.** `if s == nil { return "" }` runs first. Reverse the order and `s.mu.Lock()` would dereference a nil pointer and panic. This guard recurs in nearly every method so callers holding a possibly-nil `*ConnectionState` can call methods uniformly.
+
+3. **Map mutation is protected too.** Go maps are *not* safe for concurrent write/read — a concurrent map write is detected by the runtime and crashes the process with `fatal error: concurrent map writes`, which you'll see without even needing `-race`. The mutex is what makes the map safe.
+
+:::tip[Idiom]
+A returned pointer escapes the lock. If `GetSettings` returns `s.Settings` (a `*Settings`) while holding `mu` and then unlocks, the *pointer* is safely read, but the caller must not mutate the pointed-to `Settings` afterward — that would be an unsynchronized write. That is precisely why a `Clone` method does `clone.Settings = s.Settings.Clone()` under the lock: it hands back an independent copy the caller owns outright.
+:::
+
+## Narrow the critical section: hold the lock only around the mutation
+
+`defer Unlock` is the safe default, but sometimes you want the lock held for as short a window as possible — long enough to mutate the shared fields, then released before slow or blocking work. An action-lock helper does exactly this: the semaphore (a potentially blocking call) is taken *outside* the mutex, and the mutex is held only to bump two counters.
+
+```go title="action_lock.go — blocking work outside the lock" {2-4,7-11}
+// Try to acquire the semaphore (may block).
+if err := al.sema.Acquire(ctx, 1); err != nil {
+	return ctx, mterrors.Wrap(err, "failed to acquire action lock")
+}
+
+// Generate a unique ID for this acquisition.
+al.mu.Lock()
+lockID := al.nextID
+al.nextID++
+al.currentID = lockID
+al.mu.Unlock()
+```
+
+`Release` does the same — reads `currentID` under the lock, validates it *outside* the lock, then re-takes the lock to clear state before releasing the semaphore last.
+
+:::caution[Gotcha]
+Never hold a mutex while doing slow or blocking work — I/O, channel sends, semaphore waits, or calling out to code that might re-enter and lock again. It serializes everything behind the lock and invites deadlock. Hold the lock only around the shared-memory mutation; do the blocking part outside.
+:::
+
+Note `al.sema` is a `*semaphore.Weighted` from `golang.org/x/sync/semaphore` — an **external** module, not the standard library. There is no `sync.Semaphore`. The struct here legitimately mixes three coordination tools at once: a mutex for the counters, the weighted semaphore for mutual exclusion of the action, and an `atomic.Bool` (covered below) for the released flag.
+
+## `sync.RWMutex`: only when reads vastly dominate
+
+`RWMutex` adds `RLock`/`RUnlock` for readers that may proceed concurrently with each other, while `Lock`/`Unlock` give a writer exclusive access. Use it only for read-mostly state.
+
+A server-environment struct uses one for readiness checks, keeping a plain `Mutex` for one-shot init state and a separate `RWMutex` only for the ready-check slice:
+
+```go title="servenv.go" {4-5}
+mu           sync.Mutex
+inited       bool
+listeningURL url.URL
+readyMu      sync.RWMutex
+readyChecks  []func() error
+```
+
+The reason: the `/ready` HTTP endpoint can be polled frequently by many load balancers and orchestrators at once, and each handler only *reads* the slice. The writer takes the full `Lock` to append; the readers take `RLock`:
+
+```go title="pages.go — read side"
+sv.readyMu.RLock()
+checks := sv.readyChecks
+sv.readyMu.RUnlock()
+for _, check := range checks {
+	// ... call each check without holding the lock
+}
+```
+
+Notice the reader copies the slice header out under `RLock` and *then* runs the (potentially slow) checks with the lock released — the narrow-critical-section discipline again.
+
+:::caution[Gotcha]
+`RWMutex` is not free. It does more bookkeeping than a plain `Mutex`, so under heavy writes or low read contention a plain `Mutex` is both simpler and often faster. Reach for `RWMutex` only when reads truly dominate. Also, Go's `RWMutex` is **not reentrant**: taking `RLock` while you already hold `Lock` (or any recursive locking) deadlocks. There is no "the goroutine already holds it" escape hatch.
+:::
+
+The naming convention `readyMu` next to `readyChecks` is deliberate: the lock name echoes the data it guards so the pairing is obvious at the field level.
+
+## `sync.Once`: run something exactly once
+
+`Once.Do(f)` runs `f` exactly once across all goroutines, ever. Concurrent callers block until the first `f` returns, then return without re-running it. The zero value is ready to use.
+
+```go title="Lazy singleton"
+var (
+	once     sync.Once
+	instance *Client
+)
+
+func Get() *Client {
+	once.Do(func() { instance = newClient() })
+	return instance
+}
+```
+
+In the codebase, a pooler record uses a `Once` to start a background publisher goroutine exactly once even if `Register` is called repeatedly:
+
+```go title="pooler_record.go"
+func (r *poolerRecord) Register(parent context.Context, alarm func(string)) {
+	r.registerOnce.Do(func() {
+		ctx, cancel := context.WithCancel(parent)
+		r.publisherMu.Lock()
+		r.publisherCancel = cancel
+		r.publisherMu.Unlock()
+		r.publisherWG.Go(func() {
+			r.runPublisher(ctx)
+		})
+		// ... kick off initial registration retry loop
+	})
+}
+```
+
+The doc comment for `Register` says "Idempotent." — the `Once` is what makes that true. Without it, a second `Register` would spawn a second publisher goroutine and a second cancel function, leaking the first. The happens-before guarantee matters here too: everything the `Do` body did (storing `publisherCancel`, launching the goroutine) is visible to any later caller whose `Do` returns immediately.
+
+:::note
+You will also see `sync.Once` inside generated protobuf files guarding descriptor initialization. That is machine-generated, not a teaching specimen — the hand-written use above is the one to learn from.
+:::
+
+:::caution[Gotcha]
+A `Once` cannot be reset or reused — once `Do` has fired, every future `Do` is a no-op forever. If `f` panics, the `Once` still counts as "done"; it will not retry. Design `f` to be genuinely one-shot.
+:::
+
+## `sync.WaitGroup`: fan out, then join
+
+A `WaitGroup` counts outstanding goroutines. `Add(n)` raises the counter, each goroutine calls `Done()` (usually deferred) to decrement, and `Wait()` blocks until the counter reaches zero.
+
+### Classic form
+
+A recovery loop is the textbook fan-out/join: process each shard's problems in parallel, then wait for all of them.
+
+```go title="recovery_loop.go"
+var wg sync.WaitGroup
+for _, shardProblems := range problemsByShard {
+	wg.Add(1)
+	go func(problems []types.Problem) {
+		defer wg.Done()
+		re.processShardProblems(ctx, problems[0].ShardKey, problems)
+	}(shardProblems)
+}
+wg.Wait()
+```
+
+:::caution[Gotcha]
+`Add` must happen on the launching goroutine *before* the `go` statement, never inside the spawned goroutine. If you `Add` inside, `Wait()` can observe a zero counter and return before the goroutine has even registered — a classic race. Here `wg.Add(1)` is on the loop body, before `go`.
+:::
+
+The `func(problems []types.Problem) { ... }(shardProblems)` passes the loop variable as an argument. Before Go 1.22 the loop variable was shared across iterations, so capturing `shardProblems` by closure would have every goroutine see the *last* value — passing it as an argument was the fix. As of Go 1.22 each iteration gets a fresh variable, so this is now belt-and-suspenders rather than strictly required. It is still perfectly readable, so leaving it is fine.
+
+### Modern form: `wg.Go` (Go 1.25)
+
+Go 1.25 added `WaitGroup.Go`, which fuses `Add(1)`, `go`, and `Done()` into one call:
+
+```go title="The fused form"
+r.publisherWG.Go(func() {
+	r.runPublisher(ctx)
+})
+```
+
+This is equivalent to `wg.Add(1); go func() { defer wg.Done(); r.runPublisher(ctx) }()` but impossible to misuse — you cannot forget the `Done`, and the `Add` is guaranteed to precede the goroutine. Shutdown then calls `r.publisherWG.Wait()` after cancelling the context, so it blocks until the publisher has fully stopped. Prefer `wg.Go` for new code; recognize the classic form because it is still everywhere.
+
+:::caution[Gotcha]
+Do not reuse a `WaitGroup` for a new batch until a previous `Wait()` has returned. And like all `sync` types, never copy a `WaitGroup` after first use.
+:::
+
+## `sync/atomic`: lock-free single-word access
+
+The `sync/atomic` package provides operations that read-modify-write a single memory word atomically, without a lock. Modern Go gives you typed wrappers — `atomic.Int64`, `atomic.Int32`, `atomic.Uint64`, `atomic.Bool`, `atomic.Pointer[T]` — with methods `.Load`, `.Store`, `.Add`, `.Swap`, `.CompareAndSwap`. The zero value is ready (it reads as zero).
+
+```go title="A lock-free hit counter"
+type Stats struct {
+	hits atomic.Int64
+}
+
+func (s *Stats) Hit()         { s.hits.Add(1) }
+func (s *Stats) Count() int64 { return s.hits.Load() }
+```
+
+:::tip[Idiom]
+Prefer the typed struct (`atomic.Int64`) over the old free functions (`atomic.AddInt64(&n, 1)` on a bare `int64`). The wrapper makes the field self-document as atomic and structurally prevents an accidental non-atomic `n++` somewhere — you literally cannot write `n++` on an `atomic.Int64`, only `n.Add(1)`.
+:::
+
+### Expose atomics through methods, never the field
+
+A connection pool makes its whole metrics struct out of atomic counters, unexported and reachable only through `Load()` accessors:
+
+```go title="pool.go — metrics"
+type Metrics struct {
+	maxLifetimeClosed atomic.Int64
+	getCount          atomic.Int64
+	waitCount         atomic.Int64
+	waitTime          atomic.Int64
+	// ...
+}
+
+func (m *Metrics) GetCount() int64         { return m.getCount.Load() }
+func (m *Metrics) WaitTime() time.Duration { return time.Duration(m.waitTime.Load()) }
+// ... one Load() accessor per field
+```
+
+Note `WaitTime` stores nanoseconds as an `int64` and wraps the load in `time.Duration` — a `time.Duration` *is* an `int64`, so it travels through an `atomic.Int64` cleanly. Each counter is independent, so atomics are the right tool: no two of them need to change as a unit.
+
+### Mutex for grouped invariants, atomics for independent counters
+
+The contrast is sharp in a heartbeat reader:
+
+```go title="reader.go"
+lagMu          sync.Mutex
+lastKnownLag   time.Duration
+lastKnownTime  time.Time
+lastKnownError error
+
+reads      atomic.Int64
+readErrors atomic.Int64
+```
+
+`reads` and `readErrors` are standalone counters, so they are atomics. But `lastKnownLag`, `lastKnownTime`, and `lastKnownError` form a *triple that must be consistent together* — the lag value, the time it was measured, and any error must all reflect the same heartbeat read. So they share one `Mutex`.
+
+:::caution[Gotcha]
+Two separate atomics are *not* atomic *together*. If you replaced `lagMu` with three independent atomics, a reader could `Load` `lastKnownLag` from read #5, get descheduled, and `Load` `lastKnownTime` from read #6 — observing a lag/time/error triple that never coexisted. When several values must change as one unit, you need a mutex (or a single atomic pointer to an immutable struct holding all three — see below), never N separate atomics.
+:::
+
+### Compare-and-swap loops
+
+`CompareAndSwap(old, new)` writes `new` only if the current value still equals `old`, returning whether it succeeded. It is the building block for lock-free read-modify-write: load the old value, compute the new one, try to swap, and retry if someone else changed it underneath you.
+
+A demand tracker keeps a concurrent maximum this way, with *no mutex at all*:
+
+```go title="demand_tracker.go — CAS loop"
+for {
+	old := d.buckets[currentIdx].Load()
+	if sampled <= old {
+		break
+	}
+	if d.buckets[currentIdx].CompareAndSwap(old, sampled) {
+		break
+	}
+}
+```
+
+Read this carefully. If `sampled` is not bigger than what is there, we are done. Otherwise we attempt to store `sampled`, but *only if* the bucket still holds the `old` we read. If another goroutine bumped it in between, the CAS fails, we loop, re-`Load` the new `old`, and re-decide. Why not just `if sampled > old { Store(sampled) }`? Because between the `Load` and the `Store`, another goroutine could store a *larger* value, which our `Store` would then clobber — losing the higher max. The CAS loop closes that window.
+
+:::caution[Gotcha]
+`atomic` types must never be copied. That is why `buckets` is a `[]atomic.Int64` and the code indexes into it in place (`d.buckets[currentIdx].Load()`) rather than ranging with a value copy. `for _, b := range d.buckets { b.Load() }` would copy each `atomic.Int64` into `b` — `go vet`'s `copylocks` check flags this, and even if it compiled it would operate on copies. Read-side code therefore uses index loops: `for i := range d.buckets { d.buckets[i].Load() }`.
+:::
+
+### `atomic.Pointer[T]`: lock-free read-mostly snapshots (copy-on-write)
+
+`atomic.Pointer[T]` swaps a whole pointer atomically. Combined with treating the pointed-to value as **immutable after publication**, it gives you a read-lock-free alternative to `RWMutex`: readers `Load()` the pointer and use the value with no lock; a writer builds a brand-new value and `Store`s the new pointer (copy-on-write). Nobody ever mutates the value in place.
+
+A cancel manager shows this next to a `Mutex` doing the opposite, in the *same* struct:
+
+```go title="cancel.go"
+// prefixCache maps PID prefix to gateway gRPC address. Replaced atomically
+// on cache miss or periodic refresh; reads are lock-free.
+prefixCache atomic.Pointer[map[uint32]string]
+
+// clientsMu protects clients.
+clientsMu sync.Mutex
+clients   map[string]*gatewayConn
+```
+
+The contrast is the whole lesson:
+
+- `prefixCache` is a *swap-whole-snapshot* cache. Readers `Load()` it without locking. The map it points to is never mutated after being stored — a refresh builds a fresh map and stores its pointer.
+- `clients` is *mutated in place* (entries added on demand), so it needs the `clientsMu` mutex.
+
+The same technique drives the lock-free accessors on the pooler record's `desired atomic.Pointer[...]` field:
+
+```go title="pooler_record.go — lock-free reads"
+func (r *poolerRecord) Type() clustermetadatapb.PoolerType { return r.desired.Load().Type }
+func (r *poolerRecord) Hostname() string                   { return r.desired.Load().Hostname }
+```
+
+Mutation goes through a `Mutate` method, which clones the proto, applies changes to the clone, then stores the new pointer — never touching the published value.
+
+:::caution[Gotcha]
+`atomic.Pointer` is only safe if the pointed-to value is *immutable after `Store`*. Calling `p.Load()` and then mutating the map or struct it returns is still a data race — you have only made the *pointer* read atomic, not the data behind it. The "build new, then `Store`" copy-on-write discipline is mandatory. This is the single most common way to misuse `atomic.Pointer`.
+:::
+
+### `CompareAndSwap(nil, ...)` as a do-this-once guard
+
+A pool uses a `close atomic.Pointer[chan struct{}]` both as an open/closed flag and as a one-shot guard:
+
+```go title="pool.go — one-shot open guard"
+func (pool *Pool[C]) open() {
+	closeChan := make(chan struct{})
+	if !pool.close.CompareAndSwap(nil, &closeChan) {
+		// already open
+		return
+	}
+	// ... first opener proceeds
+}
+```
+
+If `close` is still `nil`, we atomically install our close channel and proceed; if some other goroutine got there first, the CAS fails and we bail out. This is a `sync.Once`-like guard built from a single atomic, with the bonus that the stored value (the channel) is what the rest of the code uses to signal shutdown.
+
+:::caution[Gotcha]
+`atomic.Bool` is the right type for a one-shot flag read from many goroutines without a lock. `released.Store(true)` followed by `released.Load()` elsewhere creates the happens-before edge so the released-ness is visible. A plain `bool` field touched by multiple goroutines would be a race. (In the action lock, that flag rides inside a `context.Value`, tying it to [context](/go-guide/language/08-context/).)
+:::
+
+## Never copy a struct that contains a sync or atomic type
+
+This deserves its own section because it is the most common Go concurrency bug after the bare data race.
+
+```go title="The copy bug"
+type Counter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func bad(c Counter) { c.mu.Lock() } // c is a COPY: this locks a different mutex
+```
+
+Copying a `sync.Mutex`, `RWMutex`, `WaitGroup`, `Once`, or any `atomic.*` value duplicates its internal state and silently breaks it — two copies of a mutex protect nothing, a copied `WaitGroup` loses its counter, a copied atomic is a separate variable. `go vet`'s **copylocks** analyzer flags this at build time (and golangci-lint runs it; see [tooling/lint & format](/go-guide/tooling/03-lint-and-format/)).
+
+This is *why* these structs almost always travel by pointer. Every connection-state method has a pointer receiver; the demand tracker, pooler record, pool, reader, and cancel manager are all passed and stored as pointers. It is also why the demand tracker indexes its `[]atomic.Int64` in place instead of ranging over copies. See [pointers, values & memory](/go-guide/language/04-pointers-values-memory/) for the deeper treatment of receiver choice and `copylocks`.
+
+:::caution[Gotcha]
+This bites silently. `vet` catches direct copies, but it cannot catch every indirect one (e.g. storing a value-type struct in a slice and reassigning elements). The mental rule: if a struct contains a lock or atomic, it is a *pointer-only* type. Give it a `New...` constructor that returns `*T` and never expose value copies.
+:::
+
+## Lock ordering: preventing the AB/BA deadlock
+
+When one goroutine holds lock A and waits for B while another holds B and waits for A, both block forever. The defense is discipline: whenever code holds nested locks, always acquire them in the *same* documented order everywhere.
+
+A discovery struct writes the hierarchy straight into the comments:
+
+```go title="discovery.go" {2,7}
+// State (protected by mu)
+// Lock order: acquire this BEFORE CellPoolerDiscovery.mu
+mu              sync.Mutex
+cellWatchers    map[string]*CellPoolerDiscovery
+lastCellRefresh time.Time
+
+// Listeners for pooler changes (protected by listenersMu)
+listenersMu sync.Mutex
+listeners   []PoolerChangeListener
+```
+
+The parent discovery's `mu` must be taken before any child's `mu`. Because every code path obeys the same order, the cycle that causes a deadlock can never form. There is no language feature enforcing this — the comment *is* the enforcement, so it is your job to keep it true.
+
+:::tip[Idiom]
+When a struct holds more than one lock, document the acquisition order in a comment right next to the fields, and never deviate. Better still, structure code so you only ever hold one lock at a time (the narrow-critical-section approach helps here too).
+:::
+
+## Channels vs. mutexes: which to reach for
+
+Go's slogan is "Do not communicate by sharing memory; instead, share memory by communicating." That is guidance, not law. Both tools are first-class, and real code uses both — often in the same struct.
+
+Use **channels** when you are *handing off ownership* of a value, building a pipeline, or *signaling* an event. The publisher in the pooler record uses a size-1 buffered `wakeup chan struct{}` to signal "there is work to publish" without accumulating duplicate signals — a non-blocking send schedules at most one pending wakeup. The data itself lives behind an `atomic.Pointer`. So the *signal* is a channel and the *state* is an atomic, side by side.
+
+Use a **mutex (or atomic) + fields** when you are protecting shared mutable state with a simple invariant: a counter, a map, a cache, a small consistent group of fields. Forcing that through a channel (a goroutine that owns the state and serves requests over a channel) would be more code and slower for no benefit.
+
+Rules of thumb:
+
+| Access pattern | Reach for |
+|---|---|
+| One owner producing values for others to consume | channel |
+| Many goroutines updating one independent counter | atomic |
+| Many goroutines reading/writing a shared map or a group of fields with an invariant | mutex |
+| Many readers, rare writers, value treatable as immutable | `atomic.Pointer` copy-on-write |
+| "Do this exactly once" | `sync.Once` (or `CompareAndSwap(nil, ...)`) |
+
+There is no purity test here. The skill is matching the primitive to the access pattern — exactly what a single struct combining `Once` + `WaitGroup` + `atomic.Pointer` + `Mutex` demonstrates.
+
+## Checkpoints
+
+1. Why is a Go data race "undefined behavior" rather than just a possibly-stale read?
+   <details><summary>Answer</summary>Because the compiler and CPU may reorder, cache, and tear (split) memory operations when no happens-before edge constrains them. A racing program can observe values no sequential interleaving could produce, or crash. You must not reason about it as "eventually consistent" — only `-race` and proper synchronization make it safe.</details>
+
+2. In the connection-state struct, why must `if s == nil { return ... }` come before `s.mu.Lock()`?
+   <details><summary>Answer</summary>`s.mu` is a field on the pointer `s`. If `s` is nil, evaluating `s.mu.Lock()` dereferences a nil pointer and panics. The nil guard lets callers invoke methods on a possibly-nil pointer uniformly, so it must run before any field access including the lock.</details>
+
+3. Why does the demand tracker use a CAS loop instead of `if sampled > old { bucket.Store(sampled) }`?
+   <details><summary>Answer</summary>Between the `Load` of `old` and the `Store`, another goroutine could store an even larger value; a plain `Store` would clobber it and lose the higher max. `CompareAndSwap(old, sampled)` only writes if the bucket is still `old`, retrying otherwise, so concurrent updates cannot lose the maximum.</details>
+
+4. When is a single `atomic.Pointer` the right choice over three separate atomics for a lag/time/error triple?
+   <details><summary>Answer</summary>Never with three separate atomics — they are not atomic *together*, so a reader could mix fields from different reads. Either use one mutex, or store all three inside one immutable struct behind a single `atomic.Pointer` and swap the whole struct copy-on-write. Both make the triple change as one unit.</details>
+
+## Exercises
+
+1. In a thread-safe struct of your own, list every method that takes the lock and confirm each uses a pointer receiver. Then explain why returning a `*Settings` pointer is *not* sufficient to safely mutate that `Settings` afterward, and how a `Clone` under the lock avoids the problem.
+
+2. Take the CAS loop above. On paper, trace two concurrent callers where a naive `if sampled > old { Store }` loses the higher value, then explain why the bucket slice is `[]atomic.Int64` indexed in place rather than ranged over.
+
+3. Find two uses of `atomic.Pointer[T]` in any concurrent codebase. For each, decide whether the pointed-to value is treated as immutable after `Store`, and describe the bug that appears if a reader mutated the loaded value in place.
+
+4. Compare the two `WaitGroup` styles: classic `Add(1)`/`go`/`defer Done()`/`Wait()` versus `wg.Go(...)`. State in one sentence what `wg.Go` fuses, and one footgun it removes.
+
+5. Explain why a lag/time/error triple shares one mutex while independent counters are `atomic.Int64`. Construct a concrete interleaving where replacing the mutex with three atomics lets a reader observe an inconsistent triple.
+
+6. Read a `test-race` target in any Makefile. Explain what `-race` instruments, why it is necessary-but-not-sufficient, and why the target often combines `-race` with `-short`.
+
+## Next
+
+[Standard Library & Idioms](/go-guide/language/10-stdlib-and-idioms/) — the everyday packages and patterns you reach for next.
+
+## See also
+
+- [Concurrency](/go-guide/language/07-concurrency/) — goroutines and channels; the channels-vs-mutexes guidance ties back here.
+- [Context](/go-guide/language/08-context/) — an `atomic.Bool` released flag carried inside a `context.Value`, and cancellation driving a goroutine's lifecycle.
+- [Pointers, Values & Memory](/go-guide/language/04-pointers-values-memory/) — why mutex/atomic-containing structs must use pointer receivers and must not be copied (`copylocks`).
+- [Types, Structs & Methods](/go-guide/language/02-types-structs-methods/) — method-set and receiver-type background for the accessor-method-over-atomic-field idiom.
+- [Debugging & Profiling](/go-guide/tooling/05-debugging-profiling/) — the race detector in practice.
+- [Lint & Format](/go-guide/tooling/03-lint-and-format/) — `go vet` / `copylocks`.
+- [Idioms & Gotchas](/go-guide/reference/idioms-and-gotchas/) — copylocks, lock ordering, copy-on-write `atomic.Pointer`.
+- [Glossary](/go-guide/reference/glossary/) — happens-before, data race, CAS.

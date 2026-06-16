@@ -1,0 +1,543 @@
+---
+title: Types, Structs & Methods
+description: Named types vs aliases, struct literals and field tags, method receivers, the value-vs-pointer decision rule, method sets, useful zero values, and the NewXxx constructor convention.
+sidebar:
+  order: 2
+---
+
+import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+This chapter covers how Go's named types, struct literals, field tags, and method receivers actually work — and the concrete decision rules for choosing between value and pointer receivers, when to write a `NewXxx` constructor, and how a type's method set decides whether it satisfies an interface. We'll ground each idea in real code from **multigres** ("Vitess for Postgres"), a single-module Go monorepo.
+
+A method can only be declared in the same package as the type it's attached to, so package boundaries matter here. If you haven't read [Packages, Modules & Imports](/go-guide/language/01-packages-modules-imports/), the section on the local-import prefix `github.com/multigres` is worth a skim first.
+
+## Type definitions vs type aliases
+
+Go has two superficially similar `type` forms that mean completely different things. This is the single most common confusion for newcomers, and the codebase has clean real examples of each.
+
+A **type definition** creates a brand-new named type with a distinct identity. The new type shares the same *underlying* type (memory layout, operators) but is **not** interchangeable with it — you need an explicit conversion to cross between them, and you can attach your own methods to the new type.
+
+```go
+type Celsius float64      // definition: a NEW type whose underlying type is float64
+
+func (c Celsius) String() string {
+	return fmt.Sprintf("%.1f°C", float64(c))
+}
+
+var t Celsius = 36.6      // ok: an untyped constant converts implicitly
+var f float64 = 36.6
+// t = f                  // COMPILE ERROR: cannot use f (float64) as Celsius
+t = Celsius(f)            // ok: explicit conversion required
+```
+
+A **type alias** uses the `=` form. It does **not** create a new type — it's just a second spelling for an existing type. Values are assignable in both directions with no conversion, and you **cannot** attach methods through the alias (the underlying type is owned by someone else).
+
+```go
+type Temp = float64       // alias: Temp and float64 are the SAME type
+var x Temp = 1.5
+var y float64 = x         // ok, no conversion: they are identical
+// func (t Temp) Foo() {} // COMPILE ERROR: cannot define methods on float64 here
+```
+
+### A definition over a builtin
+
+The AST package defines PostgreSQL's object identifier as a distinct type over `uint32`:
+
+```go title="go/common/parser/ast/expressions.go"
+type Oid uint32
+```
+
+This is a *definition*, not an alias. The payoff is type safety: a bare `uint32` could be anything, but an `Oid` is unambiguously a PostgreSQL type OID. Named constants like `ast.TEXTOID` make the values self-documenting, and the guidance is to never hardcode `uint32 = 25` for TEXT — use the named constant. Because `Oid` is its own type, code that mixes a raw int with an OID won't compile without a visible `Oid(x)` conversion — the conversion *is* the documentation.
+
+:::caution[Gotcha]
+With `type Oid uint32`, assigning a `uint32` variable into an `Oid` field requires `Oid(x)`. That friction is the point: it forces you to acknowledge a semantic boundary. The same file defines `type AttrNumber int16`, `type Index uint32`, and `type Datum uintptr` for the same reason — each is a distinct identity even though several share the same underlying integer type.
+:::
+
+### An alias to re-export a third-party type
+
+A utility package re-exports a type from the `pglogrepl` dependency under a local, documented name:
+
+```go title="go/tools/pgutil/lsn.go"
+// LSN is a PostgreSQL Log Sequence Number.
+type LSN = pglogrepl.LSN
+```
+
+The `=` makes `pgutil.LSN` *the exact same type* as `pglogrepl.LSN`. A value produced by the dependency can be stored in a variable typed `pgutil.LSN` and vice versa with no conversion — the local `ParseLSN` just forwards to `pglogrepl.ParseLSN` and returns the result directly. The alias gives callers a stable local name without wrapping or re-implementing anything.
+
+:::tip[Idiom]
+Use an alias to *re-export* or *rename* a type you don't own. Use a definition to create a *new* type you do own (so you can give it methods and a distinct identity). If you wanted to add an `LSN` method here, the alias would block you — you'd have to switch to a definition `type LSN pglogrepl.LSN` and pay the conversion cost.
+:::
+
+### An alias as a migration shim
+
+Aliases also smooth in-place refactors. The lexer defines its token type as an alias:
+
+```go title="go/common/parser/tokens.go"
+// TokenType represents the type of a lexical token.
+// This is now just an alias for int to maintain compatibility during transition.
+// New code should use the generated parser constants directly.
+type TokenType = int
+```
+
+Because `TokenType` *is* `int`, every existing site that passed a plain `int` keeps compiling while the code migrates to the generated constants. A definition (`type TokenType int`) would have broken all those call sites at once by demanding conversions. This "alias to avoid a big-bang rename" use is exactly what the language designers added aliases for.
+
+:::note
+The practical test: *can I attach a method here, and do I want assignments to require a conversion?* If yes to either, use a definition. If you just want a synonym that stays interchangeable, use an alias.
+:::
+
+## Structs and struct literals
+
+A struct groups named fields. The codebase constructs structs with the **keyed literal** form everywhere; the positional form is avoided.
+
+```go
+type Point struct {
+	X, Y int
+}
+
+p := Point{X: 1, Y: 2}   // keyed: explicit, order-independent, future-proof
+q := Point{3, 4}         // positional: fragile — breaks/silently shifts if fields are added
+```
+
+Here's a real constructor that sets every field by name:
+
+```go title="go/common/parser/ast/expressions.go"
+func NewVar(varno int, varattno AttrNumber, vartype Oid) *Var {
+	return &Var{
+		BaseExpr: BaseExpr{BaseNode: BaseNode{Tag: T_Var}},
+		Varno:    varno,
+		Varattno: varattno,
+		Vartype:  vartype,
+	}
+}
+```
+
+Notice that `Var` has more fields than this literal sets (`Vartypmod`, `Varcollid`, `Varlevelsup`, ...). The unset fields are **not** errors — they take their type's zero value (`0` for the int-like fields). Keyed literals let you set only what matters and lean on zero values for the rest.
+
+:::caution[Gotcha]
+The positional literal `Point{3, 4}` compiles only when you list *every* field in declaration order. The moment someone adds a field, positional literals either fail to compile or silently assign your value to the wrong field. Inside one package for tiny structs it can be fine, but standardizing on keyed literals means adding a field never silently changes existing call sites. `go vet`'s `composites` check will even flag positional literals for structs imported from other packages.
+:::
+
+## Field tags
+
+A struct field can carry a backtick-quoted **tag**: arbitrary string metadata that library code reads at runtime via reflection. The compiler doesn't interpret tags; encoders like `encoding/json`, `gopkg.in/yaml.v3`, and the protobuf runtime do.
+
+```go
+type Server struct {
+	Host string `yaml:"host"`
+	Port int    `yaml:"port,omitempty"`
+}
+```
+
+The convention is `key:"value,option1,option2"`. `omitempty` tells the *marshaler* to skip the field when it equals its zero value.
+
+### YAML config tags, the small case
+
+Start with the smallest real example — the cluster config:
+
+```go title="go/cmd/multigres/command/cluster/config.go"
+type MultigresConfig struct {
+	Provisioner       string         `yaml:"provisioner"`
+	ProvisionerConfig map[string]any `yaml:"provisioner-config,omitempty"`
+}
+```
+
+And the round trip that reads those tags via reflection:
+
+```go title="go/cmd/multigres/command/cluster/config.go"
+var config MultigresConfig
+if err := yaml.Unmarshal(data, &config); err != nil { /* ... */ }
+if config.Provisioner == "" {
+	return nil, "", fmt.Errorf("provisioner not specified in config file %s", configFile)
+}
+```
+
+`yaml.Unmarshal` uses the `yaml:"provisioner"` tag to map the YAML key `provisioner` onto the Go field `Provisioner` (the exported Go field is capitalized; the wire name is lowercase). The `map[string]any` type for `ProvisionerConfig` holds arbitrary nested config that's decoded later by whichever provisioner is selected.
+
+### YAML config tags, bigger — with pointers and renames
+
+The local provisioner shows the full vocabulary — renamed wire names, `omitempty`, pointer fields for optional sub-config, and nested maps:
+
+```go title="go/provisioner/local/config.go"
+type BackupConfig struct {
+	Type  string       `yaml:"type"` // "local", "s3", "azure", etc.
+	Local *LocalBackup `yaml:"local,omitempty"`
+	S3    *S3Backup    `yaml:"s3,omitempty"`
+}
+
+type S3Backup struct {
+	Bucket            string `yaml:"bucket"`
+	Region            string `yaml:"region"`
+	Endpoint          string `yaml:"endpoint,omitempty"`
+	KeyPrefix         string `yaml:"key-prefix,omitempty"`
+	UseEnvCredentials bool   `yaml:"use-env-credentials,omitempty"`
+}
+```
+
+Two things to internalize. First, the tag renames the Go identifier to the wire name: the field `KeyPrefix` serializes as `key-prefix`. The Go name follows Go conventions (exported, CamelCase) while the YAML stays kebab-case. Second, the optional sub-configs are **pointers** (`*LocalBackup`, `*S3Backup`): a pointer field can be `nil`, which distinguishes "this block was absent" from "this block was present but empty". A non-pointer struct field can't represent absence — it would just be the zero-value struct.
+
+:::caution[Gotcha]
+`omitempty` only affects *marshaling* (writing out). It does **not** make a field required on *unmarshal*. An absent YAML key simply leaves the Go field at its zero value; nothing errors. That's precisely why the loader validates required fields by hand (`if config.Provisioner == ""`). Tags are not a validation schema.
+:::
+
+### Generated protobuf tags — dual tags, opaque fields
+
+Generated code carries two tags per field — one for protobuf, one for JSON — plus unexported bookkeeping:
+
+```go title="go/pb/serviceinfo/serviceinfoservice.pb.go"
+type BuildInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Revision      string                 `protobuf:"bytes,1,opt,name=revision,proto3" json:"revision,omitempty"`
+	Modified      bool                   `protobuf:"varint,2,opt,name=modified,proto3" json:"modified,omitempty"`
+	CommitTime    *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=commit_time,json=commitTime,proto3" json:"commit_time,omitempty"`
+	GoVersion     string                 `protobuf:"bytes,4,opt,name=go_version,json=goVersion,proto3" json:"go_version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+```
+
+A single field tag can hold multiple `key:"..."` groups separated by spaces — here `protobuf:` carries the wire type, field number, and proto name; `json:` carries the JSON name. The `protobuf:"...,1,..."` field numbers are the wire identity in protobuf, not the Go names. The message field `CommitTime` is a pointer (`*timestamppb.Timestamp`) — protobuf message-typed fields are pointers so absence is representable as `nil`.
+
+:::caution[Gotcha]
+Never hand-write or hand-edit these tags or these structs. The `state`, `unknownFields`, and `sizeCache` fields are unexported internal state. Treat generated `pb` structs as opaque: use generated getters and the constructors in `go/common/protoutil` rather than building struct literals, and never copy them by value across goroutines. Files marked `// Code generated` are regenerated by a codegen step — see [gRPC & Protobuf](/go-guide/project/04-grpc-and-protobuf/).
+:::
+
+## Methods and receivers
+
+A method is a function with an extra parameter — the **receiver** — written before the name. The receiver type must be a *named* type defined in the *same package*. The receiver doesn't have to be a struct: it can be any named type, including one whose underlying type is a slice or an integer.
+
+```go
+// Method on a named numeric type.
+func (c Celsius) String() string {          // receiver c of type Celsius
+	return fmt.Sprintf("%.1f°C", float64(c))
+}
+```
+
+### Value-receiver methods on a named slice type
+
+The `sqltypes` package defines a column value as a named slice type and hangs read-only methods on it:
+
+```go title="go/common/sqltypes/sqltypes.go"
+// Value represents a nullable column value.
+// nil means NULL, []byte{} means empty string.
+type Value []byte
+
+// IsNull returns true if the value is NULL.
+func (v Value) IsNull() bool {
+	return v == nil
+}
+```
+
+`Value` is `type Value []byte` — a *definition*, so it owns its method set. `IsNull`, `IsTrue`, and `SQLLiteral` are all **value receivers** (`func (v Value) ...`) because they only *read* the receiver. A value receiver gets its own copy of the receiver, but for a slice that copy is cheap — it copies the three-word slice header (pointer, length, capacity), not the backing bytes. There's no reason to use a pointer here, and value receivers keep the call site clean: you call `v.IsNull()` on any `Value`, addressable or not.
+
+## Value vs pointer receivers: the decision rule
+
+This is the practical heart of the chapter. The rule the codebase follows:
+
+**Use a pointer receiver `(*T)` when any of these hold:**
+
+1. the method **mutates** the receiver (otherwise it mutates a copy that's thrown away);
+2. the struct is **large** and copying it per call is wasteful;
+3. **(decisive in practice)** the struct contains a `sync.Mutex` or any other field that must not be copied;
+4. for **consistency** — if *some* method on the type needs a pointer receiver, the convention is to make *all* of them pointer receivers so the type has one uniform method set.
+
+**Use a value receiver `(T)` when** the type is small, the method only reads, and the value is naturally immutable — like `Value []byte` above.
+
+### The decisive pointer-receiver case: `Consolidator`
+
+`Consolidator` deduplicates prepared statements across connections. It embeds a mutex and three maps:
+
+```go title="go/common/preparedstatement/consolidator.go"
+type Consolidator struct {
+	mu sync.Mutex // protects the fields below
+
+	stmts      map[string]*PreparedStatementInfo
+	incoming   map[uint32]map[string]*PreparedStatementInfo
+	usageCount map[*PreparedStatementInfo]int
+	lastUsedID int
+}
+```
+
+Every method takes a pointer receiver and locks the mutex:
+
+```go title="go/common/preparedstatement/consolidator.go"
+func (psc *Consolidator) AddPreparedStatement(connId uint32, name, queryStr string, paramTypes []uint32) (*PreparedStatementInfo, error) {
+	psc.mu.Lock()
+	defer psc.mu.Unlock()
+	// ...
+}
+```
+
+Two of the rule's clauses fire at once. The method mutates state (it inserts into the maps and bumps `lastUsedID`), so a value receiver would mutate a discarded copy. More fundamentally, `sync.Mutex` **must not be copied** — a value receiver would copy the lock on every call, defeating mutual exclusion. `go vet`'s `copylocks` check flags exactly this. So the pointer receiver is mandatory, not stylistic.
+
+:::caution[Gotcha]
+Copying a struct that contains a `sync.Mutex` silently breaks locking — each copy has its own independent lock, so two goroutines can both "hold" the lock and race. This is why you must never pass such a struct by value, range over a slice of them by value, or store them in a map by value. A pointer receiver, a `NewXxx` returning `*T`, and passing `*Consolidator` around everywhere are all consequences of this one fact.
+:::
+
+### The value-receiver case: `Value`
+
+Contrast `Value []byte` from above: small (a slice header), read-only methods, no lock, naturally treated as an immutable value. A value receiver is correct and idiomatic. The `*Result` type in the *same* file goes the other way — it's a larger struct and gets a pointer-receiver method, covered below.
+
+The pair `Consolidator` (pointer, mutable, has a mutex, needs a constructor) versus `Value` (value, immutable, no constructor) is the cleanest way to remember the rule. For the underlying cost model — why copies matter and how the compiler decides what escapes to the heap — see [Pointers, Values & Memory](/go-guide/language/04-pointers-values-memory/).
+
+## Method sets and interface satisfaction
+
+A type's **method set** is the set of methods you can call through a value of that type — and it's what decides whether the type satisfies an interface. The rule that bites newcomers:
+
+- The method set of a value `T` contains only methods declared with a **value receiver** `(T)`.
+- The method set of a pointer `*T` contains methods declared with **either** receiver — both `(T)` and `(*T)`.
+
+Consequence: **if a type has any pointer-receiver method that an interface requires, only the pointer `*T` satisfies that interface — the value `T` does not.**
+
+```go
+type Stringer interface{ String() string }
+
+type Counter struct{ n int }
+func (c *Counter) String() string { return strconv.Itoa(c.n) }  // POINTER receiver
+
+var _ Stringer = &Counter{}   // ok: *Counter has String()
+// var _ Stringer = Counter{} // COMPILE ERROR: Counter (value) lacks String() in its method set
+```
+
+### `*fundamental` implements `error` only via pointer
+
+The base error type embeds a stack and declares `Error` on a pointer receiver:
+
+```go title="go/common/mterrors/mterrors.go"
+// fundamental is an error that has a message and a stack, but no caller.
+type fundamental struct {
+	msg  string
+	code mtrpcpb.Code
+	*stack
+}
+
+func (f *fundamental) Error() string { return f.msg }
+```
+
+`Error()`, `Format()`, and the code accessor are all pointer receivers, so only `*fundamental` satisfies the `error` interface (and `fmt.Formatter`). That's why the constructors hand back a `&fundamental{...}` (a pointer) rather than a value:
+
+```go title="go/common/mterrors/mterrors.go"
+func New(code mtrpcpb.Code, message string) error {
+	return &fundamental{
+		msg:   message,
+		code:  code,
+		stack: callers(),
+	}
+}
+```
+
+The same pattern governs `PgDiagnostic`. Its methods use pointer receivers, so only `*PgDiagnostic` implements `error`, and callers extract it with a pointer target. This is real production code, not just a test:
+
+```go title="go/services/multigateway/auth/pooler_credential_provider.go"
+var diag *mterrors.PgDiagnostic
+if errors.As(err, &diag) {
+	switch diag.Code { /* ... */ }
+}
+```
+
+`errors.As` walks the error chain looking for something assignable to `diag` — the declared type `*PgDiagnostic` is exactly the type that satisfies `error`, so the target passed is `&diag` (a `**PgDiagnostic`). The pointer is needed anyway to carry shared, possibly-large diagnostic data.
+
+:::caution[Gotcha]
+The method-set rule fails *silently at the assignment site*, not where the method is called. If you try to satisfy `error` with a *value* of a type whose `Error` is a pointer-receiver method, the compiler rejects it with "does not implement error (method Error has pointer receiver)". The fix is almost always to pass the pointer, which is why the constructors return pointers. Full treatment of method sets vs interfaces is in [Interfaces & Composition](/go-guide/language/03-interfaces-composition/).
+:::
+
+## Zero values and useful-zero-value design
+
+Every type in Go has a **zero value** that you get when you declare a variable without initializing it: `0` for numbers, `""` for strings, `false` for bools, `nil` for pointers/slices/maps/channels/interfaces/functions, and recursively the zero of each field for structs. Good Go design makes the zero value *useful* so callers can skip a constructor.
+
+### `sync.Mutex` is usable at its zero value
+
+A freshly declared `var mu sync.Mutex` is ready to `Lock()` — no initialization needed. That's why `Consolidator.mu` works without any setup in its constructor; only the maps need allocating.
+
+### `Value(nil)` deliberately means SQL NULL
+
+```go title="go/common/sqltypes/sqltypes.go"
+func (v Value) IsNull() bool {
+	return v == nil
+}
+```
+
+The zero value of `Value` (which is `nil`, since the underlying type is `[]byte`) is given a domain meaning: **SQL NULL**. The comment on the type spells out the contract — `nil` means NULL, `[]byte{}` means the empty string. These are two distinct states, and `IsNull` checks identity with `nil`, so an empty-but-non-nil slice is *not* null.
+
+:::caution[Gotcha]
+Don't normalize `[]byte{}` to `nil` or vice versa. `Value([]byte{})` (empty string) and `Value(nil)` (NULL) are intentionally different. Code that "cleans up" empty slices into `nil` would turn empty strings into NULLs — a correctness bug in SQL semantics.
+:::
+
+### A `nil` pointer receiver can be a valid no-op
+
+`Result` is the larger sibling of `Value`, and its `ToProto` method guards against a nil receiver:
+
+```go title="go/common/sqltypes/sqltypes.go"
+func (r *Result) ToProto() *query.QueryResult {
+	if r == nil {
+		return nil
+	}
+	// ...
+}
+```
+
+Calling a pointer-receiver method on a `nil` pointer is **legal** in Go — `r` is simply `nil` inside the method. It only panics if the body dereferences a field of `r`. By checking `if r == nil` first and returning `nil`, the method treats "no result" as a valid input and produces "no proto", letting callers write `result.ToProto()` without a nil check at every call site.
+
+:::caution[Gotcha]
+This surprises people coming from languages where any method call on null throws. In Go the panic happens *on field access*, not on the call. The pattern is safe only because `ToProto` returns before touching `r.Rows`, `r.Fields`, etc. Forgetting the guard would make the very same call panic.
+:::
+
+## The `NewXxx` constructor convention
+
+Go has no constructors built into the language. The idiom is a package-level function named `New` or `NewType` that returns `*T` (or sometimes an interface). The discriminating question: **write a constructor only when the zero value is not enough.**
+
+### When a constructor is mandatory: `NewConsolidator`
+
+```go title="go/common/preparedstatement/consolidator.go"
+func NewConsolidator() *Consolidator {
+	return &Consolidator{
+		stmts:      make(map[string]*PreparedStatementInfo),
+		incoming:   make(map[uint32]map[string]*PreparedStatementInfo),
+		usageCount: make(map[*PreparedStatementInfo]int),
+		lastUsedID: 0,
+	}
+}
+```
+
+The zero value of a map is `nil`, and **writing to a nil map panics** (reading and ranging are fine; writing is not). `Consolidator` has three maps that get written, so a bare `Consolidator{}` would panic on the first `AddPreparedStatement`. The constructor `make()`s the maps so the value is usable. This is the litmus test: if the zero value would panic or behave wrongly, a constructor is mandatory.
+
+:::caution[Gotcha]
+`var c Consolidator` compiles fine and even locks fine (the mutex zero value works) — but the first map write panics with "assignment to entry in nil map". The bug surfaces at runtime, far from the declaration. Always route construction of such types through `NewConsolidator`.
+:::
+
+### When a constructor is still used though no maps/mutex: the AST `NewXxx` family
+
+Look again at `NewVar` (and its siblings `NewConst`, `NewParam`):
+
+```go title="go/common/parser/ast/expressions.go"
+func NewVar(varno int, varattno AttrNumber, vartype Oid) *Var {
+	return &Var{
+		BaseExpr: BaseExpr{BaseNode: BaseNode{Tag: T_Var}},
+		Varno:    varno,
+		Varattno: varattno,
+		Vartype:  vartype,
+	}
+}
+```
+
+`Var` has no maps and no mutex, so why a constructor? Because the embedded `Tag` field **must** be set to the correct discriminant (`T_Var`) and the zero value (`T_Invalid`) would be wrong. The constructor encapsulates "set the tag correctly" so no caller can forget it. A constructor is justified whenever there's a non-zero invariant to establish, not only when there's memory to allocate. (And by convention they return `*Var`, not `Var`, because AST nodes are passed around by pointer and have pointer-receiver methods.)
+
+:::tip[Idiom]
+When the zero value is fully usable (like `Value` or `sync.Mutex`), write *no* constructor — adding one is noise. When there's a map/channel to `make`, a default to set, or an invariant to enforce (like a tag), write `NewXxx` returning a pointer.
+:::
+
+## Embedding (teaser)
+
+Go has no inheritance. Instead it has **embedding**: declare a field with no name — just a type — and that type's exported fields and methods are *promoted* onto the outer struct. It's composition that *looks* like inheritance at the call site.
+
+The AST nodes form a two-level embedding chain. The base provides fields and methods:
+
+```go title="go/common/parser/ast/nodes.go"
+type BaseNode struct {
+	Tag NodeTag // Node type tag
+	Loc int     // Source location in bytes
+}
+
+func (n *BaseNode) NodeTag() NodeTag { return n.Tag }
+func (n *BaseNode) Location() int    { return n.Loc }
+```
+
+The middle layer embeds the base and adds to it:
+
+```go title="go/common/parser/ast/expressions.go"
+// BaseExpr provides common expression functionality.
+type BaseExpr struct {
+	BaseNode
+}
+
+func (e *BaseExpr) IsExpr() bool { return true }
+```
+
+And a concrete node embeds the middle layer (recall `Var` from earlier: `type Var struct { BaseExpr; Varno int; ... }`). Through two levels of promotion, a `*Var` can call `Location()` — even though `Var` declares no `Location` method — because the method is promoted up from `*BaseNode` through `BaseExpr`. That's exactly why `Var.String()` can write `v.Location()`.
+
+The error types use the same mechanism with *pointer* embedding: `fundamental` embeds `*stack`, so the stack-formatting methods are promoted onto `*fundamental`.
+
+:::note
+Embedding promotes methods, which interacts with method sets — promoted pointer-receiver methods are only in the *pointer's* method set. The full treatment of embedding, method promotion, shadowing, and how it relates to interface satisfaction lives in [Interfaces & Composition](/go-guide/language/03-interfaces-composition/). This chapter only shows that promotion exists and why `v.Location()` compiles.
+:::
+
+## Checkpoints
+
+1. You see `type Status = int` and `type Status int`. Which one lets you define `func (s Status) String() string` in this package, and which one requires `Status(x)` to assign from a plain `int`?
+   <details><summary>Answer</summary>Only the definition `type Status int` lets you attach methods (you own the type) and requires an explicit conversion `Status(x)` from `int`. The alias `type Status = int` is the same type as `int` — you cannot add methods to it here, and `int` values assign directly with no conversion. See `type Oid uint32` (definition) vs `type TokenType = int` (alias).</details>
+
+2. `Consolidator` has all pointer receivers and a mandatory `NewConsolidator`, but `Value` has value receivers and no constructor. Give the one structural fact about `Consolidator` that forces each of those choices.
+   <details><summary>Answer</summary>`Consolidator` contains a `sync.Mutex` (must never be copied, so pointer receivers) and three maps that get written (a nil map write panics, so `make()` them in `NewConsolidator` — the zero value is unusable). `Value []byte` has neither: it is small, read-only, and its zero value (`nil`) is meaningful, so value receivers and no constructor are correct.</details>
+
+3. Why does `mterrors.New` return `&fundamental{...}` rather than `fundamental{...}`?
+   <details><summary>Answer</summary>`Error()` (and `Format`) are declared on a pointer receiver `(*fundamental)`. Only `*fundamental` has those methods in its method set, so only the pointer satisfies the `error` interface. Returning a value `fundamental{...}` as `error` would fail to compile.</details>
+
+4. A method does `func (r *Result) ToProto() *query.QueryResult { if r == nil { return nil }; ... }`. Why does calling this on a nil `*Result` not panic, but removing the guard would?
+   <details><summary>Answer</summary>Calling a pointer-receiver method on a nil pointer is legal — `r` is just `nil` inside. The panic happens only when the body dereferences a field of `r`. The guard returns before touching `r.Rows`/`r.Fields`; without it, the first field access would panic with a nil-pointer dereference.</details>
+
+## Exercises
+
+1. In `go/common/parser/ast/expressions.go`, find every `NewXxx` constructor (`NewVar`, `NewConst`, `NewParam`, and any others). Confirm they all return `*T` and all initialize `BaseExpr{BaseNode{Tag: ...}}`. Explain why a constructor is justified here even though these structs have no maps or mutexes. (Hint: the embedded `Tag` must not be left at its zero value.)
+
+2. Grep the alias form `type \w+ = ` versus the definition forms `type \w+ uint32` / `type \w+ int` under `go/`. List three of each (e.g. `LSN`, `TokenType` as aliases vs `Oid`, `AttrNumber` as definitions). For each, state whether you could attach a method to it *in its own package* and whether assigning from the underlying type needs an explicit conversion.
+
+3. Open `go/common/preparedstatement/consolidator.go`. In two sentences, explain why `AddPreparedStatement` uses a pointer receiver and why `NewConsolidator` must exist. Then grep `go/common/` for another struct that embeds `sync.Mutex` and verify it also has a `NewXxx` constructor and pointer-receiver methods.
+
+4. Trace the embedding chain `Var → BaseExpr → BaseNode` in `go/common/parser/ast/`. Find the line in `expressions.go` where `.Location()` is called on a `*Var` even though `Var` declares no `Location` method, and explain how method promotion makes it compile. Bonus: why are `BaseNode`'s receivers pointer receivers?
+
+## Next
+
+<LinkCard
+  title="Interfaces & Composition"
+  description="Interfaces, the full method-set-vs-interface story, and embedding/composition in depth."
+  href="/go-guide/language/03-interfaces-composition/"
+/>
+
+## See also
+
+<CardGrid>
+  <LinkCard
+    title="Packages, Modules & Imports"
+    description="The package boundary that lets methods be defined on a type, and the local-prefix import grouping seen in these files."
+    href="/go-guide/language/01-packages-modules-imports/"
+  />
+  <LinkCard
+    title="Interfaces & Composition"
+    description="Method sets vs interface satisfaction, and embedding/composition in full."
+    href="/go-guide/language/03-interfaces-composition/"
+  />
+  <LinkCard
+    title="Pointers, Values & Memory"
+    description="Why pointer receivers avoid copies and the cost model behind the value-vs-pointer decision."
+    href="/go-guide/language/04-pointers-values-memory/"
+  />
+  <LinkCard
+    title="Errors"
+    description="mterrors fundamental/wrapping/PgDiagnostic revisited as the error-handling design."
+    href="/go-guide/language/05-errors/"
+  />
+  <LinkCard
+    title="Config & viperutil"
+    description="The YAML-tagged config structs in their real configuration context."
+    href="/go-guide/project/03-config-viperutil/"
+  />
+  <LinkCard
+    title="gRPC & Protobuf"
+    description="Generated pb structs with protobuf/json tags and why they are opaque."
+    href="/go-guide/project/04-grpc-and-protobuf/"
+  />
+  <LinkCard
+    title="Parser, Lexer, AST & Codegen"
+    description="The AST node types (Oid, Var, BaseNode) and the codegen that walks them."
+    href="/go-guide/project/06-parser-lexer-ast-codegen/"
+  />
+  <LinkCard
+    title="Glossary"
+    description="Terms: method set, named type, useful zero value."
+    href="/go-guide/reference/glossary/"
+  />
+  <LinkCard
+    title="Idioms & Gotchas"
+    description="Recurring gotchas: copied mutexes, nil maps, positional literals."
+    href="/go-guide/reference/idioms-and-gotchas/"
+  />
+</CardGrid>

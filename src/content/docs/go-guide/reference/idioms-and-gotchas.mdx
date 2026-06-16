@@ -1,0 +1,275 @@
+---
+title: Idioms & Gotchas
+description: The Go traps that bite newcomers and the idioms that avoid them — typed-nil, slice aliasing, nil maps, defer in loops, goroutine leaks, and more.
+sidebar:
+  order: 3
+---
+
+import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+The Go traps that bite newcomers, and the idioms that avoid them. Each entry follows the same shape — **what goes wrong**, **why**, and **the fix** — anchored to a real example from a production codebase. Throughout we use **multigres** ("Vitess for Postgres"), a set of small Go services in front of real PostgreSQL servers, as the running source of concrete code.
+
+Many of these are caught automatically: the codebase runs `golangci-lint` with a large `govet` analyzer set, and a few custom lint rules on top. Each entry says whether CI catches it or whether it stays manual vigilance. The [full linter map](#which-linters-catch-what) is at the end.
+
+## Typed-nil interface
+
+A nil concrete pointer boxed into an interface compares `!= nil`. This is the single most surprising thing about Go interfaces.
+
+```go title="typed-nil.go"
+func f() error {
+    var p *MyError // p == nil
+    return p       // returns a NON-nil error!
+}
+```
+
+An interface value is a `(type, value)` pair. `(*MyError)(nil)` has type `*MyError` and value `nil` — the *pair* is not the zero interface, so `== nil` is false. The interface only equals `nil` when *both* halves are empty.
+
+A test in the `mterrors` package pins this down directly, comparing a real `nil`, an explicit `(error)(nil)`, and a typed nil — only the last stays non-nil:
+
+```go title="go/common/mterrors/errors_test.go"
+type nilError struct{}
+func (nilError) Error() string { return "nil error" }
+// ...
+{ err: (*nilError)(nil), want: (*nilError)(nil) }, // typed nil is NOT nil
+```
+
+:::caution[Gotcha]
+Never return a typed-nil pointer through an `error` return. Return a literal `nil`, or a declared `error` result you only assign on the error path. This one isn't caught by a linter — it's the classic Go footgun.
+:::
+
+## Loop-variable capture (historical, pre-Go 1.22)
+
+Before Go 1.22, closures and goroutines launched in a loop all captured the *same* loop variable, so they observed its final value.
+
+```go title="loopvar.go"
+for _, v := range items {
+    go func() { use(v) }() // pre-1.22: every goroutine sees the LAST v
+}
+```
+
+The cause was that the loop variable was declared once and reused each iteration. On Go 1.22+ each iteration gets a fresh variable, so the old `v := v` shadow is no longer needed. The codebase is on Go 1.25, so per-iteration variables are the default.
+
+:::note
+Treat this as a regression risk, not a live bug. The `copyloopvar` linter plus `govet`'s `loopclosure` keep the old pattern from sneaking back in. See [Concurrency](/go-guide/language/07-concurrency/) for capturing loop variables in goroutines.
+:::
+
+## Slice aliasing & append surprises
+
+`append` may mutate a backing array shared with another slice, or hand back a slice that aliases its input.
+
+```go title="append-alias.go"
+b := a[:2]
+b = append(b, x) // may overwrite a[2] if cap(a) allows
+```
+
+Slices are `{ ptr, len, cap }` headers over a shared backing array. `append` reuses the array when capacity permits and only allocates a new one when it must — so you can never assume from the call site whether the result aliases its input.
+
+The fixes:
+
+- Force a fresh header when prepending: `append([]T{x}, rest...)`.
+- Defensive copy: `slices.Clone(s)`.
+- Always assign back: `s = append(s, x)` — and don't assume `append` allocated.
+
+:::caution[Gotcha]
+`govet`'s `appends` analyzer only flags `append` with no values to add. It does **not** detect aliasing — that stays manual vigilance. The full treatment is in [Pointers, Values & Memory](/go-guide/language/04-pointers-values-memory/).
+:::
+
+## Nil map writes panic
+
+Reading a nil map is fine (it returns zero values); *writing* one panics.
+
+```go title="nil-map.go"
+var m map[string]int
+_ = m["k"] // ok, returns 0
+m["k"] = 1 // panic: assignment to entry in nil map
+```
+
+A nil map has no backing hash table: reads short-circuit to the zero value, but writes have nowhere to go. The fix is to `make(map[K]V)` before writing — typically right in the constructor. That's exactly what the codebase does; its load balancer and recovery components initialize their maps up front (`make(map[shardKey]...)`, `make(map[gracePeriodKey]...)`) so no method ever touches a nil map.
+
+## defer in loops
+
+`defer` runs at *function* return, not at loop-iteration end — so deferred cleanups stack up and leak resources for the duration of a long loop.
+
+```go title="defer-loop.go"
+for _, f := range files {
+    fh, _ := os.Open(f)
+    defer fh.Close() // every close waits until the function returns
+}
+```
+
+Deferred calls push onto a per-function stack that unwinds only when the enclosing function exits. To fire `defer` per iteration, scope the work in a closure (or just close explicitly):
+
+```go title="defer-loop-fixed.go"
+for _, f := range files {
+    func() {
+        fh, _ := os.Open(f)
+        defer fh.Close()
+        // ...
+    }()
+}
+```
+
+## Goroutine leaks (missing ctx/cancel)
+
+A goroutine that blocks forever — on a channel, a never-cancelled context, or a non-terminating loop — never exits, leaking memory and resources. Nothing reclaims a blocked goroutine, and a `context.WithCancel`/`WithTimeout` whose `cancel` is never called leaks the context's goroutine and timer too.
+
+Two habits avoid almost all of these:
+
+- `defer cancel()` immediately after creating a cancellable context — the pattern you'll see everywhere in the codebase: `ctx, cancel := context.WithTimeout(...)` then `defer cancel()`.
+- Long-running loops `select` on `<-ctx.Done()` so they have an exit.
+
+:::tip[Idiom]
+For tests, the codebase has a leak-detection helper: `LeakCheckContext(t)` returns a context auto-cancelled at test end and runs a goroutine-leak finder (built on `go.uber.org/goleak`). `govet`'s `lostcancel` analyzer also requires the `cancel` func to actually be called. See [Context](/go-guide/language/08-context/).
+:::
+
+## Error shadowing with `:=`
+
+An inner `:=` silently creates a *new* `err`, masking the outer one — so a later check reads the wrong variable and an error gets lost.
+
+```go title="err-shadow.go"
+err := step1()
+if cond {
+    x, err := step2() // NEW err, shadows the outer one
+    _ = x
+}
+return err // outer err — step2's error is silently lost
+```
+
+`:=` declares a new variable in the inner scope whenever at least one name on the left is new. The fix is plain discipline: use `=` (not `:=`) when reusing an existing `err`, or name the new value distinctly.
+
+:::caution[Gotcha]
+CI does **not** catch this here — `govet`'s `shadow` analyzer is present but commented out in the lint config. A related linter, `nilerr`, flags returning `nil` when `err` is non-nil, but it's a heuristic with intentional exceptions marked by `//nolint:nilerr` (e.g. a best-effort abort path that deliberately returns `nil, nil`). This one is on you to get right.
+:::
+
+## `time.After` leaks
+
+The timer behind `time.After` isn't garbage-collected until it fires. In a hot loop, or on a branch that never selects it, these accumulate — each `time.After` allocates a `time.Timer` that the runtime holds until expiry.
+
+The safe one-shot form puts it in a `select` that also watches `<-ctx.Done()`, so the timer is collected when the `select` returns:
+
+```go title="go/services/multigateway/poolergateway/notification_adapter.go"
+select {
+case <-ctx.Done():
+    return
+case <-time.After(2 * time.Second):
+}
+```
+
+For long-lived or repeated waits, prefer a reusable `time.Timer`/`time.Ticker` and `Stop()` it. A nice testability trick the codebase uses: wrap timers behind a small `Timer` interface (`After(d) <-chan time.Time`) whose real implementation calls `time.After`, so tests can inject a fake clock.
+
+:::note
+In the consensus package, `time.After` (and `time.Now`/`time.Tick`/`time.Sleep`) are *banned outright* by a custom lint rule — for **determinism** in consensus simulation, not for leak reasons. That ban is scoped to consensus only, not repo-wide.
+:::
+
+## Copying sync types (copylocks)
+
+Copying a struct that embeds `sync.Mutex`, `RWMutex`, or `WaitGroup` copies the lock's internal state, producing two locks that don't coordinate.
+
+```go title="copylocks.go"
+type S struct{ mu sync.Mutex }
+func bad(s S) {} // copies the mutex — bug
+```
+
+Locks must be *shared*, not duplicated; a copied mutex carries its own stale state. The fix is to pass and hold such structs by pointer, and never assign them after first use. The codebase's discovery component, for instance, embeds `mu sync.Mutex` and `wg sync.WaitGroup` by value and is only ever used through pointer receivers.
+
+:::tip[Idiom]
+This is well-guarded: `govet`'s `copylocks` and `waitgroup` analyzers both flag it. When a struct holds a no-copy field, the whole struct inherits the no-copy constraint — so use it by pointer only. See [Sync & Memory Model](/go-guide/language/09-sync-and-memory-model/).
+:::
+
+## Map iteration order
+
+`for range aMap` visits keys in a *randomized* order that differs each run — a recipe for non-deterministic output and flaky tests. Go randomizes map iteration *on purpose*, precisely to stop code from depending on order.
+
+The fix is to collect the keys, sort them, then iterate. The codebase ships a `sortedmaps` helper (`Keys`/`Values`/`All` for `cmp.Ordered`, `ByStr` for any `comparable`) that sorts before iterating, so callers don't reimplement it each time.
+
+:::note
+In the consensus package, two custom lint rules enforce this — one forbids a bare `for ... range aMap`, the other forbids the stdlib `maps.Keys/Values/All` in favor of the sorted helpers. Both are scoped to consensus (for reproducible simulation), not repo-wide.
+:::
+
+## Struct comparability
+
+Using a struct as a map key, or comparing two with `==`, fails to **compile** if any field is non-comparable.
+
+```go title="comparability.go"
+type K struct{ tags []string } // slice field
+var m map[K]int                 // compile error: invalid map key type
+```
+
+A struct is comparable only if *all* its fields are comparable. Slices, maps, and funcs are not comparable, so a struct containing one isn't either. Keep map-key structs small and all-comparable — strings, ints, bools, pointers, arrays of comparables. The load balancer's `shardKey` is the model:
+
+```go title="go/services/multigateway/poolergateway/load_balancer.go"
+type shardKey struct {
+    tableGroup string
+    shard      string
+}
+// used as: leaders map[shardKey]*clustermetadatapb.LeaderObservation
+```
+
+See [Types, Structs & Methods](/go-guide/language/02-types-structs-methods/) for the full rule.
+
+## Which linters catch what
+
+Most — but not all — of these gotchas are caught in CI. This is the scorecard:
+
+| Gotcha | Linter / rule | Status |
+| --- | --- | --- |
+| Loop-variable capture | `copyloopvar`, `govet:loopclosure` | enabled |
+| `append` misuse (no values) | `govet:appends` | enabled (aliasing not detected) |
+| Missing `cancel` (ctx leak) | `govet:lostcancel` | enabled |
+| Copying sync types | `govet:copylocks`, `govet:waitgroup` | enabled |
+| Nil / impossible comparisons | `govet:nilness`, `govet:nilfunc` | enabled |
+| `sync/atomic` misuse | `govet:atomic` | enabled |
+| Unused writes | `govet:unusedwrite` | enabled |
+| Returning `nil` with non-nil `err` | `nilerr` | enabled (heuristic; `//nolint:nilerr` exceptions) |
+| Map iteration order | ruleguard `requireSortedMapIteration` / `requireSortedMapsOverStdlibMaps` | scoped to consensus |
+| Wall-clock in consensus | ruleguard `disallowWallClockInConsensus` | scoped to consensus |
+| **Error shadowing with `:=`** | `govet:shadow` | **commented out — manual vigilance** |
+| **Typed-nil interface** | — | none — manual vigilance |
+| **Slice aliasing** | — | none — manual vigilance |
+
+See [Lint & Format](/go-guide/tooling/03-lint-and-format/) for how these run.
+
+## See also
+
+<CardGrid>
+  <LinkCard
+    title="Errors"
+    description="Typed-nil interface, wrapping, and the mterrors package where typed-nil is tested."
+    href="/go-guide/language/05-errors/"
+  />
+  <LinkCard
+    title="Concurrency"
+    description="Goroutine leaks, select on ctx.Done, and loop-variable capture in goroutines."
+    href="/go-guide/language/07-concurrency/"
+  />
+  <LinkCard
+    title="Context"
+    description="WithCancel/WithTimeout plus defer cancel, and the lostcancel analyzer."
+    href="/go-guide/language/08-context/"
+  />
+  <LinkCard
+    title="Sync & Memory Model"
+    description="Why copying a struct with an embedded sync.Mutex is a bug (copylocks)."
+    href="/go-guide/language/09-sync-and-memory-model/"
+  />
+  <LinkCard
+    title="Pointers, Values & Memory"
+    description="Slice aliasing & append, struct copying, nil-vs-empty slices."
+    href="/go-guide/language/04-pointers-values-memory/"
+  />
+  <LinkCard
+    title="Types, Structs & Methods"
+    description="Struct comparability and what makes a valid map key."
+    href="/go-guide/language/02-types-structs-methods/"
+  />
+  <LinkCard
+    title="Lint & Format"
+    description="golangci-lint and the govet analyzers that guard these gotchas."
+    href="/go-guide/tooling/03-lint-and-format/"
+  />
+  <LinkCard
+    title="Glossary"
+    description="Slice header, typed nil, copylocks, comparability — the terms in one place."
+    href="/go-guide/reference/glossary/"
+  />
+</CardGrid>

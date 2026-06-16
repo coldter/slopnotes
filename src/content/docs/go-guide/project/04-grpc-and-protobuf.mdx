@@ -1,0 +1,657 @@
+---
+title: gRPC & Protobuf
+description: How .proto files become Go, and how a real server and client wire generated types over the query path.
+sidebar:
+  order: 4
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { FileTree, Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+**What you will learn:** how a real distributed system defines its inter-service RPC layer in `.proto` files, how those files turn into Go, and how a working server and client wire the generated types together over the query path.
+
+**Prerequisites:** this builds on [interfaces & composition](/go-guide/language/03-interfaces-composition/) (the generated server type is an interface satisfied by struct embedding), [generics](/go-guide/language/06-generics/) (generated stream types are generic), [context](/go-guide/language/08-context/) (every RPC threads a `context.Context`), and [errors](/go-guide/language/05-errors/) (the wire error model uses `errors.As`/`errors.Is` and a code-carrying interface). If you haven't read [architecture & request flow](/go-guide/project/01-architecture-request-flow/), skim it first — this page dissects the RPC plumbing underneath that flow.
+
+---
+
+## The big picture
+
+Multigres is several Go processes talking to each other. A client speaks the PostgreSQL wire protocol to a gateway; the gateway calls a pooler over gRPC; the pooler runs real SQL against PostgreSQL. Off to the side, consensus and admin services talk to the same components.
+
+<Mermaid title="Who talks to whom" height={360} code={`
+flowchart LR
+  Client(["client (PG wire)"]) --> GW["multigateway"]
+  GW -->|"gRPC"| POOL["multipooler"]
+  POOL -->|"libpq"| PG[("PostgreSQL")]
+  ORCH["multiorch"] -.->|"consensus / failover"| POOL
+  ADMIN["multiadmin"] -.->|"gRPC + REST"| POOL
+`} />
+
+Every arrow labelled "gRPC" is generated from a `.proto` file in `proto/`. The contract — message shapes, method names, error codes — lives in those files; the Go under `go/pb/` is mechanically derived from them and checked into the repo.
+
+:::note[Read generated code for shape, not logic]
+The generated `.pb.go` is large and machine-written — one service file alone is around 90 KB. When you're debugging, trace to the hand-written source rather than picking through generated code. We read the generated files here only to learn their *shape*, then live in the proto plus the hand-written service/client files.
+:::
+
+---
+
+## The proto layout: service vs. data split
+
+The first thing to understand is *why* there are two kinds of `.proto` file. The RPC messages and the service definitions live in separate files on purpose, because the messages double as wire format **and** storage format (and feed an internal non-gRPC transport too). Keeping the data definitions independent of any one transport is what makes that possible.
+
+A typical service file imports its messages from one or more sibling data files:
+
+| Service file (`*service.proto`) | Data file(s) it imports |
+| --- | --- |
+| `consensusservice.proto` | `consensusdata.proto`, `multipoolermanagerdata.proto` |
+| `multipoolermanagerservice.proto` | `multipoolermanagerdata.proto` |
+
+The cleanest example is `proto/consensusservice.proto` (package `consensus`). It defines **no messages of its own** — it imports the data files and references their types directly:
+
+```proto title="proto/consensusservice.proto"
+import "consensusdata.proto";
+import "multipoolermanagerdata.proto";
+
+service MultiPoolerConsensus {
+  rpc Recruit(consensusdata.RecruitRequest) returns (consensusdata.RecruitResponse);
+  rpc Promote(consensusdata.PromoteRequest) returns (consensusdata.PromoteResponse);
+  // ...
+}
+```
+
+:::note
+Not every service follows the split cleanly. `multiorchservice.proto` defines its request/response messages *inline* and does not import its `multiorchdata.proto` sibling (which exists but is unreferenced); `multipoolerservice.proto` is the other inline case (see the callout below). Treat the split as the *intended* style — but check the actual `import` lines before assuming a sibling `*data.proto` is in use.
+:::
+
+:::tip[Why `multipoolerservice.proto` breaks the convention]
+The latency-sensitive query path defines its request/response messages *inline* rather than owning a sibling `*data.proto`. It does this because it composes shared types from other files — `query.proto` (`query.Target`, `query.QueryResultPayload`, `query.ReservedState`) and `mtrpc.proto` (`mtrpc.CallerID`) — so there's no single data file to factor out. Its imports make that visible:
+
+```proto title="proto/multipoolerservice.proto"
+import "clustermetadata.proto";
+import "google/protobuf/duration.proto";
+import "mtrpc.proto";
+import "query.proto";
+```
+:::
+
+Every `.proto` declares its package and its Go output path:
+
+```proto title="proto/multigatewayservice.proto"
+package multigatewayservice;
+option go_package = "github.com/multigres/multigres/go/pb/multigatewayservice";
+```
+
+`go_package` is the directory under `go/pb/` that the generator writes into. A proto `import "query.proto"` becomes a normal Go import of `github.com/multigres/multigres/go/pb/query` in the generated code. So the two trees mirror each other — one proto package per generated Go package:
+
+<FileTree>
+- proto/
+  - **multigatewayservice.proto** service: one `CancelQuery` RPC
+  - multipoolerservice.proto service: query path (inline messages)
+  - consensusservice.proto service: imports its data files
+  - consensusdata.proto data: `Recruit`/`Promote` messages
+  - query.proto shared types (`Target`, `QueryResultPayload`)
+  - mtrpc.proto error model (`Code`, `RPCError`)
+- go/
+  - pb/
+    - multigatewayservice/ generated from `multigatewayservice.proto`
+    - multipoolerservice/ generated, ~90 KB of code
+    - query/ generated shared types
+    - ... one package per `.proto`
+</FileTree>
+
+---
+
+## How the codegen works
+
+You don't write the Go under `go/pb/` by hand — a single `make proto` invocation runs the protobuf compiler with three plugins and copies the result into place. There's no `buf` wrapper here; it's raw `protoc`:
+
+```bash title="Makefile (the proto recipe)"
+protoc \
+  --plugin=protoc-gen-go --go_out=. \
+  --plugin=protoc-gen-go-grpc --go-grpc_out=. \
+  --plugin=protoc-gen-grpc-gateway --grpc-gateway_out=. \
+  --grpc-gateway_opt=generate_unbound_methods=true \
+  --proto_path=proto $(PROTO_SRCS) && \
+mkdir -p go/pb && \
+cp -Rf github.com/multigres/multigres/go/pb/* go/pb/ && \
+rm -rf github.com/ google.golang.org/
+```
+
+Three plugins produce three kinds of output per service:
+
+| Plugin | Reads | Emits | Contains |
+| --- | --- | --- | --- |
+| `protoc-gen-go` | messages | `*.pb.go` | struct types + getters + reflection |
+| `protoc-gen-go-grpc` | services | `*_grpc.pb.go` | client/server interfaces, registration |
+| `protoc-gen-grpc-gateway` | `(google.api.http)` annotations | `*.pb.gw.go` | REST-to-gRPC adapter |
+
+Because of the `go_package` option, the compiler first writes into a scratch `github.com/multigres/...` tree; the recipe copies that into `go/pb/` and deletes the scratch dirs. The output is committed and stamped `// Code generated by ... DO NOT EDIT.` Trace bugs to the `.proto` source and regenerate — never hand-edit `go/pb/`.
+
+---
+
+## Generated messages (`*.pb.go`)
+
+Take the simplest service, `MultiGatewayService`, which has a single unary RPC. Its `CancelQueryRequest` message generates into a Go struct:
+
+```go title="go/pb/multigatewayservice/multigatewayservice.pb.go"
+type CancelQueryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ProcessId     uint32 `protobuf:"varint,1,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
+	SecretKey     uint32 `protobuf:"varint,2,opt,name=secret_key,json=secretKey,proto3" json:"secret_key,omitempty"`
+	Replica       bool   `protobuf:"varint,3,opt,name=replica,proto3" json:"replica,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+```
+
+Anatomy:
+
+- **Opaque header** — `state`, `unknownFields`, `sizeCache` are unexported runtime bookkeeping. You never touch them. The `` `protogen:"open.v1"` `` tag marks the modern "opaque API" mode.
+- **Exported fields** carry `` `protobuf:"..."` `` struct tags encoding the field number, wire type, and JSON name. The proto field number (`= 1`, `= 2`) is the wire identity and must never be reused — that's the basis of forward/backward compatibility.
+- **Methods** `Reset()`, `String()`, `ProtoReflect()` satisfy the protobuf-v2 `proto.Message` interface; the generated `ProtoMessage()` marker (and `Descriptor()`) are legacy v1 hold-overs you can ignore.
+- **Nil-safe getters** for every field:
+
+```go title="go/pb/multigatewayservice/multigatewayservice.pb.go"
+func (x *CancelQueryRequest) GetProcessId() uint32 {
+	if x != nil {
+		return x.ProcessId
+	}
+	return 0
+}
+```
+
+:::tip[Idiom: always use `GetX()` on proto messages]
+A generated getter returns the zero value when the receiver *or* an intermediate message is nil, so you can chain through optional nested messages safely. You'll see this everywhere in handler code: `req.GetReservationOptions().GetReasons()` walks two possibly-nil messages without a panic. It's the proto equivalent of nil-safe access you'd otherwise write by hand — see [pointers & memory](/go-guide/language/04-pointers-values-memory/) for why a nil `*CancelQueryRequest` is a valid receiver.
+:::
+
+An empty message still becomes a real struct — `CancelQueryResponse` generates a struct with only the opaque header. Empty responses are normal: the *fact* of a successful return is the payload.
+
+---
+
+## Generated service interfaces (`*_grpc.pb.go`)
+
+The `*_grpc.pb.go` file for `MultiGatewayService` is small enough to read end to end, which makes it the perfect specimen for the generated gRPC shape.
+
+It opens with a **version guard** — a compile-time assertion that the generated file matches the linked gRPC runtime:
+
+```go title="go/pb/multigatewayservice/multigatewayservice_grpc.pb.go"
+const _ = grpc.SupportPackageIsVersion9 // requires gRPC-Go v1.64.0+
+```
+
+**The client side** is an interface, an unexported impl, and a constructor:
+
+```go title="go/pb/multigatewayservice/multigatewayservice_grpc.pb.go"
+type MultiGatewayServiceClient interface {
+	CancelQuery(ctx context.Context, in *CancelQueryRequest, opts ...grpc.CallOption) (*CancelQueryResponse, error)
+}
+
+type multiGatewayServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewMultiGatewayServiceClient(cc grpc.ClientConnInterface) MultiGatewayServiceClient {
+	return &multiGatewayServiceClient{cc}
+}
+```
+
+You construct a client by handing `NewXClient` a live `*grpc.ClientConn`. The method just marshals the request and calls `cc.Invoke` on a generated full-method-name constant (`/multigatewayservice.MultiGatewayService/CancelQuery`).
+
+**The server side** is an interface you must implement, plus a mandatory embed:
+
+```go title="go/pb/multigatewayservice/multigatewayservice_grpc.pb.go"
+type MultiGatewayServiceServer interface {
+	CancelQuery(context.Context, *CancelQueryRequest) (*CancelQueryResponse, error)
+	mustEmbedUnimplementedMultiGatewayServiceServer()
+}
+
+type UnimplementedMultiGatewayServiceServer struct{}
+
+func (UnimplementedMultiGatewayServiceServer) CancelQuery(context.Context, *CancelQueryRequest) (*CancelQueryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CancelQuery not implemented")
+}
+func (UnimplementedMultiGatewayServiceServer) mustEmbedUnimplementedMultiGatewayServiceServer() {}
+```
+
+The interface has an unexported method `mustEmbedUnimplementedMultiGatewayServiceServer()`. The only way to satisfy it is to embed `UnimplementedMultiGatewayServiceServer` — interface satisfaction by **struct embedding** ([interfaces & composition](/go-guide/language/03-interfaces-composition/)).
+
+:::caution[Gotcha — embed by value, and embed it for forward compatibility]
+The generated comment says to embed `UnimplementedXServer` *by value, not pointer*, to avoid a nil-pointer dereference. The deeper reason for the embed: when a new `rpc` is added to the proto, every existing server keeps compiling, because the embedded `Unimplemented` type already provides a method for it. `RegisterXServer` even self-tests this at startup by calling a generated `testEmbeddedByValue()` probe, so a pointer-embed bug fails at registration instead of at runtime under load.
+:::
+
+Finally, the **registration function + service descriptor**:
+
+```go title="go/pb/multigatewayservice/multigatewayservice_grpc.pb.go"
+func RegisterMultiGatewayServiceServer(s grpc.ServiceRegistrar, srv MultiGatewayServiceServer) {
+	// ...
+	s.RegisterService(&MultiGatewayService_ServiceDesc, srv)
+}
+
+var MultiGatewayService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "multigatewayservice.MultiGatewayService",
+	HandlerType: (*MultiGatewayServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{{MethodName: "CancelQuery", Handler: _MultiGatewayService_CancelQuery_Handler}},
+	Streams:     []grpc.StreamDesc{},
+	Metadata:    "multigatewayservice.proto",
+}
+```
+
+The `ServiceDesc` is the routing table: it maps wire method names to generated `_Handler` functions. Each `_Handler` decodes the request, then either calls your method directly or wraps it in the configured interceptor chain.
+
+---
+
+## Unary vs. streaming RPC shapes
+
+gRPC has three call shapes, and `proto/multipoolerservice.proto` exercises all of them:
+
+```proto title="proto/multipoolerservice.proto"
+rpc ExecuteQuery(ExecuteQueryRequest) returns (ExecuteQueryResponse);                          // unary
+rpc StreamExecute(StreamExecuteRequest) returns (stream StreamExecuteResponse);                // server-streaming
+rpc CopyBidiExecute(stream CopyBidiExecuteRequest) returns (stream CopyBidiExecuteResponse);   // bidi
+```
+
+The `stream` keyword on either side changes the generated Go server signature:
+
+| Shape | Server method signature |
+| --- | --- |
+| Unary | `ExecuteQuery(context.Context, *ExecuteQueryRequest) (*ExecuteQueryResponse, error)` |
+| Server-stream | `StreamExecute(*StreamExecuteRequest, grpc.ServerStreamingServer[StreamExecuteResponse]) error` |
+| Bidi | `CopyBidiExecute(grpc.BidiStreamingServer[CopyBidiExecuteRequest, CopyBidiExecuteResponse]) error` |
+
+The stream parameter types are **Go generics** ([generics](/go-guide/language/06-generics/)): `grpc.ServerStreamingServer[T]` and `grpc.BidiStreamingServer[Req, Resp]`. The generator also emits friendly **type aliases** so you can name them in handler signatures:
+
+```go title="go/pb/multipoolerservice/multipoolerservice_grpc.pb.go"
+type MultiPoolerService_StreamExecuteServer   = grpc.ServerStreamingServer[StreamExecuteResponse]
+type MultiPoolerService_CopyBidiExecuteServer = grpc.BidiStreamingServer[CopyBidiExecuteRequest, CopyBidiExecuteResponse]
+```
+
+:::caution[Gotcha — these are aliases, not new types]
+The `MultiPoolerService_*Server` names use `=`, so they're *aliases*, fully interchangeable with the underlying generic instantiation. The generics in generated gRPC stream types arrived in gRPC-Go v1.64 (hence the `SupportPackageIsVersion9` guard); older Vitess-style code used per-RPC named interfaces instead.
+:::
+
+The mental model:
+
+- **Unary** = one request, one response. Like a function call.
+- **Server-streaming** = one request, the server pushes N responses via `stream.Send(...)`, ending when the handler returns (the framework signals `io.EOF` to the client).
+- **Bidi** = both sides `Send`/`Recv` independently until one closes.
+
+---
+
+## Registering a server
+
+The gateway, pooler, and orch share one server-construction path in `go/common/servenv/grpc_server.go`. `Create()` assembles a list of `grpc.ServerOption` (TLS creds, message-size limits, keepalive) and adds OpenTelemetry plus interceptors before building the server:
+
+```go title="go/common/servenv/grpc_server.go"
+opts = append(opts, grpc.KeepaliveParams(ka))
+opts = append(opts, grpc.StatsHandler(otelgrpc.NewServerHandler()))  // OTel = StatsHandler, NOT interceptor
+interceptorOpts, err := g.interceptors()
+// ...
+opts = append(opts, interceptorOpts...)
+g.Server = grpc.NewServer(opts...)
+```
+
+Each service registers itself in a `servenv` `OnRun` hook, gated by `CheckServiceMap` so a process only serves the services it's configured for:
+
+```go title="go/services/multipooler/grpcpoolerservice/service.go"
+func RegisterPoolerServices(senv *servenv.ServEnv, grpc *servenv.GrpcServer) {
+	poolerserver.RegisterPoolerServices = append(poolerserver.RegisterPoolerServices, func(p *poolerserver.QueryPoolerServer) {
+		if grpc.CheckServiceMap("pooler", senv) {
+			srv := &poolerService{pooler: p, pubsub: p.PubSubListener()}
+			multipoolerpb.RegisterMultiPoolerServiceServer(grpc.Server, srv)
+		}
+	})
+}
+```
+
+And `poolerService` embeds the generated `Unimplemented` type, exactly as the previous section predicted:
+
+```go title="go/services/multipooler/grpcpoolerservice/service.go"
+type poolerService struct {
+	multipoolerpb.UnimplementedMultiPoolerServiceServer
+	pooler *poolerserver.QueryPoolerServer
+	pubsub *pubsub.Listener
+}
+```
+
+:::caution[Gotcha — register before `Serve`]
+gRPC panics with `grpc: Server.RegisterService after Server.Serve` if you register a service after serving starts. The codebase avoids this structurally: `servenv` runs *all* `OnRun` hooks between `Create()` and `Serve()`. `Serve()` then registers reflection, a shared `ServiceInfo` service, and `grpc_health`, and finally calls `g.Server.Serve(listener)`.
+:::
+
+### Interceptors
+
+Interceptors are gRPC's middleware. They're chained here with `grpc-ecosystem/go-grpc-middleware`:
+
+```go title="go/common/servenv/grpc_server.go"
+return []grpc.ServerOption{
+	grpc.UnaryInterceptor(grpcmiddleware.ChainUnaryServer(collector.unaryInterceptors...)),
+	grpc.StreamInterceptor(grpcmiddleware.ChainStreamServer(collector.streamInterceptors...)),
+}
+```
+
+The only built-in interceptor is an optional auth plugin, added as both a unary and a stream interceptor only when auth mode is configured. Two things worth internalizing:
+
+- **OpenTelemetry tracing is a `StatsHandler`, not an interceptor.** Stats handlers see lower-level connection/RPC events; don't look for tracing in the interceptor chain.
+- When there are zero interceptors, the builder returns an empty option slice — no chain is installed at all.
+
+See [service anatomy](/go-guide/project/05-service-anatomy/) for how `OnRun`/`OnClose` hooks fit a service's lifecycle.
+
+---
+
+## Dialing clients
+
+There are **two client-lifetime strategies** in this codebase — know which one you're looking at.
+
+**(a) Per-connection client (query path).** The gateway holds one generated client per pooler connection:
+
+```go title="go/services/multigateway/poolergateway/grpc_query_service.go"
+type grpcQueryService struct {
+	conn   *grpc.ClientConn
+	client multipoolerservice.MultiPoolerServiceClient
+	// ...
+}
+
+func newGRPCQueryService(conn *grpc.ClientConn, /* ... */) queryservice.QueryService {
+	return &grpcQueryService{
+		conn:   conn,
+		client: multipoolerservice.NewMultiPoolerServiceClient(conn),
+		// ...
+	}
+}
+```
+
+**(b) Cached persistent client (consensus/manager path).** `go/common/rpcclient` keeps one persistent `*grpc.ClientConn` per pooler address with LRU eviction and reference counting — a pattern borrowed from Vitess's `cachedConnDialer`. Every RPC method follows the same shape:
+
+```go title="go/common/rpcclient/grpc_client.go"
+func (c *Client) Recruit(ctx context.Context, pooler *clustermetadatapb.MultiPooler, request *consensusdatapb.RecruitRequest) (*consensusdatapb.RecruitResponse, error) {
+	conn, closer, err := c.dialPersistent(ctx, pooler)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = closer() }()
+	return conn.consensusClient.Recruit(ctx, request)
+}
+```
+
+The cache stores the *generated clients*, not just the conn:
+
+```go title="go/common/rpcclient/conn_cache.go"
+conn := &cachedConn{
+	consensusClient: consensuspb.NewMultiPoolerConsensusClient(grpcConn),
+	managerClient:   multipoolermanagerpb.NewMultiPoolerManagerClient(grpcConn),
+	cc:              grpcConn,
+	// ...
+}
+```
+
+The actual `*grpc.ClientConn` is created via `grpccommon.NewClient`, which wraps `grpc.NewClient` and attaches an OTel client `StatsHandler` by default:
+
+```go title="go/tools/grpccommon/options.go"
+allOpts := append([]grpc.DialOption{
+	grpc.WithStatsHandler(otelgrpc.NewClientHandler(cfg.otelOptions...)),
+}, cfg.dialOptions...)
+return grpc.NewClient(target, allOpts...)
+```
+
+:::caution[Gotcha — connection lifetime is reference-counted, not per-call]
+`dialPersistent` returns a `closer()` that *decrements* a refcount; the conn is reused across calls and only LRU-evicted when its refcount hits zero. Forgetting `defer closer()` leaks a reference and blocks eviction forever — which is why every method in `grpc_client.go` defers it. For streams, the ref is held for the stream's lifetime and released on the first `Recv`/`Send` error via a `sync.Once` wrapper. See [sync & memory model](/go-guide/language/09-sync-and-memory-model/) for `sync.Once`. The TLS-vs-insecure dial option is injected once from flags registered with viperutil (see [config & viperutil](/go-guide/project/03-config-viperutil/)).
+:::
+
+---
+
+## grpc-gateway REST — multiadmin only
+
+Because the codegen runs the grpc-gateway plugin with `generate_unbound_methods=true`, a `.pb.gw.go` is generated for *every* service. But only `proto/multiadminservice.proto` carries `(google.api.http)` annotations, and `multiadmin` is the only process that mounts a gateway mux. The latency-sensitive client-to-gateway-to-pooler path is pure gRPC (and the gateway speaks raw PG wire to clients, not gRPC — see [pg-wire & sqltypes](/go-guide/project/07-pg-wire-and-sqltypes/)).
+
+The admin proto annotates each `rpc`:
+
+```proto title="proto/multiadminservice.proto"
+rpc GetCell(GetCellRequest) returns (GetCellResponse) {
+  option (google.api.http) = {get: "/api/v1/cells/{name}"};
+}
+```
+
+And the admin service builds the mux and registers it **in-process**:
+
+```go title="go/services/multiadmin/init.go"
+gwmux := runtime.NewServeMux(
+	runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{
+		MarshalOptions:   protojson.MarshalOptions{EmitUnpopulated: true, UseProtoNames: true},
+		UnmarshalOptions: protojson.UnmarshalOptions{DiscardUnknown: true},
+	}),
+)
+if err := multiadminpb.RegisterMultiAdminServiceHandlerServer(ctx, gwmux, ma.adminServer); err != nil {
+	// ...
+} else {
+	ma.senv.HTTPHandle("/api/", gwmux)
+}
+```
+
+`RegisterMultiAdminServiceHandlerServer` calls the server methods *directly* — no extra network hop — so REST is just a JSON front door onto the same Go methods the gRPC clients call. The marshaler uses `UseProtoNames: true` (snake_case JSON matching the proto) and `EmitUnpopulated: true` (zero-value fields still appear).
+
+:::caution[Gotcha — not every service has REST]
+The `.pb.gw.go` files exist broadly, but only multiadmin registers a mux. Don't assume an arbitrary service exposes HTTP.
+:::
+
+---
+
+## Errors over the wire
+
+This is where the system diverges most from vanilla gRPC, and it matters because PostgreSQL errors carry rich diagnostic data (SQLSTATE, severity, hint, position) that a plain status code would throw away.
+
+The contract is `proto/mtrpc.proto`. Its `enum Code` deliberately mirrors `grpc/codes` for values 0-16, then adds two custom codes; `message RPCError` carries the message, code, and optional diagnostic:
+
+```proto title="proto/mtrpc.proto"
+enum Code {
+  OK = 0;
+  CANCELED = 1;
+  // ...
+  UNAUTHENTICATED = 16;
+  CLUSTER_EVENT = 17;   // custom
+  READ_ONLY = 18;       // custom
+}
+
+message RPCError {
+  string message = 1;
+  Code code = 2;
+  optional query.PgDiagnostic pg_diagnostic = 3;  // full PG error detail
+}
+```
+
+Because 0-16 match exactly, the conversion is a direct numeric cast — `codes.Code(Code(err))`.
+
+**Outbound: `ToGRPC`.** If the error is (or wraps) a `*PgDiagnostic`, it attaches an `RPCError` carrying the full diagnostic via `status.WithDetails`:
+
+```go title="go/common/mterrors/grpc.go"
+func ToGRPC(err error) error {
+	if err == nil { return nil }
+	var diag *PgDiagnostic
+	if errors.As(err, &diag) {
+		st := status.New(codes.Code(Code(err)), truncateError(err))
+		rpcErr := &mtrpcpb.RPCError{Message: err.Error(), Code: mtrpcpb.Code_UNKNOWN, PgDiagnostic: PgDiagnosticToProto(diag)}
+		stWithDetails, detailErr := st.WithDetails(rpcErr)
+		if detailErr != nil { /* fall back if details too big */ return st.Err() }
+		return stWithDetails.Err()
+	}
+	return status.Errorf(codes.Code(Code(err)), "%v", truncateError(err))
+}
+```
+
+`Code(err)` resolves the code by checking a code-carrying interface, then the unwrapped cause, then `context.Canceled`/`DeadlineExceeded` special cases, defaulting to `Code_UNKNOWN`. The use of `errors.As` and unwrapping ties straight into Go's error model — see [errors](/go-guide/language/05-errors/).
+
+**Inbound: `FromGRPC`** reverses it, and handles three subtle cases:
+
+```go title="go/common/mterrors/grpc.go"
+func FromGRPC(err error) error {
+	if err == nil { return nil }
+	if err == io.EOF { return err }   // (1) pass io.EOF through untouched
+	st, ok := status.FromError(err)
+	if !ok { return New(mtrpcpb.Code_UNKNOWN, err.Error()) }
+
+	switch st.Code() {                // (2) rebuild PG cancel/timeout errors
+	case codes.DeadlineExceeded:
+		return NewStatementTimeout()
+	case codes.Canceled:
+		return NewQueryCanceled()
+	}
+
+	for _, detail := range st.Details() {  // (3) reconstruct PgDiagnostic from details
+		if rpcErr, ok := detail.(*mtrpcpb.RPCError); ok {
+			if rpcErr.GetPgDiagnostic() != nil {
+				return PgDiagnosticFromProto(rpcErr.GetPgDiagnostic())
+			}
+			return New(rpcErr.Code, rpcErr.Message)
+		}
+	}
+	return New(mtrpcpb.Code(st.Code()), st.Message())
+}
+```
+
+:::caution[Gotcha — PostgreSQL fidelity lives in the status details, not the status code]
+A naive client that reads only `status.Code()`/`status.Message()` loses SQLSTATE, severity, hint, and position. Always round-trip through `mterrors.FromGRPC`. And `WithDetails` can fail silently if the detail exceeds gRPC's ~8 KiB header budget — `ToGRPC` logs a warning and falls back to a code-only status. `truncateError` caps the message length for the same reason.
+:::
+
+:::caution[Gotcha — never wrap `io.EOF`]
+Streaming clients detect a *clean* stream end with `errors.Is(err, io.EOF)`. `FromGRPC` passes `io.EOF` through unchanged precisely so normal stream completion isn't mistaken for a failure.
+:::
+
+:::note[Custom codes 17/18 only round-trip between these processes]
+`CLUSTER_EVENT`/`READ_ONLY` exceed the standard gRPC range, so a vanilla gRPC client would see them as unknown. That's fine here because both ends are the same system.
+:::
+
+See [mterrors & observability](/go-guide/project/09-mterrors-and-observability/) for the full error taxonomy and the OTel `StatsHandler` instrumentation.
+
+---
+
+## The canonical trio: one streamed query, server + client
+
+This is the single best example to study, because it exercises server-streaming, the `oneof` payload, and the full `ToGRPC`/`FromGRPC` round trip at once.
+
+The proto is one line:
+
+```proto title="proto/multipoolerservice.proto"
+rpc StreamExecute(StreamExecuteRequest) returns (stream StreamExecuteResponse);
+```
+
+`StreamExecuteResponse` carries a `query.QueryResultPayload result` and an optional `query.ReservedState reserved_state`. The `result` payload is itself a `oneof` with three arms — `QueryResult`, `PgDiagnostic`, `PgNotification` — though the gateway's stream loop below only switches on the first two and warns on anything else.
+
+**Server side** — note the signature uses the alias `MultiPoolerService_StreamExecuteServer`, it `Send`s into the stream, and returns `mterrors.ToGRPC(err)`:
+
+```go title="go/services/multipooler/grpcpoolerservice/service.go"
+func (s *poolerService) StreamExecute(req *multipoolerpb.StreamExecuteRequest, stream multipoolerpb.MultiPoolerService_StreamExecuteServer) error {
+	if err := s.pooler.StartRequest(req.Target, admissionKind(/* ... */)); err != nil {
+		return mterrors.ToGRPC(err)
+	}
+	if reasons := req.GetReservationOptions().GetReasons(); reasons != 0 {
+		if err := protoutil.ValidateReasons(reasons); err != nil {
+			return status.Errorf(codes.InvalidArgument, "invalid reservation reasons: %v", err)  // boundary validation
+		}
+	}
+	// ...
+	reservedState, err := executor.StreamExecute(stream.Context(), /* ... */, func(ctx context.Context, result *sqltypes.Result) error {
+		resp := &multipoolerpb.StreamExecuteResponse{Result: rowPayload}
+		return stream.Send(resp)
+	})
+	// ...
+	return mterrors.ToGRPC(err)
+}
+```
+
+Two error styles coexist on purpose: `status.Errorf(codes.InvalidArgument, ...)` for *trust-boundary validation* (a malformed request from the network), and `mterrors.ToGRPC(err)` for *domain errors* that may carry a `PgDiagnostic`.
+
+**Client side** — it calls the generated client, loops on `Recv()` until `io.EOF`, switches on the `oneof`, and wraps every error with `FromGRPC`:
+
+```go title="go/services/multigateway/poolergateway/grpc_query_service.go"
+stream, err := g.client.StreamExecute(ctx, req)
+if err != nil {
+	return nil, mterrors.Wrapf(mterrors.FromGRPC(err), "failed to start stream execute")
+}
+for {
+	response, err := stream.Recv()
+	if errors.Is(err, io.EOF) {
+		return reservedState, nil          // clean end
+	}
+	if err != nil {
+		return reservedState, mterrors.Wrapf(mterrors.FromGRPC(err), "stream receive error")
+	}
+	switch p := response.Result.GetPayload().(type) {
+	case *querypb.QueryResultPayload_Result:
+		result := sqltypes.ResultFromProto(p.Result)
+		if err := callback(ctx, result); err != nil { return reservedState, err }
+	case *querypb.QueryResultPayload_Diagnostic:
+		diag := mterrors.PgDiagnosticFromProto(p.Diagnostic)
+		// ...
+	}
+}
+```
+
+The `oneof` from the proto becomes a Go interface whose concrete implementations are `QueryResultPayload_Result` / `QueryResultPayload_Diagnostic`; you discriminate with a [type switch](/go-guide/language/03-interfaces-composition/). The `ctx` threaded into `client.StreamExecute` carries the deadline/cancellation that `FromGRPC` translates back into PG cancel/timeout errors — see [context](/go-guide/language/08-context/).
+
+Here's the whole round trip as a sequence:
+
+<Mermaid title="One streamed query, end to end" height={420} code={`
+sequenceDiagram
+  autonumber
+  participant C as gateway (client)
+  participant P as pooler (server)
+  C->>P: client.StreamExecute(ctx, req)
+  Note over P: StartRequest / validate
+  Note over P: executor.StreamExecute(...)
+  P-->>C: StreamExecuteResponse (oneof: Result | Diagnostic)
+  Note over C: stream.Recv() loop, N times
+  P-->>C: handler returns nil → io.EOF (clean end)
+  Note over C,P: on failure: ToGRPC(err) → FromGRPC(err)
+`} />
+
+---
+
+## Checkpoints
+
+<details><summary>Why are <code>RecruitRequest</code>/<code>RecruitResponse</code> defined in <code>consensusdata.proto</code> instead of <code>consensusservice.proto</code>?</summary>
+Because RPC *messages* (data files) are deliberately split from *service* definitions (service files): the messages double as wire/storage format and feed an internal non-gRPC transport, so they're decoupled from the gRPC service. `consensusservice.proto` imports the data file and references its types directly.</details>
+
+<details><summary>What breaks if a server type embeds <code>UnimplementedXServer</code> by pointer instead of by value, and where is it caught?</summary>
+A nil-pointer dereference can occur when an unimplemented method is invoked. The generated comment warns to embed by value, and `RegisterXServer` runs a `testEmbeddedByValue()` probe at registration time so the bug surfaces at startup rather than under live traffic.</details>
+
+<details><summary>A PostgreSQL constraint-violation error travels pooler to gateway. How does SQLSTATE survive, and what would lose it?</summary>
+`mterrors.ToGRPC` detects the `*PgDiagnostic` via `errors.As`, packs it into an `mtrpcpb.RPCError`, and attaches it to the status with `status.WithDetails`. `mterrors.FromGRPC` reads `st.Details()`, finds the `RPCError`, and rebuilds the `*PgDiagnostic`. A client reading only `status.Code()`/`status.Message()` — or a detail too large for the ~8 KiB limit, which triggers the warn-and-fallback path — loses SQLSTATE.</details>
+
+<details><summary>Why must the client stream loop special-case <code>io.EOF</code>, and how does <code>FromGRPC</code> cooperate?</summary>
+`io.EOF` is the normal signal that a server-stream finished cleanly. The client checks `errors.Is(err, io.EOF)` and returns success. `FromGRPC` passes `io.EOF` through untouched; wrapping it would turn clean completion into a spurious error.</details>
+
+---
+
+## Exercises
+
+<Steps>
+
+1. **Trace one streamed query.** Follow it end to end: start at `go/services/multigateway/poolergateway/grpc_query_service.go` (`StreamExecute`, with `client.StreamExecute` and the `stream.Recv()` loop), cross the wire defined by `proto/multipoolerservice.proto`, and land in `go/services/multipooler/grpcpoolerservice/service.go` (`StreamExecute`, with `stream.Send` and `mterrors.ToGRPC`). Write down (a) where the error becomes a gRPC status (`ToGRPC`), (b) where it becomes a Go error again (`FromGRPC`), and (c) where `io.EOF` terminates the loop.
+
+2. **Predict the generated code.** Sketch a new unary `rpc Ping(PingRequest) returns (PingResponse)` on `multigatewayservice.proto`. Predict the four artifacts it would add to `multigatewayservice_grpc.pb.go`: the client interface method, the server interface method, the `MultiGatewayService_ServiceDesc.Methods` entry, and the `_Ping_Handler`. Check against the existing `CancelQuery` generated code.
+
+3. **Audit the service/data split.** For `consensusservice.proto` and `multipoolermanagerservice.proto`, confirm none of the request/response messages are defined in the service file — they all come from the imported `*data.proto`. Then explain why `multipoolerservice.proto` defines its messages inline instead.
+
+4. **Classify every generated client.** Run `grep -rn "New.*Client(" go/` (focus on `go/common/rpcclient/conn_cache.go` and `go/services/multigateway/poolergateway/grpc_query_service.go`). Classify each construction as a cached persistent client or a per-conn client, and explain why the consensus/manager clients are cached but the query-path client is per-connection.
+
+</Steps>
+
+---
+
+## Next
+
+Continue to [service anatomy](/go-guide/project/05-service-anatomy/) — how a single service wires its gRPC server, HTTP endpoints, and lifecycle hooks together through `servenv`.
+
+---
+
+## See also
+
+<CardGrid>
+  <LinkCard title="Architecture & request flow" description="The client → gateway → pooler topology this RPC layer implements." href="/go-guide/project/01-architecture-request-flow/" />
+  <LinkCard title="config & viperutil" description="The TLS/gRPC flags feeding the dial options." href="/go-guide/project/03-config-viperutil/" />
+  <LinkCard title="service anatomy" description="How servenv wires a service's server, HTTP, and lifecycle hooks." href="/go-guide/project/05-service-anatomy/" />
+  <LinkCard title="pg-wire & sqltypes" description="The QueryResult/ReservedState proto types carried over these RPCs." href="/go-guide/project/07-pg-wire-and-sqltypes/" />
+  <LinkCard title="mterrors & observability" description="The error model and OTel StatsHandler instrumentation." href="/go-guide/project/09-mterrors-and-observability/" />
+  <LinkCard title="Interfaces & composition" description="Generated server interfaces satisfied by struct embedding." href="/go-guide/language/03-interfaces-composition/" />
+  <LinkCard title="Generics" description="Why generated stream types are generic." href="/go-guide/language/06-generics/" />
+  <LinkCard title="Context" description="The ctx threaded through every RPC." href="/go-guide/language/08-context/" />
+  <LinkCard title="Errors" description="errors.As / errors.Is and the code-carrying error model." href="/go-guide/language/05-errors/" />
+  <LinkCard title="Glossary" description="unary/streaming RPC, interceptor, status code." href="/go-guide/reference/glossary/" />
+</CardGrid>

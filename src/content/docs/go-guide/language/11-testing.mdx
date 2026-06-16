@@ -1,0 +1,583 @@
+---
+title: Testing
+description: Go's built-in testing package, testify assert vs require, table-driven subtests, golden fixtures, benchmarks, examples, and the race detector — seen in real code.
+sidebar:
+  order: 11
+---
+
+import { Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+Go ships its test framework in the standard library. There is no JUnit, no RSpec, no separate runner to install. A test is a function in a file whose name ends in `_test.go`; the compiler treats those files specially (they are excluded from normal builds), and `go test` discovers and runs them. The codebase we're reading — **multigres** — has roughly 485 `_test.go` files and leans on exactly one external assertion library, `github.com/stretchr/testify`:
+
+```go title="go.mod"
+module github.com/multigres/multigres
+
+go 1.25.1
+
+require github.com/stretchr/testify v1.11.1
+```
+
+The `go 1.25` line matters later: it means the Go 1.24+ benchmark loop `for b.Loop()` is available, and the code uses it.
+
+:::note
+This page teaches what the *tests* look like — the shapes, the idioms, the gotchas. It deliberately leaves out *how to run them*. This codebase runs its tests through a dev wrapper rather than calling `go test` directly; the full command reference lives in [tooling/testing workflow](/go-guide/tooling/02-testing-workflow/).
+:::
+
+## The `_test.go` convention and test functions
+
+A test function has the exact signature `func TestXxx(t *testing.T)` — capital `T` after `Test`, one `*testing.T` parameter, no return value. The `t` is your handle for reporting failures (`t.Errorf`, `t.Fatalf`), logging (`t.Logf`), and lifecycle (`t.Cleanup`, `t.Helper`, `t.Run`).
+
+```go title="math_test.go"
+package mymath
+
+import "testing"
+
+func TestAdd(t *testing.T) {
+	got := Add(2, 3)
+	if got != 5 {
+		t.Errorf("Add(2,3) = %d, want 5", got)
+	}
+}
+```
+
+`t.Errorf` records a failure and **keeps running** the function; `t.Fatalf` records a failure and **stops** the current test (it calls `runtime.Goexit()`). That continue-vs-stop distinction is the single most important thing to internalize, and it returns below with testify.
+
+### Two package styles: white-box vs black-box
+
+A `_test.go` file can declare either the same package as the code (`package parser`) or an external test package (`package parser_test`). Same-package tests are *white-box*: they can call unexported helpers. External `_test` tests are *black-box*: they see only the exported API, which keeps the test honest about what users can actually reach.
+
+Both styles show up deliberately. The parser tests are white-box because they call an unexported helper — `go/common/parser/parse_test.go` declares `package parser`. A viperutil example test is black-box instead:
+
+```go title="go/tools/viperutil/funcs/get_test.go"
+package funcs_test
+```
+
+:::tip[Idiom]
+Go lets `package foo` and `package foo_test` coexist in the same directory. Reach for `_test` when you want to prove the public surface is usable on its own; stay in-package when a test genuinely needs internals. Picking `_test` and then discovering you need an unexported symbol is a good signal that the symbol should perhaps be exported — or that you're testing implementation detail.
+:::
+
+## Table-driven tests and `t.Run` subtests
+
+The dominant unit-test shape in idiomatic Go — and the one you'll see everywhere here — is the *table-driven test*: a slice of structs, one struct per case, iterated with `for...range`, each case wrapped in a `t.Run` subtest.
+
+```go title="classify_test.go"
+func TestClassify(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want string
+	}{
+		{name: "negative", in: -1, want: "neg"},
+		{name: "zero", in: 0, want: "zero"},
+		{name: "positive", in: 7, want: "pos"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Classify(tt.in); got != tt.want {
+				t.Errorf("Classify(%d) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+```
+
+Each `t.Run(name, fn)` is an isolated subtest with its own `*testing.T`. The name shows up in output as `TestClassify/negative`, and you can run just one with `go test -run 'TestClassify/zero'`.
+
+A clean real example is `go/tools/retry/backoff_test.go`. The table has a `name` field and several inputs; each case becomes a subtest:
+
+```go title="go/tools/retry/backoff_test.go" {2,9}
+for _, tt := range tests {
+	t.Run(tt.name, func(t *testing.T) {
+		var b backoff
+		if tt.withJitter {
+			b = newExponentialFullJitterBackoffWithRNG(tt.baseDelay, tt.maxDelay, rand.New(rand.NewPCG(tt.seed.s1, tt.seed.s2)))
+		} else {
+			b = newExponentialBackoffNoJitter(tt.baseDelay, tt.maxDelay)
+		}
+		delay := multiDelay(b, tt.attempt)
+		assert.Equal(t, tt.expected, delay)
+	})
+}
+```
+
+Why this shape pays off: each case is independently reported and selectable, a failure names the case instead of dumping a line number, and adding a case is one struct literal instead of a copy-pasted function. The `name` field is load-bearing — it becomes the subtest path.
+
+:::caution[Gotcha]
+`go test -run` matches subtests by name, but Go **replaces spaces with underscores** in subtest names. A case named `"attempt 100 with 1s min"` is selected as `` -run 'TestCalculateDelay_ExtremeAttemptCounts/attempt_100.*' ``, not with literal spaces. The match argument is a regular expression at each `/`-separated level.
+:::
+
+:::note
+In Go versions before 1.22, the loop variable `tt` was shared across iterations, so capturing it in a subtest closure that ran later (e.g. with `t.Parallel()`) was a classic bug requiring `tt := tt`. Go 1.22 made loop variables per-iteration, so on Go 1.25 you won't see the `tt := tt` shadow. Don't add it back; it's obsolete.
+:::
+
+## testify: `assert` vs `require`
+
+testify gives you readable assertions with good failure messages. The two sub-packages differ in exactly one way that matters:
+
+- `assert.Equal(t, want, got)` — on mismatch, records the failure and **continues** (built on `t.Errorf`).
+- `require.Equal(t, want, got)` — on mismatch, records the failure and **stops the test immediately** (built on `t.FailNow()` → `runtime.Goexit()`).
+
+```go title="thing_test.go"
+func TestThing(t *testing.T) {
+	obj, err := New()
+	require.NoError(t, err) // if construction failed, nothing below is meaningful — bail now
+	assert.Equal(t, "ready", obj.State()) // independent checks: keep going to report all
+	assert.Equal(t, 0, obj.Count())
+}
+```
+
+The rule of thumb: use `require` for **preconditions** whose failure makes everything after it noise (a constructor returning an error, a temp dir that couldn't be made), and use `assert` when you want to **collect multiple independent results** in one run. `require.NoError` immediately after a setup call is the most common testing pattern in the whole tree.
+
+The parser corpus loop makes the opposite choice on purpose. `go/common/parser/parse_test.go` parses tens of thousands of statements inside a *single* subtest and deliberately uses non-fatal `assert` so the first bad statement doesn't abort the entire pass:
+
+```go title="go/common/parser/parse_test.go"
+// Assertions are made with assert (non-fatal) inside the single
+// per-file subtest rather than a t.Run per statement: the corpora
+// hold tens of thousands of statements, and one subtest each
+// overwhelms the CI test reporter. Each message names the query so
+// failures are still identifiable.
+if tcase.Error != "" {
+	assert.ErrorContainsf(t, err, tcase.Error, "case: %s", testName)
+} else {
+	if assert.NoErrorf(t, err, "case: %s", testName) {
+		assert.EqualValuesf(t, expectedQuery, parsedOutput, "case: %s", testName)
+		// ...
+	}
+}
+```
+
+Two things to notice. The `f`-suffixed variants (`assert.NoErrorf`, `assert.ErrorContainsf`) take a printf-style message. And the nested `if assert.NoErrorf(...) { ... }` pattern works because testify assertions return a `bool` (did it pass?) — so you can guard a dependent assertion without aborting the whole loop the way `require` would. That's the manual version of "require, but scoped to this one case."
+
+:::caution[Gotcha — require in a spawned goroutine]
+`require.*` stops the test via `runtime.Goexit()`, which only unwinds the **current goroutine**. If you call `require.NoError` from a goroutine you spawned (not the goroutine `go test` ran `TestXxx` on), the test goroutine never learns it should stop — you can get a hang or a misleading pass. In spawned goroutines, prefer `assert.*`, or send the error back over a channel and assert on the main test goroutine. See [concurrency](/go-guide/language/07-concurrency/).
+:::
+
+:::tip[Idiom]
+testify mirrors the standard `errors` package: `require.ErrorIs(t, err, context.DeadlineExceeded)` is the testify form of `errors.Is`, and `assert.ErrorContains` checks substrings. When the condition is a disjunction testify can't express directly, the raw form works too — e.g. `assert.True(t, errors.Is(lastErr, context.DeadlineExceeded) || ...)`. See [errors](/go-guide/language/05-errors/).
+:::
+
+## testify suites — used exactly once
+
+testify also offers `suite.Suite`, an xUnit-style fixture with setup/teardown hooks where each method becomes a test. You embed `suite.Suite`, write methods like `(s *mySuite) TestFoo()`, optionally implement `SetupSuite`/`SetupTest`/`TearDownTest`/`TearDownSuite`, and wire it to `go test` with a single normal `TestXxx` that calls `suite.Run`.
+
+```go title="suite_example_test.go"
+type mySuite struct {
+	suite.Suite
+	db *DB
+}
+func (s *mySuite) SetupSuite() { s.db = openTestDB(); s.Require().NotNil(s.db) }
+func (s *mySuite) TestQuery()  { s.Equal(1, s.db.Count()) } // s.T() is the *testing.T
+func TestMySuite(t *testing.T) { suite.Run(t, new(mySuite)) }
+```
+
+There is exactly **one** suite in the entire codebase: the parser tests.
+
+```go title="go/common/parser/parse_test.go"
+type parseTestSuite struct {
+	suite.Suite
+	outputDir string
+}
+
+func (s *parseTestSuite) SetupSuite() {
+	dir := getTestExpectationDir()
+	err := os.RemoveAll(dir)
+	require.NoError(s.T(), err)
+	err = os.Mkdir(dir, 0o755)
+	require.NoError(s.T(), err)
+	s.outputDir = dir
+}
+
+func TestParseTestSuite(t *testing.T) {
+	suite.Run(t, new(parseTestSuite))
+}
+```
+
+Inside suite methods, `s.T()` returns the underlying `*testing.T` (used here to pass to `require.NoError`). The suite earns its place because the parser tests need one-time setup — clearing and recreating a `testdata/expected` directory before any test file runs.
+
+:::note
+Don't over-reach for suites. The repo-wide convention is plain top-level `TestXxx` functions, testify `assert`/`require`, and table-driven `t.Run` subtests. Roughly 398 files import `require` and 344 import `assert`, but exactly one uses `suite`. When a per-test setup helper plus `t.Cleanup` will do (next), prefer that — it composes better than a suite.
+:::
+
+## `t.Helper()` and `t.Cleanup()`
+
+Two `*testing.T` methods keep setup code clean.
+
+`t.Helper()` marks the calling function as a test helper. When an assertion inside it fails, the reported file:line points at the **caller** (the test that invoked the helper), not at the line inside the helper. Without it, every failure blames the helper, and you can't tell which call site triggered it.
+
+`t.Cleanup(fn)` registers a teardown closure to run when the test **and all its subtests** finish, in **LIFO** order (last registered runs first). It's strictly better than `defer` for shared setup: a `defer` lives only in the function where it's written, so a helper that returns can't leave a `defer` behind for its caller. A `t.Cleanup` registered inside a helper still fires when the *test* ends — and it runs even after `require.*` aborts via `Goexit`.
+
+The clearest pairing is a small test-server helper:
+
+```go title="go/test/utils/poolserver/server_test.go" {2,5,10}
+func startTestServer(t *testing.T) (socketPath string, stop func()) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "pooltest")
+	require.NoError(t, err)
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socketPath = filepath.Join(dir, "pool.sock")
+	srv, err := poolserver.NewServer(socketPath)
+	require.NoError(t, err)
+	go srv.Serve()
+	t.Cleanup(func() { srv.Stop() })
+	return socketPath, srv.Stop
+}
+```
+
+Two cleanups are registered: remove the temp dir, then stop the server. Because cleanup is LIFO, `srv.Stop()` runs first (registered last), then `os.RemoveAll(dir)` — the correct order: stop the thing using the directory before deleting it. The `t.Helper()` call means a failing `require.NoError` here is blamed on the line in the test that called `startTestServer`, which is exactly what you want.
+
+:::caution[Gotcha]
+Prefer `t.Cleanup` over a returned `stop func`. This helper returns `srv.Stop` as a convenience, but the *robust* teardown is the registered `t.Cleanup` — it fires no matter what the caller does, including when a later `require` aborts the test. Returning a `stop func()` and hoping the caller remembers to `defer stop()` is fragile; the cleanup makes correctness automatic.
+:::
+
+## `t.Setenv` and `testing.Short()` / `t.Skip`
+
+`t.Setenv(key, value)` sets an environment variable for the duration of the test and restores the old value automatically when the test ends. It also marks the test as cannot-be-parallel.
+
+```go title="env_test.go"
+func TestWithEnv(t *testing.T) {
+	t.Setenv("MY_FLAG", "1")     // auto-restored at end of test
+	// ... code that reads os.Getenv("MY_FLAG")
+}
+```
+
+`testing.Short()` returns true when the test was invoked with `-short`. Combined with `t.Skip`, it lets expensive/integration tests opt out of the fast pass:
+
+```go title="expensive_test.go"
+func TestExpensive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in -short mode")
+	}
+	// slow work...
+}
+```
+
+The end-to-end tests use both — they skip under `-short`, and their setup helpers set env vars that get restored automatically:
+
+```go title="go/test/endtoend/pgctld/pgctld_grpc_test.go" {6-7}
+func createTestGRPCServer(t *testing.T, dataDir, binDir string) (net.Listener, func()) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	grpcServer := grpc.NewServer()
+	t.Setenv(constants.PgDataDirEnvVar, filepath.Join(dataDir, "pg_data"))
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	// ...
+}
+```
+
+This matters because the fast unit pass runs `go test -short` — so anything gated behind `if testing.Short() { t.Skip() }` is excluded from it and only runs in the integration pass (or a full `go test`).
+
+:::caution[Gotcha]
+`t.Setenv` and `t.Parallel()` are mutually exclusive — calling `t.Parallel()` in a test that already called `t.Setenv` panics (`testing: t.Parallel called after t.Setenv`). This is intentional: a process-wide env var can't be safely mutated by tests running concurrently. In practice this tree has zero `t.Parallel()` usage, so subtests run sequentially by default — don't assume your subtests interleave.
+:::
+
+:::tip[Idiom — inverted skip]
+The parser property test inverts the usual pattern. Instead of skipping the *whole* test under `-short`, it always runs the curated cases and skips only the giant ~240-file PostgreSQL regression corpus — roughly `if !testing.Short() { entries, err := os.ReadDir("testdata/postgres") ... }`. The fast pass still exercises the property; only the heavy corpus is gated.
+:::
+
+## Golden / fixture files
+
+A "golden file" test stores expected output as a checked-in artifact and compares the program's actual output against it. Here the fixtures are stored as **JSON** under `testdata/`, not `.golden` files. `go test` automatically excludes any directory named `testdata` from package compilation, so it's the conventional home for fixtures.
+
+The parser corpus lives in `go/common/parser/testdata/`: curated case files like `ddl_cases.json`, `dml_cases.json`, `select_cases.json`, plus a `postgres/` subdirectory holding 240 JSON files (one per PostgreSQL regression-suite topic). Each case is a small struct:
+
+```go title="go/common/parser/parse_test.go"
+type ParseTest struct {
+	Comment  string `json:"comment,omitempty"`
+	Query    string `json:"query,omitempty"`
+	Expected string `json:"expected,omitempty"` // If empty, defaults to Query
+	Error    string `json:"error,omitempty"`
+}
+```
+
+The update workflow is **hand-rolled write-on-failure**, not a `-update` flag. When a corpus file produces any failure, the suite re-encodes the *actual* parser output into `testdata/expected/<name>.json` so you can diff and promote it:
+
+```go title="go/common/parser/parse_test.go" {9}
+// Write updated test file if there were failures
+if s.outputDir != "" && failed {
+	name := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	name = filepath.Join(s.outputDir, name+".json")
+	file, err := os.Create(name)
+	require.NoError(t, err)
+	defer file.Close()
+
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false) // keep SQL readable: don't escape < > &
+	err = enc.Encode(expected)
+	require.NoError(t, err)
+	t.Logf("Updated test expectations written to: %s", name)
+}
+```
+
+:::caution[Gotcha]
+There's no `-update` flag here. Promoting a new golden means running the suite, reviewing the diff that lands in `testdata/expected/`, and copying the reviewed result back over `testdata/*.json`. Don't go hunting for a flag — the mechanism is the `SetupSuite` that wipes `testdata/expected` plus this write-on-failure block. Note also `enc.SetEscapeHTML(false)`: without it the JSON encoder would rewrite `<`, `>`, `&` in SQL into `&lt;` and friends, making fixtures unreadable.
+:::
+
+## Benchmarks: `b.N`, `b.Loop()`, `-bench`, `-benchmem`
+
+A benchmark is `func BenchmarkXxx(b *testing.B)`. The framework runs the body enough times to get a stable per-operation time. Two loop idioms coexist here, and the difference is a real teaching point.
+
+**Classic form** — `for i := 0; i < b.N; i++`. The framework picks `b.N` adaptively. If you do setup before the loop, you must call `b.ResetTimer()` to exclude it:
+
+```go title="go/common/parser/numeric_test.go"
+func BenchmarkNumericLexing(b *testing.B) {
+	benchmarks := []struct {
+		name  string
+		input string
+	}{
+		{"simple integer", "12345"},
+		{"scientific notation", "1.23E-10"},
+		{"hex integer", "0xDEADBEEF"},
+		// ...
+	}
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				lexer := NewLexer(bm.input)
+				_ = lexer.NextToken()
+			}
+		})
+	}
+}
+```
+
+**Modern form (Go 1.24+)** — `for b.Loop()`. It manages the iteration count internally, automatically excludes work done *before* the loop from the timer (no `ResetTimer` needed), runs the body exactly once per logical iteration, and prevents the compiler from eliminating the body as dead code:
+
+```go title="go/common/parser/parse_benchmark_test.go" {6}
+func BenchmarkMultigresParser(b *testing.B) {
+	queries := loadPostgresTestQueries(b) // setup, excluded from timing automatically
+	var totalStatements int
+	var parseErrors int
+	b.ReportAllocs()
+	for b.Loop() {
+		for _, query := range queries {
+			asts, err := ParseSQL(query)
+			if err != nil {
+				parseErrors++
+				continue
+			}
+			totalStatements += len(asts)
+		}
+	}
+	b.Logf("Parsed %d total statements with %d errors", totalStatements, parseErrors)
+}
+```
+
+`b.ReportAllocs()` adds allocations-per-op and bytes-per-op to the output — the per-benchmark equivalent of passing `-benchmem`. `b.Run(name, fn)` produces named sub-benchmarks just like `t.Run`. Run benchmarks with `go test -bench=. -benchmem` (the `-bench` value is a regex; `.` matches all). And `Helper()` exists on `B` too — `loadPostgresTestQueries(b)` takes a `*testing.B` and calls `b.Helper()`.
+
+:::caution[Gotcha — dead-code elimination]
+The compiler may delete a call whose result is never used, so a naive benchmark can end up measuring nothing. Both forms above defend against this: the classic one assigns to `_`, and the modern one accumulates into `totalStatements` / `parseErrors` and then references them via `b.Logf`. The standard pattern is a *sink*: accumulate into a variable and consume it after the loop. `b.Loop()` removes much of this hazard for its own body, but the surrounding accumulate-and-log is still good hygiene.
+:::
+
+:::tip[Idiom]
+On Go 1.25, prefer `for b.Loop()`. It's harder to misuse (no forgotten `ResetTimer`, no accidental setup-in-timer), and it's the form the parser benchmarks standardized on. The classic `b.N` form is still correct and you'll see it; just don't mix expectations about timer behavior between the two.
+:::
+
+## Example tests — and the `// Output:` gotcha
+
+`func ExampleXxx()` serves double duty: it appears in generated documentation, and if it ends in an `// Output:` comment, `go test` **captures its stdout and asserts it matches**. Without that comment, the example is **compiled but never executed**.
+
+A runnable example with assertion:
+
+```go title="go/tools/viperutil/funcs/get_test.go" {10-11}
+func ExampleGetPath() {
+	reg := viperutil.NewRegistry()
+	v := viper.New()
+	val := viperutil.Configure(reg, "path", viperutil.Options[[]string]{
+		GetFunc: funcs.GetPath,
+	})
+	stub(val, v)
+	v.Set(val.Key(), []string{"/var/www", "/usr:/usr/bin", "/vt"})
+	fmt.Println(val.Get())
+	// Output: [/var/www /usr /usr/bin /vt]
+}
+```
+
+This one runs: the `// Output:` line makes the framework compare `fmt.Println`'s output against `[/var/www /usr /usr/bin /vt]`, and the test fails on mismatch. (It also exercises the generic `viperutil.Options[[]string]` API — see [generics](/go-guide/language/06-generics/).)
+
+Compile-only examples have **no** `// Output:` line:
+
+```go title="go/tools/retry/retry_test.go"
+// Example demonstrates basic backoff usage with exponential backoff and full jitter.
+func Example() {
+	r := New(500*time.Millisecond, 30*time.Second)
+	ctx := context.Background()
+	for _, err := range r.Attempts(ctx) {
+		if err != nil {
+			return
+		}
+		result, err := makeAPICall()
+		if err == nil {
+			_ = result
+			return
+		}
+	}
+}
+// (no // Output: line → compiled & shown in docs, never executed)
+```
+
+:::caution[Gotcha]
+An example with no `// Output:` comment will not fail the build no matter how broken its *runtime* behavior is — only its compilation is checked. If you want an example to actually verify behavior, add `// Output:` (ordered) or `// Unordered output:` (order-insensitive, for things like map iteration). Naming also matters: `Example`, `ExampleFoo`, `ExampleFoo_bar` (the suffix after `_` binds the example to a method or variant) attach the example to a symbol for docs.
+:::
+
+## The race detector
+
+`go test -race` instruments memory accesses and reports data races — concurrent unsynchronized access where at least one access is a write. It catches concurrent map writes, unguarded shared variables, and similar bugs that are otherwise nondeterministic. It slows tests significantly and isn't run on every pass; `-race` is available as a pass-through flag on the dev wrapper and via a `make` target.
+
+:::note
+The race detector only finds races that *actually occur during the run*, so it's most valuable on concurrency-heavy code paths and with `-count=N` to re-execute flaky scenarios. See [concurrency](/go-guide/language/07-concurrency/) and [sync & the memory model](/go-guide/language/09-sync-and-memory-model/) for what the detector is checking against.
+:::
+
+## Fuzzing — what Go offers, and what this codebase actually does
+
+Native Go fuzzing uses `func FuzzXxx(f *testing.F)`. You seed a corpus with `f.Add(...)`, then call `f.Fuzz(func(t *testing.T, in ...) { ... })` with a fuzz target. The engine mutates inputs, persists interesting ones under `testdata/fuzz/`, and you run it with `go test -fuzz=FuzzXxx`. In its standard form it looks like this:
+
+```go title="fuzz_example_test.go"
+func FuzzParse(f *testing.F) {
+	f.Add("SELECT 1")          // seed corpus
+	f.Fuzz(func(t *testing.T, s string) {
+		_, _ = Parse(s)        // must not panic on any input
+	})
+}
+// run continuously:  go test -fuzz=FuzzParse
+```
+
+:::caution[Gotcha — there's no engine fuzzing here]
+Despite the name, this codebase has **no** native Go fuzzing: zero `func FuzzXxx(f *testing.F)` targets, zero `f.Add`/`f.Fuzz` calls, and no `testdata/fuzz/` seed corpus. Running `go test -fuzz` would find nothing to fuzz. The example above is generic Go, not from this repo.
+:::
+
+The file literally named `go/common/parser/identifier_quoting_fuzz_test.go` is **not** an engine fuzzer — it's a plain `func TestIdentifierQuotingFuzz(t *testing.T)` doing reflection-driven property/corpus testing:
+
+```go title="go/common/parser/identifier_quoting_fuzz_test.go"
+func TestIdentifierQuotingFuzz(t *testing.T) {
+	queries := loadFuzzCorpus(t)
+	if len(queries) == 0 {
+		t.Fatal("no fuzz corpus loaded — check testdata paths")
+	}
+	var findings []fuzzFinding
+	// ...
+	for _, q := range queries {
+		asts, err := ParseSQL(q)
+		if err != nil {
+			continue
+		}
+		for _, stmt := range asts {
+			fuzzStmt(stmt, q, report)
+		}
+	}
+	// ...
+}
+```
+
+The property under test: for every statement in the corpus, parse to an AST, then walk the AST via `reflect`; for each string field that looks like a SQL identifier, replace its value with `"weird " + original` (a value that *requires* double-quoting on emit), deparse, and re-parse the result. If the re-parse fails, the deparser emitted that field unquoted — a missed quoting site. The corpus is the same JSON fixtures the benchmarks consume.
+
+The difference from engine fuzzing: native fuzzing generates *random* inputs to find crashes; this test takes a *fixed* corpus and applies a *deterministic, structured mutation* (force-quote every identifier) to check a round-trip *invariant* (parse → deparse → parse survives). It's property-based testing over a curated corpus, not coverage-guided random input generation. See [parser, lexer, AST & codegen](/go-guide/project/06-parser-lexer-ast-codegen/) for the AST and deparser it exercises.
+
+## `TestMain` — package-level setup
+
+`func TestMain(m *testing.M)`, if present, runs *instead of* the tests. You do your package-wide setup, call `m.Run()` to run all the tests, then `os.Exit` with its return code. This is how the end-to-end packages spin up a cluster once per package instead of per test:
+
+```go title="go/test/endtoend/queryserving/main_test.go"
+func TestMain(m *testing.M) {
+	exitCode := shardsetup.RunTestMain(m)
+	if exitCode != 0 {
+		setupManager.DumpLogs()
+		// ... dump logs for each shared setup
+	}
+	setupManager.Cleanup()
+	// ... cleanup each shared setup
+	os.Exit(exitCode) //nolint:forbidigo // TestMain() is allowed to call os.Exit
+}
+```
+
+:::caution[Gotcha]
+You **must** call `m.Run()` and propagate its exit code; if you forget, no tests run. Also note `os.Exit` skips deferred functions — so any teardown must happen *before* the `os.Exit` call, which is why cleanup here runs first. The `//nolint:forbidigo` comment exists because the linter normally forbids `os.Exit` (it bypasses defers), but `TestMain` is the sanctioned exception.
+:::
+
+## Putting a test together
+
+When you write a new test in this style, the moving parts assemble in a predictable order:
+
+<Steps>
+
+1. Create a file ending in `_test.go` and pick the package: `package foo` for white-box access to internals, or `package foo_test` to test only the exported API.
+
+2. Write `func TestXxx(t *testing.T)`. Use `require` for setup preconditions (`require.NoError` after a constructor) and `assert` for the independent checks you want all reported in one run.
+
+3. If you have several cases, make it a table: a slice of structs with a `name` field, iterated with `t.Run(tt.name, ...)` so each case is named and individually selectable.
+
+4. Factor shared setup into a helper that calls `t.Helper()` and registers teardown with `t.Cleanup` (LIFO) rather than returning a `stop func`.
+
+5. Gate slow paths behind `if testing.Short() { t.Skip() }` so they stay out of the fast pass.
+
+</Steps>
+
+## Checkpoints
+
+<details><summary>What is the difference between <code>assert.Equal</code> and <code>require.Equal</code>, and which goroutine does the difference apply to?</summary>`assert.Equal` records a failure and continues; `require.Equal` records a failure and stops the test immediately via `t.FailNow()` → `runtime.Goexit()`. The stop applies only to the **current goroutine**. Calling `require.*` from a spawned goroutine will not stop the test goroutine and can cause a hang or a misleading result — use `assert` or channel the result back in that case.</details>
+
+<details><summary>You wrote an <code>Example()</code> with a few <code>fmt.Println</code> calls but it never fails even when the output is wrong. Why, and how do you fix it?</summary>An example is only executed-and-asserted if it ends with an `// Output:` (or `// Unordered output:`) comment. Without it, the example is compiled and shown in docs but never run. Add an `// Output:` comment listing the expected stdout. Confirmed by `ExampleGetPath` (has `// Output:`, runs) vs `Example` / `Example_withTimeout` in `retry_test.go` (no `// Output:`, compile-only).</details>
+
+<details><summary>Why does the parser corpus loop use <code>assert</code> (non-fatal) instead of <code>require</code>?</summary>The corpus holds tens of thousands of statements in a single subtest. `require` would abort the whole pass on the first failing statement via `Goexit`, hiding every other failure. `assert` records each failure (with a message naming the query) and keeps going, so one run surfaces all problems. It still uses `require` for setup preconditions like `os.Create` succeeding — there, fatal-stop is correct because nothing after a failed setup is meaningful.</details>
+
+<details><summary>What does <code>t.Helper()</code> change, and in what order do two <code>t.Cleanup</code> closures run?</summary>`t.Helper()` makes failures inside the helper report the **caller's** file:line instead of the helper's, so you can tell which call site failed. `t.Cleanup` closures run in **LIFO** order (last registered first) when the test and all its subtests finish — in `startTestServer`, `srv.Stop()` (registered last) runs before `os.RemoveAll(dir)` (registered first), correctly stopping the server before deleting its directory. They also run even after a `require` abort.</details>
+
+## Exercises
+
+1. In `go/tools/retry/backoff_test.go`, find every `t.Run(tt.name, ...)` subtest and work out the exact `-run` argument that would select only the case named `"attempt 100 with 1s min, 1m max - should cap at max"` in `TestCalculateDelay_ExtremeAttemptCounts`. (Hint: spaces become underscores; the argument is a regex per `/` level.)
+
+2. Open `go/common/parser/parse_test.go`. Read the comment explaining the non-fatal corpus loop and describe what `require` would do on the first of ~10,000 statements. Then find a place in the same file that *does* use `require` (e.g. in `SetupSuite` or the write-on-failure block) and justify why fatal-stop is correct there but not in the loop.
+
+3. Compare the two benchmark idioms: `for b.Loop()` in `go/common/parser/parse_benchmark_test.go` vs `for i := 0; i < b.N; i++` in `go/common/parser/numeric_test.go`. List what `b.ReportAllocs()` adds to the output, which command-line flag (`-benchmem`) duplicates it, and one thing `b.Loop()` does that the classic form requires you to do manually (timer handling).
+
+4. Confirm by grep that `go/common/parser/identifier_quoting_fuzz_test.go` contains no `func Fuzz`, no `f.Add`, and no `testing.F` (try `grep -nE 'func Fuzz|f\.Add|testing\.F' go/common/parser/identifier_quoting_fuzz_test.go`). Then describe in one paragraph how its `reflect`-driven mutate/deparse/re-parse loop differs from native Go fuzzing, and what role `testdata/postgres/` plays as its corpus.
+
+## Next
+
+<LinkCard
+  title="Architecture & Request Flow"
+  description="Start the project track: how a client query flows multigateway → multipooler → PostgreSQL."
+  href="/go-guide/project/01-architecture-request-flow/"
+/>
+
+## See also
+
+<CardGrid>
+  <LinkCard
+    title="Testing Workflow"
+    description="How to actually run these tests — the dev wrapper, make targets, the port pool, and integration-log debugging."
+    href="/go-guide/tooling/02-testing-workflow/"
+  />
+  <LinkCard
+    title="Errors"
+    description="errors.Is / errors.As, which testify's ErrorIs / ErrorContains mirror."
+    href="/go-guide/language/05-errors/"
+  />
+  <LinkCard
+    title="Concurrency"
+    description="The -race detector and the require-in-a-goroutine gotcha."
+    href="/go-guide/language/07-concurrency/"
+  />
+  <LinkCard
+    title="Generics"
+    description="The generic viperutil.Value[T] / Options[T] API exercised by ExampleGetPath."
+    href="/go-guide/language/06-generics/"
+  />
+  <LinkCard
+    title="Parser, Lexer, AST & Codegen"
+    description="The parser, AST, and corpus the suite, benchmarks, and property test target."
+    href="/go-guide/project/06-parser-lexer-ast-codegen/"
+  />
+  <LinkCard
+    title="Idioms & Gotchas"
+    description="assert-vs-require, b.Loop vs b.N, the Example // Output: gotcha."
+    href="/go-guide/reference/idioms-and-gotchas/"
+  />
+  <LinkCard
+    title="Cheatsheet"
+    description="Quick go test / -run / -bench / -race / -short command reference."
+    href="/go-guide/reference/cheatsheet/"
+  />
+</CardGrid>

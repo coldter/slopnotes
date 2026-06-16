@@ -1,0 +1,411 @@
+---
+title: Debugging & Profiling
+description: Stepping, race-detecting, and profiling concurrent Go services with delve, the race detector, pprof, and traces.
+sidebar:
+  order: 5
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+This is the developer's "something is wrong" loop: a program that crashes, hangs, corrupts shared state, or burns CPU and memory you can't explain. Go ships strong first-party tooling for all four — a debugger (`dlv`), the race detector (`-race`), the profiler (`pprof`), execution tracing (`go tool trace`), and runtime knobs (`GODEBUG`).
+
+To make this concrete we'll lean on a real distributed system: **multigres** (a set of small Go services that front PostgreSQL). It builds flag-driven profiling on top of `runtime/pprof` and `net/http/pprof`, and runs the race detector as a first-class `make` target — a good case study in how a production codebase wires diagnostics into every service.
+
+Throughout, keep two categories separate: **what is generic Go** (delve, `GODEBUG`, `go tool pprof`/`trace`) versus **what a system bolts on top** (the `--pprof` / `--pprof-http` flags, a `make test-race` target, an end-to-end profiling harness). The generic tools transfer everywhere; the wiring is one team's choices.
+
+---
+
+## What to run when
+
+When a symptom shows up, the hardest part is picking the right tool. This table is the map for the rest of the page.
+
+| Symptom | Tool | Entry point |
+| --- | --- | --- |
+| Logic bug, want to step through code | `dlv` (generic) | `dlv debug ./go/cmd/multigateway` |
+| Test fails intermittently / shared-state corruption | race detector | `make test-race` |
+| Flaky test (timing-dependent) | repeat runs | `go test -count=10` |
+| High CPU, want hot functions | CPU profile | `--pprof cpu` or `/debug/pprof/profile` |
+| Growing memory / allocation churn | heap / allocs profile | `--pprof mem=heap` or `/debug/pprof/heap` |
+| Hang, deadlock, "where are my goroutines?" | goroutine dump | `/debug/pprof/goroutine?debug=2` or `SIGQUIT` |
+| Lock contention | mutex / block profile | `--pprof mutex` / `--pprof block` |
+| Scheduler latency, GC pauses, where time goes | execution trace | `--pprof trace` then `go tool trace` |
+| GC behavior / scheduler internals | runtime knob | `GODEBUG=gctrace=1` (generic) |
+| Microbenchmark + profile a hot package | benchmarks | `go test -bench ... -cpuprofile/-memprofile` |
+
+---
+
+## 1. Stepping with delve (`dlv`)
+
+Delve is the standard Go debugger. It isn't vendored or wrapped here — there's no `dlv` invocation in the `Makefile` and nothing under `tools/`. You install it yourself and point it at the binaries under `go/cmd/`:
+
+```bash title="Install and run delve"
+# Install (once), generic Go tooling
+go install github.com/go-delve/delve/cmd/dlv@latest
+
+# Debug a service: dlv builds it and drops you at a prompt
+dlv debug github.com/multigres/multigres/go/cmd/multigateway -- --pprof cpu
+
+# Debug a single test (build + run under the debugger)
+dlv test ./go/common/parser/ -- -test.run TestParseSimpleSelect
+
+# Attach to an already-running process by PID
+dlv attach <pid>
+```
+
+Inside the prompt the verbs you reach for most are `break <pkg>.<func>` / `break file.go:NN`, `continue`, `next`, `step`, `print <expr>`, `goroutines`, `goroutine <id>`, and `stack`. The `goroutines` command is the debugger's analogue of a goroutine dump (Section 4) — useful when a service is wedged.
+
+Because these services are launched with Cobra and `viperutil` flags (see [cmd & cobra](/go-guide/project/02-cmd-and-cobra/) and [config & viperutil](/go-guide/project/03-config-viperutil/)), pass service flags after `--` so `dlv` doesn't consume them.
+
+:::note
+For most debugging in a concurrent, distributed system you'll reach for logs, the race detector, and pprof before `dlv` — a debugger pausing one goroutine distorts timing. `dlv` shines on deterministic single-process logic, like a parser bug in `go/common/parser/`.
+:::
+
+---
+
+## 2. The race detector (`-race`)
+
+A *data race* is two goroutines touching the same memory, at least one of them writing, with no happens-before relationship ordering them. The semantics — why this is undefined behavior, not just "a bug" — are in [sync & the memory model](/go-guide/language/09-sync-and-memory-model/). The race detector is how you *find* them: it instruments memory accesses at runtime and reports any pair it observes racing.
+
+A production codebase typically exposes this as a first-class target. Here it's a one-liner in the `Makefile`:
+
+```make title="Makefile"
+test-race: ## Run tests with race detection.
+	go test -short -v -race ./...
+```
+
+```bash title="Run the suite under the race detector"
+make test-race      # whole suite under the race detector (short tests)
+```
+
+:::caution[Gotcha — the detector only sees what actually runs]
+The detector finds races that *actually happen during the run*. A race on a code path your tests never exercise stays invisible. Combine `-race` with `-count=10` to re-run tests and shake out timing-sensitive races. Binaries built with `-race` run several times slower and use more memory — it's a test/CI tool, not a production build mode.
+:::
+
+### Reading the report
+
+A race report has three stacks. Learn to read them in this order:
+
+```text title="WARNING: DATA RACE"
+==================
+WARNING: DATA RACE
+Write at 0x00c0000b4010 by goroutine 8:
+  main.(*counter).inc()
+      .../counter.go:21 +0x44      <- the WRITE: who mutated, and where
+
+Previous read at 0x00c0000b4010 by goroutine 7:
+  main.(*counter).value()
+      .../counter.go:26 +0x3c      <- the conflicting READ on the SAME address
+
+Goroutine 8 (running) created at:
+  main.run()
+      .../main.go:14 +0x88         <- WHERE the racing goroutine was spawned
+==================
+```
+
+1. **The address** (`0x00c0...`) is the same in both stacks — that's the shared memory. Often a struct field; map it back to a `file:line`.
+2. **Write stack vs. read/write stack:** identify the two operations. At least one is a write. Both `file:line`s point at the unsynchronized accesses.
+3. **"created at" stack:** tells you which `go func()` launched the offending goroutine — invaluable when the goroutine is anonymous and the stack alone doesn't say who started it. Tie this to the goroutine model in [concurrency](/go-guide/language/07-concurrency/).
+
+The fix is always to *establish happens-before* between the two accesses: guard the field with a `sync.Mutex`/`RWMutex`, replace it with `sync/atomic`, or hand ownership through a channel so only one goroutine touches it. Which one is appropriate is the subject of [sync & the memory model](/go-guide/language/09-sync-and-memory-model/) — the report tells you *where*, that module tells you *how*.
+
+---
+
+## 3. pprof: CPU / heap / goroutine / block / mutex
+
+This is where the system adds real machinery. The shape worth internalizing: a running process exposes profiles, you pull one, `go tool pprof` turns it into a report or a call graph you can read.
+
+<Mermaid title="From running service to flamegraph" height={360} code={`
+flowchart LR
+  SVC["Running service<br/>(runtime/pprof + net/http/pprof)"]
+  SVC -->|"--pprof mode"| FILE["mode.pprof file<br/>(written on shutdown)"]
+  SVC -->|"/debug/pprof/..."| HTTP["HTTP profile download"]
+  FILE --> TOOL["go tool pprof"]
+  HTTP --> TOOL
+  TOOL --> TOP["top / list (text)"]
+  TOOL --> WEB["web / -http (call graph, flamegraph)"]
+`} />
+
+There are **two independent mechanisms**, controlled by two separate flags, and they're easy to confuse:
+
+| Flag | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `--pprof <mode>` | string slice | empty (off) | File-based profiler: writes `<mode>.pprof` to disk, flushed on shutdown |
+| `--pprof-http` | bool | **on** | Exposes `net/http/pprof` endpoints (`/debug/pprof/...`) on the HTTP mux |
+
+Both flags are defined in `go/common/servenv/servenv.go`:
+
+```go title="go/common/servenv/servenv.go"
+httpPprof: viperutil.Configure(reg, "pprof-http", viperutil.Options[bool]{
+    Default:  true,
+    FlagName: "pprof-http",
+    ...
+}),
+pprofFlag: viperutil.Configure(reg, "pprof", viperutil.Options[[]string]{
+    Default:  []string{},
+    FlagName: "pprof",
+    ...
+}),
+```
+
+They're wired into every service's boot during init — `RegisterCommonHTTPEndpoints` → `HTTPRegisterPprofProfile` → `pprofInit` — so any service built on the shared `servenv` package (multigateway, multipooler, multiorch, and the rest) gets profiling for free. See [service anatomy](/go-guide/project/05-service-anatomy/) for where this sits in the lifecycle.
+
+:::note[The HTTP endpoints are on by default]
+`--pprof-http` defaults to `true`, so the `/debug/pprof/*` endpoints are *registered by default*. If a build or config sets it to `false`, the registration is skipped (the handler early-returns). Confirm the effective value for your deployment before relying on the endpoints — and never expose that HTTP mux on an untrusted network, since the endpoints are unauthenticated.
+:::
+
+### 3a. HTTP endpoints (`--pprof-http`)
+
+`HTTPRegisterPprofProfile` registers the standard handlers, gated on the flag:
+
+```go title="go/common/servenv/http.go"
+func (sv *ServEnv) HTTPRegisterPprofProfile() {
+	if !sv.httpPprof.Get() {
+		return
+	}
+	sv.HTTPHandleFunc("/debug/pprof/", pprof.Index)
+	sv.HTTPHandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	sv.HTTPHandleFunc("/debug/pprof/profile", pprof.Profile)
+	sv.HTTPHandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	sv.HTTPHandleFunc("/debug/pprof/trace", pprof.Trace)
+}
+```
+
+`pprof.Index` also serves the always-registered profiles (`heap`, `allocs`, `goroutine`, `block`, `mutex`, `threadcreate`) under `/debug/pprof/<name>`. What each endpoint means:
+
+| Endpoint | Meaning | Blocks? |
+| --- | --- | --- |
+| `/debug/pprof/profile?seconds=N` | CPU profile over an N-second window | yes, ~N s |
+| `/debug/pprof/heap` | live (in-use) memory snapshot | no |
+| `/debug/pprof/allocs` | cumulative allocations since process start | no |
+| `/debug/pprof/goroutine` | goroutine stack dump (add `?debug=2` for full stacks) | no |
+| `/debug/pprof/trace` | runtime execution trace | yes |
+
+```bash title="Pull a profile straight into go tool pprof"
+# CPU profile (10-second window)
+go tool pprof http://<addr>/debug/pprof/profile?seconds=10
+
+# Heap snapshot
+go tool pprof http://<addr>/debug/pprof/heap
+```
+
+:::caution[Gotcha — the CPU endpoint blocks for the whole window]
+`/debug/pprof/profile?seconds=N` blocks for the entire `seconds` window while sampling. Any client must set its timeout to at least `seconds` (the e2e harness uses `seconds + 30`). A client timeout shorter than the window truncates the download and you get a 0-byte / empty profile — a classic pprof footgun. The harness fetches via `context.WithTimeout` (see [context](/go-guide/language/08-context/)).
+:::
+
+### 3b. File-based profiler (`--pprof <mode>`)
+
+The `--pprof` flag drives a self-contained profiler in `go/common/servenv/pprof.go`, modeled on `github.com/pkg/profile`. The flag string maps to a mode, with comma-separated sub-flags. Each supported mode maps to a `runtime` API:
+
+| `--pprof` value | runtime call | default rate |
+| --- | --- | --- |
+| `cpu` | `pprof.StartCPUProfile` | — |
+| `mem` / `mem=heap` | `runtime.MemProfileRate`; `pprof.Lookup("heap")` | 4096 |
+| `mem=allocs` | `runtime.MemProfileRate`; `pprof.Lookup("allocs")` | 4096 |
+| `mutex` | `runtime.SetMutexProfileFraction` | 1 |
+| `block` | `runtime.SetBlockProfileRate` | 1 |
+| `trace` | `trace.Start` | — |
+| `threads` | `pprof.Lookup("threadcreate")` | — |
+| `goroutine` | `pprof.Lookup("goroutine")` | — |
+
+```bash title="File-based profiling"
+# CPU profile to a temp dir, flushed on shutdown
+bin/multigateway --pprof cpu ...
+
+# Heap profile with an explicit sampling rate and output dir
+bin/multigateway --pprof mem=heap,rate=4096,path=/tmp/mgprof ...
+
+# Mutex contention, sample every event
+bin/multipooler --pprof mutex,rate=1 ...
+
+# Defer start until the first SIGUSR1
+bin/multigateway --pprof cpu,waitSig ...
+```
+
+The lifecycle, from `pprofInit`:
+
+- Profiling **starts at init** unless `waitSig` is set.
+- A `SIGUSR1` handler **toggles** profiling on/off live — send the signal once to stop, again to start, and so on. With `waitSig`, the *first* `SIGUSR1` starts it.
+- A stop closure is registered on graceful shutdown (`OnTerm`), so the `.pprof` file is written and flushed when the service exits cleanly.
+
+```bash title="Toggle a waitSig profiler"
+# First signal starts profiling, second stops it
+kill -USR1 <pid>
+```
+
+:::caution[Gotcha — read the startup log or you'll lose the file]
+With `path=` unset, the profiler writes to a random `os.MkdirTemp("", "profile")` directory — e.g. `/tmp/profileXXXX/cpu.pprof`. Unless you pass `quiet`, it logs the chosen path at start (`"pprof: %s profiling enabled, %s"`). **Read that startup log line**, or pass `path=/some/dir` to make it predictable.
+:::
+
+:::note[Profiling only perturbs the runtime while active]
+Mutex and block profiles are sampled and have runtime overhead; the stop closures reset them to 0 (`SetMutexProfileFraction(0)` / `SetBlockProfileRate(0)`). Mem profiles set `runtime.MemProfileRate` and restore the previous value on stop. So the file profiler leaves no lingering cost once stopped.
+:::
+
+### 3c. Analyzing with `go tool pprof`
+
+```bash title="Open a profile interactively"
+go tool pprof /tmp/profileXXXX/cpu.pprof
+```
+
+Inside the interactive prompt: `top` (hottest functions by self time), `top -cum` (by cumulative time), `list <Func>` (annotated source with per-line cost), `web` (SVG call graph, needs Graphviz), `peek <Func>` (callers/callees). For memory profiles, `-inuse_space` (live) vs `-alloc_space` (cumulative) selects the sample type. You can also launch the browser UI:
+
+```bash title="Browser UI with flamegraph"
+go tool pprof -http=:8080 cpu.pprof
+```
+
+---
+
+## 4. Goroutine dumps & panics
+
+When a service **hangs** rather than crashes, you need to see what every goroutine is doing.
+
+```bash title="Full per-goroutine stacks over HTTP"
+curl 'http://<addr>/debug/pprof/goroutine?debug=2'
+```
+
+`?debug=2` prints human-readable stacks; each goroutine shows its state (`running`, `chan receive`, `sync.Mutex.Lock`, `select`, `IO wait`) and how long it's been blocked. Scan for many goroutines stuck on the *same* channel or lock — that's your deadlock or contention point. The goroutine states, and why they park, map directly onto the [concurrency](/go-guide/language/07-concurrency/) module.
+
+For a process with no HTTP endpoint (or one too wedged to serve it), send `SIGQUIT`:
+
+```bash title="Dump all goroutine stacks and abort"
+kill -QUIT <pid>   # dumps ALL goroutine stacks to stderr, then exits
+```
+
+This is the same signal the Go runtime treats as "print every goroutine stack and abort" — exactly what you want from a hung process. The e2e setup here uses `SIGQUIT` deliberately as a "kill now, skip the graceful checkpoint" signal.
+
+### Panics
+
+An unrecovered panic prints the panicking goroutine's stack and exits non-zero. The frame just below `panic(...)` is the actual failure site; frames above it are runtime machinery. When recovering, capture the stack at panic time with `runtime/debug.Stack()` — the codebase does this in its single-flight cache (`stack := debug.Stack()`) to attach the originating stack to a recovered panic, so the context isn't lost after `recover()` unwinds.
+
+---
+
+## 5. Benchmarks with profiling
+
+Benchmarks (`testing.B`, `b.Loop()`, `b.ReportAllocs()`; covered in [testing](/go-guide/language/11-testing/)) double as profiling drivers — the same `-cpuprofile`/`-memprofile` flags that work on tests work on benchmarks.
+
+The canonical bench here pits the goyacc-generated SQL parser (`ParseSQL`, see [parser, lexer & AST](/go-guide/project/06-parser-lexer-ast-codegen/)) against `pg-query-go`:
+
+```go title="go/common/parser/parse_benchmark_test.go"
+func BenchmarkMultigresParser(b *testing.B) {
+	queries := loadPostgresTestQueries(b)
+	b.ReportAllocs()
+	for b.Loop() {            // Go 1.24+ benchmark loop idiom
+		for _, query := range queries {
+			asts, err := ParseSQL(query)
+			...
+		}
+	}
+}
+```
+
+`b.ReportAllocs()` adds `allocs/op` and `B/op` columns; `for b.Loop()` is the modern replacement for `for i := 0; i < b.N; i++`.
+
+```bash title="Benchmark the parser with CPU + mem profiles"
+# Run just the parser benchmarks with allocation stats and profiles
+go test -run=^$ -bench=BenchmarkMultigresParser -benchmem \
+  -cpuprofile cpu.out -memprofile mem.out ./go/common/parser/
+
+# Then analyze
+go tool pprof cpu.out
+go tool pprof -alloc_space mem.out
+```
+
+:::note[No `make bench` target]
+Benchmarks run via plain `go test -bench`. `-cpuprofile`/`-memprofile` are standard `go test` flags, not anything the project invented.
+:::
+
+### Whole-cluster profiling under load
+
+For realistic profiles you want the services profiled while serving traffic, not a microbenchmark. The e2e harness does this, gated by env vars:
+
+```bash title="Profile a live cluster under load"
+RUN_BENCHMARKS=1 CAPTURE_PPROF=1 \
+SYSBENCH_CLIENTS=1,8,32 SYSBENCH_DURATION=60 \
+go test -v -timeout 30m -run TestSysBench \
+  ./go/test/endtoend/queryserving/benchmarking/
+```
+
+- `RUN_BENCHMARKS=1` — required; the test self-skips otherwise.
+- `CAPTURE_PPROF=1` — capture a CPU profile from multigateway and the primary multipooler.
+- `CAPTURE_HEAP=1` — also capture heap / allocs / goroutine snapshots.
+
+Output lands as gzip-compressed protobuf under `/tmp/.../pprof/<scenario>/<target>/cpu-<service>.pb.gz`, readable directly by `go tool pprof file.pb.gz`. This is the real answer to "profile a live cluster": pull profiles over the HTTP endpoints from running services while a load generator drives them.
+
+---
+
+## 6. Execution traces (`go tool trace`)
+
+A trace records *every* scheduler event — goroutine start/stop, GC, syscalls, network blocking — giving a timeline that CPU profiles (which only sample) cannot. You can emit one two ways: `--pprof trace` (file profiler, writes `trace.pprof`) or the `/debug/pprof/trace` HTTP endpoint.
+
+```bash title="Capture and open a trace"
+# File-based: capture, then open the trace UI in a browser
+bin/multigateway --pprof trace ...     # writes trace.pprof on shutdown
+go tool trace trace.pprof
+
+# Over HTTP (5-second window):
+curl -o trace.out 'http://<addr>/debug/pprof/trace?seconds=5'
+go tool trace trace.out
+```
+
+`go tool trace` opens a web UI with goroutine analysis, scheduler latency, network/sync blocking profiles, and per-goroutine timelines. Reach for it when CPU/heap profiles say "time is being spent" but not *why* — e.g. goroutines blocked waiting on the scheduler, GC pauses stalling the query path, or lock convoys.
+
+---
+
+## 7. GODEBUG (generic runtime knob)
+
+`GODEBUG` is a Go runtime environment variable that toggles diagnostic output and behavior. It's not specific to any codebase — you set it in the environment when you run any Go binary:
+
+```bash title="GODEBUG diagnostics"
+# Log every GC cycle: heap sizes, pause times, CPU fraction
+GODEBUG=gctrace=1 bin/multigateway ...
+
+# Log scheduler state every 1000ms
+GODEBUG=schedtrace=1000 bin/multipooler ...
+
+# Add per-P detail to the scheduler trace
+GODEBUG=schedtrace=1000,scheddetail=1 bin/multipooler ...
+```
+
+Other useful keys: `asyncpreemptoff=1` (disable async preemption when investigating tight-loop hangs), `madvdontneed=1`, and `inittrace=1` (package init timing). These are diagnostic aids you layer on top of any binary; they pair well with `go tool trace` and GC-related heap profiles.
+
+---
+
+## Checkpoints
+
+You understand this page when you can:
+
+- [ ] Explain why `dlv` is a generic external tool here, and run `dlv debug ./go/cmd/multigateway` / `dlv test ./go/common/parser/`.
+- [ ] Run `make test-race` and, given a `WARNING: DATA RACE` report, point to the write stack, the conflicting read/write stack, and the goroutine-creation stack — and say which synchronization fix applies.
+- [ ] Name the two profiling flags (`--pprof <mode>` file-based, `--pprof-http` HTTP endpoints), say which is on by default, and where they're wired.
+- [ ] Map each `--pprof` mode to its `runtime` call and know the default rates (mem 4096, mutex 1, block 1).
+- [ ] Capture a CPU profile both ways and analyze it with `go tool pprof` (`top`, `list`).
+- [ ] Get a goroutine dump from a hung service via `/debug/pprof/goroutine?debug=2` or `SIGQUIT`.
+- [ ] Profile the parser benchmark with `-cpuprofile`/`-memprofile`, and explain why there's no `make bench`.
+
+## Exercises
+
+<ol>
+<li><strong>Read a race.</strong> Run <code>make test-race</code> (<code>go test -short -v -race ./...</code>). If a race surfaces, identify the read stack, the write stack, and the "created at" stack; map each frame to a <code>file:line</code> and describe the fix in terms of <a href="/go-guide/language/09-sync-and-memory-model/">the memory model module</a>.</li>
+<li><strong>File profiler.</strong> Build multigateway and start it with <code>--pprof cpu</code>, then again with <code>--pprof mem=heap,rate=4096</code>. Find the printed <code>.pprof</code> path in the startup log, then run <code>go tool pprof &lt;file&gt;</code> and try <code>top</code> and <code>list</code>.</li>
+<li><strong>HTTP profiler.</strong> Confirm <code>--pprof-http</code> is enabled for your build, hit <code>/debug/pprof/</code> in a browser, and pull <code>go tool pprof http://&lt;addr&gt;/debug/pprof/profile?seconds=10</code>. Compare with <code>go tool pprof http://&lt;addr&gt;/debug/pprof/heap</code>.</li>
+<li><strong>Parser benchmark.</strong> Run <code>go test -run=^$ -bench=BenchmarkMultigresParser -benchmem -cpuprofile cpu.out -memprofile mem.out ./go/common/parser/</code>, then analyze <code>cpu.out</code>. Run <code>BenchmarkPgQueryGo</code> too and compare <code>allocs/op</code>.</li>
+<li><strong>Trace.</strong> Start a service with <code>--pprof trace</code>, exercise it, shut it down, then open <code>trace.pprof</code> with <code>go tool trace</code> and inspect the scheduler-latency and goroutine views.</li>
+<li><strong>Live toggle.</strong> Start a service with <code>--pprof cpu,waitSig</code>, send <code>kill -USR1 &lt;pid&gt;</code> to start, exercise it, send <code>SIGUSR1</code> again to stop; confirm the file only appears after profiling stops.</li>
+<li><strong>Goroutine dump.</strong> Capture <code>curl 'http://&lt;addr&gt;/debug/pprof/goroutine?debug=2'</code> from a service and identify which goroutines are parked on channels vs. mutexes. Then send <code>SIGQUIT</code> to a process and read the stack dump it prints.</li>
+</ol>
+
+## Next
+
+Continue to [modules, deps & codegen](/go-guide/tooling/04-modules-deps-codegen/) for managing dependencies and generated files — the parser benchmark above measures generated parser code. Or head back to the [tooling track start](/go-guide/tooling/01-build-and-make/).
+
+## See also
+
+- [testing workflow](/go-guide/tooling/02-testing-workflow/) — `make test-race` and flaky-test detection.
+- [build & make](/go-guide/tooling/01-build-and-make/) — Makefile targets and building the binaries you attach `--pprof` to.
+- [sync & the memory model](/go-guide/language/09-sync-and-memory-model/) — happens-before and the data-race definition behind every `-race` report.
+- [concurrency](/go-guide/language/07-concurrency/) — the goroutine model behind goroutine dumps.
+- [testing](/go-guide/language/11-testing/) — `testing.B`, `b.Loop()`, `b.ReportAllocs()`, `-bench`/`-benchmem`.
+- [context](/go-guide/language/08-context/) — `context.WithTimeout` used by the profile-capture harness.
+- [service anatomy](/go-guide/project/05-service-anatomy/) — the lifecycle where `pprofInit` / `HTTPRegisterPprofProfile` hook in.
+- [parser, lexer & AST](/go-guide/project/06-parser-lexer-ast-codegen/) — the goyacc parser the benchmark measures.
+- [glossary](/go-guide/reference/glossary/) — pprof, race detector, goroutine dump, GODEBUG.
+- [idioms & gotchas](/go-guide/reference/idioms-and-gotchas/) — profiling and race gotchas.

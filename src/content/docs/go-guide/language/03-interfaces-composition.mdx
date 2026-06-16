@@ -1,0 +1,646 @@
+---
+title: Interfaces & Composition
+description: How Go's implicit interfaces, interface and struct embedding, and "accept interfaces, return structs" combine into composition-over-inheritance — plus the typed-nil trap.
+sidebar:
+  order: 3
+---
+
+import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+Go has no classes, no inheritance, and no `implements`/`extends` keywords. The two tools it gives you instead are *interfaces* (a set of method signatures a value can satisfy) and *embedding* (placing one type inside another to reuse its methods). Everything in this chapter is built from just those two ideas — and a real distributed-systems codebase, **multigres** ("Vitess for Postgres"), leans on them everywhere: for swappable RPC backends, for the parser's AST hierarchy, and for forward-compatible gRPC servers.
+
+This chapter builds on [Types, Structs & Methods](/go-guide/language/02-types-structs-methods/) — method sets, receivers, and the AST node types introduced there.
+
+## Implicit satisfaction: there is no `implements`
+
+In Java or C# you write `class Foo implements Bar`, and the compiler checks the declaration at the point of the class. In Go, a type satisfies an interface *automatically* the moment its method set covers the interface's methods. Nothing is written down. There is no syntactic link between the interface and its implementers.
+
+```go
+type Stringer interface {
+	String() string
+}
+
+type Point struct{ X, Y int }
+
+// Point now satisfies Stringer — no declaration, no import of Stringer needed.
+func (p Point) String() string { return fmt.Sprintf("(%d,%d)", p.X, p.Y) }
+
+func describe(s Stringer) { fmt.Println(s.String()) }
+
+func main() { describe(Point{1, 2}) } // works; the compiler matches method sets
+```
+
+The consequence: an interface can be defined in *one* package and satisfied by types in packages that never import it, or that didn't even exist when the interface was written. Interfaces are defined by the *consumer*, not the producer.
+
+The `QueryService` interface is the textbook case. It lives in `go/common/queryservice/queryservice.go`, and its doc comment is the *only* place the implementers are named — because the code itself contains no link:
+
+```go title="go/common/queryservice/queryservice.go"
+// QueryService is the interface for executing queries on a multipooler.
+//
+// This interface is implemented by the grpcQueryService (the gRPC client to the
+// multipooler), by the in-process executor, and by the PoolerGateway router.
+type QueryService interface {
+	ExecuteQuery(
+		ctx context.Context,
+		target *query.Target,
+		sql string,
+		options *query.ExecuteOptions,
+	) (*sqltypes.Result, *query.ReservedState, error)
+
+	StreamExecute( /* ... */ )
+	// ... more methods
+}
+```
+
+Three structurally unrelated types — the gRPC client wrapper, the in-process executor, and the gateway router — all satisfy this without saying so. A caller holding a `QueryService` can't tell which it has, and doesn't care. That is the whole point: it lets the system swap a real gRPC backend for an in-process executor or a test mock at the boundary, with zero changes to callers.
+
+:::tip[Idiom]
+Because satisfaction is invisible, Go programmers document implementers in the interface's comment (as above) and sometimes add a compile-time assertion like `var _ QueryService = (*grpcQueryService)(nil)` to *force* a build error if a type drifts out of conformance. The `var _ ` pattern is common across Go codebases for exactly this reason.
+:::
+
+:::caution[Gotcha]
+Implicit satisfaction means a typo in a method name silently *un-implements* an interface. If `func (g *grpcQueryService) ExecuteQuery(...)` becomes `ExecuteQyery`, the type quietly stops satisfying `QueryService`, and the failure surfaces somewhere far away (`*grpcQueryService does not implement queryservice.QueryService (missing method ExecuteQuery)`) — possibly only when you try to assign it. The `var _ Interface = impl` assertion turns that into an error at the definition site.
+:::
+
+## Small vs. large interfaces
+
+Go culture favors *small* interfaces — often one or two methods (`io.Reader` is just `Read`). Small interfaces are easy to satisfy, easy to mock, and compose well. But there's a place for deliberately *large* interfaces too, and the two serve different jobs. `go/common/rpcclient/client.go` shows both side by side.
+
+The small one is a pure behavioral interface — "anything that can send and receive on this stream":
+
+```go title="go/common/rpcclient/client.go"
+type ManagerHealthStream interface {
+	Recv() (*multipoolermanagerdatapb.ManagerHealthStreamResponse, error)
+	Send(*multipoolermanagerdatapb.ManagerHealthStreamClientMessage) error
+}
+```
+
+The large one is a *capability* interface — it aggregates an entire RPC surface (consensus plus manager methods, around 20 of them) so that one object represents "talk to a multipooler node," cache and all:
+
+```go title="go/common/rpcclient/client.go"
+// MultiPoolerClient defines the unified interface for communicating with a multipooler node.
+type MultiPoolerClient interface {
+	Recruit(ctx context.Context, pooler *clustermetadatapb.MultiPooler, request *consensusdatapb.RecruitRequest) (*consensusdatapb.RecruitResponse, error)
+	Promote(ctx context.Context, pooler *clustermetadatapb.MultiPooler, request *consensusdatapb.PromoteRequest) (*consensusdatapb.PromoteResponse, error)
+	// ... ~20 methods
+}
+```
+
+When do you reach for each? A small interface is the right choice when *many* unrelated types implement it and callers only need one behavior — mocking it in a test is trivial, you implement two methods. A large capability interface is right when you want to abstract a whole subsystem behind a single swappable seam: the real implementation dials gRPC and caches connections, but a test can pass a hand-written fake that records calls. The cost of a large interface is that every implementer (including every mock) must supply all ~20 methods — which is exactly why these use generated mocks rather than hand-written ones.
+
+:::tip[Idiom]
+"The bigger the interface, the weaker the abstraction." Prefer the smallest interface the *caller* actually needs. If a function only calls `Recv`, take a `ManagerHealthStream`-shaped interface, not the whole client — even if the concrete value happens to have far more methods.
+:::
+
+## Interface embedding (interface-in-interface)
+
+An interface can embed another interface. The embedded interface's methods become part of the outer one — set union, not inheritance. The AST builds a three-level chain of these in `go/common/parser/ast/nodes.go`.
+
+```go
+type Reader interface{ Read(p []byte) (int, error) }
+type Closer interface{ Close() error }
+
+// ReadCloser = Read + Close. A type satisfies it iff it has both methods.
+type ReadCloser interface {
+	Reader
+	Closer
+}
+```
+
+The base interface every AST node satisfies is `Node`:
+
+```go title="go/common/parser/ast/nodes.go"
+type Node interface {
+	NodeTag() NodeTag
+	Location() int
+	SetLocation(location int)
+	String() string
+	SqlString() string
+}
+```
+
+`Stmt` and `Expression` each embed `Node` and add one method, and `Value` embeds `Expression` (which transitively embeds `Node`):
+
+```go title="go/common/parser/ast/nodes.go"
+type Stmt interface {
+	Node
+	StatementType() string
+}
+
+type Expression interface {
+	Node
+	ExpressionType() string
+}
+
+type Value interface {
+	Expression // which embeds Node
+	IsValue() bool
+}
+```
+
+So a `Value` requires all of `Node`'s five methods *plus* `ExpressionType()` *plus* `IsValue()`. This is how Go expresses "a value is a kind of expression is a kind of node" without inheritance: the relationship is purely *method-set containment*. A `*Integer` satisfies `Value` because it has every method in the union, and you can assign a `*Integer` to a variable of type `Value`, `Expression`, or `Node` interchangeably.
+
+Interface embedding isn't confined to the parser. The gateway grows its capability interface compositionally, by embedding `QueryService` and adding a routing method:
+
+```go title="go/services/multigateway/poolergateway/pooler_gateway.go"
+type Gateway interface {
+	// the query service that this Gateway wraps around
+	queryservice.QueryService
+
+	// QueryServiceByID returns a QueryService
+	QueryServiceByID(ctx context.Context, id *clustermetadatapb.ID, target *query.Target) (queryservice.QueryService, error)
+}
+```
+
+A `Gateway` *is* a `QueryService` (every `QueryService` method is in its set) and *also* can resolve a service by ID. Embedding the interface keeps the two in sync: if `QueryService` gains a method, `Gateway` automatically requires it too.
+
+:::note
+Don't confuse the `Gateway` *interface* with the `PoolerGateway` *struct* that implements it. The struct does **not** embed anything — it uses plain named fields (`loadBalancer`, `buffer`, `logger`). Interface embedding and struct embedding are different mechanisms that happen to share the syntax of writing a type name with no field name; the next section is about the struct side.
+:::
+
+## Struct embedding and method promotion
+
+Embed a type as an *anonymous field* (write the type with no field name) and the outer struct gains — *promotes* — the embedded type's fields and methods as if they were its own. Every AST node struct embeds `BaseNode` to inherit the boilerplate `Node` methods.
+
+```go
+type Base struct{ ID int }
+func (b *Base) Describe() string { return fmt.Sprintf("id=%d", b.ID) }
+
+type User struct {
+	Base // anonymous field — embedding
+	Name string
+}
+
+func main() {
+	u := &User{Base: Base{ID: 7}, Name: "ada"}
+	fmt.Println(u.ID)         // promoted field: actually u.Base.ID
+	fmt.Println(u.Describe()) // promoted method: actually u.Base.Describe()
+}
+```
+
+`BaseNode` carries the tag and source location and implements four of `Node`'s five methods:
+
+```go title="go/common/parser/ast/nodes.go"
+type BaseNode struct {
+	Tag NodeTag
+	Loc int
+}
+
+func (n *BaseNode) NodeTag() NodeTag         { return n.Tag }
+func (n *BaseNode) Location() int            { return n.Loc }
+func (n *BaseNode) String() string           { return fmt.Sprintf("%s@%d", n.Tag, n.Loc) }
+func (n *BaseNode) SetLocation(location int) { n.Loc = location }
+```
+
+`Integer` embeds it and so inherits `NodeTag`, `Location`, `SetLocation` for free — then *overrides* the two methods that need node-specific behavior:
+
+```go title="go/common/parser/ast/nodes.go"
+type Integer struct {
+	BaseNode
+	IVal int
+}
+
+func NewInteger(value int) *Integer {
+	return &Integer{
+		BaseNode: BaseNode{Tag: T_Integer},
+		IVal:     value,
+	}
+}
+
+func (i *Integer) String() string    { return fmt.Sprintf("Integer(%d)@%d", i.IVal, i.Location()) }
+func (i *Integer) SqlString() string { return strconv.Itoa(i.IVal) }
+```
+
+Because `*Integer` has `NodeTag`/`Location`/`SetLocation` (promoted from `*BaseNode`) plus its own `String`/`SqlString`, its method set covers all of `Node` — and with `ExpressionType()` and `IsValue()` defined elsewhere, it covers `Value` too. Embedding supplied the shared 80%; the override supplied the unique 20%.
+
+### The override / shadowing rule
+
+When the outer type defines a method with the same name as the embedded type, the outer one *shadows* the promoted one for calls through the outer type:
+
+```go
+i := NewInteger(42)
+i.SqlString()          // "42"  — Integer.SqlString wins
+i.BaseNode.SqlString() // panics — you explicitly selected the base version
+```
+
+`BaseNode.SqlString()` is deliberately written to **panic**:
+
+```go title="go/common/parser/ast/nodes.go"
+func (n *BaseNode) SqlString() string {
+	if n.Tag == T_Invalid {
+		return "<INVALID>"
+	}
+	panic(fmt.Sprintf("SqlString() not implemented for node type %s (tag: %d). "+
+		"Please implement SqlString() method for this node type to enable SQL deparsing.",
+		n.Tag, int(n.Tag)))
+}
+```
+
+This is a "fail loud" design. `SqlString` is the deparser — turning an AST back into SQL. There is no sensible *default* SQL for an arbitrary node, so instead of returning `""` (which would silently emit broken SQL), the base implementation panics with the node tag in the message. A node author who forgets to override `SqlString` finds out at the first deparse, loudly, instead of shipping a query that drops a clause.
+
+### Embedding is **not** inheritance
+
+This is the single most important correction for an OO programmer. Method promotion is *forwarding*, not virtual dispatch. The embedded `BaseNode` has no knowledge of the `Integer` that embeds it.
+
+```go
+// Suppose BaseNode had a method that called another of its own methods:
+func (n *BaseNode) Render() string { return "tag=" + n.NodeTag().String() }
+```
+
+If `BaseNode.Render()` calls `n.NodeTag()`, it calls **`BaseNode`'s** `NodeTag` — because `n` is a `*BaseNode`, and Go resolves the call against `*BaseNode`'s method set, *not* the dynamic type of whatever embedded it. There is no `super`/base-to-derived back-reference. If you come from Java expecting the base class to dispatch into the subclass override (the "template method" pattern), Go will surprise you: it simply does not do that. When you need that polymorphism, you pass the *interface* around and let interface dispatch pick the right method — which is exactly what the deparser does. It calls `someNode.SqlString()` through the `Node` interface, and interface dispatch lands on `Integer.SqlString`.
+
+:::caution[Gotcha]
+Pointer vs. value receivers decide *which* type satisfies the interface. Every AST method uses a pointer receiver (`func (i *Integer) ...`), so only `*Integer` — not `Integer` — has those methods in its set, and only `*Integer` satisfies `Node`/`Value`. Embedding `BaseNode` (a value) inside `Integer` still promotes `*BaseNode`'s pointer methods because the embedding struct is itself addressable when you hold a `*Integer`. Rule of thumb: hold AST nodes as pointers. See [Pointers, Values & Memory](/go-guide/language/04-pointers-values-memory/) for the method-set rules in full.
+:::
+
+## Embedding an interface in a struct (the `Unimplemented*Server` idiom)
+
+You can embed an *interface* (not just a struct) as an anonymous field. The struct then promotes whatever methods the embedded interface value provides — and, crucially, *satisfies* that interface even if the struct defines none of the methods itself. This powers the most pervasive embedding idiom in the codebase: gRPC server forward-compatibility.
+
+The protobuf compiler generates, for every service, an `Unimplemented<Service>Server` type whose methods all return "unimplemented." Every server struct embeds it:
+
+```go title="go/services/multiorch/grpcserver/server.go"
+type MultiOrchServer struct {
+	multiorchpb.UnimplementedMultiOrchServiceServer
+	engine      *recovery.Engine
+	coordinator *consensus.Coordinator
+	logger      *slog.Logger
+}
+```
+
+Why? The generated gRPC server *interface* lists every RPC in the `.proto`. When someone adds a new RPC and regenerates, that interface grows a method. If `MultiOrchServer` implemented the interface directly, it would *stop compiling* until you hand-wrote the new method. By embedding `UnimplementedMultiOrchServiceServer`, the new method is promoted automatically (returning an "unimplemented" gRPC error at runtime), so the struct keeps satisfying the interface and the build stays green. You override only the RPCs you actually handle; the rest fall through to the embedded defaults. This same struct appears in every service (multigateway, multiadmin, multipooler). See [gRPC & Protobuf](/go-guide/project/04-grpc-and-protobuf/) for how these types are generated.
+
+:::caution[Gotcha]
+Embedding a *real* interface field (not just the `Unimplemented` helper) can accidentally promote and expose methods you didn't mean to forward. If you embed `io.ReadWriteCloser` in a wrapper struct to "decorate" reads, you've also publicly promoted `Write` and `Close` straight through. When you want to wrap/decorate rather than expose, use a *named* field (`rw io.ReadWriteCloser`) and forward only the methods you intend.
+:::
+
+## Accept interfaces, return structs (and the nuance)
+
+The conventional Go guideline: functions should *accept* interface parameters (so callers can pass any implementation) but *return* concrete types (so callers get the full API and you don't prematurely narrow). The codebase follows this — but with a deliberate twist worth understanding.
+
+The gateway's gRPC service constructor returns the **interface**, and the concrete type is **unexported**:
+
+```go title="go/services/multigateway/poolergateway/grpc_query_service.go"
+type grpcQueryService struct { // lowercase — package-private
+	conn   *grpc.ClientConn
+	client multipoolerservice.MultiPoolerServiceClient
+	// ...
+}
+
+func newGRPCQueryService(
+	conn *grpc.ClientConn,
+	poolerID topoclient.ComponentID,
+	logger *slog.Logger,
+) queryservice.QueryService { // returns the INTERFACE
+	return &grpcQueryService{ /* ... */ }
+}
+```
+
+Here returning the interface is *intentional* narrowing: `grpcQueryService` is unexported, so no caller outside the package can even name the concrete type. Callers can only hold a `queryservice.QueryService`, which means the gRPC backend is genuinely swappable — nobody can write code that depends on it being gRPC. This is the right call when the concrete type is an *implementation detail behind an abstraction seam*.
+
+Contrast the AST constructors, which return concrete structs because the caller genuinely wants the rich type:
+
+```go
+func NewInteger(value int) *Integer  // returns concrete *Integer
+func NewString(value string) *String // returns concrete *String
+```
+
+After `i := NewInteger(42)` you can read `i.IVal` directly. Returning `Node` here would force every caller to type-assert back to `*Integer` to touch the field — pointless friction.
+
+And a third flavor: some constructors return the `Node` interface precisely *because* they pick the concrete type dynamically:
+
+```go title="go/common/parser/ast/nodes.go"
+func NewQualifiedName(schema, name string) Node { // returns interface; builds a *RangeVar
+	return &RangeVar{ /* ... */ }
+}
+```
+
+So the rule is really: **return the most specific type your caller can usefully depend on.** A factory that hides its backend returns an interface; a constructor for a concrete value returns the struct; a function that chooses among several node types returns the common interface.
+
+:::tip[Idiom]
+Accepting an interface is almost always correct (`func GetExpressionArgs(expr Node)` below takes `Node`, not `*FuncExpr`). Returning an interface is correct only when you have a *reason* to hide or unify the concrete type. When in doubt, return the struct — you can always loosen later, but tightening a return type is a breaking change.
+:::
+
+## Type assertions: extracting the concrete type back out
+
+An interface value hides its dynamic type. A *type assertion* tries to recover it. There are two forms, and the difference matters enormously.
+
+```go
+var n Node = NewInteger(5)
+
+i := n.(*Integer)     // single-value: panics if n is not actually a *Integer
+i, ok := n.(*Integer) // comma-ok: ok is false (and i is the zero value) on mismatch — no panic
+```
+
+You can also assert to an *interface* type, which asks "does this value's dynamic type satisfy this interface?" — a runtime conformance check. The AST helpers use the comma-ok form consistently, for exactly that reason. They accept `any` (an empty interface, covered below) and test whether the value is a `Node` at all:
+
+```go title="go/common/parser/ast/nodes.go"
+func IsNode(v any) bool {
+	_, ok := v.(Node) // does v satisfy the Node interface at runtime?
+	return ok
+}
+
+func CastNode(v any) Node {
+	if node, ok := v.(Node); ok {
+		return node
+	}
+	return nil // not a node → nil interface, no panic
+}
+```
+
+And the comma-ok form asserting to a *concrete* type, used to pull a typed value out of a `Node`:
+
+```go title="go/common/parser/ast/nodes.go"
+func IntVal(node Node) int {
+	if i, ok := node.(*Integer); ok {
+		return i.IVal
+	}
+	return 0
+}
+```
+
+`NodeTagOf`, `LocationOf`, and `BoolVal`/`FloatVal` follow the identical shape: comma-ok, return a safe default on mismatch. The single-value form would `panic` if handed something that isn't the expected type — unacceptable for a parser helper that gets called on arbitrary tree nodes.
+
+:::caution[Gotcha]
+The single-value form (`x := v.(T)`) panics on mismatch. Use it *only* when a mismatch is genuinely a programmer bug, not a data condition. There's exactly such a case below: the `.(Stmt)` in the normalizer is single-value because `Rewrite` is *known* to return a `Stmt` — it's a documented invariant, not a runtime branch.
+:::
+
+## Type switches: dispatching on the concrete type
+
+A type switch is a multi-way comma-ok assertion. It's how you dispatch over a closed family of node types — the AST's bread and butter.
+
+```go
+func area(s Shape) float64 {
+	switch v := s.(type) { // v is bound to the concrete type in each case
+	case *Circle:
+		return 3.14159 * v.R * v.R // v is *Circle here
+	case *Rect:
+		return v.W * v.H // v is *Rect here
+	default:
+		return 0 // v keeps the interface type (Shape) here
+	}
+}
+```
+
+`GetExpressionArgs` dispatches over a dozen expression node types to pull out their argument lists. In each `case`, the bound variable `e` has the *concrete* pointer type, so `e.Args` type-checks:
+
+```go title="go/common/parser/ast/expressions.go"
+func GetExpressionArgs(expr Node) *NodeList {
+	switch e := expr.(type) {
+	case *FuncExpr:
+		return e.Args
+	case *OpExpr:
+		return e.Args
+	case *BoolExpr:
+		return e.Args
+	case *CaseExpr:
+		return e.Args
+	case *CaseWhen:
+		return NewNodeList(e.Expr, e.Result)
+	// ... *CoalesceExpr, *ArrayExpr, *ScalarArrayOpExpr,
+	//     *RowExpr, *Aggref, *WindowFunc, *SubLink ...
+	default:
+		return nil
+	}
+}
+```
+
+A *grouped* case lists several types in one arm. When you group types, the bound variable keeps the **interface** type (here `node Node`), not any concrete type — because the cases disagree on what concrete type it is:
+
+```go title="go/common/parser/ast/nodes.go"
+switch n := node.(type) {
+case *NodeList:
+	for _, item := range n.Items { // n is *NodeList — concrete, single case
+		if item != nil {
+			WalkNodes(item, walker)
+		}
+	}
+case *Integer, *Float, *Boolean, *String, *BitString, *Null:
+	// n is still Node here (grouped case) — these are all leaves, no traversal
+	return
+default:
+	// other node types: not yet traversed
+}
+```
+
+The normalizer uses a type switch to *skip* subtrees whose literals carry planner-significant meaning, and finishes with a single-value assertion of the walk result back to the narrower `Stmt` interface:
+
+```go title="go/common/parser/ast/normalizer.go"
+switch n := node.(type) {
+case *VariableSetStmt, *VariableShowStmt, *DefElem:
+	return false // grouped: don't normalize these subtrees
+case *FuncCall:
+	if isPlannerLiteralFunc(n.Funcname) { // single case: n is *FuncCall, so n.Funcname is valid
+		// ... selectively normalize specific args ...
+		return false
+	}
+}
+// ...
+}, nil).(Stmt) // assert Rewrite's Node result back to Stmt
+```
+
+That trailing `.(Stmt)` is the rare *justified* single-value assertion: `Rewrite` always returns a `Node` whose dynamic type is a statement here, so the assert documents and enforces that invariant; a violation is a bug worth panicking over.
+
+:::note
+The AST has *two* dispatch styles that coexist. The type switch (Go's dynamic type) is one. The other is tag-based: `node.NodeTag()` returns a `NodeTag` enum and code switches on that integer. Tag dispatch is cheaper and works without importing the concrete types; type switch gives you the typed value directly. The generated files `ast_clone.go` and `ast_rewrite.go` contain enormous *machine-generated* type switches covering every node — don't treat those as hand-written examples; they're regenerated by a codegen tool. See [Parser, Lexer, AST & Codegen](/go-guide/project/06-parser-lexer-ast-codegen/).
+:::
+
+## The empty interface and `any`
+
+`interface{}` is the interface with *no* methods. Every type satisfies it, so a variable of that type can hold anything — Go's dynamic-typing escape hatch. As of Go 1.18, `any` is a built-in alias for `interface{}`; they are identical, and modern code writes `any`.
+
+`NewValue` is the canonical use: it sits at the boundary between *Go literal values* and *AST nodes*, so it accepts `any` and type-switches on the Go builtin type to build the right node:
+
+```go title="go/common/parser/ast/nodes.go"
+func NewValue(val any) Node {
+	switch v := val.(type) {
+	case string:
+		return NewString(v)
+	case int:
+		return NewInteger(v)
+	case int32:
+		return NewInteger(int(v))
+	case int64:
+		return NewInteger(int(v))
+	case float32:
+		return NewFloat(fmt.Sprintf("%g", v))
+	case float64:
+		return NewFloat(fmt.Sprintf("%g", v))
+	case bool:
+		return NewBoolean(v)
+	case nil: // matches an untyped nil val
+		return NewNull()
+	default:
+		return NewString(fmt.Sprintf("%v", v)) // unknown: stringify it
+	}
+}
+```
+
+The `IsNode`/`NodeTagOf`/`LocationOf`/`CastNode` helpers also take `any` because they're written to be safe on *anything*, node or not.
+
+:::caution[Gotcha]
+`any` discards all compile-time type safety — the type switch must handle every case you care about, or you fall through to `default`. Here the default *silently stringifies* unknown types instead of erroring. Pass `NewValue(time.Now())` and you get a `*String` of the formatted time, not a compile error and not a panic. Empty-interface parameters trade safety for flexibility; reserve them for genuine boundaries (parsing Go literals, JSON, reflection) and prefer generics when the type *is* known at the call site — see [Generics](/go-guide/language/06-generics/) for when type parameters replace `any` plus a type switch.
+:::
+
+## The typed-nil gotcha (read this twice)
+
+This is the bug every Go programmer hits once and never forgets. An interface value has two parts internally: a *type* and a *value*. An interface is `== nil` **only when both halves are nil**. If you store a nil *concrete pointer* into an interface, the type half is set (`*Foo`) and the value half is nil — so the interface is **not** `== nil`, even though the thing it wraps is nil.
+
+```go
+type E struct{}
+func (*E) Error() string { return "boom" }
+
+func bad() error {
+	var p *E = nil
+	return p // returns a non-nil error wrapping a nil *E !!
+}
+
+func main() {
+	err := bad()
+	fmt.Println(err == nil) // FALSE — surprises everyone
+	// err.Error()          // and calling a method may panic, depending on the method
+}
+```
+
+The interface `err` has dynamic type `*E` and value `nil`, so `err == nil` is false. Callers that guard with `if err != nil { ... }` will wrongly enter the error branch, and methods that dereference the receiver will panic.
+
+Production code guards against this explicitly. `InternalQueryService` returns an interface, and its `*Executor` field might be nil — so it nil-checks *before* returning, and returns the literal `nil` (an untyped nil, which is a truly nil interface):
+
+```go title="go/services/multipooler/internal/poolerserver/pooler.go"
+func (s *QueryPoolerServer) InternalQueryService() executor.InternalQueryService {
+	// Explicit nil check required: returning a nil *Executor directly would produce a
+	// non-nil interface value wrapping a nil pointer, causing callers' == nil checks to
+	// pass but method calls on the interface to panic.
+	if s.executor == nil {
+		return nil
+	}
+	return s.executor
+}
+```
+
+Without the check, `return s.executor` when `s.executor` is a nil `*Executor` hands back a non-nil `InternalQueryService` interface wrapping a nil pointer — a caller's `if svc != nil` passes, then the first method call panics.
+
+There's a real regression test for the same class of bug. A factory deliberately returns a typed nil to reproduce etcd's behavior:
+
+```go title="go/common/topoclient/wrapperconn_test.go"
+func (f *typedNilMockFactory) newConn() (Conn, error) {
+	// ...
+	var conn *mockConn // concrete type → typed nil
+	if f.shouldFail {
+		// Returns typed nil (*mockConn)(nil) wrapped in Conn interface.
+		// When assigned to Conn, it becomes a non-nil interface with a nil
+		// underlying value - the classic Go gotcha.
+		return conn, mterrors.Errorf(mtrpc.Code_UNAVAILABLE, "factory error")
+	}
+	// ...
+}
+```
+
+And the production code under test defends by checking the *error* first, never trusting the conn when an error came back:
+
+```go title="go/common/topoclient/wrapperconn.go"
+// Check error first - if err != nil, conn is unusable (may be typed nil).
+if err != nil {
+	if c.closed {
+		return false
+	}
+	return true
+}
+```
+
+Even the `mterrors` test table encodes the distinction between an untyped nil and a typed nil at the `error` boundary:
+
+```go title="go/common/mterrors/errors_test.go"
+{
+	// explicit nil error is nil
+	err:  (error)(nil), // truly nil interface — both halves nil
+	want: nil,
+}, {
+	// typed nil is nil
+	err:  (*nilError)(nil), // a non-nil error interface wrapping a nil *nilError
+	want: (*nilError)(nil), // ... and it stays that distinct value
+},
+```
+
+:::caution[Gotcha — the one to memorize]
+Never return a concrete nil pointer where the signature is an interface. Either nil-check and `return nil` (as `InternalQueryService` does), or check the accompanying error first (as `wrapperconn` does), or design so the function returns the concrete pointer type and lets the *caller* decide when to box it. The compiler will not catch this — `return s.executor` is perfectly valid Go.
+:::
+
+## Checkpoints
+
+1. A type `*Foo` has methods `Bar()` and `Baz()`. An interface `Doer` requires only `Bar()`. Does `*Foo` satisfy `Doer`, and where (if anywhere) is that relationship written down?
+<details><summary>Answer</summary>Yes — satisfaction is implicit and structural; `*Foo` satisfies `Doer` because its method set includes `Bar()` (extra methods are fine). The relationship is written down *nowhere* in code; at most it's documented in a comment or asserted with `var _ Doer = (*Foo)(nil)`. There is no <code>implements</code> keyword.</details>
+
+2. `BaseNode.SqlString()` panics, and `Integer` overrides it to return `strconv.Itoa(i.IVal)`. If you call `someInteger.BaseNode.SqlString()` directly, what happens, and why doesn't the override save you?
+<details><summary>Answer</summary>It panics. By writing `.BaseNode.SqlString()` you explicitly select the embedded base method, bypassing the override. Method promotion is forwarding, not virtual dispatch — `BaseNode` has no back-reference to the `Integer` embedding it, so the base version runs and hits its <code>panic</code>. Calls through `someInteger.SqlString()` (or through the `Node` interface) resolve to `Integer`'s override instead.</details>
+
+3. `func provide() error { var e *myErr = nil; return e }`. Is `provide() == nil` true or false? What's the fix if you want it to be true?
+<details><summary>Answer</summary>False. The returned `error` interface has dynamic type `*myErr` and a nil value, so it is not `== nil`. Fix: nil-check first and `return nil` (the untyped nil literal), or have the function return `*myErr` and only box it into `error` when it's actually non-nil — exactly the pattern in `InternalQueryService`.</details>
+
+4. In a type switch, when does the bound variable have the concrete type vs. the interface type?
+<details><summary>Answer</summary>In a single-type case (`case *FuncExpr:`) the bound variable has that concrete type, so you can access its fields. In a *grouped* case (`case *Integer, *Float, *Boolean:`) the cases disagree on the concrete type, so the bound variable keeps the original interface type (e.g. `Node`). The `default` case also keeps the interface type.</details>
+
+## Exercises
+
+1. In `go/common/parser/ast/nodes.go`, list all five methods of the `Node` interface. Then open `Integer` and classify each method as *promoted from `BaseNode`* or *overridden on `Integer`*. Explain, using `BaseNode.SqlString`, why `SqlString` *must* be overridden for `Integer` to be usable in the deparser.
+
+2. Grep for `Unimplemented` across `go/services` (try `grep -rn "Unimplemented.*Server" go/services`). Count how many server structs embed one. Pick two and write one sentence each on what breaks if the proto adds a new RPC and the struct did *not* embed it.
+
+3. Read `InternalQueryService` in `go/services/multipooler/internal/poolerserver/pooler.go`. Mentally delete the `if s.executor == nil` guard and describe the *exact* runtime failure a caller hits (be specific about which check passes and which call panics). Then read the typed-nil regression test in `go/common/topoclient/wrapperconn_test.go` and explain how `typedNilMockFactory.newConn` manufactures the same class of bug.
+
+4. Find every comma-ok type assertion in `go/common/parser/ast/nodes.go` (`IsNode`, `NodeTagOf`, `LocationOf`, `CastNode`, `IntVal`, `BoolVal`, `FloatVal`). For each, state what value it returns on a mismatch and what would happen if it had used the single-value form instead. Then explain why the single-value `.(Stmt)` in `normalizer.go` is acceptable when these are not.
+
+5. Compare `ManagerHealthStream` (two methods) with `MultiPoolerClient` (around 20 methods) in `go/common/rpcclient/client.go`. Argue, in terms of *who implements each* and *how each is faked in tests*, why one interface is deliberately tiny and the other deliberately large.
+
+## Next
+
+<LinkCard
+  title="Pointers, Values & Memory"
+  description="Pointer vs. value receivers (which decide interface satisfaction), and the memory model behind the typed-nil trap."
+  href="/go-guide/language/04-pointers-values-memory/"
+/>
+
+## See also
+
+<CardGrid>
+  <LinkCard
+    title="Types, Structs & Methods"
+    description="Method sets, struct fields, and the BaseNode / NewInteger constructors this chapter builds on."
+    href="/go-guide/language/02-types-structs-methods/"
+  />
+  <LinkCard
+    title="Errors"
+    description="The error interface is Go's most-used interface; the typed-nil rule connects directly."
+    href="/go-guide/language/05-errors/"
+  />
+  <LinkCard
+    title="Generics"
+    description="Generics vs. interfaces: when type parameters replace any plus a type switch."
+    href="/go-guide/language/06-generics/"
+  />
+  <LinkCard
+    title="gRPC & Protobuf"
+    description="How the generated Unimplemented*Server types (the struct-embedding idiom) come to exist."
+    href="/go-guide/project/04-grpc-and-protobuf/"
+  />
+  <LinkCard
+    title="Parser, Lexer, AST & Codegen"
+    description="The Node / Stmt / Expression / Value hierarchy and the exhaustive generated type switches."
+    href="/go-guide/project/06-parser-lexer-ast-codegen/"
+  />
+  <LinkCard
+    title="Service Anatomy"
+    description="How QueryService / Gateway / MultiPoolerClient shape the service boundaries."
+    href="/go-guide/project/05-service-anatomy/"
+  />
+  <LinkCard
+    title="Idioms & Gotchas"
+    description="The typed-nil and 'embedding is not inheritance' gotchas in quick-reference form."
+    href="/go-guide/reference/idioms-and-gotchas/"
+  />
+  <LinkCard
+    title="Glossary"
+    description="Implicit satisfaction, method promotion, type assertion, type switch, empty interface, typed nil."
+    href="/go-guide/reference/glossary/"
+  />
+</CardGrid>
