@@ -32,7 +32,7 @@ then gets curated into something genuinely useful to learn from.
 
 Each topic is a **course** — a folder under `src/content/docs/`. Every Markdown
 or MDX file inside becomes a page, and `src/config/sidebar.json` groups them in
-the navigation. See the [Authoring guide](/authoring/) to add your own.
+the navigation. Browse what's here from the [Courses](/courses/) page.
 
 ## How it is built
 
