@@ -35,6 +35,14 @@ export default defineConfig({
       locales,
       sidebar: sidebar.main || [],
       customCss: ["./src/styles/global.css"],
+      expressiveCode: {
+        themes: ["github-dark-default", "github-light-default"],
+        styleOverrides: {
+          borderRadius: "10px",
+          borderColor: "var(--sl-color-hairline)",
+          frames: { shadowColor: "transparent" },
+        },
+      },
       components: {
         Head: "./src/components/override-components/Head.astro",
         Header: "./src/components/override-components/Header.astro",
