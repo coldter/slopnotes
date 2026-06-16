@@ -1,6 +1,6 @@
 ---
 title: Frontmatter Reference
-description: The Starlight frontmatter fields used across slop-learn pages.
+description: The Starlight frontmatter fields used across slopnotes pages.
 sidebar:
   order: 2
 ---
@@ -14,7 +14,7 @@ built-ins.
 | Field            | Type             | Notes                                                           |
 | ---------------- | ---------------- | --------------------------------------------------------------- |
 | `title`          | string           | Required. Rendered as the page `<h1>` and used in nav.          |
-| `description`    | string           | Required on slop-learn. Used for `<meta>` description / SEO.    |
+| `description`    | string           | Required on slopnotes. Used for `<meta>` description / SEO.    |
 | `sidebar`        | object           | Controls how the page appears in the sidebar (see below).       |
 | `tableOfContents` | object \| false | Tune or disable the on-page TOC.                                |
 | `template`       | `'doc'` \| `'splash'` | Page layout. `doc` (default) has a sidebar/TOC; `splash` is a wide landing page. |
@@ -51,12 +51,12 @@ draft: false
 ---
 ```
 
-## slop-learn conventions vs Starlight built-ins
+## slopnotes conventions vs Starlight built-ins
 
 - **Starlight built-ins:** every field above is part of Starlight's content schema —
   `title`, `description`, `sidebar`, `tableOfContents`, `template`, `prev`/`next`,
   `lastUpdated`, and `draft`.
-- **slop-learn conventions:**
+- **slopnotes conventions:**
   - `description` is treated as effectively required so every page has a useful
     meta description.
   - Numeric filename prefixes (`01-`, `02-`) plus a matching `sidebar.order` keep

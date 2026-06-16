@@ -1,11 +1,11 @@
 ---
 title: Authoring Guide
-description: How slop-learn is organized and how to add AI-generated learning material.
+description: How slopnotes is organized and how to add AI-generated learning material.
 sidebar:
   order: 0
 ---
 
-slop-learn hosts AI-generated personal learning material as a set of **courses**.
+slopnotes hosts AI-generated personal learning material as a set of **courses**.
 This guide explains the conventions so a new course slots in cleanly.
 
 ## The model

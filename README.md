@@ -1,9 +1,9 @@
-# slop-learn
+# slopnotes
 
 [![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
 
 A personal home for **AI-generated learning material**. Good explanations from a
-model usually get buried in a chat log and never seen again — slop-learn is where
+model usually get buried in a chat log and never seen again — slopnotes is where
 those notes get saved, organized as courses, and given a clean, searchable,
 responsive reading experience.
 

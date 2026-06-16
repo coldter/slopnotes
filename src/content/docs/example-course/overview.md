@@ -1,6 +1,6 @@
 ---
 title: Overview
-description: A sample template course showing how content looks and behaves on slop-learn.
+description: A sample template course showing how content looks and behaves on slopnotes.
 sidebar:
   order: 0
 ---
@@ -11,7 +11,7 @@ each page exists to demonstrate a slice of what Starlight markdown can do.
 
 ## How courses are structured
 
-Every course on slop-learn is a folder under `src/content/docs/`. The folder name
+Every course on slopnotes is a folder under `src/content/docs/`. The folder name
 becomes the URL slug, and each markdown file inside it is one page. This course
 lives at `src/content/docs/example-course/` and contains:
 

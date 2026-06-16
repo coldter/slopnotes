@@ -28,7 +28,7 @@ export default defineConfig({
       logo: {
         light: logo,
         dark: logo_darkmode,
-        alt: "slop-learn",
+        alt: "slopnotes",
       },
       // @ts-ignore
       social: social.main || [],
