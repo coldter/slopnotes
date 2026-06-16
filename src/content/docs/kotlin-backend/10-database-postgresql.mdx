@@ -1,0 +1,1748 @@
+---
+title: PostgreSQL Access
+description: Four ways to talk to PostgreSQL from Kotlin — JDBC, Spring Data JPA, Exposed, and jOOQ — mapped from the data-access tools you know in TypeScript and Go.
+sidebar:
+  order: 10
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Tabs, TabItem, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Everything you know about database access from TypeScript (Prisma, Drizzle, TypeORM, Knex) and Go (GORM, sqlc, `database/sql`) has a Kotlin/JVM counterpart. The JVM ecosystem offers **four major approaches** to database access, each with different tradeoffs. This module covers all of them so you can make an informed choice.
+
+:::note[Shared infrastructure]
+Start PostgreSQL from the course's shared stack first:
+
+```bash
+cd shared-infra
+docker compose up -d postgres
+# Connection: localhost:5432, user: dev, password: dev, database: kotlin_course
+```
+
+See [the Dev Environment module](/kotlin-backend/01-dev-environment/) for the full infrastructure walkthrough.
+:::
+
+## The JVM Database Landscape
+
+### Mapping from what you know
+
+| Your Background | Closest Kotlin/JVM Equivalent | Style |
+|---|---|---|
+| `database/sql` (Go) | **JDBC** | Raw SQL, manual mapping |
+| `sqlc` (Go) | **jOOQ** | Type-safe generated code from SQL |
+| Prisma (TS) | **Exposed DAO** | ORM-like, schema-first |
+| Drizzle (TS) | **Exposed DSL** | Type-safe query builder |
+| TypeORM / Sequelize (TS) | **Spring Data JPA / Hibernate** | Full ORM with entity mapping |
+| GORM (Go) | **Spring Data JPA / Hibernate** | Full ORM with conventions |
+| Knex (TS) | **jOOQ / Exposed DSL** | Query builder |
+
+### The four approaches at a glance
+
+The four libraries sit on a spectrum from raw SQL control on the left to abstraction and convenience on the right:
+
+<Mermaid title="Data-access spectrum" height={360} code={`
+flowchart LR
+  J["JDBC\nRaw SQL\nManual mapping\nNo magic"] --> Q["jOOQ\nType-safe\nGenerated\nSQL-centric"]
+  Q --> E["Exposed DSL\nKotlin DSL\nDSL + DAO\nKotlin-first"]
+  E --> S["Spring Data JPA\nFull ORM\nAuto repositories\nConvention-heavy"]
+`} />
+
+## JDBC: The Foundation
+
+JDBC (Java Database Connectivity) is what **every** JVM database library builds on top of. It's the equivalent of Go's `database/sql` package. Even if you never use JDBC directly, understanding it helps you debug everything else.
+
+### Basic connection and query
+
+The same "open a connection, run a parameterized query, iterate rows" flow in all three ecosystems:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+import { Client } from 'pg';
+
+const client = new Client({
+  connectionString: 'postgres://dev:dev@localhost:5432/kotlin_course'
+});
+await client.connect();
+
+const { rows } = await client.query(
+  'SELECT id, name, email FROM users WHERE active = $1',
+  [true]
+);
+rows.forEach(row => console.log(`${row.id}: ${row.name} (${row.email})`));
+
+await client.end();
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+import "database/sql"
+import _ "github.com/lib/pq"
+
+db, err := sql.Open("postgres", "postgres://dev:dev@localhost:5432/kotlin_course?sslmode=disable")
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+rows, err := db.Query("SELECT id, name, email FROM users WHERE active = $1", true)
+if err != nil {
+    log.Fatal(err)
+}
+defer rows.Close()
+
+for rows.Next() {
+    var id int
+    var name, email string
+    rows.Scan(&id, &name, &email)
+    fmt.Printf("%d: %s (%s)\n", id, name, email)
+}
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import java.sql.DriverManager
+
+fun main() {
+    val url = "jdbc:postgresql://localhost:5432/kotlin_course"
+    val connection = DriverManager.getConnection(url, "dev", "dev")
+
+    connection.use { conn ->
+        val stmt = conn.prepareStatement(
+            "SELECT id, name, email FROM users WHERE active = ?"
+        )
+        stmt.setBoolean(1, true)
+
+        val rs = stmt.executeQuery()
+        while (rs.next()) {
+            val id = rs.getLong("id")
+            val name = rs.getString("name")
+            val email = rs.getString("email")
+            println("$id: $name ($email)")
+        }
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+- JDBC uses `?` for parameter placeholders (not `$1`, `$2` like PostgreSQL native).
+- `connection.use { }` is Kotlin's equivalent of Go's `defer conn.Close()` — it auto-closes.
+- `ResultSet` is cursor-based: you call `next()` and then get columns by name or index.
+- No automatic row-to-struct mapping — you do it manually.
+
+### CRUD operations with JDBC
+
+```kotlin
+import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.Statement
+
+data class User(
+    val id: Long = 0,
+    val name: String,
+    val email: String,
+    val active: Boolean = true
+)
+
+class UserJdbcRepository(private val conn: Connection) {
+
+    // CREATE
+    fun create(user: User): User {
+        val sql = "INSERT INTO users (name, email, active) VALUES (?, ?, ?) RETURNING id"
+        val stmt = conn.prepareStatement(sql)
+        stmt.setString(1, user.name)
+        stmt.setString(2, user.email)
+        stmt.setBoolean(3, user.active)
+
+        val rs = stmt.executeQuery()
+        rs.next()
+        return user.copy(id = rs.getLong("id"))
+    }
+
+    // READ (single)
+    fun findById(id: Long): User? {
+        val stmt = conn.prepareStatement("SELECT id, name, email, active FROM users WHERE id = ?")
+        stmt.setLong(1, id)
+        val rs = stmt.executeQuery()
+        return if (rs.next()) rs.toUser() else null
+    }
+
+    // READ (list)
+    fun findAll(): List<User> {
+        val stmt = conn.prepareStatement("SELECT id, name, email, active FROM users")
+        val rs = stmt.executeQuery()
+        val users = mutableListOf<User>()
+        while (rs.next()) {
+            users.add(rs.toUser())
+        }
+        return users
+    }
+
+    // UPDATE
+    fun update(user: User): Boolean {
+        val sql = "UPDATE users SET name = ?, email = ?, active = ? WHERE id = ?"
+        val stmt = conn.prepareStatement(sql)
+        stmt.setString(1, user.name)
+        stmt.setString(2, user.email)
+        stmt.setBoolean(3, user.active)
+        stmt.setLong(4, user.id)
+        return stmt.executeUpdate() > 0
+    }
+
+    // DELETE
+    fun delete(id: Long): Boolean {
+        val stmt = conn.prepareStatement("DELETE FROM users WHERE id = ?")
+        stmt.setLong(1, id)
+        return stmt.executeUpdate() > 0
+    }
+
+    // Batch insert
+    fun createBatch(users: List<User>): List<User> {
+        val sql = "INSERT INTO users (name, email, active) VALUES (?, ?, ?)"
+        val stmt = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)
+
+        for (user in users) {
+            stmt.setString(1, user.name)
+            stmt.setString(2, user.email)
+            stmt.setBoolean(3, user.active)
+            stmt.addBatch()
+        }
+
+        stmt.executeBatch()
+        val keys = stmt.generatedKeys
+        return users.mapIndexed { _, user ->
+            keys.next()
+            user.copy(id = keys.getLong(1))
+        }
+    }
+}
+
+// Extension function to map ResultSet row to User
+private fun java.sql.ResultSet.toUser() = User(
+    id = getLong("id"),
+    name = getString("name"),
+    email = getString("email"),
+    active = getBoolean("active")
+)
+```
+
+### Why not use JDBC directly?
+
+JDBC is verbose. For every query you write:
+
+1. SQL string with `?` placeholders.
+2. Manual parameter binding by index.
+3. Manual `ResultSet` → object mapping.
+4. Manual resource cleanup.
+
+This is the same reason you moved from `database/sql` to GORM in Go, or from `pg` to Prisma in TypeScript. The higher-level libraries exist to reduce this boilerplate.
+
+## Connection Pooling with HikariCP
+
+In Go, `database/sql` has a built-in connection pool. In Node.js, you use `pg.Pool`. On the JVM, the standard is **HikariCP** — the fastest connection pool available.
+
+Spring Boot auto-configures HikariCP. If you're not using Spring, configure it manually:
+
+### Manual HikariCP setup
+
+```kotlin
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
+
+fun createDataSource(): HikariDataSource {
+    val config = HikariConfig().apply {
+        jdbcUrl = "jdbc:postgresql://localhost:5432/kotlin_course"
+        username = "dev"
+        password = "dev"
+        driverClassName = "org.postgresql.Driver"
+
+        // Pool sizing
+        maximumPoolSize = 10          // Max connections in pool
+        minimumIdle = 5               // Min idle connections kept alive
+        idleTimeout = 300_000         // 5 min before idle conn is removed
+        connectionTimeout = 30_000    // 30s to wait for a connection
+        maxLifetime = 1_800_000       // 30 min max lifetime per connection
+
+        // Performance
+        addDataSourceProperty("cachePrepStmts", "true")
+        addDataSourceProperty("prepStmtCacheSize", "250")
+        addDataSourceProperty("prepStmtCacheSqlLimit", "2048")
+    }
+    return HikariDataSource(config)
+}
+
+fun main() {
+    val dataSource = createDataSource()
+
+    // Get connection from pool (not creating a new one each time)
+    dataSource.connection.use { conn ->
+        val rs = conn.prepareStatement("SELECT count(*) FROM users").executeQuery()
+        rs.next()
+        println("User count: ${rs.getLong(1)}")
+    }
+    // Connection returned to pool when `use` block ends
+
+    dataSource.close() // Shut down pool
+}
+```
+
+### Spring Boot auto-configuration
+
+In Spring Boot, just set properties — HikariCP is the default pool:
+
+```yaml title="application.yml"
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/kotlin_course
+    username: dev
+    password: dev
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      idle-timeout: 300000
+      connection-timeout: 30000
+      max-lifetime: 1800000
+```
+
+### Pool sizing rules
+
+| Guideline | Value | Reason |
+|---|---|---|
+| Max pool size | `CPU cores * 2 + disk spindles` | Classic formula, typically 10-20 |
+| Minimum idle | Same as max (for steady load) | Avoids connection creation latency |
+| Connection timeout | 30s | Fail fast if pool exhausted |
+| Max lifetime | 30 min | Prevent stale connections |
+
+Compared to the pools you already know:
+
+| Feature | Go (`database/sql`) | TS (`pg.Pool`) | Kotlin (HikariCP) |
+|---|---|---|---|
+| Built-in pool | Yes | Yes (`Pool` class) | No (need HikariCP) |
+| Max connections | `SetMaxOpenConns()` | `max` option | `maximumPoolSize` |
+| Idle connections | `SetMaxIdleConns()` | `idleTimeoutMillis` | `minimumIdle` |
+| Health checks | `SetConnMaxLifetime()` | `allowExitOnIdle` | `maxLifetime` |
+
+## Spring Data JPA / Hibernate
+
+Spring Data JPA is the closest equivalent to TypeORM or GORM. It provides:
+
+- **Hibernate** as the ORM engine (maps objects to tables).
+- **Spring Data** repositories (auto-generated CRUD from interface definitions).
+- JPQL for custom queries.
+
+### Dependency setup
+
+```kotlin title="build.gradle.kts"
+plugins {
+    kotlin("jvm") version "2.1.0"
+    kotlin("plugin.spring") version "2.1.0"
+    kotlin("plugin.jpa") version "2.1.0"       // CRITICAL for Kotlin entities
+    kotlin("plugin.allopen") version "2.1.0"   // Opens JPA classes for proxying
+    id("org.springframework.boot") version "3.4.1"
+    id("io.spring.dependency-management") version "1.1.7"
+}
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    runtimeOnly("org.postgresql:postgresql")
+}
+```
+
+:::caution[Plugins are essential]
+The `kotlin-jpa` and `kotlin-allopen` plugins are required. Without them, your JPA entities will fail at runtime because Hibernate needs no-arg constructors and non-final classes. See [Kotlin JPA Gotchas](#kotlin-jpa-gotchas) below for details.
+:::
+
+### Defining entities
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+@Entity()
+export class User {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  name: string;
+
+  @Column({ unique: true })
+  email: string;
+
+  @Column({ default: true })
+  active: boolean;
+
+  @CreateDateColumn()
+  createdAt: Date;
+}
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+type User struct {
+    gorm.Model
+    Name   string `gorm:"not null"`
+    Email  string `gorm:"uniqueIndex;not null"`
+    Active bool   `gorm:"default:true"`
+}
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import jakarta.persistence.*
+import java.time.Instant
+
+@Entity
+@Table(name = "users", schema = "mod10_database")
+class User(
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    val id: Long = 0,
+
+    @Column(nullable = false)
+    var name: String,
+
+    @Column(nullable = false, unique = true)
+    var email: String,
+
+    @Column(nullable = false)
+    var active: Boolean = true,
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    val createdAt: Instant = Instant.now()
+)
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+- JPA entities are **classes, not data classes** (see [Kotlin JPA Gotchas](#kotlin-jpa-gotchas) for why).
+- Mutable fields use `var`, immutable use `val`.
+- `@GeneratedValue(strategy = GenerationType.IDENTITY)` is auto-increment (like `SERIAL` in PostgreSQL).
+- JPA uses `jakarta.persistence.*` (Jakarta EE 9+, not the old `javax.persistence.*`).
+
+### Relationships
+
+```kotlin
+@Entity
+@Table(name = "posts", schema = "mod10_database")
+class Post(
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    val id: Long = 0,
+
+    @Column(nullable = false)
+    var title: String,
+
+    @Column(columnDefinition = "TEXT")
+    var content: String,
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "author_id", nullable = false)
+    var author: User,
+
+    @OneToMany(mappedBy = "post", cascade = [CascadeType.ALL], orphanRemoval = true)
+    val comments: MutableList<Comment> = mutableListOf(),
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    val createdAt: Instant = Instant.now()
+)
+
+@Entity
+@Table(name = "comments", schema = "mod10_database")
+class Comment(
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    val id: Long = 0,
+
+    @Column(columnDefinition = "TEXT", nullable = false)
+    var body: String,
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "post_id", nullable = false)
+    var post: Post,
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "author_id", nullable = false)
+    var author: User
+)
+```
+
+**Fetch types:**
+
+- `FetchType.LAZY` loads the related entity only when accessed (the default for `@ManyToOne` *should* be LAZY).
+- `FetchType.EAGER` loads immediately with the parent (the actual default for `@ManyToOne`, often a performance trap).
+
+:::tip[Rule of thumb]
+Always set `@ManyToOne(fetch = FetchType.LAZY)`. Eager fetching causes N+1 problems silently.
+:::
+
+### Spring Data repositories
+
+This is where Spring Data shines. Define an interface, and Spring generates the implementation:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// TypeORM repository
+const userRepo = dataSource.getRepository(User);
+const user = await userRepo.findOneBy({ email: 'alice@example.com' });
+const activeUsers = await userRepo.find({ where: { active: true } });
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// GORM
+var user User
+db.Where("email = ?", "alice@example.com").First(&user)
+
+var users []User
+db.Where("active = ?", true).Find(&users)
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Query
+
+interface UserRepository : JpaRepository<User, Long> {
+
+    // Spring generates the query from the method name
+    fun findByEmail(email: String): User?
+    fun findByActiveTrue(): List<User>
+    fun findByNameContainingIgnoreCase(name: String): List<User>
+
+    // Custom JPQL query
+    @Query("SELECT u FROM User u WHERE u.createdAt > :since AND u.active = true")
+    fun findRecentActiveUsers(since: Instant): List<User>
+
+    // Native SQL query
+    @Query(
+        value = "SELECT * FROM mod10_database.users WHERE email LIKE %:domain",
+        nativeQuery = true
+    )
+    fun findByEmailDomain(domain: String): List<User>
+}
+```
+
+  </TabItem>
+</Tabs>
+
+**Method-name query derivation** — Spring parses method names into queries:
+
+| Method Name | Generated SQL |
+|---|---|
+| `findByEmail(email)` | `WHERE email = ?` |
+| `findByActiveTrue()` | `WHERE active = true` |
+| `findByNameContainingIgnoreCase(name)` | `WHERE LOWER(name) LIKE LOWER('%' \|\| ? \|\| '%')` |
+| `findByCreatedAtAfter(date)` | `WHERE created_at > ?` |
+| `countByActiveTrue()` | `SELECT COUNT(*) ... WHERE active = true` |
+| `deleteByEmail(email)` | `DELETE ... WHERE email = ?` |
+| `existsByEmail(email)` | `SELECT EXISTS(... WHERE email = ?)` |
+
+### Using repositories in a service
+
+```kotlin
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
+
+@Service
+class UserService(private val userRepository: UserRepository) {
+
+    fun getUser(id: Long): User =
+        userRepository.findById(id)
+            .orElseThrow { NoSuchElementException("User $id not found") }
+
+    fun getUserByEmail(email: String): User? =
+        userRepository.findByEmail(email)
+
+    @Transactional
+    fun createUser(name: String, email: String): User {
+        // Check uniqueness
+        if (userRepository.findByEmail(email) != null) {
+            throw IllegalArgumentException("Email $email already taken")
+        }
+        return userRepository.save(User(name = name, email = email))
+    }
+
+    @Transactional
+    fun deactivateUser(id: Long): User {
+        val user = getUser(id)
+        user.active = false
+        return userRepository.save(user)
+    }
+
+    fun listActiveUsers(): List<User> =
+        userRepository.findByActiveTrue()
+}
+```
+
+### Pagination and sorting
+
+```kotlin
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
+import org.springframework.data.domain.PageRequest
+import org.springframework.data.domain.Sort
+
+interface UserRepository : JpaRepository<User, Long> {
+    fun findByActiveTrue(pageable: Pageable): Page<User>
+}
+
+// Usage
+val page: Page<User> = userRepository.findByActiveTrue(
+    PageRequest.of(
+        0,                           // page number (0-based)
+        20,                          // page size
+        Sort.by("createdAt").descending()  // sort order
+    )
+)
+
+println("Total users: ${page.totalElements}")
+println("Total pages: ${page.totalPages}")
+println("Current page users: ${page.content.size}")
+page.content.forEach { println(it.name) }
+```
+
+### Specifications for dynamic queries
+
+When you need dynamic where-clauses (like a search endpoint with optional filters):
+
+```kotlin
+import org.springframework.data.jpa.domain.Specification
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor
+
+interface UserRepository : JpaRepository<User, Long>, JpaSpecificationExecutor<User>
+
+object UserSpecs {
+    fun hasName(name: String?): Specification<User>? =
+        name?.let {
+            Specification { root, _, cb ->
+                cb.like(cb.lower(root.get("name")), "%${it.lowercase()}%")
+            }
+        }
+
+    fun isActive(active: Boolean?): Specification<User>? =
+        active?.let {
+            Specification { root, _, cb ->
+                cb.equal(root.get<Boolean>("active"), it)
+            }
+        }
+
+    fun createdAfter(since: Instant?): Specification<User>? =
+        since?.let {
+            Specification { root, _, cb ->
+                cb.greaterThan(root.get("createdAt"), it)
+            }
+        }
+}
+
+// Usage: combine specs dynamically
+fun searchUsers(name: String?, active: Boolean?, since: Instant?): List<User> {
+    val spec = listOfNotNull(
+        UserSpecs.hasName(name),
+        UserSpecs.isActive(active),
+        UserSpecs.createdAfter(since)
+    ).reduceOrNull { acc, s -> acc.and(s) }
+
+    return if (spec != null) {
+        userRepository.findAll(spec)
+    } else {
+        userRepository.findAll()
+    }
+}
+```
+
+## Exposed: Kotlin-First SQL
+
+[Exposed](https://github.com/JetBrains/Exposed) is JetBrains' own SQL library for Kotlin. It offers two flavors:
+
+- **DSL** — type-safe query builder (like Drizzle or Knex).
+- **DAO** — lightweight ORM (like a simpler Prisma).
+
+### Dependencies
+
+```kotlin title="build.gradle.kts"
+val exposedVersion = "0.57.0"
+
+dependencies {
+    implementation("org.jetbrains.exposed:exposed-core:$exposedVersion")
+    implementation("org.jetbrains.exposed:exposed-dao:$exposedVersion")
+    implementation("org.jetbrains.exposed:exposed-jdbc:$exposedVersion")
+    implementation("org.jetbrains.exposed:exposed-java-time:$exposedVersion")
+    implementation("org.postgresql:postgresql:42.7.4")
+    implementation("com.zaxxer:HikariCP:6.2.1")
+}
+```
+
+### Table definitions
+
+Exposed table definitions read much like a Drizzle schema:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// Drizzle schema
+import { pgTable, serial, varchar, boolean, timestamp } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  name: varchar('name', { length: 255 }).notNull(),
+  email: varchar('email', { length: 255 }).notNull().unique(),
+  active: boolean('active').default(true).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.javatime.timestamp
+import java.time.Instant
+
+object Users : Table("mod10_database.users") {
+    val id = long("id").autoIncrement()
+    val name = varchar("name", 255)
+    val email = varchar("email", 255).uniqueIndex()
+    val active = bool("active").default(true)
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+
+    override val primaryKey = PrimaryKey(id)
+}
+
+object Posts : Table("mod10_database.posts") {
+    val id = long("id").autoIncrement()
+    val title = varchar("title", 255)
+    val content = text("content")
+    val authorId = long("author_id").references(Users.id)
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+
+    override val primaryKey = PrimaryKey(id)
+}
+```
+
+  </TabItem>
+</Tabs>
+
+### DSL approach (query builder)
+
+The DSL approach is like Drizzle or Knex — you write type-safe queries:
+
+```kotlin
+import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+
+fun main() {
+    // Connect
+    Database.connect(
+        url = "jdbc:postgresql://localhost:5432/kotlin_course",
+        driver = "org.postgresql.Driver",
+        user = "dev",
+        password = "dev"
+    )
+
+    transaction {
+        // Create table (for development only — use Flyway in production)
+        SchemaUtils.create(Users)
+
+        // INSERT
+        val userId = Users.insertAndGetId {
+            it[name] = "Alice"
+            it[email] = "alice@example.com"
+            it[active] = true
+        }
+        println("Created user with ID: $userId")
+
+        // SELECT single
+        val alice = Users
+            .selectAll()
+            .where { Users.email eq "alice@example.com" }
+            .singleOrNull()
+
+        alice?.let {
+            println("Found: ${it[Users.name]} (${it[Users.email]})")
+        }
+
+        // SELECT with conditions
+        val activeUsers = Users
+            .selectAll()
+            .where { Users.active eq true }
+            .orderBy(Users.createdAt, SortOrder.DESC)
+            .limit(10)
+            .map { row ->
+                UserDTO(
+                    id = row[Users.id],
+                    name = row[Users.name],
+                    email = row[Users.email],
+                    active = row[Users.active]
+                )
+            }
+
+        // UPDATE
+        Users.update({ Users.id eq userId.value }) {
+            it[name] = "Alice Updated"
+        }
+
+        // DELETE
+        Users.deleteWhere { Users.id eq userId.value }
+
+        // JOIN
+        val postsWithAuthors = (Posts innerJoin Users)
+            .select(Posts.title, Posts.content, Users.name)
+            .where { Users.active eq true }
+            .map { row ->
+                "${row[Posts.title]} by ${row[Users.name]}"
+            }
+
+        // Aggregation
+        val userCount = Users
+            .selectAll()
+            .where { Users.active eq true }
+            .count()
+        println("Active users: $userCount")
+    }
+}
+
+data class UserDTO(val id: Long, val name: String, val email: String, val active: Boolean)
+```
+
+### DAO approach (ORM-like)
+
+The DAO approach wraps rows in entity objects — closer to Prisma or GORM:
+
+```kotlin
+import org.jetbrains.exposed.dao.LongEntity
+import org.jetbrains.exposed.dao.LongEntityClass
+import org.jetbrains.exposed.dao.id.EntityID
+import org.jetbrains.exposed.dao.id.LongIdTable
+import org.jetbrains.exposed.sql.javatime.timestamp
+import java.time.Instant
+
+// Table definitions for DAO (must use LongIdTable)
+object UsersTable : LongIdTable("mod10_database.users") {
+    val name = varchar("name", 255)
+    val email = varchar("email", 255).uniqueIndex()
+    val active = bool("active").default(true)
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+}
+
+object PostsTable : LongIdTable("mod10_database.posts") {
+    val title = varchar("title", 255)
+    val content = text("content")
+    val author = reference("author_id", UsersTable)
+    val createdAt = timestamp("created_at").defaultExpression(CurrentTimestamp)
+}
+
+// Entity classes
+class UserEntity(id: EntityID<Long>) : LongEntity(id) {
+    companion object : LongEntityClass<UserEntity>(UsersTable)
+
+    var name by UsersTable.name
+    var email by UsersTable.email
+    var active by UsersTable.active
+    val createdAt by UsersTable.createdAt
+
+    // One-to-many relationship
+    val posts by PostEntity referrersOn PostsTable.author
+}
+
+class PostEntity(id: EntityID<Long>) : LongEntity(id) {
+    companion object : LongEntityClass<PostEntity>(PostsTable)
+
+    var title by PostsTable.title
+    var content by PostsTable.content
+    var author by UserEntity referencedOn PostsTable.author
+    val createdAt by PostsTable.createdAt
+}
+
+// Usage
+fun main() {
+    Database.connect(
+        url = "jdbc:postgresql://localhost:5432/kotlin_course",
+        driver = "org.postgresql.Driver",
+        user = "dev",
+        password = "dev"
+    )
+
+    transaction {
+        SchemaUtils.create(UsersTable, PostsTable)
+
+        // CREATE
+        val alice = UserEntity.new {
+            name = "Alice"
+            email = "alice@example.com"
+            active = true
+        }
+
+        val post = PostEntity.new {
+            title = "First Post"
+            content = "Hello from Exposed DAO!"
+            author = alice
+        }
+
+        // READ
+        val user = UserEntity.findById(alice.id)
+        println("User: ${user?.name}")
+
+        // Query with conditions
+        val activeUsers = UserEntity.find { UsersTable.active eq true }
+            .sortedByDescending { it.createdAt }
+        activeUsers.forEach { println("${it.name}: ${it.email}") }
+
+        // Access relationships (lazy loaded)
+        val alicePosts = alice.posts.toList()
+        println("Alice has ${alicePosts.size} posts")
+
+        // UPDATE
+        alice.name = "Alice Updated"  // Automatically tracked and saved
+
+        // DELETE
+        alice.delete()
+    }
+}
+```
+
+### DSL vs DAO: when to use which
+
+| Factor | DSL | DAO |
+|---|---|---|
+| Style | Query builder (like Drizzle) | ORM entities (like Prisma) |
+| Control | Full SQL control | Convention-based |
+| Performance | Slightly better (no entity overhead) | Small overhead for tracking |
+| Relationships | Manual joins | Automatic lazy loading |
+| Best for | Complex queries, reporting | Standard CRUD, rapid prototyping |
+
+## jOOQ: Type-Safe SQL
+
+[jOOQ](https://www.jooq.org/) generates Java/Kotlin classes from your database schema. You write SQL using a fluent API, and jOOQ ensures type safety at compile time. It's the closest equivalent to Go's `sqlc`.
+
+### How jOOQ works
+
+Both jOOQ and `sqlc` generate code from your database — jOOQ generates a query DSL, `sqlc` generates concrete query functions:
+
+<Mermaid title="jOOQ vs sqlc code generation" height={360} code={`
+flowchart LR
+  subgraph jooq["jOOQ (JVM)"]
+    SCH["Database schema"] --> GEN["jOOQ code generator"]
+    GEN --> CLS["Generated classes"]
+    CLS --> Q["Type-safe queries\n(compile-time checks)"]
+  end
+  subgraph sqlc["sqlc (Go)"]
+    S2["schema.sql + queries.sql"] --> G2["sqlc generate"]
+    G2 --> R2["Go structs + query functions"]
+  end
+`} />
+
+### Dependencies and code generation
+
+```kotlin title="build.gradle.kts"
+plugins {
+    kotlin("jvm") version "2.1.0"
+    id("org.jooq.jooq-codegen-gradle") version "3.19.16"
+}
+
+dependencies {
+    implementation("org.jooq:jooq:3.19.16")
+    implementation("org.postgresql:postgresql:42.7.4")
+    implementation("com.zaxxer:HikariCP:6.2.1")
+    jooqCodegen("org.postgresql:postgresql:42.7.4")
+}
+
+jooq {
+    configuration {
+        jdbc {
+            driver = "org.postgresql.Driver"
+            url = "jdbc:postgresql://localhost:5432/kotlin_course"
+            user = "dev"
+            password = "dev"
+        }
+        generator {
+            database {
+                name = "org.jooq.meta.postgres.PostgresDatabase"
+                inputSchema = "mod10_database"
+            }
+            target {
+                packageName = "com.example.generated"
+                directory = "src/main/kotlin"
+            }
+        }
+    }
+}
+```
+
+Run code generation:
+
+```bash
+./gradlew jooqCodegen
+```
+
+This generates classes like:
+
+<FileTree>
+- src/main/kotlin/com/example/generated/
+  - **Tables.kt** Table references
+  - tables/
+    - Users.kt Users table with typed columns
+    - Posts.kt Posts table with typed columns
+  - tables/records/
+    - UsersRecord.kt Typed row record
+    - PostsRecord.kt
+</FileTree>
+
+### Type-safe queries
+
+```kotlin
+import org.jooq.DSLContext
+import org.jooq.impl.DSL
+import com.example.generated.Tables.USERS
+import com.example.generated.Tables.POSTS
+
+fun main() {
+    val dsl: DSLContext = DSL.using(
+        "jdbc:postgresql://localhost:5432/kotlin_course",
+        "dev",
+        "dev"
+    )
+
+    // INSERT
+    val userId = dsl.insertInto(USERS)
+        .set(USERS.NAME, "Alice")
+        .set(USERS.EMAIL, "alice@example.com")
+        .set(USERS.ACTIVE, true)
+        .returning(USERS.ID)
+        .fetchOne()!!
+        .id
+
+    // SELECT — fully type-safe
+    val user = dsl.selectFrom(USERS)
+        .where(USERS.EMAIL.eq("alice@example.com"))
+        .fetchOne()
+
+    // user.name is String, user.active is Boolean — all typed
+    println("Found: ${user?.name} (active: ${user?.active})")
+
+    // SELECT with JOIN
+    val postsWithAuthors = dsl
+        .select(POSTS.TITLE, POSTS.CONTENT, USERS.NAME)
+        .from(POSTS)
+        .join(USERS).on(POSTS.AUTHOR_ID.eq(USERS.ID))
+        .where(USERS.ACTIVE.isTrue)
+        .orderBy(POSTS.CREATED_AT.desc())
+        .fetch()
+
+    postsWithAuthors.forEach { record ->
+        println("${record[POSTS.TITLE]} by ${record[USERS.NAME]}")
+    }
+
+    // Complex query with aggregation
+    val authorStats = dsl
+        .select(
+            USERS.NAME,
+            DSL.count(POSTS.ID).`as`("post_count"),
+            DSL.max(POSTS.CREATED_AT).`as`("latest_post")
+        )
+        .from(USERS)
+        .leftJoin(POSTS).on(POSTS.AUTHOR_ID.eq(USERS.ID))
+        .where(USERS.ACTIVE.isTrue)
+        .groupBy(USERS.NAME)
+        .having(DSL.count(POSTS.ID).gt(0))
+        .orderBy(DSL.count(POSTS.ID).desc())
+        .fetch()
+
+    // UPDATE
+    dsl.update(USERS)
+        .set(USERS.NAME, "Alice Updated")
+        .where(USERS.ID.eq(userId))
+        .execute()
+
+    // DELETE
+    dsl.deleteFrom(USERS)
+        .where(USERS.ID.eq(userId))
+        .execute()
+
+    // Upsert (INSERT ... ON CONFLICT)
+    dsl.insertInto(USERS)
+        .set(USERS.NAME, "Bob")
+        .set(USERS.EMAIL, "bob@example.com")
+        .set(USERS.ACTIVE, true)
+        .onConflict(USERS.EMAIL)
+        .doUpdate()
+        .set(USERS.NAME, DSL.excluded(USERS.NAME))
+        .execute()
+}
+```
+
+### Mapping to Kotlin data classes
+
+```kotlin
+data class UserDTO(val id: Long, val name: String, val email: String, val active: Boolean)
+
+// Map records to data classes
+val users: List<UserDTO> = dsl
+    .selectFrom(USERS)
+    .where(USERS.ACTIVE.isTrue)
+    .fetch { record ->
+        UserDTO(
+            id = record[USERS.ID]!!,
+            name = record[USERS.NAME]!!,
+            email = record[USERS.EMAIL]!!,
+            active = record[USERS.ACTIVE]!!
+        )
+    }
+
+// Or use jOOQ's built-in mapping
+val users2: List<UserDTO> = dsl
+    .selectFrom(USERS)
+    .fetchInto(UserDTO::class.java)
+```
+
+### jOOQ with Spring Boot
+
+Spring Boot auto-configures `DSLContext` when the jOOQ starter is on the classpath:
+
+```kotlin
+// build.gradle.kts
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-jooq")
+}
+
+@Service
+class UserService(private val dsl: DSLContext) {
+
+    fun findActiveUsers(): List<UserDTO> =
+        dsl.selectFrom(USERS)
+            .where(USERS.ACTIVE.isTrue)
+            .fetchInto(UserDTO::class.java)
+
+    @Transactional
+    fun createUser(name: String, email: String): UserDTO {
+        val record = dsl.insertInto(USERS)
+            .set(USERS.NAME, name)
+            .set(USERS.EMAIL, email)
+            .returning()
+            .fetchOne()!!
+
+        return UserDTO(
+            id = record.id!!,
+            name = record.name!!,
+            email = record.email!!,
+            active = record.active!!
+        )
+    }
+}
+```
+
+## Database Migrations with Flyway
+
+Database migrations in the JVM world use **Flyway** or Liquibase. Flyway is simpler and more popular — it works like Prisma Migrate or golang-migrate.
+
+### How migrations compare
+
+| Tool | Style | Schema Source |
+|---|---|---|
+| Prisma Migrate (TS) | Schema-first, auto-generated SQL | `schema.prisma` file |
+| golang-migrate (Go) | SQL files, manual | `*.up.sql` / `*.down.sql` |
+| Flyway (JVM) | SQL files, manual | `V{version}__{description}.sql` |
+| Liquibase (JVM) | XML/YAML/SQL, can auto-diff | Changelog files |
+
+### Setup
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("org.flywaydb:flyway-core")
+    implementation("org.flywaydb:flyway-database-postgresql")
+}
+```
+
+Spring Boot auto-runs migrations on startup when Flyway is on the classpath:
+
+```yaml title="application.yml"
+spring:
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    schemas: mod10_database
+    baseline-on-migrate: true
+```
+
+### Migration files
+
+Place migration files in `src/main/resources/db/migration/`:
+
+<FileTree>
+- src/main/resources/db/migration/
+  - V1__create_users_table.sql
+  - V2__create_posts_table.sql
+  - V3__add_user_role_column.sql
+  - V4__create_comments_table.sql
+</FileTree>
+
+**Naming convention:** `V{version}__{description}.sql` (two underscores after the version).
+
+```sql title="V1__create_users_table.sql"
+CREATE TABLE IF NOT EXISTS mod10_database.users (
+    id          BIGSERIAL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    email       VARCHAR(255) NOT NULL UNIQUE,
+    active      BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_users_email ON mod10_database.users (email);
+CREATE INDEX idx_users_active ON mod10_database.users (active);
+```
+
+```sql title="V2__create_posts_table.sql"
+CREATE TABLE IF NOT EXISTS mod10_database.posts (
+    id          BIGSERIAL PRIMARY KEY,
+    title       VARCHAR(255) NOT NULL,
+    content     TEXT NOT NULL,
+    author_id   BIGINT NOT NULL REFERENCES mod10_database.users(id),
+    created_at  TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_posts_author ON mod10_database.posts (author_id);
+```
+
+```sql title="V3__add_user_role_column.sql"
+ALTER TABLE mod10_database.users
+    ADD COLUMN role VARCHAR(50) NOT NULL DEFAULT 'user';
+```
+
+### Flyway without Spring Boot
+
+```kotlin
+import org.flywaydb.core.Flyway
+
+fun main() {
+    val flyway = Flyway.configure()
+        .dataSource(
+            "jdbc:postgresql://localhost:5432/kotlin_course",
+            "dev",
+            "dev"
+        )
+        .schemas("mod10_database")
+        .locations("classpath:db/migration")
+        .load()
+
+    // Apply all pending migrations
+    val result = flyway.migrate()
+    println("Applied ${result.migrationsExecuted} migrations")
+
+    // Other commands
+    // flyway.info()      // Show migration status
+    // flyway.validate()  // Validate applied vs available
+    // flyway.repair()    // Fix broken state
+    // flyway.clean()     // DROP everything (dangerous!)
+}
+```
+
+### Repeatable migrations
+
+For views, functions, or seed data that should be re-applied when changed:
+
+```sql title="R__create_user_stats_view.sql"
+-- R prefix = repeatable
+CREATE OR REPLACE VIEW mod10_database.user_stats AS
+SELECT
+    u.id,
+    u.name,
+    COUNT(p.id) AS post_count,
+    MAX(p.created_at) AS last_post_at
+FROM mod10_database.users u
+LEFT JOIN mod10_database.posts p ON p.author_id = u.id
+GROUP BY u.id, u.name;
+```
+
+### Migration tips
+
+| Tip | Explanation |
+|---|---|
+| Never edit applied migrations | Flyway checksums applied migrations. Editing breaks validation. |
+| Use `IF NOT EXISTS` | Makes migrations idempotent for safety. |
+| Version sequentially | `V1`, `V2`, `V3` or use timestamps: `V20240115120000`. |
+| Separate DDL and DML | Don't mix schema changes and data changes in one migration. |
+| Test migrations | Run them against a fresh DB and against a migrated DB. |
+
+## Transaction Management
+
+### JDBC transactions
+
+```kotlin
+// Manual JDBC transaction
+fun transferCredits(conn: Connection, fromId: Long, toId: Long, amount: Int) {
+    conn.autoCommit = false
+    try {
+        val debit = conn.prepareStatement(
+            "UPDATE accounts SET credits = credits - ? WHERE id = ? AND credits >= ?"
+        )
+        debit.setInt(1, amount)
+        debit.setLong(2, fromId)
+        debit.setInt(3, amount)
+        val updated = debit.executeUpdate()
+
+        if (updated == 0) {
+            throw IllegalStateException("Insufficient credits")
+        }
+
+        val credit = conn.prepareStatement(
+            "UPDATE accounts SET credits = credits + ? WHERE id = ?"
+        )
+        credit.setInt(1, amount)
+        credit.setLong(2, toId)
+        credit.executeUpdate()
+
+        conn.commit()
+    } catch (e: Exception) {
+        conn.rollback()
+        throw e
+    } finally {
+        conn.autoCommit = true
+    }
+}
+```
+
+### Spring @Transactional
+
+Spring's `@Transactional` is the standard way to manage transactions in Spring Boot. It's declarative — just annotate and Spring handles begin/commit/rollback:
+
+```kotlin
+@Service
+class OrderService(
+    private val orderRepository: OrderRepository,
+    private val inventoryRepository: InventoryRepository,
+    private val paymentService: PaymentService
+) {
+    // Basic transaction — rolls back on any exception
+    @Transactional
+    fun placeOrder(request: OrderRequest): Order {
+        val order = orderRepository.save(
+            Order(userId = request.userId, total = request.total)
+        )
+
+        inventoryRepository.decrementStock(request.productId, request.quantity)
+        paymentService.charge(request.userId, request.total)
+
+        return order
+    }
+
+    // Read-only transaction — optimizes for reads
+    @Transactional(readOnly = true)
+    fun getOrderHistory(userId: Long): List<Order> =
+        orderRepository.findByUserIdOrderByCreatedAtDesc(userId)
+
+    // Custom rollback rules
+    @Transactional(
+        rollbackFor = [PaymentException::class],
+        noRollbackFor = [NotificationException::class]
+    )
+    fun processOrder(orderId: Long) {
+        val order = orderRepository.findById(orderId).orElseThrow()
+        paymentService.charge(order.userId, order.total)       // Rolls back on failure
+        notificationService.notify(order.userId, "Order placed") // Does NOT rollback on failure
+    }
+
+    // Propagation — nested transactions
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    fun auditLog(action: String, userId: Long) {
+        // Runs in its own transaction — committed even if outer tx fails
+        auditRepository.save(AuditEntry(action = action, userId = userId))
+    }
+}
+```
+
+**Transaction propagation types:**
+
+| Propagation | Behavior |
+|---|---|
+| `REQUIRED` (default) | Join existing tx or create new one |
+| `REQUIRES_NEW` | Always create new tx (suspend existing) |
+| `NESTED` | Create savepoint within existing tx |
+| `SUPPORTS` | Use tx if one exists, otherwise run without |
+| `MANDATORY` | Must run in existing tx (throw if none) |
+| `NOT_SUPPORTED` | Suspend existing tx, run without |
+| `NEVER` | Throw if tx exists |
+
+### Exposed transactions
+
+```kotlin
+import org.jetbrains.exposed.sql.transactions.transaction
+
+// Every database operation in Exposed must be inside a transaction block
+transaction {
+    // All operations here are in a single transaction
+    val userId = Users.insertAndGetId {
+        it[name] = "Alice"
+        it[email] = "alice@example.com"
+    }
+
+    Posts.insert {
+        it[title] = "First Post"
+        it[content] = "Hello!"
+        it[authorId] = userId.value
+    }
+    // Auto-commits if no exception, auto-rollbacks on exception
+}
+
+// Nested transactions
+transaction {
+    // Outer transaction
+    Users.insert { it[name] = "Bob"; it[email] = "bob@example.com" }
+
+    try {
+        transaction {
+            // Inner transaction (savepoint)
+            Users.insert { it[name] = "Charlie"; it[email] = "charlie@example.com" }
+            throw RuntimeException("Oops")
+        }
+    } catch (e: RuntimeException) {
+        // Inner transaction rolled back, outer continues
+        println("Inner failed, but Bob is still being inserted")
+    }
+}
+```
+
+### Common transaction pitfalls
+
+**1. Calling `@Transactional` methods from the same class:**
+
+```kotlin
+@Service
+class UserService {
+    // This WILL NOT create a transaction!
+    // Spring proxies intercept calls from outside the class only
+    fun createUserAndLog(name: String) {
+        createUser(name)  // @Transactional is IGNORED here
+    }
+
+    @Transactional
+    fun createUser(name: String) { /* ... */ }
+}
+
+// Fix: inject the service into itself, or use a separate service
+@Service
+class UserService(private val self: UserService) {
+    fun createUserAndLog(name: String) {
+        self.createUser(name)  // Now the proxy intercepts it
+    }
+
+    @Transactional
+    fun createUser(name: String) { /* ... */ }
+}
+```
+
+**2. Swallowing exceptions:**
+
+```kotlin
+@Transactional
+fun badExample() {
+    try {
+        // database operations
+        throw RuntimeException("Something failed")
+    } catch (e: Exception) {
+        // This catches the exception — Spring never sees it
+        // Transaction will COMMIT even though something failed!
+        logger.error("Failed", e)
+    }
+}
+
+// Fix: rethrow or use programmatic rollback
+@Transactional
+fun goodExample() {
+    try {
+        // database operations
+    } catch (e: Exception) {
+        logger.error("Failed", e)
+        throw e  // Let Spring see the exception and rollback
+    }
+}
+```
+
+**3. Long-running transactions:**
+
+```kotlin
+// BAD: holds a database connection for the entire duration
+@Transactional
+fun processLargeFile(file: File) {
+    file.readLines().forEach { line ->
+        // Each line insert holds the transaction open
+        repository.save(parseLine(line))
+    }
+}
+
+// GOOD: batch processing with chunked transactions
+fun processLargeFile(file: File) {
+    file.readLines().chunked(1000).forEach { chunk ->
+        processBatch(chunk)  // Each chunk is its own transaction
+    }
+}
+
+@Transactional
+fun processBatch(lines: List<String>) {
+    lines.forEach { repository.save(parseLine(it)) }
+}
+```
+
+## Kotlin JPA Gotchas
+
+This section covers the most common traps when using JPA/Hibernate with Kotlin. These are unique to Kotlin and don't exist when using JPA from Java.
+
+### Data classes vs JPA entities
+
+The problem: Kotlin `data class` features conflict with JPA requirements:
+
+| Feature | `data class` | JPA Entity Needs |
+|---|---|---|
+| `equals()`/`hashCode()` | Uses all constructor properties | Should use only `id` (or business key) |
+| `val` properties | Immutable by default | Hibernate needs mutable (`var`) for dirty checking |
+| No-arg constructor | Not generated by default | Required for proxy creation |
+| `final` class | Kotlin classes are `final` | Hibernate needs `open` classes for lazy loading |
+
+Don't do this:
+
+```kotlin
+// BAD: data class JPA entity
+@Entity
+data class User(
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    val id: Long = 0,
+    val name: String,
+    val email: String
+)
+// Problems:
+// 1. equals/hashCode uses all fields — breaks in sets when fields change
+// 2. toString may trigger lazy loading
+// 3. copy() creates detached entities that confuse Hibernate
+```
+
+Do this instead:
+
+```kotlin
+// GOOD: regular class JPA entity
+@Entity
+@Table(name = "users", schema = "mod10_database")
+class User(
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    val id: Long = 0,
+
+    @Column(nullable = false)
+    var name: String,
+
+    @Column(nullable = false, unique = true)
+    var email: String,
+
+    @Column(nullable = false)
+    var active: Boolean = true
+) {
+    // Override equals/hashCode using only id
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is User) return false
+        return id != 0L && id == other.id
+    }
+
+    override fun hashCode(): Int = id.hashCode()
+
+    override fun toString(): String = "User(id=$id, name=$name, email=$email)"
+}
+```
+
+### The all-open plugin
+
+Hibernate creates proxy subclasses for lazy loading. But Kotlin classes are `final` by default — you can't subclass them. The `kotlin-allopen` plugin (bundled with the `kotlin-jpa` plugin) automatically opens JPA-annotated classes:
+
+```kotlin
+// build.gradle.kts
+plugins {
+    kotlin("plugin.jpa") version "2.1.0"
+    // This automatically configures allopen for:
+    // @Entity, @Embeddable, @MappedSuperclass
+}
+```
+
+Without this plugin, you'd need to manually mark every entity as `open`:
+
+```kotlin
+// Without plugin — verbose and error-prone
+open class User(
+    open var name: String,
+    open var email: String
+)
+```
+
+### The no-arg plugin
+
+JPA requires a no-argument constructor. Kotlin classes with required constructor parameters don't have one by default. The `kotlin-jpa` plugin also adds `kotlin-noarg` support:
+
+```kotlin
+// build.gradle.kts
+plugins {
+    kotlin("plugin.jpa") version "2.1.0"
+    // Generates synthetic no-arg constructors for @Entity, @Embeddable, @MappedSuperclass
+}
+```
+
+The no-arg constructor is synthetic (not visible in Kotlin code) but available via reflection, which is how Hibernate uses it.
+
+### Lazy loading gotchas
+
+```kotlin
+@Entity
+class Post(
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    val id: Long = 0,
+
+    var title: String,
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "author_id")
+    var author: User   // This is a Hibernate proxy, not a real User
+)
+
+// Outside a transaction:
+val post = postRepository.findById(1L).get()
+post.author.name  // LazyInitializationException! Session is closed.
+
+// Fix 1: Use @Transactional on the service method
+@Transactional(readOnly = true)
+fun getPostWithAuthor(id: Long): Post {
+    val post = postRepository.findById(id).orElseThrow()
+    post.author.name  // Works — session still open
+    return post
+}
+
+// Fix 2: Use JOIN FETCH in the query
+@Query("SELECT p FROM Post p JOIN FETCH p.author WHERE p.id = :id")
+fun findByIdWithAuthor(id: Long): Post?
+
+// Fix 3: Use EntityGraph
+@EntityGraph(attributePaths = ["author"])
+fun findWithAuthorById(id: Long): Post?
+```
+
+### Summary: required plugins for Kotlin + JPA
+
+```kotlin
+// build.gradle.kts — ALWAYS include these for JPA projects
+plugins {
+    kotlin("jvm") version "2.1.0"
+    kotlin("plugin.spring") version "2.1.0"   // Opens @Component, @Service, etc.
+    kotlin("plugin.jpa") version "2.1.0"      // no-arg + allopen for JPA annotations
+}
+```
+
+| Plugin | What It Does | Why Needed |
+|---|---|---|
+| `kotlin-spring` | Opens Spring-annotated classes | Spring creates proxies via subclassing |
+| `kotlin-jpa` | Adds no-arg constructors to entities | Hibernate instantiates via reflection |
+| `kotlin-jpa` | Opens entity classes | Hibernate creates lazy-loading proxies |
+
+## Comparison: When to Use What
+
+### Decision matrix
+
+| Factor | JDBC | Spring Data JPA | Exposed | jOOQ |
+|---|---|---|---|---|
+| **Learning curve** | Low (just SQL) | Medium (JPA concepts) | Low (Kotlin-intuitive) | Medium (code generation) |
+| **Type safety** | None (strings) | Partial (JPQL strings) | Full (Kotlin DSL) | Full (generated code) |
+| **SQL control** | Full | Limited (JPQL/native) | Full | Full |
+| **Boilerplate** | High | Low | Low | Low |
+| **Performance** | Best (no overhead) | Good (caching helps) | Good | Good |
+| **Complex queries** | Easy (raw SQL) | Hard (Criteria API) | Easy (DSL) | Easy (type-safe) |
+| **Relationships** | Manual | Automatic (lazy/eager) | Manual (DSL) / Auto (DAO) | Manual |
+| **Migrations** | Manual | Hibernate auto-DDL | SchemaUtils (dev) | Generate from schema |
+| **Kotlin-native** | No | No (Java-first) | Yes | No (Java-first) |
+| **Spring integration** | Manual | Native | Community | Native (starter) |
+| **Comparable to** | `database/sql` (Go) | GORM (Go) / TypeORM (TS) | Drizzle (TS) | sqlc (Go) |
+
+### Recommendations
+
+**Choose JDBC when:**
+
+- You need maximum control and performance.
+- You're writing a library or framework.
+- The project is tiny and doesn't justify a dependency.
+
+**Choose Spring Data JPA when:**
+
+- You're building a standard Spring Boot CRUD application.
+- Entities have complex relationships (one-to-many, many-to-many).
+- You want auto-generated repositories and pagination.
+- Your team knows JPA/Hibernate already.
+
+**Choose Exposed when:**
+
+- You want Kotlin-first API design.
+- You prefer query builders over ORMs.
+- You want something lighter than JPA.
+- You're using Ktor (or not using Spring).
+
+**Choose jOOQ when:**
+
+- You love SQL and want to keep writing it.
+- You need compile-time safety for complex queries.
+- Your schema is the source of truth (not code).
+- You have complex reporting queries.
+
+### Can you mix them?
+
+Yes. In a Spring Boot app, you can use JPA for standard CRUD and jOOQ for complex reporting queries. They can share the same `DataSource` and transaction manager.
+
+```kotlin
+@Service
+class ReportService(
+    private val userRepository: UserRepository,  // JPA for simple CRUD
+    private val dsl: DSLContext                   // jOOQ for complex queries
+) {
+    fun getUser(id: Long): User = userRepository.findById(id).orElseThrow()
+
+    fun getUserPostStats(): List<UserStatsDTO> = dsl
+        .select(USERS.NAME, DSL.count(POSTS.ID), DSL.max(POSTS.CREATED_AT))
+        .from(USERS)
+        .leftJoin(POSTS).on(POSTS.AUTHOR_ID.eq(USERS.ID))
+        .groupBy(USERS.NAME)
+        .fetchInto(UserStatsDTO::class.java)
+}
+```
+
+## Practice
+
+Put all four data-access approaches to work, then practice evolving a schema safely over time.
+
+<CardGrid>
+  <LinkCard
+    title="Four Ways to CRUD"
+    href="/kotlin-backend/10-database-postgresql/four-ways-crud/"
+    description="Implement the same User CRUD operations with JDBC, JPA, Exposed, and jOOQ, then compare the developer experience side by side."
+  />
+  <LinkCard
+    title="Flyway Migrations"
+    href="/kotlin-backend/10-database-postgresql/flyway-migrations/"
+    description="Evolve a schema across multiple versioned migrations, including a data migration, using Flyway against a fresh PostgreSQL database."
+  />
+</CardGrid>

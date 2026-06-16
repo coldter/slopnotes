@@ -1,0 +1,1877 @@
+---
+title: API Design & Serialization
+description: REST, GraphQL, and gRPC on the JVM — plus Jackson vs kotlinx.serialization — mapped from the Express, tRPC, and Go tooling you already know.
+sidebar:
+  order: 15
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+You've built REST APIs in Express with Zod validation, maybe used tRPC for
+end-to-end type safety, or Apollo Server for GraphQL. In Go, you've used
+`encoding/json` struct tags, maybe gqlgen or grpc-go. On the JVM, you get a
+richer (and more complex) ecosystem: Jackson, kotlinx.serialization,
+springdoc-openapi, graphql-kotlin, and grpc-kotlin.
+
+This module covers:
+
+1. **REST best practices** — naming, versioning, pagination, filtering, HATEOAS
+2. **OpenAPI/Swagger** — auto-generate docs with springdoc-openapi
+3. **Serialization** — kotlinx.serialization vs Jackson, when to use which
+4. **GraphQL** — graphql-kotlin (Expedia) with Spring Boot
+5. **gRPC** — protobuf definitions, server/client in Kotlin
+
+## REST API Best Practices
+
+### Resource Naming
+
+Use nouns (not verbs), plural, lowercase, kebab-case for multi-word:
+
+```text
+Good:
+  GET    /api/tasks           → list tasks
+  GET    /api/tasks/123       → get task 123
+  POST   /api/tasks           → create task
+  PUT    /api/tasks/123       → replace task 123
+  PATCH  /api/tasks/123       → partial update task 123
+  DELETE /api/tasks/123       → delete task 123
+
+  GET    /api/tasks/123/comments      → list comments on task 123
+  POST   /api/tasks/123/comments      → add comment to task 123
+  GET    /api/task-categories          → multi-word resource (kebab-case)
+
+Bad:
+  GET    /api/getTask/123     → verb in URL
+  POST   /api/createTask      → verb in URL
+  GET    /api/task/123        → singular (use plural)
+  GET    /api/Task/123        → uppercase
+```
+
+### API Versioning
+
+Three common strategies:
+
+```kotlin
+// 1. URL path versioning (most common, simplest)
+@RestController
+@RequestMapping("/api/v1/tasks")
+class TaskV1Controller { /* ... */ }
+
+@RestController
+@RequestMapping("/api/v2/tasks")
+class TaskV2Controller { /* ... */ }
+
+// 2. Header versioning
+@GetMapping("/api/tasks", headers = ["X-API-Version=1"])
+fun getTasksV1(): List<TaskV1> { /* ... */ }
+
+@GetMapping("/api/tasks", headers = ["X-API-Version=2"])
+fun getTasksV2(): List<TaskV2> { /* ... */ }
+
+// 3. Media type versioning (content negotiation)
+@GetMapping("/api/tasks", produces = ["application/vnd.myapp.v1+json"])
+fun getTasksV1(): List<TaskV1> { /* ... */ }
+
+@GetMapping("/api/tasks", produces = ["application/vnd.myapp.v2+json"])
+fun getTasksV2(): List<TaskV2> { /* ... */ }
+```
+
+:::tip[Recommendation]
+URL path versioning (`/api/v1/`) is the most practical. It's visible, cacheable,
+and easy to document. Use it unless you have a strong reason not to.
+:::
+
+### Pagination
+
+**Offset-based pagination** (simple, works for most cases):
+
+```kotlin
+// Request: GET /api/tasks?page=0&size=20&sort=createdAt,desc
+// Spring Data provides Pageable out of the box
+
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
+import org.springframework.data.web.PageableDefault
+
+@GetMapping
+fun getTasks(
+    @PageableDefault(size = 20, sort = ["createdAt"], direction = Sort.Direction.DESC)
+    pageable: Pageable,
+): Page<TaskResponse> {
+    return taskService.findAll(pageable).map { it.toResponse() }
+}
+```
+
+Spring's `Page<T>` response includes pagination metadata:
+
+```json
+{
+  "content": [
+    { "id": 1, "title": "Task 1" },
+    { "id": 2, "title": "Task 2" }
+  ],
+  "pageable": {
+    "pageNumber": 0,
+    "pageSize": 20,
+    "sort": { "sorted": true, "direction": "DESC" }
+  },
+  "totalElements": 42,
+  "totalPages": 3,
+  "first": true,
+  "last": false
+}
+```
+
+**Cursor-based pagination** (better for real-time data, infinite scroll):
+
+```kotlin
+data class CursorPage<T>(
+    val items: List<T>,
+    val nextCursor: String?,  // Opaque cursor for next page
+    val hasMore: Boolean,
+)
+
+@GetMapping
+fun getTasks(
+    @RequestParam cursor: String? = null,
+    @RequestParam(defaultValue = "20") limit: Int,
+): CursorPage<TaskResponse> {
+    val decodedCursor = cursor?.let { decodeCursor(it) }
+    val tasks = taskRepository.findAfterCursor(decodedCursor, limit + 1)
+
+    val hasMore = tasks.size > limit
+    val items = tasks.take(limit).map { it.toResponse() }
+    val nextCursor = if (hasMore) encodeCursor(items.last().id) else null
+
+    return CursorPage(items = items, nextCursor = nextCursor, hasMore = hasMore)
+}
+
+private fun encodeCursor(id: Long): String =
+    java.util.Base64.getEncoder().encodeToString("id:$id".toByteArray())
+
+private fun decodeCursor(cursor: String): Long {
+    val decoded = String(java.util.Base64.getDecoder().decode(cursor))
+    return decoded.removePrefix("id:").toLong()
+}
+```
+
+The same offset-pagination handler, in each ecosystem:
+
+<Tabs syncKey="apistyle">
+  <TabItem label="REST">
+
+```kotlin
+// Kotlin (Spring): Pageable + Page<T> do the work for you
+@GetMapping
+fun getTasks(
+    @PageableDefault(size = 20, sort = ["createdAt"]) pageable: Pageable,
+): Page<TaskResponse> =
+    taskService.findAll(pageable).map { it.toResponse() }
+```
+
+  </TabItem>
+  <TabItem label="GraphQL">
+
+```kotlin
+// graphql-kotlin: limit/offset (or cursor) are just query arguments
+@Component
+class TaskQuery(private val taskService: TaskService) : Query {
+    fun tasks(limit: Int = 20, offset: Int = 0): List<TaskDto> =
+        taskService.findAll(limit, offset).map { it.toDto() }
+}
+```
+
+  </TabItem>
+  <TabItem label="gRPC">
+
+```protobuf
+// gRPC: page size + opaque page token live in the message
+message ListTasksRequest {
+    int32 page_size = 2;
+    string page_token = 3;
+}
+message ListTasksResponse {
+    repeated Task tasks = 1;
+    string next_page_token = 2;
+}
+```
+
+  </TabItem>
+</Tabs>
+
+For reference, here's the offset-pagination handler written by hand in the
+TypeScript and Go worlds you're coming from:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// Express: manual pagination
+app.get("/api/tasks", async (req, res) => {
+  const page = parseInt(req.query.page as string) || 0;
+  const size = parseInt(req.query.size as string) || 20;
+  const [tasks, total] = await db.tasks.findAndCount({
+    skip: page * size,
+    take: size,
+    order: { createdAt: "DESC" },
+  });
+  res.json({
+    content: tasks,
+    totalElements: total,
+    totalPages: Math.ceil(total / size),
+    page,
+    size,
+  });
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func listTasks(w http.ResponseWriter, r *http.Request) {
+    page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+    size := 20
+    offset := page * size
+
+    tasks, total := db.FindTasks(offset, size)
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "content":       tasks,
+        "totalElements": total,
+        "totalPages":    (total + size - 1) / size,
+    })
+}
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+@GetMapping
+fun getTasks(
+    @PageableDefault(size = 20, sort = ["createdAt"], direction = Sort.Direction.DESC)
+    pageable: Pageable,
+): Page<TaskResponse> =
+    taskService.findAll(pageable).map { it.toResponse() }
+```
+
+  </TabItem>
+</Tabs>
+
+### Filtering and Sorting
+
+```kotlin
+// Request: GET /api/tasks?status=OPEN&priority=HIGH&sort=dueDate,asc
+
+@GetMapping
+fun getTasks(
+    @RequestParam status: TaskStatus? = null,
+    @RequestParam priority: Priority? = null,
+    @RequestParam assignee: String? = null,
+    @PageableDefault(size = 20) pageable: Pageable,
+): Page<TaskResponse> {
+    return taskService.findByFilters(status, priority, assignee, pageable)
+        .map { it.toResponse() }
+}
+```
+
+With Spring Data JPA `Specification<Task>` for dynamic queries:
+
+```kotlin
+import org.springframework.data.jpa.domain.Specification
+
+object TaskSpecifications {
+    fun hasStatus(status: TaskStatus?): Specification<Task> {
+        return Specification { root, _, cb ->
+            status?.let { cb.equal(root.get<TaskStatus>("status"), it) }
+        }
+    }
+
+    fun hasPriority(priority: Priority?): Specification<Task> {
+        return Specification { root, _, cb ->
+            priority?.let { cb.equal(root.get<Priority>("priority"), it) }
+        }
+    }
+
+    fun assignedTo(assignee: String?): Specification<Task> {
+        return Specification { root, _, cb ->
+            assignee?.let { cb.equal(root.get<String>("assigneeId"), it) }
+        }
+    }
+}
+
+// In service
+fun findByFilters(
+    status: TaskStatus?,
+    priority: Priority?,
+    assignee: String?,
+    pageable: Pageable,
+): Page<Task> {
+    val spec = Specification.where(TaskSpecifications.hasStatus(status))
+        .and(TaskSpecifications.hasPriority(priority))
+        .and(TaskSpecifications.assignedTo(assignee))
+
+    return taskRepository.findAll(spec, pageable)
+}
+```
+
+### Error Responses — Consistent Format
+
+Use RFC 7807 Problem Details (Spring Boot 3.x supports this natively):
+
+```yaml title="application.yml"
+spring:
+  mvc:
+    problemdetails:
+      enabled: true
+```
+
+```kotlin
+import org.springframework.http.HttpStatus
+import org.springframework.http.ProblemDetail
+import org.springframework.web.bind.annotation.ExceptionHandler
+import org.springframework.web.bind.annotation.RestControllerAdvice
+import java.net.URI
+
+@RestControllerAdvice
+class GlobalExceptionHandler {
+
+    @ExceptionHandler(TaskNotFoundException::class)
+    fun handleNotFound(ex: TaskNotFoundException): ProblemDetail {
+        return ProblemDetail.forStatusAndDetail(
+            HttpStatus.NOT_FOUND,
+            ex.message ?: "Resource not found",
+        ).apply {
+            title = "Not Found"
+            type = URI.create("https://api.example.com/errors/not-found")
+            setProperty("taskId", ex.taskId)
+        }
+    }
+
+    @ExceptionHandler(ValidationException::class)
+    fun handleValidation(ex: ValidationException): ProblemDetail {
+        return ProblemDetail.forStatusAndDetail(
+            HttpStatus.BAD_REQUEST,
+            "Validation failed",
+        ).apply {
+            title = "Bad Request"
+            setProperty("errors", ex.errors)
+        }
+    }
+}
+```
+
+Response:
+
+```json
+{
+  "type": "https://api.example.com/errors/not-found",
+  "title": "Not Found",
+  "status": 404,
+  "detail": "Task with id 999 not found",
+  "instance": "/api/tasks/999",
+  "taskId": 999
+}
+```
+
+### HATEOAS (Mention, Don't Enforce)
+
+HATEOAS adds hypermedia links to responses. Spring has full support, but it adds
+complexity most APIs don't need:
+
+```kotlin
+// With Spring HATEOAS
+import org.springframework.hateoas.EntityModel
+import org.springframework.hateoas.server.mvc.WebMvcLinkBuilder.linkTo
+import org.springframework.hateoas.server.mvc.WebMvcLinkBuilder.methodOn
+
+@GetMapping("/{id}")
+fun getTask(@PathVariable id: Long): EntityModel<TaskResponse> {
+    val task = taskService.findById(id).toResponse()
+
+    return EntityModel.of(task).apply {
+        add(linkTo(methodOn(TaskController::class.java).getTask(id)).withSelfRel())
+        add(linkTo(methodOn(TaskController::class.java).getTasks(Pageable.unpaged())).withRel("tasks"))
+        add(linkTo(methodOn(CommentController::class.java).getComments(id)).withRel("comments"))
+    }
+}
+```
+
+Response:
+
+```json
+{
+  "id": 1,
+  "title": "Task 1",
+  "_links": {
+    "self": { "href": "http://localhost:8080/api/tasks/1" },
+    "tasks": { "href": "http://localhost:8080/api/tasks" },
+    "comments": { "href": "http://localhost:8080/api/tasks/1/comments" }
+  }
+}
+```
+
+:::tip[Verdict]
+HATEOAS is academically correct but rarely used in practice. Most teams use
+OpenAPI docs instead. Include links only if your clients will actually use them.
+:::
+
+## OpenAPI / Swagger with springdoc-openapi
+
+### Setup
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.0")
+}
+```
+
+That's it. Visit `http://localhost:8080/swagger-ui.html` and you get
+auto-generated Swagger UI.
+
+### Configuration
+
+```yaml title="application.yml"
+springdoc:
+  api-docs:
+    path: /api-docs                # OpenAPI JSON at /api-docs
+  swagger-ui:
+    path: /swagger-ui.html         # Swagger UI
+    tags-sorter: alpha
+    operations-sorter: method
+  default-produces-media-type: application/json
+```
+
+```kotlin
+import io.swagger.v3.oas.models.OpenAPI
+import io.swagger.v3.oas.models.info.Info
+import io.swagger.v3.oas.models.info.Contact
+import io.swagger.v3.oas.models.Components
+import io.swagger.v3.oas.models.security.SecurityScheme
+import io.swagger.v3.oas.models.security.SecurityRequirement
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+
+@Configuration
+class OpenApiConfig {
+
+    @Bean
+    fun customOpenAPI(): OpenAPI {
+        return OpenAPI()
+            .info(
+                Info()
+                    .title("Task API")
+                    .version("1.0.0")
+                    .description("Task management API with JWT authentication")
+                    .contact(Contact().name("Dev Team").email("dev@example.com"))
+            )
+            .addSecurityItem(SecurityRequirement().addList("Bearer Auth"))
+            .components(
+                Components().addSecuritySchemes(
+                    "Bearer Auth",
+                    SecurityScheme()
+                        .type(SecurityScheme.Type.HTTP)
+                        .scheme("bearer")
+                        .bearerFormat("JWT")
+                        .description("Enter JWT token")
+                )
+            )
+    }
+}
+```
+
+### Annotating Controllers
+
+springdoc auto-generates most docs from your controller signatures. Add
+annotations for extra detail:
+
+```kotlin
+import io.swagger.v3.oas.annotations.Operation
+import io.swagger.v3.oas.annotations.Parameter
+import io.swagger.v3.oas.annotations.media.Content
+import io.swagger.v3.oas.annotations.media.Schema
+import io.swagger.v3.oas.annotations.responses.ApiResponse
+import io.swagger.v3.oas.annotations.responses.ApiResponses
+import io.swagger.v3.oas.annotations.tags.Tag
+import io.swagger.v3.oas.annotations.security.SecurityRequirement
+
+@RestController
+@RequestMapping("/api/v1/tasks")
+@Tag(name = "Tasks", description = "Task management endpoints")
+@SecurityRequirement(name = "Bearer Auth")
+class TaskController(
+    private val taskService: TaskService,
+) {
+    @Operation(
+        summary = "List all tasks",
+        description = "Returns a paginated list of tasks for the authenticated user",
+    )
+    @ApiResponses(
+        ApiResponse(responseCode = "200", description = "Tasks retrieved successfully"),
+        ApiResponse(responseCode = "401", description = "Not authenticated"),
+    )
+    @GetMapping
+    fun getTasks(
+        @Parameter(description = "Page number (0-indexed)")
+        @RequestParam(defaultValue = "0") page: Int,
+        @Parameter(description = "Page size")
+        @RequestParam(defaultValue = "20") size: Int,
+    ): Page<TaskResponse> {
+        return taskService.findAll(PageRequest.of(page, size))
+    }
+
+    @Operation(summary = "Create a new task")
+    @ApiResponses(
+        ApiResponse(responseCode = "201", description = "Task created"),
+        ApiResponse(
+            responseCode = "400",
+            description = "Invalid request",
+            content = [Content(schema = Schema(implementation = ProblemDetail::class))],
+        ),
+    )
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    fun createTask(@RequestBody request: CreateTaskRequest): TaskResponse {
+        return taskService.create(request).toResponse()
+    }
+
+    @Operation(summary = "Get task by ID")
+    @ApiResponses(
+        ApiResponse(responseCode = "200", description = "Task found"),
+        ApiResponse(responseCode = "404", description = "Task not found"),
+    )
+    @GetMapping("/{id}")
+    fun getTask(
+        @Parameter(description = "Task ID") @PathVariable id: Long,
+    ): TaskResponse {
+        return taskService.findById(id).toResponse()
+    }
+
+    @Operation(summary = "Delete a task")
+    @ApiResponse(responseCode = "204", description = "Task deleted")
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    fun deleteTask(@PathVariable id: Long) {
+        taskService.delete(id)
+    }
+}
+```
+
+### Schema Annotations on DTOs
+
+```kotlin
+import io.swagger.v3.oas.annotations.media.Schema
+
+@Schema(description = "Request to create a new task")
+data class CreateTaskRequest(
+    @Schema(description = "Task title", example = "Buy groceries", minLength = 1, maxLength = 200)
+    val title: String,
+
+    @Schema(description = "Task description", example = "Milk, eggs, bread", required = false)
+    val description: String? = null,
+
+    @Schema(description = "Task priority", example = "HIGH")
+    val priority: Priority = Priority.MEDIUM,
+
+    @Schema(description = "Due date (ISO 8601)", example = "2026-12-31T23:59:59Z", required = false)
+    val dueDate: Instant? = null,
+)
+
+@Schema(description = "Task response")
+data class TaskResponse(
+    @Schema(description = "Task ID", example = "1")
+    val id: Long,
+
+    @Schema(description = "Task title")
+    val title: String,
+
+    @Schema(description = "Current status")
+    val status: TaskStatus,
+
+    @Schema(description = "Creation timestamp")
+    val createdAt: Instant,
+)
+```
+
+### Generating an OpenAPI Client
+
+The OpenAPI spec at `/api-docs` can generate typed clients for any language:
+
+```bash
+# Generate TypeScript client
+npx @openapitools/openapi-generator-cli generate \
+  -i http://localhost:8080/api-docs \
+  -g typescript-fetch \
+  -o ./generated-client
+
+# Generate Go client
+openapi-generator-cli generate \
+  -i http://localhost:8080/api-docs \
+  -g go \
+  -o ./generated-client-go
+```
+
+Compare to the TypeScript approach:
+
+```typescript
+// TypeScript: tRPC gives you end-to-end type safety without codegen
+// But only works with TypeScript clients
+
+// Express + OpenAPI: use tsoa or swagger-jsdoc
+import swaggerJsdoc from "swagger-jsdoc";
+import swaggerUi from "swagger-ui-express";
+
+const specs = swaggerJsdoc({
+  definition: {
+    openapi: "3.0.0",
+    info: { title: "Task API", version: "1.0.0" },
+  },
+  apis: ["./routes/*.ts"],
+});
+app.use("/swagger", swaggerUi.serve, swaggerUi.setup(specs));
+```
+
+## Serialization: kotlinx.serialization vs Jackson
+
+### The Two Ecosystems
+
+| | kotlinx.serialization | Jackson |
+|---|---|---|
+| **Origin** | JetBrains (Kotlin-native) | FasterXML (Java ecosystem) |
+| **Default in** | Ktor | Spring Boot |
+| **Approach** | Compiler plugin, `@Serializable` | Reflection-based + annotations |
+| **Multiplatform** | Yes (JVM, JS, Native) | JVM only |
+| **Performance** | Faster (no reflection) | Slightly slower (reflection) |
+| **Java interop** | Kotlin-only classes | Works with Java + Kotlin |
+| **Null handling** | Kotlin null safety | `@JsonInclude`, `@JsonProperty` |
+| **Custom** | Custom serializers | `@JsonDeserialize`, mixins |
+
+:::tip[Rule of thumb]
+- **Spring Boot** → use Jackson (it's the default, deeply integrated)
+- **Ktor** → use kotlinx.serialization (it's the default, multiplatform-ready)
+- **Shared library** → use kotlinx.serialization (works everywhere Kotlin runs)
+:::
+
+### Jackson with Kotlin
+
+Spring Boot auto-configures Jackson with the Kotlin module. It works out of the
+box:
+
+```kotlin title="build.gradle.kts"
+// Spring Boot already includes this
+dependencies {
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+}
+```
+
+Basic usage — it just works with data classes:
+
+```kotlin
+data class Task(
+    val id: Long,
+    val title: String,
+    val status: TaskStatus = TaskStatus.OPEN,
+    val description: String? = null,
+    val createdAt: Instant = Instant.now(),
+)
+
+// Spring automatically serializes/deserializes this
+@PostMapping("/api/tasks")
+fun createTask(@RequestBody task: CreateTaskRequest): Task { /* ... */ }
+```
+
+Jackson annotations:
+
+```kotlin
+import com.fasterxml.jackson.annotation.*
+
+data class UserResponse(
+    val id: Long,
+    val email: String,
+
+    @JsonIgnore  // Never serialize password
+    val passwordHash: String,
+
+    @JsonProperty("full_name")  // Custom JSON field name
+    val name: String,
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)  // Omit if null
+    val bio: String? = null,
+
+    @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'", timezone = "UTC")
+    val createdAt: Instant,
+)
+```
+
+Custom `ObjectMapper`:
+
+```kotlin
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.SerializationFeature
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+
+@Configuration
+class JacksonConfig {
+
+    @Bean
+    fun objectMapper(): ObjectMapper {
+        return jacksonObjectMapper().apply {
+            registerModule(JavaTimeModule())
+            disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+            enable(SerializationFeature.INDENT_OUTPUT)
+
+            // Don't fail on unknown properties in requests
+            disable(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+        }
+    }
+}
+```
+
+Polymorphic serialization with sealed classes:
+
+```kotlin
+import com.fasterxml.jackson.annotation.JsonSubTypes
+import com.fasterxml.jackson.annotation.JsonTypeInfo
+
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type")
+@JsonSubTypes(
+    JsonSubTypes.Type(value = EmailNotification::class, name = "email"),
+    JsonSubTypes.Type(value = SlackNotification::class, name = "slack"),
+    JsonSubTypes.Type(value = WebhookNotification::class, name = "webhook"),
+)
+sealed class Notification {
+    abstract val message: String
+}
+
+data class EmailNotification(
+    override val message: String,
+    val to: String,
+    val subject: String,
+) : Notification()
+
+data class SlackNotification(
+    override val message: String,
+    val channel: String,
+) : Notification()
+
+data class WebhookNotification(
+    override val message: String,
+    val url: String,
+) : Notification()
+
+// JSON:
+// {"type":"email","message":"Hello","to":"user@test.com","subject":"Hi"}
+// {"type":"slack","message":"Hello","channel":"#general"}
+```
+
+### kotlinx.serialization
+
+Setup:
+
+```kotlin title="build.gradle.kts"
+plugins {
+    kotlin("plugin.serialization") version "2.1.0"
+}
+
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+}
+```
+
+Basic usage:
+
+```kotlin
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+
+@Serializable
+data class Task(
+    val id: Long,
+    val title: String,
+    val status: TaskStatus = TaskStatus.OPEN,
+    val description: String? = null,
+)
+
+// Serialize
+val json = Json.encodeToString(Task(1, "Buy groceries"))
+// → {"id":1,"title":"Buy groceries","status":"OPEN"}
+
+// Deserialize
+val task = Json.decodeFromString<Task>("""{"id":1,"title":"Buy groceries"}""")
+// → Task(id=1, title="Buy groceries", status=OPEN, description=null)
+```
+
+Custom JSON configuration:
+
+```kotlin
+val json = Json {
+    prettyPrint = true
+    ignoreUnknownKeys = true          // Don't fail on extra fields
+    encodeDefaults = false             // Skip default values
+    isLenient = true                   // Allow unquoted strings, etc.
+    coerceInputValues = true           // Coerce nulls to defaults
+    explicitNulls = false              // Don't write "field": null
+}
+```
+
+Custom field names and ignoring fields:
+
+```kotlin
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Transient
+
+@Serializable
+data class UserResponse(
+    val id: Long,
+    val email: String,
+
+    @Transient  // Never serialize
+    val passwordHash: String = "",
+
+    @SerialName("full_name")  // Custom JSON key
+    val name: String,
+)
+```
+
+Polymorphic serialization with sealed classes — compiler-supported:
+
+```kotlin
+import kotlinx.serialization.SerialName
+
+@Serializable
+sealed class Notification {
+    abstract val message: String
+}
+
+@Serializable
+@SerialName("email")
+data class EmailNotification(
+    override val message: String,
+    val to: String,
+    val subject: String,
+) : Notification()
+
+@Serializable
+@SerialName("slack")
+data class SlackNotification(
+    override val message: String,
+    val channel: String,
+) : Notification()
+
+// Serialize
+val notification: Notification = EmailNotification("Hello", "a@b.com", "Hi")
+val json = Json.encodeToString(notification)
+// → {"type":"email","message":"Hello","to":"a@b.com","subject":"Hi"}
+
+// Deserialize (polymorphic)
+val decoded: Notification = Json.decodeFromString(json)
+// → EmailNotification(message=Hello, to=a@b.com, subject=Hi)
+```
+
+Custom serializer:
+
+```kotlin
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import java.time.Instant
+
+object InstantSerializer : KSerializer<Instant> {
+    override val descriptor = PrimitiveSerialDescriptor("Instant", PrimitiveKind.STRING)
+
+    override fun serialize(encoder: Encoder, value: Instant) {
+        encoder.encodeString(value.toString())
+    }
+
+    override fun deserialize(decoder: Decoder): Instant {
+        return Instant.parse(decoder.decodeString())
+    }
+}
+
+@Serializable
+data class Task(
+    val id: Long,
+    val title: String,
+    @Serializable(with = InstantSerializer::class)
+    val createdAt: Instant,
+)
+```
+
+### Using kotlinx.serialization in Ktor
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("io.ktor:ktor-server-content-negotiation:3.0.3")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.0.3")
+}
+```
+
+```kotlin
+import io.ktor.serialization.kotlinx.json.*
+import io.ktor.server.application.*
+import io.ktor.server.plugins.contentnegotiation.*
+import kotlinx.serialization.json.Json
+
+fun Application.configureSerialization() {
+    install(ContentNegotiation) {
+        json(Json {
+            prettyPrint = true
+            ignoreUnknownKeys = true
+            encodeDefaults = false
+        })
+    }
+}
+```
+
+### Comparison: TS / Go / Kotlin Serialization
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+import { z } from "zod";
+
+const TaskSchema = z.object({
+  id: z.number(),
+  title: z.string().min(1).max(200),
+  status: z.enum(["OPEN", "IN_PROGRESS", "DONE"]),
+  description: z.string().optional(),
+});
+
+type Task = z.infer<typeof TaskSchema>;
+
+// Parse + validate
+const task = TaskSchema.parse(JSON.parse(body));
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+type Task struct {
+    ID          int64     `json:"id"`
+    Title       string    `json:"title"`
+    Status      string    `json:"status"`
+    Description *string   `json:"description,omitempty"`
+    CreatedAt   time.Time `json:"created_at"`
+}
+
+// Marshal
+data, _ := json.Marshal(task)
+
+// Unmarshal
+var task Task
+json.Unmarshal([]byte(body), &task)
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+@Serializable
+data class Task(
+    val id: Long,
+    val title: String,
+    val status: TaskStatus = TaskStatus.OPEN,
+    val description: String? = null,
+)
+
+val task = Json.decodeFromString<Task>(body)
+val json = Json.encodeToString(task)
+```
+
+  </TabItem>
+</Tabs>
+
+**Key Differences:**
+
+| Aspect | TypeScript | Go | Kotlin (kotlinx) | Kotlin (Jackson) |
+|--------|-----------|-----|-------------------|------------------|
+| Null safety | Zod `.optional()` | `*string`, `omitempty` | `String?` built-in | `@JsonInclude` |
+| Validation | Zod schema | Manual | Manual or JSR 380 | JSR 380 (`@Valid`) |
+| Custom names | N/A (JS convention) | Struct tags | `@SerialName` | `@JsonProperty` |
+| Polymorphism | Discriminated unions | Interface + manual | Sealed classes | `@JsonTypeInfo` |
+| Performance | V8 JSON.parse | Reflection | Compiler plugin | Reflection |
+
+## GraphQL with graphql-kotlin
+
+### Why GraphQL?
+
+REST requires multiple requests for related data. GraphQL lets clients request
+exactly what they need in one query:
+
+```graphql
+# Instead of: GET /tasks/1, GET /tasks/1/comments, GET /users/5
+query {
+  task(id: 1) {
+    title
+    status
+    comments {
+      text
+      author {
+        name
+      }
+    }
+  }
+}
+```
+
+### Ecosystem Comparison
+
+| | TypeScript | Go | Kotlin |
+|---|---|---|---|
+| **Schema-first** | Apollo Server | gqlgen | DGS Framework |
+| **Code-first** | TypeGraphQL, Nexus | — | graphql-kotlin |
+| **Popular choice** | Apollo Server | gqlgen | graphql-kotlin |
+
+### graphql-kotlin (Expedia) — Code-First
+
+graphql-kotlin generates the GraphQL schema from your Kotlin code. No `.graphql`
+schema files to maintain.
+
+Dependencies:
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("com.expediagroup:graphql-kotlin-spring-boot-starter:8.2.1")
+}
+```
+
+Configuration:
+
+```yaml title="application.yml"
+graphql:
+  packages:
+    - "com.example.graphql"
+  playground:
+    enabled: true  # GraphQL Playground at /playground
+  sdl:
+    enabled: true  # Schema at /sdl
+```
+
+### Defining Queries
+
+```kotlin
+import com.expediagroup.graphql.server.operations.Query
+import org.springframework.stereotype.Component
+
+// Every @Component that implements Query becomes a root query field
+
+@Component
+class TaskQuery(
+    private val taskService: TaskService,
+) : Query {
+
+    // Becomes: query { tasks { id, title, ... } }
+    fun tasks(
+        status: TaskStatus? = null,
+        limit: Int = 20,
+        offset: Int = 0,
+    ): List<TaskDto> {
+        return taskService.findAll(status, limit, offset).map { it.toDto() }
+    }
+
+    // Becomes: query { task(id: 1) { id, title, ... } }
+    fun task(id: Long): TaskDto? {
+        return taskService.findById(id)?.toDto()
+    }
+}
+```
+
+### Data Classes as GraphQL Types
+
+```kotlin
+import com.expediagroup.graphql.generator.annotations.GraphQLDescription
+import com.expediagroup.graphql.generator.annotations.GraphQLIgnore
+
+@GraphQLDescription("A task in the system")
+data class TaskDto(
+    val id: Long,
+    val title: String,
+    val status: TaskStatus,
+    val description: String?,
+    val createdAt: String,  // ISO 8601
+
+    @GraphQLIgnore  // Not exposed in schema
+    val internalNotes: String? = null,
+)
+
+enum class TaskStatus {
+    OPEN,
+    IN_PROGRESS,
+    DONE,
+    CANCELLED,
+}
+```
+
+### Nested Resolvers (N+1 Prevention)
+
+The killer feature: resolve related data lazily with data loaders. A method on
+the type (e.g. `assignee`) becomes a field resolver that returns a
+`CompletableFuture<UserDto?>` — only called if the client actually requests that
+field.
+
+```kotlin
+import com.expediagroup.graphql.generator.annotations.GraphQLDescription
+import graphql.schema.DataFetchingEnvironment
+import java.util.concurrent.CompletableFuture
+
+@GraphQLDescription("A task in the system")
+data class TaskDto(
+    val id: Long,
+    val title: String,
+    val status: TaskStatus,
+    val assigneeId: Long?,
+) {
+    // This becomes a field resolver — only called if client requests 'assignee'
+    fun assignee(env: DataFetchingEnvironment): CompletableFuture<UserDto?> {
+        if (assigneeId == null) return CompletableFuture.completedFuture(null)
+
+        // Use DataLoader to batch multiple user lookups
+        return env.getDataLoader<Long, UserDto>("userLoader")
+            .load(assigneeId)
+    }
+
+    // Resolve comments for this task
+    fun comments(env: DataFetchingEnvironment): CompletableFuture<List<CommentDto>> {
+        return env.getDataLoader<Long, List<CommentDto>>("commentsLoader")
+            .load(id)
+    }
+}
+```
+
+DataLoader configuration (batch loading):
+
+```kotlin
+import com.expediagroup.graphql.dataloader.KotlinDataLoaderRegistryFactory
+import com.expediagroup.graphql.dataloader.KotlinDataLoader
+import graphql.GraphQLContext
+import org.dataloader.DataLoaderFactory
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+
+@Configuration
+class DataLoaderConfig(
+    private val userService: UserService,
+    private val commentService: CommentService,
+) {
+    @Bean
+    fun dataLoaderRegistryFactory(): KotlinDataLoaderRegistryFactory {
+        return KotlinDataLoaderRegistryFactory(
+            object : KotlinDataLoader<Long, UserDto> {
+                override val dataLoaderName = "userLoader"
+                override fun getDataLoader(graphQLContext: GraphQLContext) =
+                    DataLoaderFactory.newDataLoader<Long, UserDto> { ids ->
+                        // Batch load all users at once instead of N+1 queries
+                        CompletableFuture.supplyAsync {
+                            val users = userService.findByIds(ids)
+                            ids.map { id -> users.find { it.id == id } }
+                        }
+                    }
+            },
+            object : KotlinDataLoader<Long, List<CommentDto>> {
+                override val dataLoaderName = "commentsLoader"
+                override fun getDataLoader(graphQLContext: GraphQLContext) =
+                    DataLoaderFactory.newDataLoader<Long, List<CommentDto>> { taskIds ->
+                        CompletableFuture.supplyAsync {
+                            val comments = commentService.findByTaskIds(taskIds)
+                            taskIds.map { taskId ->
+                                comments.filter { it.taskId == taskId }
+                            }
+                        }
+                    }
+            },
+        )
+    }
+}
+```
+
+### Mutations
+
+```kotlin
+import com.expediagroup.graphql.server.operations.Mutation
+import org.springframework.stereotype.Component
+
+@Component
+class TaskMutation(
+    private val taskService: TaskService,
+) : Mutation {
+
+    // mutation { createTask(input: { title: "New task" }) { id, title } }
+    fun createTask(input: CreateTaskInput): TaskDto {
+        return taskService.create(input.title, input.description, input.priority).toDto()
+    }
+
+    // mutation { updateTaskStatus(id: 1, status: DONE) { id, status } }
+    fun updateTaskStatus(id: Long, status: TaskStatus): TaskDto {
+        return taskService.updateStatus(id, status).toDto()
+    }
+
+    // mutation { deleteTask(id: 1) }
+    fun deleteTask(id: Long): Boolean {
+        taskService.delete(id)
+        return true
+    }
+}
+
+data class CreateTaskInput(
+    val title: String,
+    val description: String? = null,
+    val priority: Priority = Priority.MEDIUM,
+)
+```
+
+### Subscriptions
+
+```kotlin
+import com.expediagroup.graphql.server.operations.Subscription
+import kotlinx.coroutines.flow.Flow
+import org.springframework.stereotype.Component
+
+@Component
+class TaskSubscription(
+    private val taskEventService: TaskEventService,
+) : Subscription {
+
+    // subscription { taskUpdated(userId: "user-1") { id, title, status } }
+    fun taskUpdated(userId: String): Flow<TaskDto> {
+        return taskEventService.getTaskUpdatesForUser(userId)
+    }
+}
+```
+
+### Authentication in GraphQL
+
+```kotlin
+import com.expediagroup.graphql.generator.annotations.GraphQLDescription
+import com.expediagroup.graphql.server.operations.Query
+import graphql.schema.DataFetchingEnvironment
+import org.springframework.security.core.context.SecurityContextHolder
+import org.springframework.stereotype.Component
+
+@Component
+class TaskQuery(
+    private val taskService: TaskService,
+) : Query {
+
+    @GraphQLDescription("Get tasks for the authenticated user")
+    fun myTasks(env: DataFetchingEnvironment): List<TaskDto> {
+        val authentication = SecurityContextHolder.getContext().authentication
+            ?: throw GraphQLException("Not authenticated")
+
+        val userId = authentication.name
+        return taskService.getTasksForUser(userId).map { it.toDto() }
+    }
+}
+```
+
+### Schema-First Alternative: DGS Framework (Netflix)
+
+If you prefer schema-first (write `.graphql` files, then implement resolvers):
+
+```graphql title="src/main/resources/schema/schema.graphqls"
+type Query {
+    tasks(status: TaskStatus): [Task!]!
+    task(id: ID!): Task
+}
+
+type Mutation {
+    createTask(input: CreateTaskInput!): Task!
+}
+
+type Task {
+    id: ID!
+    title: String!
+    status: TaskStatus!
+    description: String
+    assignee: User
+    comments: [Comment!]!
+}
+
+enum TaskStatus {
+    OPEN
+    IN_PROGRESS
+    DONE
+}
+
+input CreateTaskInput {
+    title: String!
+    description: String
+}
+```
+
+```kotlin
+// DGS data fetcher
+import com.netflix.graphql.dgs.DgsComponent
+import com.netflix.graphql.dgs.DgsQuery
+import com.netflix.graphql.dgs.DgsMutation
+import com.netflix.graphql.dgs.InputArgument
+
+@DgsComponent
+class TaskDataFetcher(
+    private val taskService: TaskService,
+) {
+    @DgsQuery
+    fun tasks(@InputArgument status: TaskStatus?): List<Task> {
+        return taskService.findAll(status)
+    }
+
+    @DgsQuery
+    fun task(@InputArgument id: Long): Task? {
+        return taskService.findById(id)
+    }
+
+    @DgsMutation
+    fun createTask(@InputArgument input: CreateTaskInput): Task {
+        return taskService.create(input)
+    }
+}
+```
+
+### graphql-kotlin vs DGS vs Apollo Server vs gqlgen
+
+| Feature | graphql-kotlin | DGS | Apollo Server (TS) | gqlgen (Go) |
+|---------|---------------|-----|-------------------|-------------|
+| Approach | Code-first | Schema-first | Both | Schema-first |
+| Schema generation | From Kotlin code | From `.graphql` files | From TS or `.graphql` | From `.graphql` |
+| Spring integration | Yes | Yes (Netflix OSS) | N/A (Express) | N/A (net/http) |
+| DataLoader | Built-in | Built-in | `dataloader` pkg | `dataloaden` codegen |
+| Subscriptions | Kotlin Flow | Reactor | PubSub | Channels |
+| Federation | Supported | Supported | Native | Supported |
+
+## gRPC with Kotlin
+
+### What is gRPC?
+
+gRPC uses Protocol Buffers (protobuf) for schema definition and binary
+serialization. It's faster than JSON REST for service-to-service communication:
+
+<Mermaid title="REST vs gRPC transport" code={`
+flowchart LR
+  subgraph REST
+    R1["HTTP/1.1"] --> R2["JSON text"] --> R3["Manual client code"]
+  end
+  subgraph gRPC
+    G1["HTTP/2"] --> G2["Protobuf binary"] --> G3["Generated client code"]
+  end
+`} height={360} />
+
+### Project Setup
+
+```kotlin title="build.gradle.kts"
+import com.google.protobuf.gradle.*
+
+plugins {
+    kotlin("jvm") version "2.1.0"
+    id("com.google.protobuf") version "0.9.4"
+}
+
+dependencies {
+    implementation("io.grpc:grpc-kotlin-stub:1.4.1")
+    implementation("io.grpc:grpc-protobuf:1.68.2")
+    implementation("io.grpc:grpc-netty-shaded:1.68.2")
+    implementation("com.google.protobuf:protobuf-kotlin:4.29.2")
+
+    // For coroutine support
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:4.29.2"
+    }
+    plugins {
+        id("grpc") {
+            artifact = "io.grpc:protoc-gen-grpc-java:1.68.2"
+        }
+        id("grpckt") {
+            artifact = "io.grpc:protoc-gen-grpc-kotlin:1.4.1:jdk8@jar"
+        }
+    }
+    generateProtoTasks {
+        all().forEach { task ->
+            task.plugins {
+                id("grpc")
+                id("grpckt")
+            }
+            task.builtins {
+                id("kotlin")
+            }
+        }
+    }
+}
+```
+
+### Protobuf Definition
+
+```protobuf title="src/main/proto/task.proto"
+syntax = "proto3";
+
+package taskapi;
+
+option java_package = "com.example.grpc";
+option java_multiple_files = true;
+
+import "google/protobuf/timestamp.proto";
+
+service TaskService {
+    rpc ListTasks (ListTasksRequest) returns (ListTasksResponse);
+    rpc GetTask (GetTaskRequest) returns (Task);
+    rpc CreateTask (CreateTaskRequest) returns (Task);
+    rpc UpdateTaskStatus (UpdateStatusRequest) returns (Task);
+    rpc DeleteTask (DeleteTaskRequest) returns (DeleteTaskResponse);
+
+    // Server streaming: get real-time task updates
+    rpc WatchTasks (WatchTasksRequest) returns (stream TaskEvent);
+}
+
+message Task {
+    int64 id = 1;
+    string title = 2;
+    string description = 3;
+    TaskStatus status = 4;
+    string assignee_id = 5;
+    google.protobuf.Timestamp created_at = 6;
+    google.protobuf.Timestamp updated_at = 7;
+}
+
+enum TaskStatus {
+    TASK_STATUS_UNSPECIFIED = 0;
+    TASK_STATUS_OPEN = 1;
+    TASK_STATUS_IN_PROGRESS = 2;
+    TASK_STATUS_DONE = 3;
+}
+
+message ListTasksRequest {
+    TaskStatus status_filter = 1;
+    int32 page_size = 2;
+    string page_token = 3;
+}
+
+message ListTasksResponse {
+    repeated Task tasks = 1;
+    string next_page_token = 2;
+    int32 total_count = 3;
+}
+
+message GetTaskRequest {
+    int64 id = 1;
+}
+
+message CreateTaskRequest {
+    string title = 1;
+    string description = 2;
+    string assignee_id = 3;
+}
+
+message UpdateStatusRequest {
+    int64 id = 1;
+    TaskStatus status = 2;
+}
+
+message DeleteTaskRequest {
+    int64 id = 1;
+}
+
+message DeleteTaskResponse {
+    bool success = 1;
+}
+
+message WatchTasksRequest {
+    string user_id = 1;
+}
+
+message TaskEvent {
+    enum EventType {
+        EVENT_TYPE_UNSPECIFIED = 0;
+        CREATED = 1;
+        UPDATED = 2;
+        DELETED = 3;
+    }
+    EventType type = 1;
+    Task task = 2;
+}
+```
+
+### gRPC Server in Kotlin
+
+```kotlin
+import com.example.grpc.*
+import com.google.protobuf.Timestamp
+import io.grpc.Status
+import io.grpc.StatusException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import java.time.Instant
+
+class TaskGrpcService(
+    private val taskRepository: TaskRepository,
+) : TaskServiceGrpcKt.TaskServiceCoroutineImplBase() {
+
+    override suspend fun listTasks(request: ListTasksRequest): ListTasksResponse {
+        val tasks = taskRepository.findAll(
+            statusFilter = request.statusFilter.takeIf { it != TaskStatus.TASK_STATUS_UNSPECIFIED },
+            pageSize = request.pageSize.takeIf { it > 0 } ?: 20,
+            pageToken = request.pageToken.takeIf { it.isNotEmpty() },
+        )
+
+        return listTasksResponse {
+            this.tasks.addAll(tasks.items.map { it.toProto() })
+            nextPageToken = tasks.nextToken ?: ""
+            totalCount = tasks.total
+        }
+    }
+
+    override suspend fun getTask(request: GetTaskRequest): Task {
+        val task = taskRepository.findById(request.id)
+            ?: throw StatusException(Status.NOT_FOUND.withDescription("Task ${request.id} not found"))
+
+        return task.toProto()
+    }
+
+    override suspend fun createTask(request: CreateTaskRequest): Task {
+        if (request.title.isBlank()) {
+            throw StatusException(Status.INVALID_ARGUMENT.withDescription("Title is required"))
+        }
+
+        val task = taskRepository.save(
+            TaskEntity(
+                title = request.title,
+                description = request.description,
+                assigneeId = request.assigneeId.takeIf { it.isNotEmpty() },
+            )
+        )
+
+        return task.toProto()
+    }
+
+    override suspend fun updateTaskStatus(request: UpdateStatusRequest): Task {
+        val task = taskRepository.findById(request.id)
+            ?: throw StatusException(Status.NOT_FOUND.withDescription("Task ${request.id} not found"))
+
+        val updated = taskRepository.save(task.copy(status = request.status.toDomain()))
+        return updated.toProto()
+    }
+
+    override suspend fun deleteTask(request: DeleteTaskRequest): DeleteTaskResponse {
+        taskRepository.deleteById(request.id)
+        return deleteTaskResponse { success = true }
+    }
+
+    override fun watchTasks(request: WatchTasksRequest): Flow<TaskEvent> = flow {
+        // Emit task events as they happen (simplified — real impl would use a message queue)
+        taskRepository.watchChanges(request.userId).collect { event ->
+            emit(taskEvent {
+                type = event.type.toProto()
+                task = event.task.toProto()
+            })
+        }
+    }
+
+    private fun TaskEntity.toProto(): Task = task {
+        id = this@toProto.id
+        title = this@toProto.title
+        description = this@toProto.description ?: ""
+        status = this@toProto.status.toProto()
+        assigneeId = this@toProto.assigneeId ?: ""
+        createdAt = this@toProto.createdAt.toTimestamp()
+        updatedAt = this@toProto.updatedAt.toTimestamp()
+    }
+
+    private fun Instant.toTimestamp(): Timestamp = Timestamp.newBuilder()
+        .setSeconds(epochSecond)
+        .setNanos(nano)
+        .build()
+}
+```
+
+### Starting the gRPC Server
+
+```kotlin
+import io.grpc.ServerBuilder
+
+fun main() {
+    val taskRepository = InMemoryTaskRepository()  // Or real DB
+    val server = ServerBuilder
+        .forPort(50051)
+        .addService(TaskGrpcService(taskRepository))
+        .build()
+
+    server.start()
+    println("gRPC server started on port 50051")
+    server.awaitTermination()
+}
+```
+
+### gRPC Client in Kotlin
+
+```kotlin
+import com.example.grpc.*
+import io.grpc.ManagedChannelBuilder
+import kotlinx.coroutines.runBlocking
+
+fun main() = runBlocking {
+    val channel = ManagedChannelBuilder
+        .forAddress("localhost", 50051)
+        .usePlaintext()  // No TLS for local dev
+        .build()
+
+    val client = TaskServiceGrpcKt.TaskServiceCoroutineStub(channel)
+
+    // Create a task
+    val created = client.createTask(createTaskRequest {
+        title = "Learn gRPC"
+        description = "Complete the gRPC module"
+    })
+    println("Created task: ${created.id} - ${created.title}")
+
+    // List tasks
+    val response = client.listTasks(listTasksRequest {
+        pageSize = 10
+    })
+    println("Tasks (${response.totalCount} total):")
+    response.tasksList.forEach { task ->
+        println("  ${task.id}: ${task.title} [${task.status}]")
+    }
+
+    // Watch for updates (server streaming)
+    client.watchTasks(watchTasksRequest {
+        userId = "user-1"
+    }).collect { event ->
+        println("Event: ${event.type} - ${event.task.title}")
+    }
+
+    channel.shutdown()
+}
+```
+
+### gRPC with Spring Boot
+
+Use `grpc-spring-boot-starter` for Spring integration:
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("net.devh:grpc-spring-boot-starter:3.1.0.RELEASE")
+}
+```
+
+```kotlin
+import net.devh.boot.grpc.server.service.GrpcService
+
+@GrpcService
+class TaskGrpcService(
+    private val taskService: TaskService,  // Inject Spring beans
+) : TaskServiceGrpcKt.TaskServiceCoroutineImplBase() {
+    // Same implementation as above, but with Spring DI
+}
+```
+
+```yaml title="application.yml"
+grpc:
+  server:
+    port: 50051
+```
+
+### gRPC Comparison: TypeScript / Go / Kotlin
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// grpc-js: callback-based, less ergonomic
+import * as grpc from "@grpc/grpc-js";
+import * as protoLoader from "@grpc/proto-loader";
+
+const packageDef = protoLoader.loadSync("task.proto");
+const proto = grpc.loadPackageDefinition(packageDef);
+
+const server = new grpc.Server();
+server.addService(proto.taskapi.TaskService.service, {
+  listTasks: (call, callback) => {
+    // Implementation
+    callback(null, { tasks: [], totalCount: 0 });
+  },
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go: generated code + interface implementation
+type taskServer struct {
+    pb.UnimplementedTaskServiceServer
+}
+
+func (s *taskServer) ListTasks(ctx context.Context, req *pb.ListTasksRequest) (*pb.ListTasksResponse, error) {
+    // Implementation
+    return &pb.ListTasksResponse{}, nil
+}
+
+func main() {
+    lis, _ := net.Listen("tcp", ":50051")
+    s := grpc.NewServer()
+    pb.RegisterTaskServiceServer(s, &taskServer{})
+    s.Serve(lis)
+}
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+// Kotlin: coroutine-based, Flow for streaming
+class TaskGrpcService : TaskServiceGrpcKt.TaskServiceCoroutineImplBase() {
+    override suspend fun listTasks(request: ListTasksRequest): ListTasksResponse {
+        // Suspend function — natural coroutine support
+        return listTasksResponse { /* ... */ }
+    }
+
+    override fun watchTasks(request: WatchTasksRequest): Flow<TaskEvent> = flow {
+        // Kotlin Flow for server streaming — elegant
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+**Key Differences:**
+
+| Aspect | TypeScript | Go | Kotlin |
+|--------|-----------|-----|--------|
+| API style | Callbacks | Sync/goroutines | Coroutines + Flow |
+| Streaming | EventEmitter | Channels | Kotlin Flow |
+| Code gen | `grpc-tools` | `protoc-gen-go-grpc` | `protoc-gen-grpc-kotlin` |
+| Spring integration | N/A | N/A | `grpc-spring-boot-starter` |
+| Type safety | Generated TS types | Generated Go structs | Generated Kotlin classes |
+
+## Content Negotiation
+
+Content negotiation lets your API serve different formats based on the `Accept`
+header.
+
+<Tabs syncKey="lang">
+  <TabItem label="Kotlin">
+
+```kotlin
+// Spring supports JSON, XML, etc. based on Accept header
+// JSON is the default with Jackson on classpath
+
+// Add XML support — build.gradle.kts
+// implementation("com.fasterxml.jackson.dataformat:jackson-dataformat-xml")
+
+// Controller — no changes needed
+@GetMapping(
+    "/api/tasks/{id}",
+    produces = [MediaType.APPLICATION_JSON_VALUE, MediaType.APPLICATION_XML_VALUE],
+)
+fun getTask(@PathVariable id: Long): TaskResponse {
+    return taskService.findById(id).toResponse()
+}
+
+// Client sends Accept: application/json → JSON response
+// Client sends Accept: application/xml  → XML response
+```
+
+  </TabItem>
+</Tabs>
+
+In Ktor, register each format on the `ContentNegotiation` plugin:
+
+```kotlin
+import io.ktor.serialization.kotlinx.json.*
+import io.ktor.serialization.kotlinx.xml.*
+import io.ktor.server.plugins.contentnegotiation.*
+
+fun Application.configureSerialization() {
+    install(ContentNegotiation) {
+        json()  // application/json
+        xml()   // application/xml (needs ktor-serialization-kotlinx-xml)
+    }
+}
+```
+
+## API Design Comparison
+
+### REST vs GraphQL vs gRPC — When to Use What
+
+| Factor | REST | GraphQL | gRPC |
+|--------|------|---------|------|
+| **Use case** | Public APIs, CRUD | Flexible queries, BFF | Service-to-service |
+| **Format** | JSON over HTTP/1.1 | JSON over HTTP/1.1 | Protobuf over HTTP/2 |
+| **Schema** | OpenAPI (optional) | GraphQL schema (required) | Protobuf (required) |
+| **Over-fetching** | Common | Solved | N/A (typed messages) |
+| **N+1 problem** | Not applicable | DataLoader needed | Not applicable |
+| **Caching** | HTTP caching easy | Hard (POST for queries) | Manual |
+| **File upload** | Multipart | Complex | Streaming |
+| **Browser support** | Native fetch | Client library | grpc-web proxy |
+| **Learning curve** | Low | Medium | Medium-high |
+| **Best for** | External APIs | Mobile apps, SPAs | Microservices |
+
+### Real-World Architecture
+
+Most production systems use a combination: REST for the public API, GraphQL for
+the BFF layer, and gRPC for internal service-to-service calls.
+
+<Mermaid title="Combined REST / GraphQL / gRPC architecture" code={`
+flowchart TB
+  FE["Frontend"] --> GW["API Gateway (REST / GraphQL)"]
+  GW --> TS["Task Service"]
+  GW --> US["User Service"]
+  GW --> NS["Notification Service"]
+  TS <-->|"gRPC"| US
+  US <-->|"gRPC"| NS
+  TS <-->|"gRPC"| NS
+`} height={420} />
+
+- **REST** for the public API (easy to consume, well-understood)
+- **GraphQL** for the BFF layer (frontend-optimized queries)
+- **gRPC** for internal service-to-service communication (fast, typed)
+
+### Summary
+
+| Topic | TypeScript | Go | Kotlin/JVM |
+|-------|-----------|-----|------------|
+| REST docs | swagger-jsdoc, tsoa | swaggo/swag | springdoc-openapi |
+| JSON | Built-in JSON | encoding/json | Jackson / kotlinx.serialization |
+| Validation | Zod, class-validator | Manual | JSR 380 (`@Valid`) |
+| GraphQL | Apollo Server | gqlgen | graphql-kotlin / DGS |
+| gRPC | grpc-js | grpc-go | grpc-kotlin |
+| Type safety | TypeScript types | Go structs | Kotlin data classes |
+| Code-first schema | TypeGraphQL | N/A | graphql-kotlin |
+| Schema-first | Apollo | gqlgen | DGS Framework |
+
+**Key takeaways:**
+
+- Use Jackson for Spring Boot, kotlinx.serialization for Ktor and multiplatform.
+- springdoc-openapi gives you Swagger UI with minimal annotation effort.
+- graphql-kotlin's code-first approach maps naturally to Kotlin data classes.
+- gRPC with Kotlin coroutines and Flow is the most ergonomic gRPC experience.
+- Match the API style to the use case: REST for external, GraphQL for flexible
+  queries, gRPC for internal.
+
+## Practice
+
+Build real APIs in two different styles on top of the same task domain.
+
+<CardGrid>
+  <LinkCard
+    title="GraphQL API with graphql-kotlin"
+    href="/kotlin-backend/15-api-design/graphql-api/"
+    description="Build a code-first GraphQL API: queries with filtering, mutations, nested resolvers for assignee and comments, and DataLoader to avoid N+1 queries."
+  />
+  <LinkCard
+    title="OpenAPI Documentation with springdoc-openapi"
+    href="/kotlin-backend/15-api-design/openapi-docs/"
+    description="Document a Spring Boot Task API with Swagger UI, schema annotations on DTOs, JWT Bearer auth, and an exportable OpenAPI JSON spec."
+  />
+</CardGrid>

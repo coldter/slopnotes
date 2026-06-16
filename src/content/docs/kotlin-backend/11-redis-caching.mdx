@@ -1,0 +1,1254 @@
+---
+title: Redis & Caching
+description: Use Redis from the JVM with Spring Data Redis, the @Cacheable abstraction, and the caching strategies you already know from ioredis and go-redis.
+sidebar:
+  order: 11
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+You already know Redis from `ioredis` (TypeScript) or `go-redis` (Go). The JVM
+ecosystem uses **Lettuce** as the low-level Redis client and **Spring Data Redis**
+as the high-level abstraction. Spring also provides a **cache abstraction**
+(`@Cacheable`) that makes caching nearly invisible.
+
+:::note[Shared infrastructure]
+Redis comes from the shared Docker stack — see the [Dev Environment](/kotlin-backend/01-dev-environment/)
+module. A one-line reminder:
+
+```bash
+cd shared-infra
+docker compose up -d redis
+# Connection: localhost:6379, no auth
+```
+:::
+
+## Redis in the JVM Ecosystem
+
+### Client Comparison
+
+| Feature | ioredis (TS) | go-redis (Go) | Spring Data Redis / Lettuce (Kotlin) |
+|---|---|---|---|
+| Client library | `ioredis` | `github.com/redis/go-redis` | Lettuce (default), Jedis (alt) |
+| Connection model | Single + pipeline | Pool-based | Lettuce: shared connection, Jedis: pool |
+| Async support | Native (Promise) | Context-based | Reactive (Project Reactor) + coroutines |
+| Cluster support | Built-in | Built-in | Built-in |
+| High-level cache | Manual | Manual | `@Cacheable` annotation |
+| Serialization | JSON (manual) | JSON (manual) | Configurable (JSON, JDK, etc.) |
+
+### Dependency Setup
+
+```kotlin title="build.gradle.kts"
+plugins {
+    kotlin("jvm") version "2.1.0"
+    kotlin("plugin.spring") version "2.1.0"
+    id("org.springframework.boot") version "3.4.1"
+    id("io.spring.dependency-management") version "1.1.7"
+}
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-data-redis")
+    // Lettuce is the default client — included transitively
+    // For JSON serialization in Redis:
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+}
+```
+
+### Configuration
+
+```yaml title="application.yml"
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # password: secret       # if auth is enabled
+      timeout: 5000             # connection timeout in ms
+      lettuce:
+        pool:
+          max-active: 10        # max connections
+          max-idle: 5           # max idle connections
+          min-idle: 2           # min idle connections
+          max-wait: 3000        # wait time for connection from pool
+```
+
+## Spring Data Redis: RedisTemplate
+
+`RedisTemplate` is the core API for Redis operations in Spring. It's the
+equivalent of the `ioredis` client object or `go-redis.Client`.
+
+### Configuration with JSON Serialization
+
+By default, `RedisTemplate` uses Java serialization (unreadable in `redis-cli`).
+Configure JSON serialization instead:
+
+```kotlin title="config/RedisConfig.kt"
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.data.redis.connection.RedisConnectionFactory
+import org.springframework.data.redis.core.RedisTemplate
+import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer
+import org.springframework.data.redis.serializer.StringRedisSerializer
+
+@Configuration
+class RedisConfig {
+
+    @Bean
+    fun redisTemplate(connectionFactory: RedisConnectionFactory): RedisTemplate<String, Any> {
+        val template = RedisTemplate<String, Any>()
+        template.connectionFactory = connectionFactory
+
+        // Key serializer — always use String
+        template.keySerializer = StringRedisSerializer()
+        template.hashKeySerializer = StringRedisSerializer()
+
+        // Value serializer — use JSON so values are human-readable
+        val jsonSerializer = GenericJackson2JsonRedisSerializer()
+        template.valueSerializer = jsonSerializer
+        template.hashValueSerializer = jsonSerializer
+
+        return template
+    }
+
+    // StringRedisTemplate is auto-configured, but you can customize it
+    @Bean
+    fun stringRedisTemplate(connectionFactory: RedisConnectionFactory): StringRedisTemplate {
+        return StringRedisTemplate(connectionFactory)
+    }
+}
+```
+
+### Basic Operations
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+import Redis from 'ioredis';
+
+const redis = new Redis(); // localhost:6379
+
+// String
+await redis.set('user:1:name', 'Alice');
+const name = await redis.get('user:1:name');  // 'Alice'
+
+// With TTL
+await redis.setex('session:abc', 3600, JSON.stringify({ userId: 1 }));
+
+// Delete
+await redis.del('user:1:name');
+
+// Check existence
+const exists = await redis.exists('user:1:name');  // 0 or 1
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+
+// String
+rdb.Set(ctx, "user:1:name", "Alice", 0)
+name, _ := rdb.Get(ctx, "user:1:name").Result()
+
+// With TTL
+rdb.Set(ctx, "session:abc", `{"userId":1}`, time.Hour)
+
+// Delete
+rdb.Del(ctx, "user:1:name")
+
+// Check existence
+exists, _ := rdb.Exists(ctx, "user:1:name").Result()
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import org.springframework.data.redis.core.RedisTemplate
+import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.stereotype.Service
+import java.time.Duration
+
+@Service
+class RedisBasicService(
+    private val redisTemplate: RedisTemplate<String, Any>,
+    private val stringRedisTemplate: StringRedisTemplate
+) {
+    // --- String operations ---
+
+    fun setString(key: String, value: String) {
+        stringRedisTemplate.opsForValue().set(key, value)
+    }
+
+    fun getString(key: String): String? {
+        return stringRedisTemplate.opsForValue().get(key)
+    }
+
+    fun setWithTTL(key: String, value: String, ttl: Duration) {
+        stringRedisTemplate.opsForValue().set(key, value, ttl)
+    }
+
+    // Store objects as JSON
+    fun setObject(key: String, value: Any) {
+        redisTemplate.opsForValue().set(key, value)
+    }
+
+    fun getObject(key: String): Any? {
+        return redisTemplate.opsForValue().get(key)
+    }
+
+    // --- Key operations ---
+
+    fun delete(key: String): Boolean {
+        return redisTemplate.delete(key)
+    }
+
+    fun exists(key: String): Boolean {
+        return redisTemplate.hasKey(key)
+    }
+
+    fun setExpiration(key: String, ttl: Duration): Boolean {
+        return redisTemplate.expire(key, ttl)
+    }
+
+    fun getExpiration(key: String): Long {
+        return redisTemplate.getExpire(key)  // seconds, -1 = no expiry, -2 = key doesn't exist
+    }
+
+    // --- Increment/Decrement ---
+
+    fun increment(key: String): Long {
+        return stringRedisTemplate.opsForValue().increment(key)!!
+    }
+
+    fun incrementBy(key: String, delta: Long): Long {
+        return stringRedisTemplate.opsForValue().increment(key, delta)!!
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+### The opsFor* Pattern
+
+`RedisTemplate` exposes different Redis data structures through `opsFor*()`
+methods:
+
+| Method | Redis Type | Equivalent ioredis | Equivalent go-redis |
+|---|---|---|---|
+| `opsForValue()` | String | `get/set` | `Get/Set` |
+| `opsForHash()` | Hash | `hget/hset/hgetall` | `HGet/HSet/HGetAll` |
+| `opsForList()` | List | `lpush/rpush/lrange` | `LPush/RPush/LRange` |
+| `opsForSet()` | Set | `sadd/smembers/sismember` | `SAdd/SMembers/SIsMember` |
+| `opsForZSet()` | Sorted Set | `zadd/zrange/zrangebyscore` | `ZAdd/ZRange/ZRangeByScore` |
+
+## Working with Redis Data Structures
+
+### Hashes (Objects)
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+await redis.hset('user:1', { name: 'Alice', email: 'alice@example.com', score: '100' });
+const user = await redis.hgetall('user:1');  // { name: 'Alice', ... }
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+rdb.HSet(ctx, "user:1", "name", "Alice", "email", "alice@example.com", "score", 100)
+result, _ := rdb.HGetAll(ctx, "user:1").Result()  // map[string]string
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+@Service
+class RedisHashService(private val stringRedisTemplate: StringRedisTemplate) {
+
+    private val hashOps = stringRedisTemplate.opsForHash<String, String>()
+
+    fun saveUserProfile(userId: Long, profile: Map<String, String>) {
+        hashOps.putAll("user:$userId", profile)
+    }
+
+    fun getUserProfile(userId: Long): Map<String, String> {
+        return hashOps.entries("user:$userId")
+    }
+
+    fun getUserField(userId: Long, field: String): String? {
+        return hashOps.get("user:$userId", field)
+    }
+
+    fun incrementScore(userId: Long, delta: Long): Long {
+        return hashOps.increment("user:$userId", "score", delta)
+    }
+}
+
+// Usage
+hashService.saveUserProfile(1, mapOf(
+    "name" to "Alice",
+    "email" to "alice@example.com",
+    "score" to "100"
+))
+
+val profile = hashService.getUserProfile(1)
+// {name=Alice, email=alice@example.com, score=100}
+```
+
+  </TabItem>
+</Tabs>
+
+### Lists (Queues)
+
+This is a single-language Kotlin example — Redis lists make a natural FIFO queue,
+left-push to enqueue and right-pop to dequeue.
+
+```kotlin
+@Service
+class RedisListService(private val stringRedisTemplate: StringRedisTemplate) {
+
+    private val listOps = stringRedisTemplate.opsForList()
+
+    // Push to queue (FIFO: left push, right pop)
+    fun enqueue(queue: String, message: String) {
+        listOps.leftPush(queue, message)
+    }
+
+    fun dequeue(queue: String): String? {
+        return listOps.rightPop(queue)
+    }
+
+    // Blocking pop (waits for message)
+    fun blockingDequeue(queue: String, timeout: Duration): String? {
+        return listOps.rightPop(queue, timeout)
+    }
+
+    fun queueSize(queue: String): Long {
+        return listOps.size(queue) ?: 0
+    }
+
+    // Recent items (like recent notifications)
+    fun addRecent(key: String, item: String, maxSize: Long) {
+        listOps.leftPush(key, item)
+        listOps.trim(key, 0, maxSize - 1)  // Keep only last N items
+    }
+
+    fun getRecent(key: String, count: Long): List<String> {
+        return listOps.range(key, 0, count - 1) ?: emptyList()
+    }
+}
+```
+
+### Sets and Sorted Sets
+
+Sets give you unique collections and set algebra (intersections); sorted sets are
+the classic leaderboard structure, scored and rankable.
+
+```kotlin
+@Service
+class RedisSetService(private val stringRedisTemplate: StringRedisTemplate) {
+
+    private val setOps = stringRedisTemplate.opsForSet()
+    private val zsetOps = stringRedisTemplate.opsForZSet()
+
+    // --- Sets (unique collections) ---
+
+    fun addTags(articleId: Long, vararg tags: String) {
+        setOps.add("article:$articleId:tags", *tags)
+    }
+
+    fun getTags(articleId: Long): Set<String> {
+        return setOps.members("article:$articleId:tags") ?: emptySet()
+    }
+
+    // Articles with BOTH tags (intersection)
+    fun articlesWithAllTags(vararg tags: String): Set<String> {
+        val keys = tags.map { "tag:$it:articles" }
+        return setOps.intersect(keys) ?: emptySet()
+    }
+
+    // --- Sorted Sets (leaderboards, ranking) ---
+
+    fun recordScore(leaderboard: String, userId: String, score: Double) {
+        zsetOps.add(leaderboard, userId, score)
+    }
+
+    fun incrementScore(leaderboard: String, userId: String, delta: Double) {
+        zsetOps.incrementScore(leaderboard, userId, delta)
+    }
+
+    // Top N players (highest scores)
+    fun getTopPlayers(leaderboard: String, count: Long): Set<String> {
+        return zsetOps.reverseRange(leaderboard, 0, count - 1) ?: emptySet()
+    }
+
+    // Top N with scores
+    fun getTopPlayersWithScores(leaderboard: String, count: Long):
+        Set<org.springframework.data.redis.core.ZSetOperations.TypedTuple<String>> {
+        return zsetOps.reverseRangeWithScores(leaderboard, 0, count - 1) ?: emptySet()
+    }
+
+    // Player rank (0-based, lowest = best)
+    fun getPlayerRank(leaderboard: String, userId: String): Long? {
+        return zsetOps.reverseRank(leaderboard, userId)
+    }
+}
+```
+
+## Spring Cache Abstraction
+
+Spring's cache abstraction lets you add caching to any method with annotations.
+It's the highest-level way to use Redis — no manual get/set calls.
+
+### Enable Caching
+
+```kotlin
+import org.springframework.cache.annotation.EnableCaching
+import org.springframework.boot.autoconfigure.SpringBootApplication
+
+@SpringBootApplication
+@EnableCaching
+class Application
+```
+
+```yaml title="application.yml"
+spring:
+  cache:
+    type: redis
+    redis:
+      time-to-live: 600000      # 10 minutes default TTL (in ms)
+      cache-null-values: false   # Don't cache null results
+      key-prefix: "myapp:"      # Prefix all cache keys
+      use-key-prefix: true
+```
+
+### Custom Cache Configuration
+
+```kotlin title="config/CacheConfig.kt"
+import org.springframework.cache.CacheManager
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.data.redis.cache.RedisCacheConfiguration
+import org.springframework.data.redis.cache.RedisCacheManager
+import org.springframework.data.redis.connection.RedisConnectionFactory
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer
+import org.springframework.data.redis.serializer.RedisSerializationContext
+import org.springframework.data.redis.serializer.StringRedisSerializer
+import java.time.Duration
+
+@Configuration
+class CacheConfig {
+
+    @Bean
+    fun cacheManager(connectionFactory: RedisConnectionFactory): CacheManager {
+        // Default config for all caches
+        val defaultConfig = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(10))
+            .serializeKeysWith(
+                RedisSerializationContext.SerializationPair
+                    .fromSerializer(StringRedisSerializer())
+            )
+            .serializeValuesWith(
+                RedisSerializationContext.SerializationPair
+                    .fromSerializer(GenericJackson2JsonRedisSerializer())
+            )
+            .disableCachingNullValues()
+
+        // Per-cache TTL overrides
+        val cacheConfigs = mapOf(
+            "users" to defaultConfig.entryTtl(Duration.ofMinutes(30)),
+            "products" to defaultConfig.entryTtl(Duration.ofHours(1)),
+            "sessions" to defaultConfig.entryTtl(Duration.ofHours(24)),
+            "rate-limits" to defaultConfig.entryTtl(Duration.ofMinutes(1))
+        )
+
+        return RedisCacheManager.builder(connectionFactory)
+            .cacheDefaults(defaultConfig)
+            .withInitialCacheConfigurations(cacheConfigs)
+            .transactionAware()  // Respect @Transactional boundaries
+            .build()
+    }
+}
+```
+
+### @Cacheable — Cache Method Results
+
+**The concept:** First call executes the method and caches the result. Subsequent
+calls with the same key return the cached value without executing the method.
+
+```kotlin
+import org.springframework.cache.annotation.Cacheable
+import org.springframework.cache.annotation.CacheEvict
+import org.springframework.cache.annotation.CachePut
+import org.springframework.stereotype.Service
+
+@Service
+class UserService(private val userRepository: UserRepository) {
+
+    // Cache the result — key is the method parameter
+    @Cacheable(value = ["users"], key = "#id")
+    fun getUser(id: Long): UserDTO {
+        println("Fetching user $id from database")  // Only printed on cache miss
+        val user = userRepository.findById(id).orElseThrow {
+            NoSuchElementException("User $id not found")
+        }
+        return user.toDTO()
+    }
+
+    // Cache with composite key
+    @Cacheable(value = ["users"], key = "'email:' + #email")
+    fun getUserByEmail(email: String): UserDTO? {
+        return userRepository.findByEmail(email)?.toDTO()
+    }
+
+    // Conditional caching — only cache active users
+    @Cacheable(value = ["users"], key = "#id", condition = "#id > 0",
+               unless = "#result != null && !#result.active")
+    fun getUserIfActive(id: Long): UserDTO? {
+        return userRepository.findById(id).orElse(null)?.toDTO()
+    }
+}
+```
+
+**Comparison to manual caching** — the `@Cacheable` annotation replaces a
+hand-written cache-aside block:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// TypeScript — manual cache-aside pattern
+async function getUser(id: number): Promise<User> {
+  const cached = await redis.get(`user:${id}`);
+  if (cached) return JSON.parse(cached);
+
+  const user = await db.user.findUnique({ where: { id } });
+  if (user) {
+    await redis.setex(`user:${id}`, 600, JSON.stringify(user));
+  }
+  return user;
+}
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+// Kotlin — Spring @Cacheable does exactly the above automatically
+@Cacheable(value = ["users"], key = "#id")
+fun getUser(id: Long): UserDTO {
+    return userRepository.findById(id).orElseThrow().toDTO()
+}
+```
+
+  </TabItem>
+</Tabs>
+
+### @CacheEvict — Invalidate Cache
+
+```kotlin
+@Service
+class UserService(private val userRepository: UserRepository) {
+
+    // Evict single entry when user is updated
+    @CacheEvict(value = ["users"], key = "#id")
+    fun updateUser(id: Long, request: UpdateUserRequest): UserDTO {
+        val user = userRepository.findById(id).orElseThrow()
+        user.name = request.name
+        user.email = request.email
+        return userRepository.save(user).toDTO()
+    }
+
+    // Evict single entry when user is deleted
+    @CacheEvict(value = ["users"], key = "#id")
+    fun deleteUser(id: Long) {
+        userRepository.deleteById(id)
+    }
+
+    // Evict ALL entries in the cache
+    @CacheEvict(value = ["users"], allEntries = true)
+    fun refreshAllUsers() {
+        // Called when you need to invalidate everything
+        // e.g., after a bulk import
+    }
+
+    // Evict BEFORE the method executes (useful for delete operations)
+    @CacheEvict(value = ["users"], key = "#id", beforeInvocation = true)
+    fun forceDeleteUser(id: Long) {
+        userRepository.deleteById(id)
+    }
+}
+```
+
+### @CachePut — Update Cache Without Skipping
+
+Unlike `@Cacheable` (which skips execution on cache hit), `@CachePut` always
+executes the method and updates the cache with the result:
+
+```kotlin
+@Service
+class ProductService(private val productRepository: ProductRepository) {
+
+    @Cacheable(value = ["products"], key = "#id")
+    fun getProduct(id: Long): ProductDTO {
+        return productRepository.findById(id).orElseThrow().toDTO()
+    }
+
+    // Always execute AND update cache
+    @CachePut(value = ["products"], key = "#id")
+    fun updateProduct(id: Long, request: UpdateProductRequest): ProductDTO {
+        val product = productRepository.findById(id).orElseThrow()
+        product.name = request.name
+        product.price = request.price
+        return productRepository.save(product).toDTO()
+    }
+}
+```
+
+### Combining Cache Annotations
+
+```kotlin
+import org.springframework.cache.annotation.Caching
+
+@Service
+class UserService(private val userRepository: UserRepository) {
+
+    // Multiple cache operations on one method
+    @Caching(
+        evict = [
+            CacheEvict(value = ["users"], key = "#id"),
+            CacheEvict(value = ["users"], key = "'email:' + #result.email")
+        ]
+    )
+    fun updateUser(id: Long, request: UpdateUserRequest): UserDTO {
+        val user = userRepository.findById(id).orElseThrow()
+        user.name = request.name
+        user.email = request.email
+        return userRepository.save(user).toDTO()
+    }
+}
+```
+
+### Cache Annotations Summary
+
+| Annotation | Behavior | Use Case |
+|---|---|---|
+| `@Cacheable` | Return cached value; execute + cache on miss | Read operations |
+| `@CacheEvict` | Remove entry from cache | After updates/deletes |
+| `@CachePut` | Always execute + update cache | Update operations where you want cache refreshed |
+| `@Caching` | Combine multiple cache operations | Complex invalidation |
+| `@CacheConfig` | Class-level defaults | Reduce annotation repetition |
+
+## Caching Strategies
+
+### Cache-Aside (Lazy Loading)
+
+This is what `@Cacheable` implements. The application manages the cache
+explicitly: on a read it checks the cache first and only hits the database on a
+miss; on a write it updates the database and invalidates the cache.
+
+<Mermaid title="Cache-aside read & write" code={`
+sequenceDiagram
+  participant App
+  participant Cache as Redis
+  participant DB
+  Note over App,DB: Read path
+  App->>Cache: GET key
+  alt cache hit
+    Cache-->>App: cached value
+  else cache miss
+    Cache-->>App: nil
+    App->>DB: query
+    DB-->>App: row
+    App->>Cache: SET key (with TTL)
+  end
+  Note over App,DB: Write path
+  App->>DB: update
+  App->>Cache: invalidate key
+`} />
+
+```kotlin
+// Cache-aside is the default with @Cacheable + @CacheEvict
+@Service
+class ProductService(private val productRepository: ProductRepository) {
+
+    @Cacheable("products")
+    fun getProduct(id: Long): ProductDTO {
+        // Only called on cache miss
+        return productRepository.findById(id).orElseThrow().toDTO()
+    }
+
+    @CacheEvict("products", key = "#id")
+    fun updateProduct(id: Long, request: UpdateProductRequest): ProductDTO {
+        // Update DB, then invalidate cache
+        val product = productRepository.findById(id).orElseThrow()
+        product.name = request.name
+        return productRepository.save(product).toDTO()
+    }
+}
+```
+
+**Pros:** Simple, only caches what's actually read.
+**Cons:** First request is always a cache miss (cold start).
+
+### Read-Through
+
+The cache itself is responsible for loading data from the source. Spring doesn't
+support this natively with annotations, but you can implement it:
+
+```kotlin
+@Service
+class ReadThroughCacheService(
+    private val redisTemplate: RedisTemplate<String, Any>,
+    private val userRepository: UserRepository
+) {
+    fun getUser(id: Long): UserDTO {
+        val key = "user:$id"
+
+        // Try cache first
+        val cached = redisTemplate.opsForValue().get(key)
+        if (cached != null) {
+            return cached as UserDTO
+        }
+
+        // Load from DB and populate cache atomically
+        val user = userRepository.findById(id).orElseThrow()
+        val dto = user.toDTO()
+        redisTemplate.opsForValue().set(key, dto, Duration.ofMinutes(30))
+        return dto
+    }
+}
+```
+
+### Write-Through
+
+Write to cache and database simultaneously, so the cache is always up to date.
+
+<Mermaid title="Write-through write path" code={`
+sequenceDiagram
+  participant App
+  participant Cache as Redis
+  participant DB
+  App->>DB: save / update
+  DB-->>App: persisted row
+  App->>Cache: SET key (with TTL)
+  Cache-->>App: ok
+`} />
+
+```kotlin
+@Service
+class WriteThroughService(
+    private val redisTemplate: RedisTemplate<String, Any>,
+    private val userRepository: UserRepository
+) {
+    fun createUser(request: CreateUserRequest): UserDTO {
+        // Write to database
+        val user = userRepository.save(User(name = request.name, email = request.email))
+        val dto = user.toDTO()
+
+        // Write to cache immediately
+        redisTemplate.opsForValue().set("user:${user.id}", dto, Duration.ofMinutes(30))
+
+        return dto
+    }
+
+    fun updateUser(id: Long, request: UpdateUserRequest): UserDTO {
+        // Update database
+        val user = userRepository.findById(id).orElseThrow()
+        user.name = request.name
+        val saved = userRepository.save(user)
+        val dto = saved.toDTO()
+
+        // Update cache immediately
+        redisTemplate.opsForValue().set("user:$id", dto, Duration.ofMinutes(30))
+
+        return dto
+    }
+}
+```
+
+**Pros:** Cache is always warm and consistent.
+**Cons:** Write latency increases; cache may store data that's never read.
+
+### Write-Behind (Write-Back)
+
+Write to cache immediately, then asynchronously write to the database. Useful for
+high-write scenarios:
+
+```kotlin
+@Service
+class WriteBehindService(
+    private val redisTemplate: RedisTemplate<String, Any>,
+    private val userRepository: UserRepository
+) {
+    // Write to cache immediately
+    fun updateUserScore(userId: Long, score: Int) {
+        redisTemplate.opsForHash<String, String>()
+            .put("user:$userId", "score", score.toString())
+
+        // Queue for async DB write
+        redisTemplate.opsForList()
+            .leftPush("write-behind:queue", "$userId:score:$score")
+    }
+
+    // Background worker flushes queue to DB periodically
+    @Scheduled(fixedDelay = 5000)  // Every 5 seconds
+    fun flushWriteBehindQueue() {
+        val ops = redisTemplate.opsForList()
+        while (true) {
+            val item = ops.rightPop("write-behind:queue") as? String ?: break
+            val (userId, field, value) = item.split(":")
+            // Write to DB
+            userRepository.updateScore(userId.toLong(), value.toInt())
+        }
+    }
+}
+```
+
+**Pros:** Very fast writes.
+**Cons:** Data loss risk if Redis crashes before flush; complex to implement
+correctly.
+
+### Strategy Comparison
+
+| Strategy | Read Perf | Write Perf | Consistency | Complexity |
+|---|---|---|---|---|
+| Cache-Aside | Good (miss on cold) | Good | Eventual | Low |
+| Read-Through | Good (miss on cold) | Good | Eventual | Medium |
+| Write-Through | Good | Slower (2 writes) | Strong | Medium |
+| Write-Behind | Good | Fastest | Eventual | High |
+
+:::tip[Recommendation for most apps]
+Cache-Aside with `@Cacheable`/`@CacheEvict`. It's the simplest and handles 90% of
+use cases.
+:::
+
+## TTL, Eviction & Memory Management
+
+### Setting TTL
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+await redis.setex('key', 3600, 'value');  // 1 hour TTL
+await redis.expire('existing-key', 300);  // Set TTL on existing key
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+rdb.Set(ctx, "key", "value", time.Hour)
+rdb.Expire(ctx, "existing-key", 5*time.Minute)
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+@Service
+class TTLService(private val stringRedisTemplate: StringRedisTemplate) {
+
+    // Set with TTL
+    fun setWithTTL(key: String, value: String, ttl: Duration) {
+        stringRedisTemplate.opsForValue().set(key, value, ttl)
+    }
+
+    // Set TTL on existing key
+    fun setExpiration(key: String, ttl: Duration): Boolean {
+        return stringRedisTemplate.expire(key, ttl)
+    }
+
+    // Set expiration to a specific time
+    fun expireAt(key: String, expireAt: Instant): Boolean {
+        return stringRedisTemplate.expireAt(key, expireAt)
+    }
+
+    // Remove TTL (make persistent)
+    fun persist(key: String): Boolean {
+        return stringRedisTemplate.persist(key)
+    }
+
+    // Check remaining TTL
+    fun ttl(key: String): Long {
+        return stringRedisTemplate.getExpire(key)  // seconds, -1 = no TTL, -2 = key missing
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+### Per-Cache TTL with Spring Cache
+
+```kotlin
+@Bean
+fun cacheManager(connectionFactory: RedisConnectionFactory): CacheManager {
+    val defaultConfig = RedisCacheConfiguration.defaultCacheConfig()
+        .entryTtl(Duration.ofMinutes(10))
+
+    val cacheConfigs = mapOf(
+        "users" to defaultConfig.entryTtl(Duration.ofMinutes(30)),
+        "products" to defaultConfig.entryTtl(Duration.ofHours(2)),
+        "config" to defaultConfig.entryTtl(Duration.ofHours(24)),
+        "rate-limits" to defaultConfig.entryTtl(Duration.ofSeconds(60))
+    )
+
+    return RedisCacheManager.builder(connectionFactory)
+        .cacheDefaults(defaultConfig)
+        .withInitialCacheConfigurations(cacheConfigs)
+        .build()
+}
+```
+
+### Redis Eviction Policies
+
+When Redis reaches `maxmemory`, it must evict keys. Configure in `redis.conf` or
+at runtime:
+
+| Policy | Behavior | Use Case |
+|---|---|---|
+| `noeviction` | Return error on write | When data loss is unacceptable |
+| `allkeys-lru` | Evict least recently used | General-purpose cache |
+| `allkeys-lfu` | Evict least frequently used | Hot/cold data patterns |
+| `volatile-lru` | LRU among keys with TTL | Mix of cache + persistent data |
+| `volatile-ttl` | Evict keys closest to expiry | Prioritize newer data |
+| `allkeys-random` | Random eviction | When all keys are equally important |
+
+```bash
+# Check current policy
+redis-cli CONFIG GET maxmemory-policy
+
+# Set policy
+redis-cli CONFIG SET maxmemory-policy allkeys-lru
+redis-cli CONFIG SET maxmemory 256mb
+```
+
+## Redis Pub/Sub
+
+Redis Pub/Sub is for real-time messaging between services. It's fire-and-forget:
+if no subscriber is listening, the message is lost.
+
+<Mermaid title="Redis Pub/Sub fan-out" code={`
+flowchart LR
+  P["Publisher"] -->|"PUBLISH notifications"| R["Redis channel: notifications"]
+  R --> S1["Subscriber A"]
+  R --> S2["Subscriber B"]
+  R --> S3["Subscriber C"]
+`} />
+
+### Comparison
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// Publisher
+const pub = new Redis();
+await pub.publish('notifications', JSON.stringify({ userId: 1, message: 'Hello' }));
+
+// Subscriber
+const sub = new Redis();
+sub.subscribe('notifications');
+sub.on('message', (channel, message) => {
+  console.log(`${channel}: ${JSON.parse(message)}`);
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Publisher
+rdb.Publish(ctx, "notifications", `{"userId":1,"message":"Hello"}`)
+
+// Subscriber
+sub := rdb.Subscribe(ctx, "notifications")
+ch := sub.Channel()
+for msg := range ch {
+    fmt.Printf("%s: %s\n", msg.Channel, msg.Payload)
+}
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import org.springframework.data.redis.connection.Message
+import org.springframework.data.redis.connection.MessageListener
+import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.data.redis.listener.ChannelTopic
+import org.springframework.data.redis.listener.RedisMessageListenerContainer
+import org.springframework.data.redis.listener.adapter.MessageListenerAdapter
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+
+// --- Publisher ---
+@Service
+class NotificationPublisher(private val stringRedisTemplate: StringRedisTemplate) {
+
+    private val objectMapper = ObjectMapper().registerKotlinModule()
+
+    fun publishNotification(notification: NotificationEvent) {
+        val json = objectMapper.writeValueAsString(notification)
+        stringRedisTemplate.convertAndSend("notifications", json)
+    }
+}
+
+data class NotificationEvent(val userId: Long, val message: String, val type: String)
+
+// --- Subscriber ---
+@Service
+class NotificationSubscriber : MessageListener {
+
+    private val objectMapper = ObjectMapper().registerKotlinModule()
+
+    override fun onMessage(message: Message, pattern: ByteArray?) {
+        val event = objectMapper.readValue(
+            message.body,
+            NotificationEvent::class.java
+        )
+        println("Received notification: ${event.message} for user ${event.userId}")
+        // Process the notification...
+    }
+}
+
+// --- Configuration ---
+@Configuration
+class RedisPubSubConfig {
+
+    @Bean
+    fun redisMessageListenerContainer(
+        connectionFactory: RedisConnectionFactory,
+        notificationSubscriber: NotificationSubscriber
+    ): RedisMessageListenerContainer {
+        val container = RedisMessageListenerContainer()
+        container.setConnectionFactory(connectionFactory)
+
+        // Subscribe to channels
+        container.addMessageListener(
+            MessageListenerAdapter(notificationSubscriber),
+            ChannelTopic("notifications")
+        )
+
+        // Pattern subscription (e.g., "events.*")
+        // container.addMessageListener(
+        //     adapter,
+        //     PatternTopic("events.*")
+        // )
+
+        return container
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+### Pub/Sub vs Kafka
+
+| Feature | Redis Pub/Sub | Kafka |
+|---|---|---|
+| Delivery | At-most-once (fire and forget) | At-least-once / exactly-once |
+| Persistence | No (messages lost if no subscriber) | Yes (retained on disk) |
+| Consumer groups | No (all subscribers get all messages) | Yes (partitioned consumption) |
+| Ordering | Per-channel | Per-partition |
+| Use case | Real-time notifications, cache invalidation | Event sourcing, data pipelines |
+| Throughput | Very high (in-memory) | High (disk-based) |
+
+**Use Redis Pub/Sub for:** Cache invalidation across instances, real-time UI
+updates, lightweight notifications.
+**Use Kafka for:** Event sourcing, reliable message processing, data pipelines
+(see [Module 12](/kotlin-backend/12-kafka-events/)).
+
+## Session Management with Redis
+
+Storing HTTP sessions in Redis enables stateless application servers (any instance
+can handle any request).
+
+### Spring Session with Redis
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-data-redis")
+    implementation("org.springframework.session:spring-session-data-redis")
+}
+```
+
+```yaml title="application.yml"
+spring:
+  session:
+    store-type: redis
+    redis:
+      namespace: myapp:sessions
+    timeout: 1800  # 30 minutes
+```
+
+```kotlin
+import org.springframework.session.data.redis.config.annotation.web.http.EnableRedisHttpSession
+
+@SpringBootApplication
+@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
+class Application
+
+// Sessions just work — Spring automatically stores them in Redis
+@RestController
+class SessionController {
+
+    @GetMapping("/login")
+    fun login(session: HttpSession, @RequestParam username: String): String {
+        session.setAttribute("username", username)
+        session.setAttribute("loginTime", Instant.now().toString())
+        return "Logged in as $username"
+    }
+
+    @GetMapping("/me")
+    fun me(session: HttpSession): Map<String, Any?> {
+        return mapOf(
+            "sessionId" to session.id,
+            "username" to session.getAttribute("username"),
+            "loginTime" to session.getAttribute("loginTime")
+        )
+    }
+
+    @PostMapping("/logout")
+    fun logout(session: HttpSession): String {
+        session.invalidate()
+        return "Logged out"
+    }
+}
+```
+
+What it looks like in Redis:
+
+```bash
+redis-cli
+> KEYS myapp:sessions:*
+1) "myapp:sessions:sessions:abc123"
+
+> HGETALL myapp:sessions:sessions:abc123
+# Contains serialized session attributes
+```
+
+## Lettuce: The Underlying Client
+
+Lettuce is the default Redis client in Spring Boot. Unlike Jedis (which uses
+blocking I/O and connection pools), Lettuce uses **Netty** and shares a single
+connection across threads.
+
+### When to Use Lettuce Directly
+
+Most of the time, use `RedisTemplate` or `@Cacheable`. Use Lettuce directly when
+you need:
+
+- Reactive/async Redis operations
+- Redis Streams
+- Custom connection management
+- Pipeline operations for bulk commands
+
+### Pipelining (Batch Operations)
+
+```kotlin
+@Service
+class RedisPipelineService(private val stringRedisTemplate: StringRedisTemplate) {
+
+    // Execute multiple commands in a single round-trip
+    fun batchSet(entries: Map<String, String>) {
+        stringRedisTemplate.executePipelined { connection ->
+            entries.forEach { (key, value) ->
+                connection.stringCommands().set(
+                    key.toByteArray(),
+                    value.toByteArray()
+                )
+            }
+            null  // Must return null
+        }
+    }
+
+    // Batch get
+    fun batchGet(keys: List<String>): List<String?> {
+        val results = stringRedisTemplate.executePipelined { connection ->
+            keys.forEach { key ->
+                connection.stringCommands().get(key.toByteArray())
+            }
+            null
+        }
+        @Suppress("UNCHECKED_CAST")
+        return results as List<String?>
+    }
+}
+```
+
+### Lua Scripts (Atomic Operations)
+
+For operations that need to be atomic (like rate limiting), use Lua scripts:
+
+```kotlin
+@Service
+class RedisScriptService(private val stringRedisTemplate: StringRedisTemplate) {
+
+    // Rate limiter using Lua script
+    private val rateLimitScript = DefaultRedisScript<Long>().apply {
+        setScriptText("""
+            local key = KEYS[1]
+            local limit = tonumber(ARGV[1])
+            local window = tonumber(ARGV[2])
+
+            local current = redis.call('INCR', key)
+            if current == 1 then
+                redis.call('EXPIRE', key, window)
+            end
+
+            if current > limit then
+                return 0
+            end
+            return 1
+        """.trimIndent())
+        resultType = Long::class.java
+    }
+
+    /**
+     * Returns true if the request is allowed, false if rate limited.
+     * @param key identifier (e.g., "rate:user:123" or "rate:ip:1.2.3.4")
+     * @param limit max requests per window
+     * @param windowSeconds window duration
+     */
+    fun isAllowed(key: String, limit: Int, windowSeconds: Int): Boolean {
+        val result = stringRedisTemplate.execute(
+            rateLimitScript,
+            listOf(key),
+            limit.toString(),
+            windowSeconds.toString()
+        )
+        return result == 1L
+    }
+}
+```
+
+## Practice
+
+Put these patterns to work — wire up real caching annotations and an atomic
+Lua-backed limiter against the shared Redis instance.
+
+<CardGrid>
+  <LinkCard
+    title="API Caching Layer"
+    href="/kotlin-backend/11-redis-caching/api-caching/"
+    description="Add @Cacheable, @CachePut, and @CacheEvict to a Products REST API with per-cache TTLs and a cache hit/miss stats endpoint."
+  />
+  <LinkCard
+    title="Redis Rate Limiter"
+    href="/kotlin-backend/11-redis-caching/rate-limiter/"
+    description="Build fixed-window and sliding-window rate limiters with Lua scripts and a Spring MVC interceptor returning 429 with a Retry-After header."
+  />
+</CardGrid>

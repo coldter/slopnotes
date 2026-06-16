@@ -1,0 +1,1994 @@
+---
+title: Observability
+description: Logging, metrics, tracing, and sealed-class error handling on the JVM — mapped from the winston/slog and prom-client tooling you already use.
+sidebar:
+  order: 16
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Tabs, TabItem, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Production systems need three pillars of observability: **logging**, **metrics**,
+and **tracing**. They also need structured error handling that's explicit about
+failure modes. This module covers all of these in Kotlin/JVM, mapped to what you
+already know from TypeScript and Go.
+
+## Observability ecosystem overview
+
+A quick map of which tool plays which role in each ecosystem:
+
+| Concept | TypeScript | Go | Kotlin/JVM |
+|---------|-----------|-----|------------|
+| Logging library | winston / pino | slog / zap / zerolog | SLF4J + Logback |
+| Structured logging | pino (JSON by default) | slog (structured by default) | logstash-logback-encoder |
+| Logging wrapper | -- | slog stdlib | kotlin-logging (`io.github.oshai`) |
+| Metrics | prom-client | prometheus/client_golang | Micrometer |
+| Metrics endpoint | custom `/metrics` | `promhttp.Handler()` | Spring Actuator `/actuator/prometheus` |
+| Tracing | `@opentelemetry/sdk-node` | `go.opentelemetry.io/otel` | opentelemetry-java |
+| Health checks | custom `/health` | custom or framework | Spring Actuator `/actuator/health` |
+| Error handling | `Error` subclasses / neverthrow | `error` interface, `fmt.Errorf` | `Result`, sealed classes, exceptions |
+
+### Dependency overview
+
+The dependencies that show up across this module:
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    // Logging
+    implementation("ch.qos.logback:logback-classic:1.5.12")
+    implementation("io.github.oshai:kotlin-logging-jvm:7.0.3")
+    implementation("net.logstash.logback:logstash-logback-encoder:8.0")
+
+    // Metrics (Micrometer + Prometheus)
+    implementation("io.micrometer:micrometer-registry-prometheus:1.14.2")
+
+    // Spring Boot (includes most of the above)
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+
+    // OpenTelemetry
+    implementation(platform("io.opentelemetry:opentelemetry-bom:1.44.1"))
+    implementation("io.opentelemetry:opentelemetry-api")
+    implementation("io.opentelemetry:opentelemetry-sdk")
+    implementation("io.opentelemetry:opentelemetry-exporter-otlp")
+}
+```
+
+## Structured error handling
+
+### The Kotlin error handling spectrum
+
+Kotlin sits between TypeScript (exceptions everywhere) and Go (explicit error
+returns). You have three approaches:
+
+| Approach | When to use |
+|----------|------------|
+| Exceptions | Truly exceptional, unrecoverable situations (OOM, broken connections, programmer errors) |
+| `kotlin.Result` | Wrapping a single operation that may fail |
+| Sealed class hierarchies | Domain errors with distinct failure modes (the recommended approach) |
+
+### Comparing error handling
+
+The same "user not found" problem, the idiomatic way in each language:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// Option 1: Throw
+function getUser(id: string): User {
+  const user = db.find(id);
+  if (!user) throw new NotFoundError(`User ${id} not found`);
+  return user;
+}
+
+// Option 2: neverthrow / fp-ts Result
+function getUser(id: string): Result<User, AppError> {
+  const user = db.find(id);
+  if (!user) return err(new NotFoundError(`User ${id}`));
+  return ok(user);
+}
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func GetUser(id string) (*User, error) {
+    user, err := db.Find(id)
+    if err != nil {
+        return nil, fmt.Errorf("finding user %s: %w", id, err)
+    }
+    if user == nil {
+        return nil, ErrNotFound
+    }
+    return user, nil
+}
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+// Define your error hierarchy
+sealed class AppError {
+    data class NotFound(val resource: String, val id: String) : AppError()
+    data class Validation(val field: String, val message: String) : AppError()
+    data class Conflict(val message: String) : AppError()
+    data class Unauthorized(val reason: String) : AppError()
+    data class Internal(val cause: Throwable) : AppError()
+}
+
+// Define a Result type
+sealed class Result<out T> {
+    data class Success<T>(val value: T) : Result<T>()
+    data class Failure(val error: AppError) : Result<Nothing>()
+}
+
+// Use it
+fun getUser(id: String): Result<User> {
+    val user = db.find(id)
+        ?: return Result.Failure(AppError.NotFound("User", id))
+    return Result.Success(user)
+}
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+- The sealed class `Result<T>` makes failure a value, like Go's `error` return —
+  but the compiler tracks the exact failure cases via the sealed hierarchy.
+- Unlike Go's untyped `error`, each `AppError` subtype carries its own typed
+  fields (`NotFound(resource, id)`, `Validation(field, message)`).
+- Unlike TypeScript's throw, the failure modes are visible in the return type, not
+  hidden behind `try/catch`.
+
+### Why sealed classes over exceptions?
+
+```kotlin
+// BAD: Callers don't know what can go wrong
+fun createUser(name: String, email: String): User {
+    if (name.isBlank()) throw IllegalArgumentException("Name required")
+    if (!email.contains("@")) throw IllegalArgumentException("Invalid email")
+    if (userRepo.existsByEmail(email)) throw ConflictException("Email taken")
+    return userRepo.save(User(name = name, email = email))
+}
+
+// GOOD: The return type tells the full story
+fun createUser(name: String, email: String): Result<User> {
+    if (name.isBlank()) return Result.Failure(AppError.Validation("name", "Name is required"))
+    if (!email.contains("@")) return Result.Failure(AppError.Validation("email", "Invalid email"))
+    if (userRepo.existsByEmail(email)) return Result.Failure(AppError.Conflict("Email already taken"))
+
+    val user = userRepo.save(User(name = name, email = email))
+    return Result.Success(user)
+}
+```
+
+The sealed class approach gives you:
+
+- **Exhaustive `when`:** the compiler forces you to handle every error case.
+- **No hidden control flow:** no `try/catch` guessing games.
+- **Self-documenting:** the function signature tells you what can fail.
+- **Composable:** easy to `map`, `flatMap`, and chain results.
+
+### The full Result type with utility methods
+
+Adding combinators turns `Result<T>` into something you can chain like a
+neverthrow or fp-ts result:
+
+```kotlin
+sealed class Result<out T> {
+    data class Success<T>(val value: T) : Result<T>()
+    data class Failure(val error: AppError) : Result<Nothing>()
+
+    fun <R> map(transform: (T) -> R): Result<R> = when (this) {
+        is Success -> Success(transform(value))
+        is Failure -> this
+    }
+
+    fun <R> flatMap(transform: (T) -> Result<R>): Result<R> = when (this) {
+        is Success -> transform(value)
+        is Failure -> this
+    }
+
+    fun getOrNull(): T? = when (this) {
+        is Success -> value
+        is Failure -> null
+    }
+
+    fun getOrElse(default: () -> @UnsafeVariance T): T = when (this) {
+        is Success -> value
+        is Failure -> default()
+    }
+
+    fun onSuccess(action: (T) -> Unit): Result<T> {
+        if (this is Success) action(value)
+        return this
+    }
+
+    fun onFailure(action: (AppError) -> Unit): Result<T> {
+        if (this is Failure) action(error)
+        return this
+    }
+}
+```
+
+### Using Result in a service layer
+
+```kotlin
+class TaskService(
+    private val taskRepo: TaskRepository,
+    private val userRepo: UserRepository
+) {
+    fun createTask(userId: String, title: String, description: String): Result<Task> {
+        // Validate
+        if (title.isBlank()) {
+            return Result.Failure(AppError.Validation("title", "Title is required"))
+        }
+        if (title.length > 200) {
+            return Result.Failure(AppError.Validation("title", "Title must be under 200 chars"))
+        }
+
+        // Check user exists
+        val user = userRepo.findById(userId)
+            ?: return Result.Failure(AppError.NotFound("User", userId))
+
+        // Create
+        val task = taskRepo.save(
+            Task(title = title, description = description, assignedTo = user.id)
+        )
+        return Result.Success(task)
+    }
+
+    fun completeTask(taskId: String, userId: String): Result<Task> {
+        val task = taskRepo.findById(taskId)
+            ?: return Result.Failure(AppError.NotFound("Task", taskId))
+
+        if (task.assignedTo != userId) {
+            return Result.Failure(AppError.Unauthorized("Only the assignee can complete this task"))
+        }
+
+        if (task.completed) {
+            return Result.Failure(AppError.Conflict("Task is already completed"))
+        }
+
+        val updated = taskRepo.save(task.copy(completed = true))
+        return Result.Success(updated)
+    }
+}
+```
+
+### Mapping Result to HTTP responses (Spring Boot)
+
+A single `when` over the sealed `Result` turns domain outcomes into HTTP status
+codes — no scattered `try/catch` in your controllers:
+
+```kotlin title="src/main/kotlin/com/example/TaskController.kt"
+import org.springframework.http.ResponseEntity
+import org.springframework.http.HttpStatus
+import org.springframework.web.bind.annotation.*
+
+@RestController
+@RequestMapping("/api/tasks")
+class TaskController(private val taskService: TaskService) {
+
+    @PostMapping
+    fun createTask(@RequestBody request: CreateTaskRequest): ResponseEntity<Any> {
+        return when (val result = taskService.createTask(request.userId, request.title, request.description)) {
+            is Result.Success -> ResponseEntity.status(HttpStatus.CREATED).body(result.value)
+            is Result.Failure -> result.error.toResponse()
+        }
+    }
+
+    @PatchMapping("/{id}/complete")
+    fun completeTask(
+        @PathVariable id: String,
+        @RequestHeader("X-User-Id") userId: String
+    ): ResponseEntity<Any> {
+        return when (val result = taskService.completeTask(id, userId)) {
+            is Result.Success -> ResponseEntity.ok(result.value)
+            is Result.Failure -> result.error.toResponse()
+        }
+    }
+}
+
+// Extension function to map AppError to HTTP responses
+fun AppError.toResponse(): ResponseEntity<Any> = when (this) {
+    is AppError.NotFound -> ResponseEntity.status(HttpStatus.NOT_FOUND)
+        .body(ErrorResponse("NOT_FOUND", "$resource with id $id not found"))
+    is AppError.Validation -> ResponseEntity.status(HttpStatus.BAD_REQUEST)
+        .body(ErrorResponse("VALIDATION_ERROR", "$field: $message"))
+    is AppError.Conflict -> ResponseEntity.status(HttpStatus.CONFLICT)
+        .body(ErrorResponse("CONFLICT", message))
+    is AppError.Unauthorized -> ResponseEntity.status(HttpStatus.FORBIDDEN)
+        .body(ErrorResponse("UNAUTHORIZED", reason))
+    is AppError.Internal -> ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+        .body(ErrorResponse("INTERNAL_ERROR", "An internal error occurred"))
+}
+
+data class ErrorResponse(val code: String, val message: String)
+```
+
+### kotlin.Result (standard library)
+
+Kotlin has a built-in `Result` type that wraps success or exception. It's useful
+for simple cases:
+
+```kotlin
+fun parseAge(input: String): kotlin.Result<Int> = runCatching {
+    val age = input.toInt()
+    require(age in 0..150) { "Age out of range: $age" }
+    age
+}
+
+fun main() {
+    parseAge("25")
+        .onSuccess { println("Age: $it") }
+        .onFailure { println("Error: ${it.message}") }
+
+    val age = parseAge("abc").getOrDefault(-1)
+    println("Parsed: $age")  // -1
+
+    // Map / recover
+    val result = parseAge("25")
+        .map { it * 365 }       // 25 * 365
+        .getOrElse { 0 }
+    println("Days: $result")    // 9125
+}
+```
+
+When to use `kotlin.Result` vs a sealed class:
+
+- `kotlin.Result` — wrapping a single fallible operation (parsing, I/O).
+- Sealed class `Result<T>` — domain errors with distinct types (your service layer).
+
+### When NOT to use exceptions
+
+Follow this rule (similar to Go's philosophy):
+
+| Situation | Use |
+|-----------|-----|
+| Expected failure (user input, not found, conflict) | `Result` / sealed class |
+| Programmer error (null deref, index OOB) | Let it crash (exception) |
+| Infrastructure failure (DB down, network error) | Exception at boundary, catch and wrap in `Result` at service layer |
+| Library API design | `Result` for operations that commonly fail |
+
+```kotlin
+// DO: Expected failures return Result
+fun findUser(id: String): Result<User> { /* ... */ }
+fun validateEmail(email: String): Result<String> { /* ... */ }
+
+// DON'T: Don't throw for expected failures
+fun findUser(id: String): User {
+    return repo.find(id) ?: throw NotFoundException("...")  // Bad
+}
+
+// OK: Infrastructure exceptions -- catch at boundary
+fun findUser(id: String): Result<User> {
+    return try {
+        val user = repo.find(id)  // May throw DB exception
+            ?: return Result.Failure(AppError.NotFound("User", id))
+        Result.Success(user)
+    } catch (e: Exception) {
+        Result.Failure(AppError.Internal(e))
+    }
+}
+```
+
+## Logging with SLF4J and Logback
+
+### The JVM logging architecture
+
+SLF4J is the facade (like an interface). Logback is the implementation. This
+separation means you can swap implementations without changing code — similar to
+how Go's `slog` is the standard interface.
+
+<Mermaid title="JVM logging pipeline" height={360} code={`
+flowchart LR
+  C["Your Code"] --> S["SLF4J (API)"]
+  S --> L["Logback (Implementation)"]
+  L --> O["Console / File / JSON"]
+  CFG["logback.xml (config)"] -.-> L
+`} />
+
+### Basic logging
+
+The same "create user, log it, log failures" loop in each ecosystem:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+import winston from 'winston';
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.json(),
+  transports: [new winston.transports.Console()],
+});
+
+logger.info('Server started', { port: 8080 });
+logger.error('Failed to connect', { error: err.message });
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+slog.Info("Server started", "port", 8080)
+slog.Error("Failed to connect", "error", err)
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import org.slf4j.LoggerFactory
+
+class UserService {
+    // One logger per class -- standard pattern
+    private val logger = LoggerFactory.getLogger(UserService::class.java)
+
+    fun createUser(name: String, email: String): User {
+        logger.info("Creating user: name={}, email={}", name, email)
+
+        try {
+            val user = repo.save(User(name = name, email = email))
+            logger.info("User created: id={}", user.id)
+            return user
+        } catch (e: Exception) {
+            logger.error("Failed to create user: name={}", name, e)
+            throw e
+        }
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+- SLF4J uses `{}` placeholders (not string interpolation) so the message is only
+  formatted if the level is enabled.
+- The convention is one logger per class via `LoggerFactory.getLogger(Foo::class.java)`.
+- Passing the exception as the last argument (`logger.error("...", name, e)`)
+  logs the full stack trace.
+
+### Log levels
+
+| Level | When to use | Example |
+|-------|------------|---------|
+| `TRACE` | Very detailed debugging | `logger.trace("Parsing token: {}", token)` |
+| `DEBUG` | Developer debugging info | `logger.debug("Cache miss for key: {}", key)` |
+| `INFO` | Normal operations | `logger.info("Server started on port {}", port)` |
+| `WARN` | Something unexpected but handled | `logger.warn("Retry attempt {} for {}", attempt, url)` |
+| `ERROR` | Something failed | `logger.error("Database connection failed", exception)` |
+
+### Logback configuration
+
+Create `src/main/resources/logback.xml`:
+
+```xml title="src/main/resources/logback.xml"
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- Console output with colors (for development) -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- File output with rotation -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>logs/app.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>logs/app.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>3GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Set log levels per package -->
+    <logger name="com.example" level="DEBUG"/>
+    <logger name="org.springframework" level="INFO"/>
+    <logger name="org.hibernate.SQL" level="DEBUG"/>
+
+    <!-- Root level -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
+    </root>
+</configuration>
+```
+
+### Spring Boot logging configuration
+
+In Spring Boot, configure logging in `application.yml` (which overrides logback
+defaults):
+
+```yaml title="application.yml"
+logging:
+  level:
+    root: INFO
+    com.example: DEBUG
+    org.springframework.web: INFO
+    org.hibernate.SQL: DEBUG
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+  file:
+    name: logs/app.log
+    max-size: 100MB
+    max-history: 30
+```
+
+### Profile-specific logging
+
+For per-environment behavior, layer the config files like this:
+
+<FileTree>
+- src/main/resources/
+  - logback-spring.xml Spring-aware logback config
+  - application.yml default config
+  - application-dev.yml dev overrides
+  - application-prod.yml prod overrides
+</FileTree>
+
+`logback-spring.xml` with Spring profiles:
+
+```xml title="src/main/resources/logback-spring.xml"
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+    <!-- Development: human-readable console -->
+    <springProfile name="dev">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%clr(%d{HH:mm:ss.SSS}){faint} %clr(%-5level) %clr(%logger{36}){cyan} - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="DEBUG">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <!-- Production: JSON structured logging -->
+    <springProfile name="prod">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+</configuration>
+```
+
+## Structured logging
+
+Structured logging outputs JSON instead of plain text, making logs
+machine-parseable for tools like ELK, Loki, or Datadog.
+
+### Plain text vs structured
+
+```text
+# Plain text (hard to parse)
+2024-01-15 10:23:45.123 INFO  UserService - User created: id=123, name=Alice
+
+# Structured JSON (machine-parseable)
+{"timestamp":"2024-01-15T10:23:45.123Z","level":"INFO","logger":"UserService","message":"User created","userId":"123","userName":"Alice"}
+```
+
+### Setup: logstash-logback-encoder
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("net.logstash.logback:logstash-logback-encoder:8.0")
+}
+```
+
+`logback.xml` for JSON output:
+
+```xml title="src/main/resources/logback.xml"
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <includeMdcKeyName>requestId</includeMdcKeyName>
+            <includeMdcKeyName>userId</includeMdcKeyName>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>
+```
+
+### Adding context with MDC (Mapped Diagnostic Context)
+
+MDC attaches key-value context to all log messages in the current thread. This is
+how you correlate logs for a single request — the JVM equivalent of Go's
+`slog.With(...)` or Node's `AsyncLocalStorage`.
+
+<Tabs syncKey="lang">
+  <TabItem label="Go">
+
+```go
+logger := slog.With("requestId", requestId, "userId", userId)
+logger.Info("Processing request")
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import org.slf4j.MDC
+import org.slf4j.LoggerFactory
+
+class RequestFilter : jakarta.servlet.Filter {
+    override fun doFilter(
+        request: jakarta.servlet.ServletRequest,
+        response: jakarta.servlet.ServletResponse,
+        chain: jakarta.servlet.FilterChain
+    ) {
+        val httpRequest = request as jakarta.servlet.http.HttpServletRequest
+        val requestId = httpRequest.getHeader("X-Request-Id") ?: java.util.UUID.randomUUID().toString()
+
+        try {
+            MDC.put("requestId", requestId)
+            MDC.put("method", httpRequest.method)
+            MDC.put("path", httpRequest.requestURI)
+            chain.doFilter(request, response)
+        } finally {
+            MDC.clear()
+        }
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+- Go threads context explicitly via `context.Context`; MDC is thread-local, so you
+  `put` at the start of the request and `clear` in a `finally`.
+- Once set, every log line on that thread automatically includes `requestId`,
+  `method`, and `path` — no need to pass the logger around.
+
+Now all logs within this request automatically include the MDC fields:
+
+```json
+{
+  "timestamp": "2024-01-15T10:23:45.123Z",
+  "level": "INFO",
+  "logger": "com.example.UserService",
+  "message": "User created",
+  "requestId": "abc-123",
+  "method": "POST",
+  "path": "/api/users"
+}
+```
+
+### Structured fields with markers
+
+For adding fields to specific log statements (not thread-wide):
+
+```kotlin
+import net.logstash.logback.argument.StructuredArguments.*
+import org.slf4j.LoggerFactory
+
+class OrderService {
+    private val logger = LoggerFactory.getLogger(OrderService::class.java)
+
+    fun processOrder(orderId: String, total: Double) {
+        logger.info(
+            "Processing order",
+            keyValue("orderId", orderId),
+            keyValue("total", total),
+            keyValue("currency", "USD")
+        )
+        // Output: {"message":"Processing order","orderId":"abc","total":99.99,"currency":"USD"}
+    }
+}
+```
+
+## kotlin-logging wrapper
+
+`kotlin-logging` provides an idiomatic Kotlin wrapper around SLF4J. It's like using
+`slog` in Go instead of the raw `log` package.
+
+### Setup
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("io.github.oshai:kotlin-logging-jvm:7.0.3")
+}
+```
+
+### Basic usage
+
+```kotlin
+import io.github.oshai.kotlinlogging.KotlinLogging
+
+// Create logger -- one per file (not per class)
+private val logger = KotlinLogging.logger {}
+
+class UserService(private val repo: UserRepository) {
+
+    fun createUser(name: String, email: String): User {
+        logger.info { "Creating user: name=$name, email=$email" }
+
+        val user = repo.save(User(name = name, email = email))
+        logger.info { "User created: id=${user.id}" }
+
+        return user
+    }
+
+    fun deleteUser(id: String) {
+        logger.debug { "Deleting user: id=$id" }
+
+        try {
+            repo.delete(id)
+            logger.info { "User deleted: id=$id" }
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to delete user: id=$id" }
+        }
+    }
+}
+```
+
+### Why kotlin-logging over raw SLF4J?
+
+```kotlin
+// SLF4J: message is always evaluated (even if debug is disabled)
+logger.debug("Processing items: count=${expensiveCount()}")
+
+// kotlin-logging: lambda is only evaluated if debug is enabled
+logger.debug { "Processing items: count=${expensiveCount()}" }
+```
+
+The lambda-based API avoids unnecessary string concatenation when the log level is
+disabled. This matters in hot paths.
+
+### kotlin-logging with structured arguments
+
+```kotlin
+import io.github.oshai.kotlinlogging.KotlinLogging
+import net.logstash.logback.argument.StructuredArguments.keyValue
+
+private val logger = KotlinLogging.logger {}
+
+fun processPayment(orderId: String, amount: Double) {
+    logger.atInfo {
+        message = "Payment processed"
+        payload = mapOf(
+            "orderId" to orderId,
+            "amount" to amount,
+            "currency" to "USD"
+        )
+    }
+}
+```
+
+### Logging in coroutines with MDC
+
+MDC is thread-local, but coroutines can switch threads. Use `MDCContext` to
+preserve MDC across coroutine suspension points:
+
+```kotlin
+import kotlinx.coroutines.*
+import kotlinx.coroutines.slf4j.MDCContext
+import org.slf4j.MDC
+import io.github.oshai.kotlinlogging.KotlinLogging
+
+private val logger = KotlinLogging.logger {}
+
+suspend fun handleRequest(requestId: String) {
+    MDC.put("requestId", requestId)
+
+    // MDCContext copies MDC to the coroutine context
+    withContext(MDCContext()) {
+        logger.info { "Starting request processing" }
+
+        // Even after suspension, MDC is preserved
+        val result = withContext(Dispatchers.IO + MDCContext()) {
+            logger.info { "Fetching from database" }  // requestId still in MDC
+            fetchFromDatabase()
+        }
+
+        logger.info { "Request processed: result=$result" }
+    }
+}
+```
+
+Add the dependency:
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-slf4j:1.9.0")
+}
+```
+
+## Metrics with Micrometer and Prometheus
+
+### Micrometer: the SLF4J of metrics
+
+Micrometer is a metrics facade (like SLF4J for logging). It supports multiple
+backends: Prometheus, Datadog, New Relic, CloudWatch, etc. You write code once and
+switch backends via configuration.
+
+<Mermaid title="Micrometer metrics pipeline" height={360} code={`
+flowchart LR
+  C["Your Code"] --> M["Micrometer (API)"]
+  M --> P["Prometheus Registry"]
+  P --> E["/metrics endpoint"]
+  M -.-> ALT["(or Datadog, New Relic, etc.)"]
+`} />
+
+The same labeled counter, three ways:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// prom-client
+const counter = new promClient.Counter({
+  name: 'http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['method', 'path', 'status'],
+});
+counter.inc({ method: 'GET', path: '/api/users', status: 200 });
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+var httpRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+    Name: "http_requests_total",
+    Help: "Total HTTP requests",
+}, []string{"method", "path", "status"})
+
+httpRequests.WithLabelValues("GET", "/api/users", "200").Inc()
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
+
+class RequestMetrics(private val registry: MeterRegistry) {
+
+    private val requestCounter = Counter.builder("http.requests.total")
+        .description("Total HTTP requests")
+        .tag("service", "task-api")
+        .register(registry)
+
+    fun recordRequest(method: String, path: String, status: Int) {
+        Counter.builder("http.requests.total")
+            .tag("method", method)
+            .tag("path", path)
+            .tag("status", status.toString())
+            .register(registry)
+            .increment()
+    }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+- Micrometer "tags" are Prometheus "labels"; dotted metric names (`http.requests.total`)
+  are normalized to underscores at the scrape endpoint.
+- You build meters against a `MeterRegistry` rather than a global; the registry is
+  what gets wired to a backend.
+
+### Metric types
+
+| Type | Purpose | Example |
+|------|---------|---------|
+| Counter | Monotonically increasing value | Total requests, errors, items processed |
+| Gauge | Value that goes up and down | Active connections, queue size, memory usage |
+| Timer | Duration + count of events | Request latency, DB query time |
+| Distribution Summary | Distribution of values | Request/response sizes |
+| Histogram | Bucketed distribution | Request latency buckets for percentiles |
+
+### Standalone Micrometer setup (without Spring Boot)
+
+```kotlin
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.prometheusmetrics.PrometheusConfig
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
+
+fun main() {
+    // Create a Prometheus registry
+    val registry: PrometheusMeterRegistry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+
+    // Register metrics
+    val requestCount = registry.counter("app.requests.total", "endpoint", "/api/tasks")
+    val activeConnections = registry.gauge("app.connections.active", java.util.concurrent.atomic.AtomicInteger(0))
+
+    // Simulate some activity
+    requestCount.increment()
+    requestCount.increment()
+    activeConnections?.set(5)
+
+    // Scrape metrics in Prometheus text format
+    println(registry.scrape())
+    // Output:
+    // # HELP app_requests_total
+    // # TYPE app_requests_total counter
+    // app_requests_total{endpoint="/api/tasks"} 2.0
+    // # HELP app_connections_active
+    // # TYPE app_connections_active gauge
+    // app_connections_active 5.0
+}
+```
+
+## Custom metrics
+
+### Counter
+
+```kotlin
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Counter
+
+class TaskService(private val registry: MeterRegistry) {
+
+    private val tasksCreated = Counter.builder("tasks.created.total")
+        .description("Total number of tasks created")
+        .register(registry)
+
+    private val tasksFailed = Counter.builder("tasks.failed.total")
+        .description("Total number of task creation failures")
+        .register(registry)
+
+    fun createTask(title: String): Task {
+        try {
+            val task = repo.save(Task(title = title))
+            tasksCreated.increment()
+            return task
+        } catch (e: Exception) {
+            tasksFailed.increment()
+            throw e
+        }
+    }
+}
+```
+
+### Gauge
+
+```kotlin
+import io.micrometer.core.instrument.Gauge
+import java.util.concurrent.atomic.AtomicInteger
+
+class ConnectionPool(registry: MeterRegistry) {
+
+    private val activeConnections = AtomicInteger(0)
+    private val pendingRequests = AtomicInteger(0)
+
+    init {
+        Gauge.builder("pool.connections.active", activeConnections) { it.toDouble() }
+            .description("Number of active connections")
+            .register(registry)
+
+        Gauge.builder("pool.requests.pending", pendingRequests) { it.toDouble() }
+            .description("Number of pending connection requests")
+            .register(registry)
+    }
+
+    fun acquire(): Connection {
+        pendingRequests.incrementAndGet()
+        try {
+            val conn = pool.borrow()
+            activeConnections.incrementAndGet()
+            return conn
+        } finally {
+            pendingRequests.decrementAndGet()
+        }
+    }
+
+    fun release(conn: Connection) {
+        pool.returnObject(conn)
+        activeConnections.decrementAndGet()
+    }
+}
+```
+
+### Timer
+
+```kotlin
+import io.micrometer.core.instrument.Timer
+import io.micrometer.core.instrument.MeterRegistry
+
+class UserRepository(private val registry: MeterRegistry) {
+
+    private val queryTimer = Timer.builder("db.query.duration")
+        .description("Database query execution time")
+        .tag("table", "users")
+        .publishPercentiles(0.5, 0.95, 0.99)  // p50, p95, p99
+        .publishPercentileHistogram()
+        .register(registry)
+
+    fun findById(id: String): User? {
+        return queryTimer.record<User?> {
+            // Actual DB query
+            jdbcTemplate.queryForObject(
+                "SELECT * FROM users WHERE id = ?",
+                userRowMapper,
+                id
+            )
+        }
+    }
+}
+```
+
+### Timer with suspending functions
+
+```kotlin
+import io.micrometer.core.instrument.Timer
+import kotlin.system.measureTimeMillis
+
+class AsyncUserRepository(private val registry: MeterRegistry) {
+
+    private val queryTimer = Timer.builder("db.query.duration")
+        .tag("table", "users")
+        .register(registry)
+
+    suspend fun findById(id: String): User? {
+        val startTime = System.nanoTime()
+        try {
+            return suspendingQuery("SELECT * FROM users WHERE id = ?", id)
+        } finally {
+            val duration = System.nanoTime() - startTime
+            queryTimer.record(java.time.Duration.ofNanos(duration))
+        }
+    }
+}
+```
+
+### Distribution summary
+
+```kotlin
+import io.micrometer.core.instrument.DistributionSummary
+
+class PayloadMetrics(registry: MeterRegistry) {
+
+    private val requestSize = DistributionSummary.builder("http.request.size")
+        .description("HTTP request body size in bytes")
+        .baseUnit("bytes")
+        .publishPercentiles(0.5, 0.95, 0.99)
+        .register(registry)
+
+    fun recordRequestSize(sizeBytes: Long) {
+        requestSize.record(sizeBytes.toDouble())
+    }
+}
+```
+
+### Custom business metrics
+
+```kotlin
+class OrderMetrics(private val registry: MeterRegistry) {
+
+    fun recordOrderPlaced(amount: Double, currency: String) {
+        registry.counter(
+            "orders.placed.total",
+            "currency", currency
+        ).increment()
+
+        registry.summary(
+            "orders.amount",
+            "currency", currency
+        ).record(amount)
+    }
+
+    fun recordOrderFulfillmentTime(durationMs: Long) {
+        registry.timer("orders.fulfillment.duration")
+            .record(java.time.Duration.ofMillis(durationMs))
+    }
+
+    fun trackInventoryLevel(productId: String, level: () -> Double) {
+        Gauge.builder("inventory.level", level)
+            .tag("productId", productId)
+            .register(registry)
+    }
+}
+```
+
+### Metrics filter for HTTP requests
+
+```kotlin
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
+import jakarta.servlet.Filter
+import jakarta.servlet.FilterChain
+import jakarta.servlet.ServletRequest
+import jakarta.servlet.ServletResponse
+import jakarta.servlet.http.HttpServletRequest
+import jakarta.servlet.http.HttpServletResponse
+import org.springframework.stereotype.Component
+
+@Component
+class MetricsFilter(private val registry: MeterRegistry) : Filter {
+
+    override fun doFilter(request: ServletRequest, response: ServletResponse, chain: FilterChain) {
+        val httpRequest = request as HttpServletRequest
+        val httpResponse = response as HttpServletResponse
+
+        val sample = Timer.start(registry)
+
+        try {
+            chain.doFilter(request, response)
+        } finally {
+            sample.stop(
+                Timer.builder("http.server.requests")
+                    .tag("method", httpRequest.method)
+                    .tag("uri", normalizeUri(httpRequest.requestURI))
+                    .tag("status", httpResponse.status.toString())
+                    .register(registry)
+            )
+        }
+    }
+
+    private fun normalizeUri(uri: String): String {
+        // Replace path parameters with placeholders for lower cardinality
+        return uri.replace(Regex("/\\d+"), "/{id}")
+    }
+}
+```
+
+:::note
+Spring Boot Actuator already provides `http.server.requests` metrics out of the
+box. The filter above shows how it works internally, or how to do it in a
+non-Spring application.
+:::
+
+## Spring Boot Actuator
+
+Spring Boot Actuator provides production-ready features out of the box: health
+checks, metrics, info, and more.
+
+### Setup
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+    implementation("io.micrometer:micrometer-registry-prometheus")
+}
+```
+
+### Configuration
+
+```yaml title="application.yml"
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: task-api
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5, 0.95, 0.99
+```
+
+### Exposed endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `/actuator/health` | Health check (UP/DOWN) |
+| `/actuator/info` | Application info |
+| `/actuator/prometheus` | Prometheus scrape endpoint |
+| `/actuator/metrics` | List all metrics |
+| `/actuator/metrics/{name}` | Get specific metric |
+
+### Health check response
+
+```bash
+curl http://localhost:8080/actuator/health
+```
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "db": {
+      "status": "UP",
+      "details": {
+        "database": "PostgreSQL",
+        "validationQuery": "isValid()"
+      }
+    },
+    "diskSpace": {
+      "status": "UP",
+      "details": {
+        "total": 499963174912,
+        "free": 389537574912,
+        "threshold": 10485760
+      }
+    },
+    "redis": {
+      "status": "UP",
+      "details": {
+        "version": "7.2.4"
+      }
+    }
+  }
+}
+```
+
+### Prometheus metrics endpoint
+
+```bash
+curl http://localhost:8080/actuator/prometheus
+```
+
+```text
+# HELP http_server_requests_seconds Duration of HTTP server request handling
+# TYPE http_server_requests_seconds summary
+http_server_requests_seconds_count{method="GET",status="200",uri="/api/tasks"} 42
+http_server_requests_seconds_sum{method="GET",status="200",uri="/api/tasks"} 1.234
+http_server_requests_seconds{method="GET",status="200",uri="/api/tasks",quantile="0.95"} 0.045
+# HELP jvm_memory_used_bytes The amount of used memory
+# TYPE jvm_memory_used_bytes gauge
+jvm_memory_used_bytes{area="heap",id="G1 Eden Space"} 1.2345678E7
+```
+
+### Using metrics in Spring components
+
+```kotlin
+import io.micrometer.core.instrument.MeterRegistry
+import org.springframework.stereotype.Service
+
+@Service
+class TaskService(
+    private val taskRepo: TaskRepository,
+    private val registry: MeterRegistry  // Auto-injected by Spring
+) {
+
+    fun createTask(request: CreateTaskRequest): Task {
+        val timer = registry.timer("task.creation.duration")
+        return timer.recordCallable {
+            val task = taskRepo.save(request.toEntity())
+            registry.counter("tasks.created", "priority", request.priority.name).increment()
+            task
+        }!!
+    }
+
+    fun getTaskStats(): TaskStats {
+        val total = taskRepo.count()
+        val completed = taskRepo.countByCompleted(true)
+
+        // Register gauges that track current state
+        registry.gauge("tasks.total", total)
+        registry.gauge("tasks.completed", completed)
+
+        return TaskStats(total = total, completed = completed)
+    }
+}
+```
+
+### Custom health indicator
+
+```kotlin
+import org.springframework.boot.actuate.health.Health
+import org.springframework.boot.actuate.health.HealthIndicator
+import org.springframework.stereotype.Component
+
+@Component
+class ExternalApiHealthIndicator(
+    private val externalApiClient: ExternalApiClient
+) : HealthIndicator {
+
+    override fun health(): Health {
+        return try {
+            val response = externalApiClient.ping()
+            if (response.isSuccessful) {
+                Health.up()
+                    .withDetail("externalApi", "reachable")
+                    .withDetail("responseTime", "${response.durationMs}ms")
+                    .build()
+            } else {
+                Health.down()
+                    .withDetail("externalApi", "unhealthy")
+                    .withDetail("status", response.statusCode)
+                    .build()
+            }
+        } catch (e: Exception) {
+            Health.down()
+                .withDetail("externalApi", "unreachable")
+                .withDetail("error", e.message)
+                .build()
+        }
+    }
+}
+```
+
+## Distributed tracing with OpenTelemetry
+
+Distributed tracing tracks a request across multiple services. OpenTelemetry is the
+vendor-neutral standard.
+
+### Concepts
+
+A single trace ID threads through every service the request touches, with each
+service contributing its own span:
+
+<Mermaid title="A trace across three services" height={360} code={`
+flowchart LR
+  subgraph A["Service A"]
+    SA["span A"]
+  end
+  subgraph B["Service B"]
+    SB["span B"]
+  end
+  subgraph C["Service C"]
+    SC["span C"]
+  end
+  A -->|"trace"| B -->|"trace"| C
+  SA -.->|"same trace ID"| SB -.->|"same trace ID"| SC
+`} />
+
+| Term | Meaning |
+|------|---------|
+| Trace | End-to-end request journey |
+| Span | Single unit of work within a trace |
+| Trace ID | Unique ID shared by all spans in a trace |
+| Span ID | Unique ID for a single span |
+| Parent Span ID | Links child spans to parent spans |
+| Baggage | Key-value pairs propagated across services |
+
+### OpenTelemetry setup
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation(platform("io.opentelemetry:opentelemetry-bom:1.44.1"))
+    implementation("io.opentelemetry:opentelemetry-api")
+    implementation("io.opentelemetry:opentelemetry-sdk")
+    implementation("io.opentelemetry:opentelemetry-exporter-otlp")
+    implementation("io.opentelemetry:opentelemetry-semconv:1.29.0-alpha")
+}
+```
+
+### Manual instrumentation
+
+A parent span wraps the operation; child spans nest under it via `makeCurrent()`:
+
+```kotlin
+import io.opentelemetry.api.OpenTelemetry
+import io.opentelemetry.api.trace.Span
+import io.opentelemetry.api.trace.StatusCode
+import io.opentelemetry.api.trace.Tracer
+import io.opentelemetry.context.Context
+
+class OrderService(private val openTelemetry: OpenTelemetry) {
+
+    private val tracer: Tracer = openTelemetry.getTracer("order-service", "1.0.0")
+
+    fun processOrder(orderId: String): Order {
+        val span = tracer.spanBuilder("process-order")
+            .setAttribute("order.id", orderId)
+            .startSpan()
+
+        return try {
+            span.makeCurrent().use {
+                // Child span for validation
+                validateOrder(orderId)
+
+                // Child span for payment
+                processPayment(orderId)
+
+                // Child span for notification
+                sendConfirmation(orderId)
+
+                val order = Order(orderId, status = "completed")
+                span.setAttribute("order.status", "completed")
+                order
+            }
+        } catch (e: Exception) {
+            span.setStatus(StatusCode.ERROR, e.message ?: "Unknown error")
+            span.recordException(e)
+            throw e
+        } finally {
+            span.end()
+        }
+    }
+
+    private fun validateOrder(orderId: String) {
+        val span = tracer.spanBuilder("validate-order")
+            .startSpan()
+        try {
+            span.makeCurrent().use {
+                // validation logic
+                span.addEvent("Validation passed")
+            }
+        } finally {
+            span.end()
+        }
+    }
+
+    private fun processPayment(orderId: String) {
+        val span = tracer.spanBuilder("process-payment")
+            .setAttribute("payment.provider", "stripe")
+            .startSpan()
+        try {
+            span.makeCurrent().use {
+                // payment logic
+                span.addEvent("Payment captured", io.opentelemetry.api.common.Attributes.of(
+                    io.opentelemetry.api.common.AttributeKey.stringKey("payment.id"), "pay_123"
+                ))
+            }
+        } finally {
+            span.end()
+        }
+    }
+
+    private fun sendConfirmation(orderId: String) {
+        val span = tracer.spanBuilder("send-confirmation")
+            .startSpan()
+        try {
+            span.makeCurrent().use {
+                // email logic
+            }
+        } finally {
+            span.end()
+        }
+    }
+}
+```
+
+### OpenTelemetry SDK configuration
+
+```kotlin
+import io.opentelemetry.api.OpenTelemetry
+import io.opentelemetry.sdk.OpenTelemetrySdk
+import io.opentelemetry.sdk.trace.SdkTracerProvider
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor
+import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter
+import io.opentelemetry.sdk.resources.Resource
+import io.opentelemetry.api.common.Attributes
+import io.opentelemetry.semconv.ResourceAttributes
+
+fun configureOpenTelemetry(): OpenTelemetry {
+    val resource = Resource.getDefault().merge(
+        Resource.create(
+            Attributes.of(
+                ResourceAttributes.SERVICE_NAME, "task-api",
+                ResourceAttributes.SERVICE_VERSION, "1.0.0"
+            )
+        )
+    )
+
+    val spanExporter = OtlpGrpcSpanExporter.builder()
+        .setEndpoint("http://localhost:4317")  // OTLP collector endpoint
+        .build()
+
+    val tracerProvider = SdkTracerProvider.builder()
+        .setResource(resource)
+        .addSpanProcessor(BatchSpanProcessor.builder(spanExporter).build())
+        .build()
+
+    val openTelemetry = OpenTelemetrySdk.builder()
+        .setTracerProvider(tracerProvider)
+        .buildAndRegisterGlobal()
+
+    // Shutdown hook to flush remaining spans
+    Runtime.getRuntime().addShutdownHook(Thread {
+        tracerProvider.shutdown()
+    })
+
+    return openTelemetry
+}
+```
+
+### Auto-instrumentation with the Java agent
+
+The easiest approach — no code changes needed:
+
+```bash
+# Download the agent
+curl -L -o opentelemetry-javaagent.jar \
+  https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
+
+# Run your app with the agent
+java -javaagent:opentelemetry-javaagent.jar \
+  -Dotel.service.name=task-api \
+  -Dotel.exporter.otlp.endpoint=http://localhost:4317 \
+  -jar your-app.jar
+```
+
+The agent auto-instruments:
+
+- Spring MVC / WebFlux
+- JDBC (all queries)
+- HTTP clients (OkHttp, Apache HttpClient)
+- Kafka producer/consumer
+- Redis (Jedis, Lettuce)
+- gRPC
+
+### Spring Boot OpenTelemetry integration
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("io.micrometer:micrometer-tracing-bridge-otel")
+    implementation("io.opentelemetry:opentelemetry-exporter-otlp")
+}
+```
+
+```yaml title="application.yml"
+management:
+  tracing:
+    sampling:
+      probability: 1.0  # 100% sampling (use lower in production)
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+```
+
+### Trace context in coroutines
+
+OpenTelemetry context is thread-local, similar to MDC. For coroutines, propagate
+the context:
+
+```kotlin
+import io.opentelemetry.context.Context
+import io.opentelemetry.extension.kotlin.asContextElement
+import kotlinx.coroutines.*
+
+suspend fun processOrderAsync(orderId: String) {
+    val span = tracer.spanBuilder("process-order-async").startSpan()
+
+    try {
+        // Propagate OTel context to coroutine
+        withContext(span.makeCurrent().use { Context.current() }.asContextElement()) {
+            val result = async(Dispatchers.IO) {
+                // Context is preserved here
+                fetchOrderDetails(orderId)
+            }
+            result.await()
+        }
+    } finally {
+        span.end()
+    }
+}
+```
+
+Add the Kotlin extension:
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("io.opentelemetry:opentelemetry-extension-kotlin")
+}
+```
+
+## Health checks and readiness probes
+
+### Kubernetes probe types
+
+| Probe | Purpose | Spring Boot Endpoint |
+|-------|---------|---------------------|
+| Liveness | "Is the process alive?" | `/actuator/health/liveness` |
+| Readiness | "Can it accept traffic?" | `/actuator/health/readiness` |
+| Startup | "Has it finished starting?" | `/actuator/health/liveness` (with startup config) |
+
+### Spring Boot configuration
+
+```yaml title="application.yml"
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState, db, redis
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+```
+
+### Kubernetes deployment
+
+```yaml title="k8s-deployment.yml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task-api
+spec:
+  template:
+    spec:
+      containers:
+        - name: task-api
+          image: task-api:latest
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            failureThreshold: 30  # 30 * 5s = 150s max startup time
+```
+
+### Custom health checks
+
+```kotlin
+import org.springframework.boot.actuate.health.Health
+import org.springframework.boot.actuate.health.HealthIndicator
+import org.springframework.stereotype.Component
+
+@Component("database")
+class DatabaseHealthIndicator(
+    private val dataSource: javax.sql.DataSource
+) : HealthIndicator {
+
+    override fun health(): Health {
+        return try {
+            dataSource.connection.use { conn ->
+                conn.prepareStatement("SELECT 1").use { stmt ->
+                    stmt.executeQuery()
+                }
+            }
+            Health.up()
+                .withDetail("database", "PostgreSQL")
+                .withDetail("status", "connected")
+                .build()
+        } catch (e: Exception) {
+            Health.down(e)
+                .withDetail("database", "PostgreSQL")
+                .withDetail("error", e.message)
+                .build()
+        }
+    }
+}
+
+@Component("redis")
+class RedisHealthIndicator(
+    private val redisTemplate: org.springframework.data.redis.core.StringRedisTemplate
+) : HealthIndicator {
+
+    override fun health(): Health {
+        return try {
+            val pong = redisTemplate.connectionFactory?.connection?.ping()
+            Health.up()
+                .withDetail("redis", "connected")
+                .withDetail("ping", pong)
+                .build()
+        } catch (e: Exception) {
+            Health.down(e)
+                .withDetail("redis", "disconnected")
+                .build()
+        }
+    }
+}
+```
+
+### Non-Spring health checks (Ktor / plain Kotlin)
+
+```kotlin
+import io.ktor.server.application.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import io.ktor.http.*
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class HealthResponse(
+    val status: String,
+    val checks: Map<String, HealthCheck>
+)
+
+@Serializable
+data class HealthCheck(
+    val status: String,
+    val details: Map<String, String> = emptyMap()
+)
+
+fun Application.configureHealthRoutes(
+    dataSource: javax.sql.DataSource,
+    redis: redis.clients.jedis.JedisPool
+) {
+    routing {
+        get("/health") {
+            val dbHealth = checkDatabase(dataSource)
+            val redisHealth = checkRedis(redis)
+
+            val overallStatus = if (dbHealth.status == "UP" && redisHealth.status == "UP") "UP" else "DOWN"
+
+            val response = HealthResponse(
+                status = overallStatus,
+                checks = mapOf("db" to dbHealth, "redis" to redisHealth)
+            )
+
+            val httpStatus = if (overallStatus == "UP") HttpStatusCode.OK else HttpStatusCode.ServiceUnavailable
+            call.respond(httpStatus, response)
+        }
+
+        get("/health/live") {
+            call.respond(HttpStatusCode.OK, mapOf("status" to "UP"))
+        }
+
+        get("/health/ready") {
+            val dbHealth = checkDatabase(dataSource)
+            val status = if (dbHealth.status == "UP") HttpStatusCode.OK else HttpStatusCode.ServiceUnavailable
+            call.respond(status, mapOf("status" to dbHealth.status))
+        }
+    }
+}
+
+private fun checkDatabase(dataSource: javax.sql.DataSource): HealthCheck {
+    return try {
+        dataSource.connection.use { it.prepareStatement("SELECT 1").execute() }
+        HealthCheck("UP", mapOf("type" to "postgresql"))
+    } catch (e: Exception) {
+        HealthCheck("DOWN", mapOf("error" to (e.message ?: "unknown")))
+    }
+}
+
+private fun checkRedis(pool: redis.clients.jedis.JedisPool): HealthCheck {
+    return try {
+        pool.resource.use { it.ping() }
+        HealthCheck("UP")
+    } catch (e: Exception) {
+        HealthCheck("DOWN", mapOf("error" to (e.message ?: "unknown")))
+    }
+}
+```
+
+## Docker observability stack
+
+### Prometheus + Grafana + your app
+
+The standard pull-based pipeline: your app exposes metrics, Prometheus scrapes
+them, Grafana queries Prometheus for dashboards.
+
+<Mermaid title="Prometheus + Grafana stack" height={360} code={`
+flowchart LR
+  App["Your App (:8080)<br/>/actuator/prometheus"] -->|"scrape"| Prom["Prometheus (:9090)<br/>stores time-series"]
+  Prom -->|"query"| Graf["Grafana (:3000)"]
+`} />
+
+### Docker Compose for the stack
+
+```yaml title="docker-compose.yml"
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/taskdb
+      - SPRING_DATASOURCE_USERNAME=app
+      - SPRING_DATASOURCE_PASSWORD=app
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: taskdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+
+volumes:
+  pgdata:
+  prometheus-data:
+  grafana-data:
+```
+
+### Prometheus configuration
+
+```yaml title="config/prometheus.yml"
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'task-api'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['app:8080']
+        labels:
+          application: 'task-api'
+          environment: 'docker'
+```
+
+### Grafana data source provisioning
+
+```yaml title="config/grafana/provisioning/datasources/prometheus.yml"
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+```
+
+### Useful Prometheus queries (PromQL)
+
+```text
+# Request rate (requests per second)
+rate(http_server_requests_seconds_count[5m])
+
+# 95th percentile latency
+histogram_quantile(0.95, rate(http_server_requests_seconds_bucket[5m]))
+
+# Error rate (5xx responses)
+rate(http_server_requests_seconds_count{status=~"5.."}[5m])
+  / rate(http_server_requests_seconds_count[5m])
+
+# JVM heap usage
+jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"}
+
+# Active threads
+jvm_threads_live_threads
+
+# Custom: tasks created per minute
+rate(tasks_created_total[1m]) * 60
+```
+
+### Full observability with the OpenTelemetry Collector
+
+For production setups, use the OpenTelemetry Collector to receive, process, and
+export telemetry:
+
+```yaml title="docker-compose.yml (additions)"
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus metrics exporter
+    volumes:
+      - ./config/otel-collector.yml:/etc/otelcol-contrib/config.yaml
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # Jaeger collector
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+```
+
+```yaml title="config/otel-collector.yml"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+```
+
+## Summary
+
+| Concern | TypeScript | Go | Kotlin/JVM |
+|---------|-----------|-----|------------|
+| Error handling | throw / neverthrow Result | `error` interface, explicit returns | Sealed class Result hierarchies |
+| Logging | winston / pino | slog / zap | SLF4J + Logback + kotlin-logging |
+| Structured logging | pino JSON | slog structured | logstash-logback-encoder |
+| Log context | AsyncLocalStorage | `context.Context` | MDC (+ `MDCContext` for coroutines) |
+| Metrics | prom-client | prometheus/client_golang | Micrometer + Prometheus |
+| Tracing | `@opentelemetry/sdk-node` | `go.opentelemetry.io/otel` | OpenTelemetry Java/Kotlin |
+| Health checks | custom endpoint | custom endpoint | Spring Actuator |
+| Metrics dashboard | Grafana | Grafana | Grafana |
+
+## Practice
+
+Put the three pillars to work — wire up a real observability stack, then tighten
+your service layer's error handling.
+
+<CardGrid>
+  <LinkCard
+    title="Observability Stack"
+    href="/kotlin-backend/16-observability/observability-stack/"
+    description="Instrument a Spring Boot Task API with structured JSON logging, custom Prometheus metrics, and health checks, then run Prometheus and Grafana via Docker Compose to visualize them."
+  />
+  <LinkCard
+    title="Sealed Class Result Error Handling"
+    href="/kotlin-backend/16-observability/sealed-result-errors/"
+    description="Replace exception-based error handling with a sealed class Result hierarchy and map each domain error to the right HTTP status code."
+  />
+</CardGrid>

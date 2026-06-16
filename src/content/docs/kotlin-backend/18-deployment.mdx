@@ -1,0 +1,1755 @@
+---
+title: Deployment & Production
+description: Ship a Kotlin/JVM service to production — Docker multi-stage builds, GraalVM native images, Kubernetes manifests, and a full CI/CD pipeline.
+sidebar:
+  order: 18
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Docker multi-stage builds, GraalVM native images, fat JARs, Kubernetes manifests,
+and CI/CD pipelines — everything you need to ship a JVM application to production.
+You already deploy TypeScript and Go services; this module maps each step to its
+JVM equivalent and shows where the JVM needs special care (memory flags, slow
+startup, layer caching).
+
+## Docker for JVM Applications
+
+### The JVM Docker Challenge
+
+JVM apps have unique containerization concerns compared to Node.js or Go:
+
+| Concern | Node.js (TS) | Go | JVM (Kotlin) |
+|---------|-------------|-----|--------------|
+| Base image size | ~180MB (`node:slim`) | ~0 (scratch/distroless) | ~200MB (`eclipse-temurin:21-jre`) |
+| Startup time | ~500ms | ~10ms | ~2-5s (Spring Boot) |
+| Memory footprint | ~50-100MB | ~10-30MB | ~200-400MB |
+| Build dependencies | npm/node | Go toolchain | JDK + Gradle |
+| Final artifact | Source + `node_modules` | Static binary | JAR + JRE |
+| Layer caching | `package.json` first | `go.sum` first | gradle wrapper + deps first |
+
+### Cross-language comparison: Dockerfiles
+
+The same multi-stage build pattern in each ecosystem. Note how the final image
+sizes diverge — Go ships a static binary into `scratch`, the JVM needs a JRE.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```dockerfile
+# Multi-stage build for Node.js/TypeScript
+FROM node:20-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src/ ./src/
+RUN npm run build
+
+FROM node:20-slim
+WORKDIR /app
+COPY --from=builder /app/package*.json ./
+RUN npm ci --production
+COPY --from=builder /app/dist/ ./dist/
+EXPOSE 8080
+USER node
+CMD ["node", "dist/index.js"]
+# Final image: ~200MB
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```dockerfile
+# Multi-stage build for Go
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /server ./cmd/server
+
+FROM scratch
+COPY --from=builder /server /server
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+EXPOSE 8080
+ENTRYPOINT ["/server"]
+# Final image: ~10-15MB
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```dockerfile title="Dockerfile"
+# Multi-stage build for Kotlin/Spring Boot
+FROM eclipse-temurin:21-jdk AS builder
+WORKDIR /app
+
+# 1. Copy Gradle wrapper (cacheable layer)
+COPY gradle/ gradle/
+COPY gradlew gradlew.bat ./
+RUN chmod +x gradlew
+
+# 2. Copy build files only (dependency resolution layer)
+COPY build.gradle.kts settings.gradle.kts gradle.properties* ./
+RUN ./gradlew dependencies --no-daemon || true
+
+# 3. Copy source and build
+COPY src/ src/
+RUN ./gradlew bootJar --no-daemon
+
+# --- Runtime stage ---
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+
+# Create non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Copy the fat JAR
+COPY --from=builder /app/build/libs/*.jar app.jar
+
+# JVM container flags
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75.0 \
+               -XX:+UseContainerSupport \
+               -XX:+UseG1GC \
+               -Djava.security.egd=file:/dev/./urandom"
+
+EXPOSE 8080
+
+USER appuser
+
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+# Final image: ~250MB (JRE + app)
+```
+
+  </TabItem>
+</Tabs>
+
+The Kotlin build splits into distinct layers so dependency resolution is cached
+independently of your source. The flow looks like this:
+
+<Mermaid title="JVM multi-stage Docker build" code={`
+flowchart LR
+  subgraph build["Builder stage (JDK)"]
+    W["Gradle wrapper"] --> B["Build files"]
+    B --> D["./gradlew dependencies"]
+    D --> S["Copy src/"]
+    S --> J["./gradlew bootJar"]
+  end
+  subgraph runtime["Runtime stage (JRE)"]
+    U["Non-root user"] --> A["COPY app.jar"]
+    A --> R["java -jar app.jar"]
+  end
+  J -->|"app.jar"| A
+`} />
+
+### JVM container flags explained
+
+These flags are critical for running JVM apps in containers. Without
+container-awareness the JVM sizes its heap against the host machine, not the
+cgroup limit, and gets OOM-killed.
+
+```bash
+# Memory management
+-XX:MaxRAMPercentage=75.0
+# Use 75% of container memory limit for heap
+# Default would use 1/4 of PHYSICAL memory, ignoring container limits
+# Replaces the old -Xmx flag in containerized environments
+
+-XX:+UseContainerSupport
+# Enabled by default since JDK 10
+# Makes JVM aware of cgroup limits (CPU, memory)
+# Without this, JVM sees the HOST's resources, not the container's
+
+-XX:InitialRAMPercentage=50.0
+# Starting heap size as % of container memory
+# Reduces GC pressure during startup
+
+# GC selection
+-XX:+UseG1GC
+# G1 garbage collector -- good default for server workloads
+# Balances throughput and latency
+# Alternatives:
+#   -XX:+UseZGC           -- ultra-low latency (<1ms pauses), JDK 21+
+#   -XX:+UseShenandoahGC  -- low latency alternative
+#   -XX:+UseSerialGC      -- for small heaps (<100MB)
+
+# Startup optimization
+-Djava.security.egd=file:/dev/./urandom
+# Faster SecureRandom initialization in containers
+# /dev/random can block if entropy pool is empty (common in containers)
+
+# CPU management
+-XX:ActiveProcessorCount=2
+# Override detected CPU count (useful if cgroup CPU limits don't match)
+
+# Diagnostics
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/tmp/heapdump.hprof
+# Dump heap when OOM occurs -- critical for debugging memory leaks
+
+-XX:+ExitOnOutOfMemoryError
+# Kill the JVM on OOM so the container restarts
+# Better than limping along in a broken state
+```
+
+### Layer caching optimization
+
+The order of `COPY` commands determines Docker layer cache effectiveness. Copy the
+things that change rarely first, source last.
+
+```dockerfile
+# GOOD: Maximize layer caching
+FROM eclipse-temurin:21-jdk AS builder
+WORKDIR /app
+
+# Layer 1: Gradle wrapper (changes rarely)
+COPY gradle/ gradle/
+COPY gradlew ./
+RUN chmod +x gradlew
+
+# Layer 2: Build configuration (changes occasionally)
+COPY build.gradle.kts settings.gradle.kts ./
+COPY gradle.properties* ./
+
+# Layer 3: Download dependencies (changes when deps change)
+# This is the expensive step -- cached unless build files change
+RUN ./gradlew dependencies --no-daemon
+
+# Layer 4: Source code (changes frequently)
+COPY src/ src/
+
+# Layer 5: Build (re-runs on source changes, but deps are cached)
+RUN ./gradlew bootJar --no-daemon
+```
+
+```dockerfile
+# BAD: Busts cache on every source change
+FROM eclipse-temurin:21-jdk AS builder
+WORKDIR /app
+COPY . .                      # ANY file change busts EVERYTHING below
+RUN ./gradlew bootJar         # always re-downloads all dependencies
+```
+
+### Spring Boot layered JARs
+
+Spring Boot 3.x supports layered JARs for even better Docker caching — it splits
+the fat JAR into layers by change frequency.
+
+```dockerfile
+# Using Spring Boot's layered JAR feature
+FROM eclipse-temurin:21-jdk AS builder
+WORKDIR /app
+COPY gradle/ gradle/
+COPY gradlew build.gradle.kts settings.gradle.kts ./
+RUN chmod +x gradlew
+COPY src/ src/
+RUN ./gradlew bootJar --no-daemon
+
+# Extract layers from the fat JAR
+RUN java -Djarmode=layertools -jar build/libs/*.jar extract --destination extracted
+
+# Runtime stage with individual layers
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Copy layers in order of change frequency (least -> most)
+COPY --from=builder /app/extracted/dependencies/ ./
+COPY --from=builder /app/extracted/spring-boot-loader/ ./
+COPY --from=builder /app/extracted/snapshot-dependencies/ ./
+COPY --from=builder /app/extracted/application/ ./
+
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75.0 -XX:+UseContainerSupport"
+EXPOSE 8080
+USER appuser
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+The layers, from least to most frequently changing:
+
+1. `dependencies/` — third-party JARs (change rarely)
+2. `spring-boot-loader/` — Spring Boot launch classes (change rarely)
+3. `snapshot-dependencies/` — SNAPSHOT JARs (change occasionally)
+4. `application/` — your code (changes every build)
+
+### Docker Compose for development
+
+A local stack with the app plus its backing services, wired with health checks so
+the app waits for the database and Redis to be ready.
+
+```yaml title="docker-compose.yml"
+# local development environment
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=dev
+      - DATABASE_URL=jdbc:postgresql://db:5432/myapp
+      - DATABASE_USER=postgres
+      - DATABASE_PASSWORD=postgres
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Mount source for hot reload (with Spring DevTools)
+    # volumes:
+    #   - ./src:/app/src
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+```
+
+### .dockerignore
+
+Always include a `.dockerignore` to speed up builds and keep junk out of the image:
+
+```text title=".dockerignore"
+.git
+.github
+.idea
+.gradle
+build
+out
+*.md
+!README.md
+docker-compose*.yml
+.env
+.env.*
+**/*.log
+**/node_modules
+```
+
+## GraalVM Native Image
+
+### What is GraalVM Native Image?
+
+GraalVM Native Image compiles JVM bytecode into a **standalone native binary** —
+no JVM needed at runtime. This gives Go-like startup times and memory usage, at the
+cost of build time and some dynamic features.
+
+| Metric | JVM (Standard) | GraalVM Native | Go |
+|--------|----------------|----------------|-----|
+| Startup time | 2-5s | 50-200ms | 10-50ms |
+| Memory (idle) | 200-400MB | 30-80MB | 10-30MB |
+| Peak throughput | Highest (JIT optimized) | 80-90% of JIT | Good |
+| Build time | 5-30s | 2-10min | 5-30s |
+| Binary size | JAR ~30MB + JRE ~200MB | 50-100MB standalone | 10-20MB |
+| Reflection | Full support | Requires configuration | N/A |
+| Dynamic classloading | Full support | Not supported | N/A |
+
+### Spring Boot native image
+
+Spring Boot 3.x has first-class GraalVM support via AOT (Ahead-of-Time) processing.
+Add the native build plugin and configure the binary:
+
+```kotlin title="build.gradle.kts"
+plugins {
+    id("org.springframework.boot") version "3.3.0"
+    id("io.spring.dependency-management") version "1.1.5"
+    kotlin("jvm") version "2.0.0"
+    kotlin("plugin.spring") version "2.0.0"
+    id("org.graalvm.buildtools.native") version "0.10.2"
+}
+
+graalvmNative {
+    binaries {
+        named("main") {
+            // Additional native-image flags
+            buildArgs.add("--enable-url-protocols=http,https")
+            buildArgs.add("-H:+ReportExceptionStackTraces")
+
+            // Memory for the build process itself
+            jvmArgs.add("-Xmx4g")
+        }
+    }
+}
+```
+
+Building and running a native image:
+
+```bash
+# Build the native image (requires GraalVM JDK)
+./gradlew nativeCompile
+
+# Or build a native container image directly (no local GraalVM needed!)
+./gradlew bootBuildImage
+
+# Run the native binary
+./build/native/nativeCompile/my-app
+# Starts in ~100ms instead of ~3s
+```
+
+### Dockerfile for GraalVM native image
+
+Build the binary inside a GraalVM image, then copy just the binary into a slim base
+— no JRE in the final image.
+
+```dockerfile
+# Option 1: Build native image in Docker (no local GraalVM needed)
+FROM ghcr.io/graalvm/native-image-community:21 AS builder
+WORKDIR /app
+
+# native-image is bundled in GraalVM CE 21+ (no separate install needed)
+
+# Copy Gradle wrapper and build files
+COPY gradle/ gradle/
+COPY gradlew build.gradle.kts settings.gradle.kts ./
+RUN chmod +x gradlew
+
+# Download dependencies
+RUN ./gradlew dependencies --no-daemon
+
+# Copy source and build native image
+COPY src/ src/
+RUN ./gradlew nativeCompile --no-daemon
+
+# Runtime: use distroless or alpine -- no JRE needed!
+FROM debian:bookworm-slim
+WORKDIR /app
+
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+
+# Copy ONLY the native binary
+COPY --from=builder /app/build/native/nativeCompile/my-app ./my-app
+
+EXPOSE 8080
+USER appuser
+ENTRYPOINT ["./my-app"]
+# Final image: ~80-100MB (most is the base OS)
+# Startup: ~100ms
+```
+
+```dockerfile
+# Option 2: Even smaller with distroless
+FROM gcr.io/distroless/base-debian12
+COPY --from=builder /app/build/native/nativeCompile/my-app /my-app
+EXPOSE 8080
+USER nonroot
+ENTRYPOINT ["/my-app"]
+# Final image: ~50-70MB
+```
+
+### Tradeoffs and limitations
+
+**What works well:**
+
+- Simple REST APIs with Spring Boot or Ktor
+- Apps with well-known class hierarchies
+- Libraries that provide GraalVM metadata (most popular ones do)
+
+**What requires extra work:**
+
+- **Reflection:** must be declared in `reflect-config.json` or via `@RegisterReflection`
+- **Dynamic proxies:** must be registered at build time
+- **Resource loading:** `classpath:` resources must be declared
+- **Serialization:** kotlinx.serialization works great; Jackson needs configuration
+
+Spring Boot handles most reflection registration automatically. When you need
+manual registration, use `@RegisterReflection` or a `RuntimeHintsRegistrar`:
+
+```kotlin
+// Spring Boot handles most reflection registration automatically
+// But if you need manual registration:
+
+@RegisterReflection(classes = [User::class, Order::class])
+@SpringBootApplication
+class MyApplication
+
+// Or create a RuntimeHintsRegistrar
+class MyRuntimeHints : RuntimeHintsRegistrar {
+    override fun registerHints(hints: RuntimeHints, classLoader: ClassLoader?) {
+        // Register reflection
+        hints.reflection().registerType(
+            User::class.java,
+            MemberCategory.INVOKE_DECLARED_CONSTRUCTORS,
+            MemberCategory.INVOKE_DECLARED_METHODS
+        )
+
+        // Register resources
+        hints.resources().registerPattern("config/*.yml")
+
+        // Register serialization
+        hints.serialization().registerType(User::class.java)
+    }
+}
+```
+
+:::tip[When to use GraalVM native]
+Reach for native images for serverless/Lambda functions (cold start matters), CLI
+tools (instant startup), microservices with simple dependency graphs, and cost
+optimization (lower memory = fewer/smaller containers).
+:::
+
+:::caution[When to stick with the JVM]
+Stay on the standard JVM for high-throughput services (JIT optimization wins
+long-term), complex reflection-heavy frameworks, services that use dynamic
+classloading, and when build time is critical (CI/CD speed).
+:::
+
+### Ktor native image
+
+Ktor is lightweight and works well with GraalVM:
+
+```kotlin title="build.gradle.kts"
+plugins {
+    kotlin("jvm") version "2.0.0"
+    id("io.ktor.plugin") version "3.0.0"
+    id("org.graalvm.buildtools.native") version "0.10.2"
+}
+
+application {
+    mainClass.set("com.example.ApplicationKt")
+}
+
+ktor {
+    fatJar {
+        archiveFileName.set("app.jar")
+    }
+}
+
+graalvmNative {
+    binaries {
+        named("main") {
+            mainClass.set("com.example.ApplicationKt")
+            buildArgs.add("--enable-url-protocols=http,https")
+        }
+    }
+}
+```
+
+```bash
+# Build native binary
+./gradlew nativeCompile
+
+# Run
+./build/native/nativeCompile/app
+# Ktor starts in ~20ms as native image
+```
+
+## Application Packaging
+
+### Fat JAR (Uber JAR)
+
+A fat JAR bundles your application code AND all dependencies into a single JAR file.
+Which plugin you use depends on whether you're on Spring Boot.
+
+<Tabs syncKey="lang">
+  <TabItem label="Kotlin">
+
+```kotlin title="build.gradle.kts"
+// Spring Boot plugin (default for Spring Boot apps)
+plugins {
+    id("org.springframework.boot") version "3.3.0"
+    kotlin("jvm") version "2.0.0"
+}
+
+// The bootJar task is configured automatically
+tasks.bootJar {
+    archiveFileName.set("my-app.jar")
+    // Exclude unnecessary files
+    exclude("**/*.psd", "**/*.md")
+}
+```
+
+```bash
+# Build
+./gradlew bootJar
+
+# Run
+java -jar build/libs/my-app.jar
+
+# The JAR contains:
+# - Your compiled classes
+# - All dependency JARs (nested)
+# - Spring Boot loader
+# - application.yml and other resources
+```
+
+  </TabItem>
+</Tabs>
+
+For non-Spring apps, use the Shadow plugin, which gives you control over merging,
+relocation, and minimization:
+
+```kotlin title="build.gradle.kts"
+// Shadow plugin (for non-Spring apps)
+plugins {
+    kotlin("jvm") version "2.0.0"
+    id("com.gradleup.shadow") version "8.3.0"
+    application
+}
+
+application {
+    mainClass.set("com.example.MainKt")
+}
+
+tasks.shadowJar {
+    archiveBaseName.set("my-app")
+    archiveClassifier.set("")
+    archiveVersion.set("")
+
+    // Merge service files (important for SLF4J, etc.)
+    mergeServiceFiles()
+
+    // Relocate to avoid classpath conflicts
+    relocate("com.google.common", "shadow.com.google.common")
+
+    // Minimize -- remove unused classes
+    minimize {
+        exclude(dependency("org.slf4j:.*"))
+        exclude(dependency("ch.qos.logback:.*"))
+    }
+}
+```
+
+```bash
+# Build
+./gradlew shadowJar
+
+# Run
+java -jar build/libs/my-app.jar
+```
+
+### Jlink custom runtime images
+
+`jlink` creates a custom JRE containing only the modules your app needs — shaving
+the runtime from ~200MB to ~40MB.
+
+```bash
+# Step 1: Find which JDK modules your app uses
+jdeps --ignore-missing-deps --multi-release 21 \
+    --print-module-deps build/libs/my-app.jar
+# Output: java.base,java.logging,java.sql,java.net.http,...
+
+# Step 2: Create custom runtime with only those modules
+jlink --add-modules java.base,java.logging,java.sql,java.net.http \
+    --strip-debug \
+    --compress zip-6 \
+    --no-header-files \
+    --no-man-pages \
+    --output custom-jre
+
+# Result: custom-jre/ is ~40MB instead of ~200MB for full JRE
+```
+
+A Dockerfile that builds the custom JRE and ships it alongside the JAR:
+
+```dockerfile
+FROM eclipse-temurin:21-jdk AS builder
+WORKDIR /app
+
+# Build the app
+COPY . .
+RUN ./gradlew bootJar --no-daemon
+
+# Create custom JRE
+RUN jlink \
+    --add-modules java.base,java.logging,java.sql,java.naming,java.management,java.net.http,java.security.jgss,java.instrument,jdk.unsupported \
+    --strip-debug \
+    --compress zip-6 \
+    --no-header-files \
+    --no-man-pages \
+    --output /custom-jre
+
+# Runtime stage
+FROM debian:bookworm-slim
+WORKDIR /app
+
+# Copy custom JRE and app
+COPY --from=builder /custom-jre /opt/java
+COPY --from=builder /app/build/libs/*.jar app.jar
+
+ENV PATH="/opt/java/bin:$PATH"
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75.0 -XX:+UseContainerSupport"
+
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+EXPOSE 8080
+USER appuser
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+# Final image: ~100MB (custom JRE + app) vs ~250MB with full JRE
+```
+
+### Packaging comparison
+
+| Method | Size | Startup | Build Time | Complexity |
+|--------|------|---------|------------|------------|
+| Fat JAR + Full JRE | ~250MB | ~2-5s | Fast | Low |
+| Fat JAR + jlink JRE | ~100MB | ~2-5s | Medium | Medium |
+| Spring Boot layers | ~250MB (better caching) | ~2-5s | Fast | Low |
+| GraalVM native | ~50-100MB | ~50-200ms | Slow | High |
+| Go binary (reference) | ~10-20MB | ~10-50ms | Fast | Low |
+| Node.js (reference) | ~200MB | ~500ms | Fast | Low |
+
+## Kubernetes Deployment
+
+A production Kotlin service in Kubernetes is built from a handful of resources that
+fit together: a `Deployment` runs the pods, a `Service` gives them a stable
+in-cluster address, `ConfigMap` and `Secret` supply configuration, an `Ingress`
+exposes HTTP, and an `HorizontalPodAutoscaler` scales replicas.
+
+<Mermaid title="Kubernetes topology" code={`
+flowchart TB
+  Client["Client"] --> Ing["Ingress (nginx, TLS)"]
+  Ing --> Svc["Service (ClusterIP)"]
+  Svc --> D["Deployment: 3 replicas"]
+  subgraph pod["Pod"]
+    App["my-kotlin-app container"]
+  end
+  D --> pod
+  CM["ConfigMap"] -.->|"env"| App
+  Sec["Secret"] -.->|"env"| App
+  HPA["HorizontalPodAutoscaler"] -.->|"scales"| D
+`} />
+
+### Deployment manifest
+
+The `Deployment` is the centerpiece. For JVM workloads, the key parts are the three
+probes (the JVM is slow to start, so a generous `startupProbe` matters), the
+resource limits sized above the heap, and the container memory flags.
+
+```yaml title="k8s/deployment.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-kotlin-app
+  labels:
+    app: my-kotlin-app
+    version: "1.0.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-kotlin-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: my-kotlin-app
+        version: "1.0.0"
+      annotations:
+        # Prometheus scraping (if using Actuator + Micrometer)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      serviceAccountName: my-kotlin-app
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: app
+          image: my-registry/my-kotlin-app:1.0.0
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "prod"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: my-kotlin-app-secrets
+                  key: database-url
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: my-kotlin-app-secrets
+                  key: database-user
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: my-kotlin-app-secrets
+                  key: database-password
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: my-kotlin-app-config
+                  key: redis-host
+            - name: JAVA_OPTS
+              value: >-
+                -XX:MaxRAMPercentage=75.0
+                -XX:+UseContainerSupport
+                -XX:+UseG1GC
+                -XX:+ExitOnOutOfMemoryError
+                -XX:+HeapDumpOnOutOfMemoryError
+                -XX:HeapDumpPath=/tmp/heapdump.hprof
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          # Liveness probe: is the process alive?
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            initialDelaySeconds: 30   # JVM needs time to start
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness probe: can it serve traffic?
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 3
+          # Startup probe: give the JVM extra time on first boot
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30   # 10 + 30*5 = 160s max startup time
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 60
+```
+
+:::caution[Sizing memory for the JVM]
+The container memory limit must cover more than the heap: JVM heap (controlled by
+`MaxRAMPercentage`), metaspace (~100MB), thread stacks (~1MB per thread), native
+memory (NIO buffers, etc.), and OS overhead. Rule of thumb: set the limit 25-30%
+above your desired heap size. With `limits.memory: 1Gi` and `MaxRAMPercentage=75`,
+the heap is ~768MB.
+:::
+
+### Service
+
+```yaml title="k8s/service.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-kotlin-app
+  labels:
+    app: my-kotlin-app
+spec:
+  type: ClusterIP
+  selector:
+    app: my-kotlin-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+```
+
+### ConfigMap
+
+```yaml title="k8s/configmap.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-kotlin-app-config
+data:
+  # Non-sensitive configuration
+  redis-host: "redis-master.default.svc.cluster.local"
+  redis-port: "6379"
+  kafka-brokers: "kafka-0.kafka-headless.default.svc.cluster.local:9092"
+  log-level: "INFO"
+  server-port: "8080"
+```
+
+### Secret
+
+```yaml title="k8s/secret.yaml"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-kotlin-app-secrets
+type: Opaque
+# In practice, use a secrets manager (Vault, Sealed Secrets, External Secrets)
+# These base64-encoded values are for demonstration only
+data:
+  database-url: amRiYzpwb3N0Z3Jlc3FsOi8vZGItcG9zdGdyZXM6NTQzMi9teWFwcA==
+  database-user: YXBwX3VzZXI=
+  database-password: c3VwZXJfc2VjcmV0X3Bhc3N3b3Jk
+```
+
+In practice, create secrets imperatively instead of committing YAML:
+
+```bash
+kubectl create secret generic my-kotlin-app-secrets \
+  --from-literal=database-url="jdbc:postgresql://db-postgres:5432/myapp" \
+  --from-literal=database-user="app_user" \
+  --from-literal=database-password="super_secret_password"
+```
+
+### Ingress
+
+```yaml title="k8s/ingress.yaml"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-kotlin-app
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-kotlin-app
+                port:
+                  name: http
+  tls:
+    - hosts:
+        - api.example.com
+      secretName: api-tls-cert
+```
+
+### Horizontal Pod Autoscaler
+
+```yaml title="k8s/hpa.yaml"
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-kotlin-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-kotlin-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+```
+
+### Spring Boot Kubernetes configuration
+
+The production profile wires graceful shutdown, the datasource from env vars, and
+the Actuator health probes that the K8s `livenessProbe`/`readinessProbe` hit.
+
+```yaml title="application-prod.yml"
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+  datasource:
+    url: ${DATABASE_URL}
+    username: ${DATABASE_USER}
+    password: ${DATABASE_PASSWORD}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+      connection-timeout: 5000
+      idle-timeout: 300000
+      max-lifetime: 600000
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true     # enables /actuator/health/liveness and /readiness
+      show-details: never  # don't leak internal details in prod
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+```
+
+### Graceful shutdown
+
+When K8s sends `SIGTERM`, Spring stops accepting new requests, finishes in-flight
+ones, then runs your cleanup before the process exits. If it overruns
+`terminationGracePeriodSeconds`, K8s sends `SIGKILL`.
+
+```kotlin
+// Spring Boot handles graceful shutdown with:
+// server.shutdown=graceful
+// spring.lifecycle.timeout-per-shutdown-phase=30s
+
+// For custom cleanup, implement DisposableBean or use @PreDestroy:
+@Component
+class AppLifecycle(
+    private val kafkaConsumer: KafkaConsumer<String, String>,
+    private val connectionPool: HikariDataSource
+) : DisposableBean {
+
+    override fun destroy() {
+        println("Shutting down gracefully...")
+        kafkaConsumer.close()
+        connectionPool.close()
+        println("Cleanup complete")
+    }
+}
+
+// K8s sends SIGTERM -> Spring starts graceful shutdown ->
+// Stops accepting new requests -> Finishes in-flight requests ->
+// Calls destroy() -> Process exits
+// If it takes longer than terminationGracePeriodSeconds, K8s sends SIGKILL
+```
+
+In TS and Go you wire signal handling yourself; in Spring Boot it's just
+configuration.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// Node.js doesn't have graceful shutdown built-in
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received, shutting down...");
+  server.close(() => {
+    db.end().then(() => {
+      process.exit(0);
+    });
+  });
+
+  // Force exit after timeout
+  setTimeout(() => process.exit(1), 30000);
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go pattern: context with cancellation
+func main() {
+    ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+    defer cancel()
+
+    server := &http.Server{Addr: ":8080"}
+    go server.ListenAndServe()
+
+    <-ctx.Done()
+    log.Println("Shutting down...")
+
+    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer shutdownCancel()
+    server.Shutdown(shutdownCtx)
+}
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```yaml
+# Just configuration -- Spring Boot handles everything
+server:
+  shutdown: graceful
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+```
+
+  </TabItem>
+</Tabs>
+
+## CI/CD Pipeline
+
+A typical pipeline fans out test and lint in parallel, then builds and pushes a
+container image, then rolls it out to Kubernetes — only on `main`.
+
+<Mermaid title="CI/CD pipeline" code={`
+flowchart LR
+  Push["push / PR"] --> Test["test (Postgres + Redis services)"]
+  Push --> Lint["lint (detekt + ktlint)"]
+  Test --> Build["build-and-push (bootJar + Docker)"]
+  Lint --> Build
+  Build -->|"main only"| Deploy["deploy (kubectl rollout)"]
+`} />
+
+### GitHub Actions for Kotlin/Gradle projects
+
+The `test` job spins up Postgres and Redis as service containers, `lint` runs
+detekt and ktlint, `build-and-push` builds the image with GHA layer caching, and
+`deploy` updates the K8s Deployment.
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Enable build cache
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Run tests
+        run: ./gradlew test
+        env:
+          DATABASE_URL: jdbc:postgresql://localhost:5432/testdb
+          DATABASE_USER: test
+          DATABASE_PASSWORD: test
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build/reports/tests/
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run detekt (linting)
+        run: ./gradlew detekt
+
+      - name: Check formatting
+        run: ./gradlew ktlintCheck
+
+  build-and-push:
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build JAR
+        run: ./gradlew bootJar
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Set image tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "IMAGE_TAG=sha-${SHORT_SHA}" >> $GITHUB_ENV
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl set image deployment/my-kotlin-app \
+            app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            --namespace=production
+          kubectl rollout status deployment/my-kotlin-app \
+            --namespace=production \
+            --timeout=300s
+```
+
+### Gradle build cache in CI
+
+Dependency resolution and compilation are slow — cache them aggressively. The
+`setup-gradle` action handles most of this, but you can configure a local (or
+remote) build cache too.
+
+```kotlin title="settings.gradle.kts"
+buildCache {
+    local {
+        isEnabled = true
+        directory = File(rootDir, ".gradle/build-cache")
+    }
+    // Remote cache for CI (e.g., Gradle Enterprise or a custom HTTP cache)
+    // remote<HttpBuildCache> {
+    //     url = uri("https://cache.example.com/cache/")
+    //     isPush = System.getenv("CI") != null
+    //     credentials {
+    //         username = System.getenv("CACHE_USER") ?: ""
+    //         password = System.getenv("CACHE_PASSWORD") ?: ""
+    //     }
+    // }
+}
+```
+
+```yaml
+# GitHub Actions caches Gradle dependencies automatically with setup-gradle
+# But you can also cache manually:
+- name: Cache Gradle packages
+  uses: actions/cache@v4
+  with:
+    path: |
+      ~/.gradle/caches
+      ~/.gradle/wrapper
+    key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+    restore-keys: |
+      gradle-${{ runner.os }}-
+```
+
+### Multi-module CI optimization
+
+For monorepos with multiple Gradle modules, use a path filter so you only test the
+modules that changed:
+
+```yaml
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      worker: ${{ steps.filter.outputs.worker }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'api/**'
+              - 'shared/**'
+            worker:
+              - 'worker/**'
+              - 'shared/**'
+
+  test-api:
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - run: ./gradlew :api:test
+
+  test-worker:
+    needs: changes
+    if: needs.changes.outputs.worker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - run: ./gradlew :worker:test
+```
+
+### Release workflow with semantic versioning
+
+Tag-triggered builds that version the JAR and image from the git tag, then create a
+GitHub Release:
+
+```yaml title=".github/workflows/release.yml"
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Extract version from tag
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Build with version
+        run: ./gradlew bootJar -Pversion=${{ env.VERSION }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/libs/*.jar
+          generate_release_notes: true
+```
+
+## Environment Configuration & the 12-Factor App
+
+### The 12-Factor App principles
+
+The [12-Factor App](https://12factor.net) methodology applies to any backend stack.
+Here is how each factor maps to Kotlin/JVM:
+
+| Factor | Principle | Kotlin/JVM Implementation |
+|--------|-----------|--------------------------|
+| I. Codebase | One codebase, many deploys | Git repo, same code for dev/staging/prod |
+| II. Dependencies | Explicitly declare deps | `build.gradle.kts` with version catalog |
+| III. Config | Config in environment | `application.yml` + env vars, Spring profiles |
+| IV. Backing Services | Treat as attached resources | JDBC URLs, Redis hosts from env vars |
+| V. Build, Release, Run | Strictly separate stages | Gradle build → Docker image → K8s deploy |
+| VI. Processes | Stateless processes | No in-memory session state; use Redis |
+| VII. Port Binding | Export services via port | `server.port` from env var |
+| VIII. Concurrency | Scale via process model | K8s replicas + HPA |
+| IX. Disposability | Fast startup, graceful shutdown | Spring graceful shutdown + startup/readiness probes |
+| X. Dev/Prod Parity | Keep environments similar | Docker Compose (dev) mirrors K8s (prod) |
+| XI. Logs | Treat as event streams | Write to stdout, collect with Fluentd/Loki |
+| XII. Admin Processes | Run admin tasks as one-off | K8s Jobs, Flyway migrations at startup |
+
+### Configuration hierarchy
+
+Spring Boot resolves configuration in this order (highest priority first):
+
+```text
+1. Command line arguments         (--server.port=9090)
+2. SPRING_APPLICATION_JSON        (inline JSON)
+3. OS environment variables       (SERVER_PORT=9090)
+4. application-{profile}.yml      (profile-specific)
+5. application.yml                (default)
+6. @PropertySource annotations    (code-defined)
+7. Default properties             (SpringApplication.setDefaultProperties)
+```
+
+### Spring profiles vs environment variables
+
+Shared defaults live in `application.yml`; profile-specific overrides go in
+`application-{profile}.yml`. The `${VAR:default}` syntax reads an env var with a
+fallback.
+
+```yaml
+# application.yml -- shared defaults
+spring:
+  application:
+    name: my-kotlin-app
+
+server:
+  port: ${SERVER_PORT:8080}
+
+app:
+  feature-flags:
+    new-ui: ${FEATURE_NEW_UI:false}
+    beta-feature: ${FEATURE_BETA:false}
+
+---
+# application-dev.yml
+spring:
+  config:
+    activate:
+      on-profile: dev
+  datasource:
+    url: jdbc:postgresql://localhost:5432/myapp_dev
+    username: postgres
+    password: postgres
+  data:
+    redis:
+      host: localhost
+
+logging:
+  level:
+    root: DEBUG
+    com.example: TRACE
+
+---
+# application-prod.yml
+spring:
+  config:
+    activate:
+      on-profile: prod
+  datasource:
+    url: ${DATABASE_URL}
+    username: ${DATABASE_USER}
+    password: ${DATABASE_PASSWORD}
+  data:
+    redis:
+      host: ${REDIS_HOST}
+
+logging:
+  level:
+    root: WARN
+    com.example: INFO
+```
+
+Bind configuration to type-safe Kotlin data classes with
+`@ConfigurationProperties`:
+
+```kotlin
+@ConfigurationProperties(prefix = "app")
+data class AppProperties(
+    val featureFlags: FeatureFlags = FeatureFlags()
+) {
+    data class FeatureFlags(
+        val newUi: Boolean = false,
+        val betaFeature: Boolean = false
+    )
+}
+
+// Usage
+@RestController
+class FeatureController(private val appProps: AppProperties) {
+
+    @GetMapping("/features")
+    fun getFeatures(): Map<String, Boolean> = mapOf(
+        "new-ui" to appProps.featureFlags.newUi,
+        "beta-feature" to appProps.featureFlags.betaFeature
+    )
+}
+```
+
+### Cross-language comparison: configuration
+
+TS parses `.env` by hand with no type safety; Go uses struct tags; Spring binds to a
+validated, IDE-aware, profile-aware data class.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// .env files parsed at startup -- no type safety
+import dotenv from "dotenv";
+dotenv.config();
+
+const config = {
+  port: parseInt(process.env.PORT || "8080"),
+  databaseUrl: process.env.DATABASE_URL || "postgresql://localhost/mydb",
+  redisHost: process.env.REDIS_HOST || "localhost",
+  logLevel: process.env.LOG_LEVEL || "info",
+};
+
+// No built-in profile support
+// No type validation
+// No IDE autocompletion for config keys
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go uses struct tags with envconfig
+type Config struct {
+    Port        int    `envconfig:"PORT" default:"8080"`
+    DatabaseURL string `envconfig:"DATABASE_URL" required:"true"`
+    RedisHost   string `envconfig:"REDIS_HOST" default:"localhost"`
+    LogLevel    string `envconfig:"LOG_LEVEL" default:"info"`
+}
+
+var cfg Config
+envconfig.Process("", &cfg)
+```
+
+  </TabItem>
+  <TabItem label="Kotlin">
+
+```kotlin
+// Type-safe, validated, IDE-supported, profile-aware
+@ConfigurationProperties(prefix = "app.database")
+@Validated
+data class DatabaseProperties(
+    @field:NotBlank val url: String,
+    @field:NotBlank val username: String,
+    @field:NotBlank val password: String,
+    @field:Min(1) @field:Max(100) val maxPoolSize: Int = 10,
+    @field:Min(0) val minIdle: Int = 2
+)
+
+// Spring validates at startup -- fails fast with clear error messages
+// IDE provides autocompletion for application.yml keys
+```
+
+  </TabItem>
+</Tabs>
+
+### Secrets management
+
+:::danger[Never commit secrets]
+Never put secrets in `application.yml` committed to git, in Docker image layers, or
+in `ENV` lines in your Dockerfile. Use K8s Secrets at minimum, and prefer an
+External Secrets Operator, HashiCorp Vault, or a cloud provider secret manager that
+syncs into the cluster.
+:::
+
+```kotlin
+// Spring Vault integration example
+// build.gradle.kts
+// implementation("org.springframework.vault:spring-vault-core:3.1.0")
+
+// bootstrap.yml
+// spring:
+//   cloud:
+//     vault:
+//       uri: https://vault.example.com
+//       authentication: kubernetes
+//       kubernetes:
+//         role: my-kotlin-app
+//       kv:
+//         enabled: true
+//         backend: secret
+```
+
+### Logging for production
+
+Treat logs as event streams (12-Factor XI): write structured JSON to stdout and let
+the platform collect it. Use `logback-spring.xml` with profile-specific appenders.
+
+```xml title="src/main/resources/logback-spring.xml"
+<configuration>
+    <springProfile name="dev">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%d{HH:mm:ss.SSS} %highlight(%-5level) %cyan(%logger{36}) - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="DEBUG">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="prod">
+        <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <includeMdcKeyName>traceId</includeMdcKeyName>
+                <includeMdcKeyName>spanId</includeMdcKeyName>
+                <includeMdcKeyName>userId</includeMdcKeyName>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="JSON"/>
+        </root>
+    </springProfile>
+</configuration>
+```
+
+## Summary
+
+| Concern | Node.js (TS) | Go | Kotlin/JVM |
+|---------|-------------|-----|------------|
+| Docker image | ~200MB (`node-slim`) | ~10MB (scratch) | ~250MB (JRE) / ~70MB (native) |
+| Startup | ~500ms | ~10ms | ~2-5s (JVM) / ~100ms (native) |
+| Packaging | `node_modules` + source | Static binary | Fat JAR / native binary |
+| K8s probes | Custom HTTP endpoint | Custom HTTP endpoint | Spring Actuator (built-in) |
+| Config | dotenv + `process.env` | envconfig/Viper | Spring `@ConfigurationProperties` |
+| Graceful shutdown | Manual signal handling | `context.Context` | `server.shutdown=graceful` |
+| CI caching | npm cache | Go module cache | Gradle build cache |
+| Native compile | N/A | Default (Go is compiled) | GraalVM Native Image |
+
+**What to remember:**
+
+- JVM Docker images need proper memory flags (`-XX:MaxRAMPercentage`, `UseContainerSupport`).
+- Layer your Dockerfile: Gradle wrapper → build files → dependencies → source.
+- Spring Boot layered JARs give Docker cache benefits without GraalVM complexity.
+- GraalVM native images trade build time and throughput for startup time and memory.
+- K8s startup probes are critical for JVM apps (they take longer to start).
+- Use Spring profiles for environment-specific config, env vars for secrets.
+- 12-Factor principles apply equally to JVM apps — write to stdout, keep processes stateless, config in env.
+- CI should cache Gradle dependencies aggressively — dependency resolution is slow.
+
+## Practice
+
+Take a service all the way to production: containerize it, then wire up the pipeline
+and cluster manifests.
+
+<CardGrid>
+  <LinkCard
+    title="Dockerized Task API with Multi-Stage Build and GraalVM"
+    href="/kotlin-backend/18-deployment/dockerized-app/"
+    description="Containerize a Spring Boot REST API with a layer-cached multi-stage Dockerfile, JVM memory flags, a Docker Compose dev stack, and a GraalVM native image variant."
+  />
+  <LinkCard
+    title="CI/CD Pipeline and Kubernetes Manifests"
+    href="/kotlin-backend/18-deployment/cicd-k8s/"
+    description="Build a GitHub Actions pipeline that tests, lints, and pushes an image, plus Kubernetes Deployment, Service, ConfigMap, Secret, Ingress, and HPA manifests with JVM-aware health probes."
+  />
+</CardGrid>
