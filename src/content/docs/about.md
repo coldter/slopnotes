@@ -37,7 +37,6 @@ the navigation. See the [Authoring guide](/authoring/) to add your own.
 ## How it is built
 
 slop-learn is built on [Astro](https://astro.build/) and
-[Starlight](https://starlight.astro.build/), using the
-[DocKit](https://github.com/themefisher/dockit-astro) theme (MIT). Branding and
-navigation are driven by JSON files in `src/config/`, and styling lives in
-`src/config/theme.json` and `src/styles/global.css`.
+[Starlight](https://starlight.astro.build/). Branding and navigation are driven
+by JSON files in `src/config/`, and styling lives in `src/config/theme.json`
+and `src/styles/global.css`.

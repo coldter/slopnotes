@@ -7,8 +7,7 @@ model usually get buried in a chat log and never seen again — slop-learn is wh
 those notes get saved, organized as courses, and given a clean, searchable,
 responsive reading experience.
 
-Built on [Astro](https://astro.build/) + [Starlight](https://starlight.astro.build/),
-using the [DocKit](https://github.com/themefisher/dockit-astro) theme (MIT).
+Built on [Astro](https://astro.build/) + [Starlight](https://starlight.astro.build/).
 
 ## Quick start
 
@@ -62,7 +61,6 @@ src/
 Full details — including the frontmatter reference — live in the on-site
 [Authoring guide](src/content/docs/authoring/index.md).
 
-## Credits
+## License
 
-Theme: [DocKit](https://github.com/themefisher/dockit-astro) by
-[Themefisher](https://themefisher.com), MIT licensed. See [`LICENSE`](LICENSE).
+MIT. Includes third-party theme code — see [`LICENSE`](LICENSE).
