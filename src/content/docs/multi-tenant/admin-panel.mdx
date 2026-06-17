@@ -1,0 +1,496 @@
+---
+title: Admin Panel & Operators
+description: The operator-facing worker behind Cloudflare Access, its role matrix and API surface, and the operator-led onboarding flow that creates tenants.
+sidebar:
+  order: 5
+---
+
+import { Steps, Badge } from "@astrojs/starlight/components";
+
+Onboarding a new customer is an operator action, not a self-serve sign-up — every
+tenant is created by your ops team, and every tenant user arrives by invitation. That
+makes the operator surface a small but high-value target, so it lives in its own
+worker (`apps/admin`) on `admin.example.com`, behind Cloudflare Access, and never
+touches a tenant cookie or issues a tenant JWT. This chapter covers how operators
+authenticate, what they're allowed to do, and the exact orchestration that turns
+"operator clicks Create Tenant" into "tenant admin signs in for the first time."
+
+## Identity and authentication
+
+Operator access is gated twice, and both layers are mandatory:
+
+1. **Cloudflare Access** — the perimeter. Operators authenticate against the
+   corporate IdP (Google Workspace, Okta, or GitHub), with MFA enforced at the IdP.
+   Cloudflare then issues a JWT in the `Cf-Access-Jwt-Assertion` header, signed
+   against the team's JWKS.
+2. **A `global_admins` row** — the database gate. The operator's CF Access `sub` (or,
+   on first login, an `enrollment_token`) must match an active row in the
+   `global_admins` table.
+
+Operators are deliberately **not** stored in the Better Auth `users` table. Operator
+and customer identities are fully isolated: a SQL injection or ORM misconfiguration
+that leaks `users` cannot expose operator credentials, because they live in a
+different table reached only by a different worker.
+
+### CF Access setup (one-time runbook)
+
+Configuring the Access application is a one-time zone task:
+
+<Steps>
+
+1. In Zero Trust, go to Access → Applications → Add → Self-hosted.
+2. Set the hostname to `admin.example.com` and leave the path empty.
+3. Choose the IdP (Google Workspace or Okta) and configure it with MFA enforced.
+4. Add a policy that allows `Email Domain @yourcompany.com` and requires the
+   authentication method to be one of `{mfa, swk, hwk, otp}`.
+5. Set the session duration to 8 hours.
+6. Copy the AUD tag and set it as the `CF_ACCESS_AUD` secret on `apps/admin`.
+
+</Steps>
+
+### Verifying the CF Access JWT
+
+The admin worker's first middleware validates the Access token against the team's
+remote JWKS before any business logic runs. Note the host-header guard on the first
+line and the three-strike JWKS reset, which lets keys rotate without letting invalid
+tokens trigger a denial-of-service by repeatedly clearing the cache:
+
+```ts title="apps/admin/src/middlewares/cf-access.ts" {2,30-35}
+import { createRemoteJWKSet, jwtVerify } from "jose";
+
+let cachedJWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
+let consecutiveFailures = 0;
+
+export const cfAccessMiddleware = createMiddleware<AdminEnv>(async (c, next) => {
+  // Defense in depth: reject if not on configured admin host (closes workers.dev bypass).
+  if (c.req.header("host") !== c.env.ADMIN_HOST) return c.text("Not Found", 404);
+
+  // Local dev short-circuit (double-gated; fails hard if misconfigured in production).
+  if (c.env.NODE_ENV === "development" && c.env.ALLOW_DEV_ADMIN_AUTH === "true" && c.env.LOCAL_DEV_ADMIN_EMAIL) {
+    c.set("accessIdentity", { sub: `local-dev-${c.env.LOCAL_DEV_ADMIN_EMAIL}`, email: c.env.LOCAL_DEV_ADMIN_EMAIL.toLowerCase().trim() });
+    return next();
+  }
+  if (c.env.NODE_ENV !== "development" && c.env.LOCAL_DEV_ADMIN_EMAIL) {
+    return c.text("Misconfigured", 500);
+  }
+
+  const token = c.req.header("cf-access-jwt-assertion");
+  if (!token) return c.json({ error: "Access token required" }, 403);
+
+  const teamDomain = c.env.CF_ACCESS_TEAM_DOMAIN.replace(/\/$/, "");
+  if (!cachedJWKS) {
+    cachedJWKS = createRemoteJWKSet(new URL(`${teamDomain}/cdn-cgi/access/certs`));
+  }
+
+  let payload;
+  try {
+    const r = await jwtVerify(token, cachedJWKS, {
+      issuer: teamDomain,
+      audience: c.env.CF_ACCESS_AUD,
+      clockTolerance: 60,
+    });
+    payload = r.payload;
+    consecutiveFailures = 0;
+  } catch {
+    // 3-strike JWKS reset to handle key rotation without enabling DoS via invalid tokens.
+    consecutiveFailures += 1;
+    if (consecutiveFailures >= 3) { cachedJWKS = null; consecutiveFailures = 0; }
+    return c.json({ error: "Invalid Access token" }, 403);
+  }
+
+  // Reject service tokens — admin panel is human-only.
+  if (!payload.email || payload.common_name || payload.type !== "org") {
+    return c.json({ error: "Identity token required" }, 403);
+  }
+  if (!payload.sub) return c.json({ error: "Identity token required" }, 403);
+
+  c.set("accessIdentity", { sub: payload.sub as string, email: (payload.email as string).toLowerCase().trim() });
+  return next();
+});
+```
+
+After the Phase C consolidation, this middleware becomes the public face of
+`authenticateOperator(...)`, described in
+[Deep Modules](/multi-tenant/deep-modules/#operator-authorization).
+
+:::caution[Why service tokens are rejected]
+A CF Access `payload.type` of `"org"` is the human identity-token shape; `"app"` is a
+service token. The admin panel is human-only, so the middleware rejects anything that
+isn't an `org`-type token with an `email` and no `common_name`.
+:::
+
+### The database gate, with enrollment tokens
+
+The second middleware looks the operator up in `global_admins` **only** by their CF
+Access `sub`. There is deliberately no email fallback: when an attacker can register
+the same email at the IdP, matching by email becomes a silent account-takeover
+vector. First-time operators instead present a one-time enrollment token, claimed
+atomically:
+
+```ts title="apps/admin/src/middlewares/global-admin.ts" {12-23}
+export const globalAdminMiddleware = createMiddleware<AdminEnv>(async (c, next) => {
+  const identity = c.get("accessIdentity");
+  const db = c.get("db");
+
+  // Lookup ONLY by CF Access sub.
+  let admin = await db.query.globalAdmins.findFirst({ where: { cfAccessSub: { eq: identity.sub } } });
+
+  // First-login: operator presents one-time enrollment token (out-of-band, 24h TTL).
+  if (!admin) {
+    const enrollmentToken = c.req.header("x-admin-enrollment-token");
+    if (enrollmentToken) {
+      const candidate = await db.query.globalAdmins.findFirst({
+        where: {
+          enrollmentToken: { eq: enrollmentToken },
+          enrollmentTokenExpiresAt: { gt: new Date() },
+          cfAccessSub: { isNull: true },
+        },
+      });
+      if (candidate && candidate.email === identity.email) {
+        // Atomic claim — race-safe: only succeeds if cf_access_sub is still NULL.
+        const result = await db.update(globalAdmins)
+          .set({ cfAccessSub: identity.sub, enrollmentToken: null, enrollmentTokenExpiresAt: null, lastActiveAt: new Date() })
+          .where(and(eq(globalAdmins.id, candidate.id), isNull(globalAdmins.cfAccessSub)));
+        if (result.rowCount === 1) admin = { ...candidate, cfAccessSub: identity.sub };
+      }
+    }
+  }
+
+  if (!admin) return c.json({ error: "Not authorized", code: "ENROLLMENT_REQUIRED" }, 403);
+  if (admin.deactivatedAt) return c.json({ error: "Account deactivated" }, 403);
+
+  c.executionCtx.waitUntil(
+    db.update(globalAdmins).set({ lastActiveAt: new Date() }).where(eq(globalAdmins.id, admin.id)),
+  );
+  c.set("globalAdmin", admin);
+  return next();
+});
+```
+
+The `ENROLLMENT_REQUIRED` code is what lets the admin SPA auto-navigate to
+`/enrollment` on a first login.
+
+:::danger[No email fallback — it's a takeover vector]
+The CF Access `payload.sub` may not be stable across an IdP reconfiguration, and the
+obvious workaround is to match operators by email instead. Don't. If an attacker can
+register the same email at the IdP, an email match silently hands them an operator
+account. Enrollment tokens, claimed atomically against a `NULL` `cf_access_sub`, are
+the safe alternative.
+:::
+
+### Provisioning a new operator
+
+A `super_admin` provisions a new operator by `POST`-ing to
+`/api/admin/global-admins` with `{ email, name, role }`. The lifecycle is an
+out-of-band token handoff:
+
+<Steps>
+
+1. The server generates an `enrollmentToken` (a cuid) and sets
+   `enrollmentTokenExpiresAt` to `now() + 24h`, then inserts the row with
+   `cfAccessSub = NULL`.
+2. The UI shows the token to the `super_admin` once (a one-time view).
+3. The `super_admin` shares the token with the new operator out-of-band — over Slack
+   or a password manager, never in the same channel as the panel URL.
+4. The new operator authenticates through CF Access at `https://admin.example.com`,
+   receives the `ENROLLMENT_REQUIRED` 403, and the SPA navigates to `/enrollment`.
+   The operator pastes the token, the browser re-fetches with the
+   `x-admin-enrollment-token` header set, and the middleware atomically claims the
+   row with the operator's `sub` and clears the token.
+
+</Steps>
+
+If a token expires unused, the `super_admin` re-issues one via
+`POST /api/admin/global-admins/{id}/reissue-enrollment`.
+
+## Operator roles
+
+Operator authority is a closed enum on `global_admins.role`. Four roles cover the
+spectrum from full control to audit-only visibility:
+
+| Role | Allowed actions |
+| --- | --- |
+| `super_admin` | All — including managing other global admins, deleting tenants, and changing roles |
+| `support` | Tenant CRUD (no delete), invite admins, support reads, feature flags, audit logs |
+| `read_only` | Tenant view and audit-log read; no mutations |
+| `security` | Read all audit logs (including admin-action logs); no mutations |
+
+A handful of separation-of-duties invariants keep the role system honest:
+
+- Only a `super_admin` can grant `super_admin` to another operator.
+- The first `super_admin` is provisioned by a one-shot migration script
+  (`scripts/seed-global-admins.ts`) — the bootstrap trust anchor.
+- An operator cannot deactivate themselves.
+- The system never allows zero active `super_admin`s.
+- A `support` admin cannot read `admin.*` audit events, only tenant-action events.
+  The `security` role has read-only access to all admin events.
+
+After Phase C, this matrix lives in `OPERATOR_PERMISSIONS` as a typed const — a single
+source of truth, described in
+[Deep Modules](/multi-tenant/deep-modules/#operator-authorization).
+
+## API surface
+
+Every operator endpoint is guarded by a named permission, checked against the
+operator's role:
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| `POST` | `/api/admin/tenants` | `tenant.create` |
+| `GET` | `/api/admin/tenants` | `tenant.list` |
+| `GET` | `/api/admin/tenants/:id` | `tenant.view` |
+| `POST` | `/api/admin/tenants/:id/suspend` | `tenant.suspend` |
+| `POST` | `/api/admin/tenants/:id/restore` | `tenant.suspend` |
+| `DELETE` | `/api/admin/tenants/:id` | `tenant.delete` |
+| `POST` | `/api/admin/tenants/:id/invitations` | `tenant.invite_admin` |
+| `GET` | `/api/admin/users` | `platform.view_audit_logs_global` (cross-tenant search; rate-limited; row-capped) |
+| `GET` | `/api/admin/audit-logs` | `platform.view_audit_logs_global` |
+| `GET` | `/api/admin/global-admins` | `platform.manage_global_admins` |
+| `POST` | `/api/admin/global-admins` | `platform.manage_global_admins` |
+| `POST` | `/api/admin/global-admins/:id/deactivate` | `platform.manage_global_admins` |
+| `POST` | `/api/admin/global-admins/:id/reissue-enrollment` | `platform.manage_global_admins` |
+| `GET` | `/api/admin/system/queues` | `platform.view_system_metrics` |
+| `GET` | `/api/admin/system/workflows` | `platform.view_system_metrics` |
+
+Mutations additionally require an `Origin: https://admin.example.com` header check —
+defense in depth above CF Access. After Phase C, each endpoint becomes a five-line
+wrapper around `tenantOperations.<method>`, described in
+[Deep Modules](/multi-tenant/deep-modules/#tenant-operations).
+
+## Operator-led onboarding
+
+This is the full flow from the moment an operator clicks Create Tenant to the moment
+the tenant admin signs in for the first time. Tenant creation crosses the perimeter
+into the admin worker, which provisions the org and an invitation, then hands the
+sign-in over to the public tenant API.
+
+<Steps>
+
+1. **The operator creates the tenant.** A `POST /api/admin/tenants` with
+   `{ slug, name, primaryAdminEmail }` validates the slug (`isValidSlug` plus
+   reserved-slug and tombstone checks), then calls
+   `env.API.createTenantOnBehalfOf(operatorId, payload)` over the service binding to
+   `apps/server`'s `AdminApiEntrypoint`. The handler inserts the organization and a
+   pending invitation in one transaction, alongside a dual-scope audit row:
+
+   ```ts title="apps/server/src/entrypoints/admin-api.ts"
+   async createTenantOnBehalfOf(operatorId, payload) {
+     return withDrizzleClient(this.env, async (db) => {
+       return db.transaction(async (tx) => {
+         const orgId = generatePrefixedCuid("org");
+         await tx.insert(organizations).values({ id: orgId, slug: payload.slug, name: payload.name });
+
+         const invitationId = generatePrefixedCuid("inv");
+         await tx.insert(invitations).values({
+           id: invitationId,
+           email: payload.primaryAdminEmail.toLowerCase().trim(),
+           inviterId: null,                    // operator is not a BA user; FK is nullable (migration)
+           organizationId: orgId,
+           role: "owner",
+           status: "pending",
+           expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),  // 48h
+         });
+
+         await auditLogService.createDualScope({
+           event: AUDIT_EVENTS.TENANT.CREATED.event,
+           actorType: "global_admin", actorId: operatorId,
+           targetType: "tenant", targetId: orgId,
+           organizationId: orgId,
+         }, tx);
+
+         return { orgId, invitationId, hostedAt: `${payload.slug}.app.example.com` };
+       });
+     }, { waitUntil: (p) => this.ctx.waitUntil(p) });
+   }
+   ```
+
+   The invitation email is sent **after** the transaction commits, with a link of the
+   form `https://{slug}.app.example.com/accept-invite/{invitationId}`.
+
+2. **The tenant admin clicks the link.** The browser hits
+   `https://acme.app.example.com/accept-invite/{id}`. `tenantMiddleware` resolves the
+   org, `apps/server` proxies to `apps/app`'s SPA over the `STATIC_ASSETS` binding,
+   and the SPA renders the public form. The `/accept-invite/:invitationId` route lives
+   **outside** the `(protected)` route group, so it loads without a session.
+
+3. **The tenant admin sets a password.** A
+   `POST /api/invitations/accept/{invitationId}` with `{ name, password }` runs the
+   server-side orchestration: it guards the invitation, creates the user via the
+   server-side admin path, signs them in, accepts the invitation, and forwards the
+   session cookie:
+
+   ```ts title="apps/server/src/modules/invitations/handler.ts" {5-13}
+   async accept(invitationId, { password, name }, c) {
+     const invitation = await loadAndGuardInvitation(invitationId, c.var.tenant.organizationId);
+
+     let user;
+     try {
+       user = await c.env.AUTH.createUser({
+         email: invitation.email, password, name, emailVerified: true,
+       });
+     } catch (err) {
+       // Recovery: a prior attempt created the user but didn't accept the invitation.
+       if (isUserAlreadyExistsError(err)) {
+         user = await c.env.AUTH.findUserByEmail(invitation.email);
+       } else { throw err; }
+     }
+
+     const signInResult = await c.env.AUTH.signInEmail({ email: invitation.email, password });
+     if (!signInResult.ok) return c.json({ error: "Invalid credentials" }, 401);
+
+     await c.env.AUTH.acceptInvitation({ headers: signInResult.headers, invitationId });
+
+     // Forward Set-Cookie back to the browser so the user is logged in immediately.
+     const cookie = signInResult.headers.get("Set-Cookie");
+     if (cookie) c.header("Set-Cookie", cookie);
+     return c.json({ redirectTo: "/dashboard" });
+   }
+   ```
+
+4. **The tenant admin lands logged in.** The browser receives a `Set-Cookie`
+   (host-only on `acme.app.example.com`) and navigates to `/dashboard`. A `member`
+   row now exists with `role: "owner"`. From here the tenant admin uses Better Auth's
+   existing `organization.invite` flow to add team members.
+
+</Steps>
+
+:::note[Why this orchestration exists]
+Better Auth's `POST /api/auth/organization/accept-invitation` requires an
+already-authenticated user with `{ invitationId }` in the body — but with
+`disableSignUp: true` there is no public sign-up path to create that user. The custom
+orchestration creates the user through the server-side admin path
+(`auth.api.createUser`, which bypasses `disableSignUp`), signs them in, accepts the
+invitation, and forwards the cookie, so the whole thing is atomic from the browser's
+point of view.
+:::
+
+### Partial-failure recovery
+
+The Drizzle `db.transaction` can't span the Better Auth RPC calls, so the
+orchestration has to be safe to retry. The risk case is `signInEmail` succeeding but
+`acceptInvitation` failing:
+
+- The invitation row is only marked `status='accepted'` **after** `acceptInvitation`
+  returns successfully. If it fails, the invitation stays `pending`.
+- The user can retry the same link. `createUser` is not idempotent — it returns
+  `USER_ALREADY_EXISTS` — so the recovery path catches that error and looks up the
+  existing user instead.
+- A recovery audit row, `org.invitation.partial_failure`, records the `user_id`
+  created without a membership so that ops can inspect it.
+
+## Gating Better Auth's `organization.create`
+
+Better Auth's organization plugin mounts `POST /api/auth/organization/create` for any
+authenticated user by default. Because tenant creation must be operator-led, the auth
+worker rejects that endpoint unconditionally:
+
+```ts title="apps/auth/src/plugins/organization-setup.ts"
+hooks: {
+  before: createAuthMiddleware(async (ctx) => {
+    if (ctx.path === "/organization/create") {
+      throw new APIError("FORBIDDEN", { message: "Tenant creation is operator-led" });
+    }
+  }),
+}
+```
+
+There's no shared secret and no header marker. Tenants are created exclusively by
+`AdminApiEntrypoint.createTenantOnBehalfOf` via direct Drizzle inserts, bypassing
+Better Auth's HTTP layer entirely.
+
+## Cross-tenant operator queries
+
+Some operator support work — "find a user by email across all tenants," for example —
+has to read across the org boundary. These are explicit admin-only handlers. They do
+**not** reuse the tenant middleware, and there is no generic "bypass tenant isolation"
+switch; the action is modeled as a platform-level operator action and guarded
+directly.
+
+Each cross-tenant read carries three constraints:
+
+- It writes a **CRITICAL audit event** in the same transaction as the `SELECT`, so it
+  cannot be buffered or lost.
+- It has a **hard row cap of 100** per query. Paginating beyond that produces a
+  separate audit event per page.
+- It's subject to a **per-operator rate limit** through the RateLimiter Durable
+  Object, partitioned by `(globalAdminId, "support_query")`, at 60 per hour.
+
+The audit row records the SQL predicate digest and the row count — not just "an
+operator queried tenant data."
+
+## Why no impersonation in v1 <Badge text="deferred to v2" variant="caution" />
+
+Operator "view as tenant admin" is the single highest-risk admin feature, so it's
+deliberately out of scope for the first version. A safe implementation needs all of:
+
+- A separate impersonation session record with a distinct cookie name.
+- A time box (30 minutes or less) and tenant scoping.
+- Read-only behavior by default, with writes requiring step-up auth.
+- Dual-rendered audit on every request — both the impersonator and the impersonated.
+- Customer-visible audit attribution.
+
+That's its own design pass. v1 ships the read-only cross-tenant support endpoints
+above instead, which cover the support use cases without the takeover surface.
+
+## Audit attribution to tenants
+
+When an operator acts on a tenant, the system writes **two** audit rows in the same
+transaction via `auditLogService.createDualScope`:
+
+- **Global view:** `actor_type: "global_admin"`, `actor_id: operator.id`,
+  `target_type: "tenant"`, `target_id: org.id`, `organization_id: NULL`.
+- **Tenant view:** `actor_type: "global_admin"`, `actor_id: operator.id`,
+  `target_type: "organization"`, `target_id: org.id`, `organization_id: org.id`.
+
+The tenant-view row is what lets tenant admins, reading their own audit log, see
+operator actions attributed with the operator's name and a "via system operator"
+label. This dual-write is a SOC 2 and customer-trust requirement.
+
+## Risk mitigations
+
+The operator surface is small but sensitive, so each threat has an explicit
+mitigation:
+
+| Threat | Mitigation |
+| --- | --- |
+| Compromised CF Access session | `deactivatedAt` check on every request (faster than CF Access cookie TTL) plus quarterly access reviews |
+| Operator privilege escalation (`support` → `super_admin`) | Only a `super_admin` can grant `super_admin` (policy gate) |
+| Operator covers their tracks | `support` cannot read `admin.*` events; `security` role has read-only access |
+| Stale CF Access token after offboarding | The `deactivatedAt` row check is authoritative; CF Access removal is the second step of the offboarding runbook |
+| Operator action invisible to the customer | Dual-write audit |
+| First-login `cfAccessSub` race | Atomic `UPDATE WHERE cf_access_sub IS NULL`; the second writer becomes a no-op |
+| Email spoofing during enrollment | Enrollment-token check plus an email cross-check at redemption |
+| `super_admin` self-deactivation | API guard rejects self-deactivation and zero-active-`super_admin`s |
+| `workers.dev` bypass | `workers_dev: false` plus the Host-header guard as the first middleware |
+| MFA bypass via a misconfigured Access policy | Unmitigable in v1 (no `amr` claim in the CF Access JWT); v2 will call the Identity API |
+
+:::danger[Operator privilege escalation]
+The dangerous failure mode is a `support` operator climbing to `super_admin`. Only an
+existing `super_admin` can grant that role, the system refuses to drop below one
+active `super_admin`, and an operator can never deactivate themselves — together these
+keep the trust anchor from being captured.
+:::
+
+## Operator-side gotchas
+
+A few sharp edges are worth keeping in mind when operating this worker:
+
+- **The CF Access JWT `iss` is the team domain *without* a trailing slash.** Normalize
+  the secret on read with `replace(/\/$/, "")` — the verification middleware does.
+- **`payload.type === "org"` is the identity-token shape; `"app"` is a service token.**
+  Reject anything else.
+- **Logout from the admin panel** is
+  `https://admin.example.com/cdn-cgi/access/logout`. It's Cloudflare-managed, so the
+  worker doesn't proxy it.
+- **The local-dev fallback must be double-gated.** `NODE_ENV` alone is insufficient —
+  it's a Wrangler `var` and can be misconfigured into production — so the bypass also
+  requires `ALLOW_DEV_ADMIN_AUTH` and a `LOCAL_DEV_ADMIN_EMAIL`, and the middleware
+  fails hard if those are set outside development.
+- **The service binding is the perimeter.** An `INTERNAL_ADMIN_TOKEN` shared secret
+  was considered and discarded as leak-prone; service bindings aren't publicly
+  reachable, so they need no extra secret.
+
+:::note[Pricing]
+The Cloudflare Access free tier (around 50 users) comfortably covers a typical ops
+team. Beyond that, per-seat pricing applies.
+:::

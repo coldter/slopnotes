@@ -1,0 +1,212 @@
+---
+title: Hono Walkthrough — Schema
+description: Shrinking the Hono template's database schema so Auther owns identity and your app keeps only its own user fields.
+sidebar:
+  order: 13
+---
+
+This page begins the concrete, file-by-file migration of the Hono/Drizzle template
+onto Auther. The starting point is the schema layer, because identity now lives
+*outside* your database. Once you adopt the [Shadow-User pattern](/auther/integration/shadow-user/),
+Auther owns sessions, accounts, credentials, two-factor secrets, and the signing
+keys — so the matching tables in your app become dead weight. The job here is to
+delete what Auther now owns, shrink the `users` table down to the projection your
+app actually reads, and let the compiler point out every place that still references
+the removed code.
+
+The walkthrough below touches four files in `packages/db`: the schema definition
+(`auth.ts`), the barrel export (`index.ts`), the ID-prefix table (`ids.ts`), and the
+Drizzle relations (`relations.ts`). The next page,
+[Hono Walkthrough — Auth Core](/auther/integration/hono-auth-core/), picks up the
+server code that these schema changes break.
+
+## Shrinking `auth.ts`
+
+The template's `auth.ts` defines a full local identity model: a wide `users` table
+plus `sessions`, `accounts`, `verifications`, `jwks`, and `two_factors`. Under
+Auther, all of those auxiliary tables disappear, and `users` collapses to a thin
+local projection of the identity Auther vends. The `id` column is the most important
+change — it stops generating its own prefixed CUID and instead stores Auther's `sub`
+verbatim.
+
+Before — the current Hono template file:
+
+```ts title="packages/db/src/schema/auth.ts"
+export const users = pgTable("users", {
+  id: varchar("id", { length: 255 })
+    .primaryKey()
+    .$defaultFn(() => generatePrefixedCuid(ID_PREFIXES.user)),
+  name: text("name").notNull(),
+  email: text("email").notNull().unique(),
+  emailVerified: boolean("email_verified").default(false).notNull(),
+  image: text("image"),
+  createdAt: timestamp(...).defaultNow().notNull(),
+  updatedAt: timestamp(...).defaultNow().$onUpdate(...).notNull(),
+  status: text("status").default("active").notNull(),
+  deactivatedAt: timestamp(...),
+  deactivatedBy: varchar("deactivated_by", { length: 255 }),
+  deactivatedReason: text("deactivated_reason"),
+  failedLoginAttempts: integer(...).default(0).notNull(),
+  lockedUntil: timestamp(...),
+  roleSlugs: text("role_slugs").array().default([]).notNull(),
+  onboardingCompletedAt: timestamp(...),
+  twoFactorEnabled: boolean(...).default(false).notNull(),
+});
+
+export const sessions = pgTable("sessions", {...});       // DELETE
+export const accounts = pgTable("accounts", {...});       // DELETE
+export const verifications = pgTable("verifications", {...}); // DELETE
+export const jwkss = pgTable("jwks", {...});              // DELETE
+export const twoFactors = pgTable("two_factors", {...});  // DELETE
+```
+
+After — only the local projection remains:
+
+```ts title="packages/db/src/schema/auth.ts" {7}
+import { boolean, pgTable, text, timestamp, varchar } from "drizzle-orm/pg-core";
+
+export const users = pgTable("users", {
+  id: varchar("id", { length: 255 }).primaryKey(),                // ← Auther's sub, no $defaultFn
+  name: text("name").notNull(),
+  email: text("email").notNull().unique(),
+  emailVerified: boolean("email_verified").default(false).notNull(),
+  image: text("image"),
+
+  // App-only fields
+  onboardingCompletedAt: timestamp("onboarding_completed_at", { withTimezone: true }),
+
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .defaultNow()
+    .$onUpdate(() => new Date())
+    .notNull(),
+});
+
+// sessions, accounts, verifications, jwks, two_factors: all removed.
+```
+
+Notice what stays: `name`, `email`, `emailVerified`, and `image` are kept as a
+convenient local mirror of Auther's identity claims, and `onboardingCompletedAt` is
+a genuinely app-owned field that has no home in Auther. Everything tied to *how* a
+user authenticates — lockout counters, status flags, two-factor enablement, role
+slugs — moves to Auther.
+
+The schema change produces a Drizzle migration that drops the auxiliary tables and
+the now-orphaned columns. The generated SQL should look like this:
+
+```sql
+-- drop auth tables owned by Auther now
+DROP TABLE IF EXISTS "two_factors" CASCADE;
+DROP TABLE IF EXISTS "jwks" CASCADE;
+DROP TABLE IF EXISTS "verifications" CASCADE;
+DROP TABLE IF EXISTS "accounts" CASCADE;
+DROP TABLE IF EXISTS "sessions" CASCADE;
+
+-- shrink users
+ALTER TABLE "users" DROP COLUMN IF EXISTS "status";
+ALTER TABLE "users" DROP COLUMN IF EXISTS "deactivated_at";
+ALTER TABLE "users" DROP COLUMN IF EXISTS "deactivated_by";
+ALTER TABLE "users" DROP COLUMN IF EXISTS "deactivated_reason";
+ALTER TABLE "users" DROP COLUMN IF EXISTS "failed_login_attempts";
+ALTER TABLE "users" DROP COLUMN IF EXISTS "locked_until";
+ALTER TABLE "users" DROP COLUMN IF EXISTS "role_slugs";
+ALTER TABLE "users" DROP COLUMN IF EXISTS "two_factor_enabled";
+```
+
+What deliberately does *not* change are the foreign keys pointing at `users.id`.
+Because the `id` column keeps the same type and value (Auther's `sub` is still a
+string primary key), every existing relationship survives untouched:
+
+| Reference | Target | Status |
+|-----------|--------|--------|
+| `notifications.user_id` | `users.id` | same FK, works unchanged |
+| `push_tokens.user_id` | `users.id` | same |
+| `notification_preferences.user_id` | `users.id` | same |
+| `audit_logs.actor_id` | `users.id` | same |
+| `members.user_id` | `users.id` | same (org memberships) |
+| `auth_relations.subject_id` | — | plain text, no FK, unchanged |
+
+:::caution[Migration hazard]
+`DROP TABLE sessions` will fail if live sessions are referenced elsewhere. There are
+none in this template, but check your branch before running it. Apply this migration
+as part of the planned cutover, not mid-traffic.
+:::
+
+## Removing the barrel exports
+
+`index.ts` re-exports the schema. The line itself does not change — but what flows
+through it does, because `auth.ts` now exports only `users`.
+
+```ts title="packages/db/src/schema/index.ts"
+// before
+export * from "./auth";   // exports users, sessions, accounts, verifications, jwkss, twoFactors
+
+// after
+export * from "./auth";   // exports only users now — same line, different contents
+```
+
+:::note[Let the compiler find the dead references]
+Anywhere in the codebase that still imports `sessions` or `accounts` from
+`@repo/db/schema` now produces a compile error. That is exactly what you want: the
+errors are a complete, machine-checked inventory of every dead reference the
+migration leaves behind. The next page walks through fixing them in `apps/server`.
+:::
+
+## Pruning ID prefixes
+
+`ids.ts` holds the prefix table used to mint local CUIDs. Auther now generates user
+IDs, so the `user` prefix is dead, along with the prefixes for the auxiliary tables
+you just deleted. Keep the prefixes your app still owns.
+
+```ts title="packages/db/src/ids.ts"
+// before
+export const ID_PREFIXES = {
+  user: "usr",
+  session: "ses",       // UNUSED
+  account: "act",       // UNUSED
+  verification: "ver",  // UNUSED
+  relation: "rel",
+  notification: "ntf",
+  ...
+};
+
+// after
+export const ID_PREFIXES = {
+  // user prefix unused now — Auther generates IDs
+  relation: "rel",
+  notification: "ntf",
+  ...
+};
+```
+
+## Trimming the user relations
+
+Finally, `relations.ts` declares Drizzle relations from `users` to the tables that
+referenced it. Drop the relations to `sessions`, `accounts`, and `twoFactors` — those
+tables no longer exist — and keep the app-owned ones.
+
+```ts title="packages/db/src/relations.ts"
+// before
+export const usersRelations = relations(users, ({ many }) => ({
+  sessions: many(sessions),
+  accounts: many(accounts),
+  twoFactors: many(twoFactors),
+  notifications: many(notifications),
+  memberships: many(members),
+  ...
+}));
+
+// after
+export const usersRelations = relations(users, ({ many }) => ({
+  notifications: many(notifications),
+  memberships: many(members),
+  pushTokens: many(pushTokens),
+  notificationPreferences: many(notificationPreferences),
+}));
+```
+
+With the schema layer reduced to a thin local projection, the database no longer
+pretends to own identity. The compile errors surfaced by the trimmed exports are the
+to-do list for the next step: [Hono Walkthrough — Auth Core](/auther/integration/hono-auth-core/),
+where you replace the local better-auth instance with JWT verification against
+Auther.

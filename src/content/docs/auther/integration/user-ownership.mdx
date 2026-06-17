@@ -1,0 +1,115 @@
+---
+title: Who Owns the User Row?
+description: The central question of integrating a centralized IdP into an app that already has a users table — and a per-column source-of-truth model that answers it.
+sidebar:
+  order: 10
+---
+
+When you adopt a centralized identity provider like Auther, you stop owning
+authentication. The IdP runs sign-up, sign-in, password hashes, 2FA, session
+tokens, and key rotation. Your app gets a signed JWT with claims, and that's it.
+(If you haven't yet, the [Auther overview](/auther/overview/) explains what the
+server itself does.)
+
+The trouble is that your app database is not a blank slate. It already has a
+`users` table and a web of foreign keys pointing at it. This page is about the one
+decision that makes the whole integration tractable: for every piece of data on the
+user row, deciding who is allowed to be the source of truth.
+
+## What you already have
+
+In the running reference example — the `hono-node-template-2026` monorepo — the
+schema you start with looks like this. The auth-related tables come straight from
+better-auth; the rest are ordinary domain tables with foreign keys back to
+`users.id`.
+
+```sql title="packages/db/src/schema/auth.ts"
+users              (id, email, name, emailVerified, image, status, roleSlugs, ...)
+sessions           (user_id → users.id  ON DELETE CASCADE, platform, activeOrganizationId, ...)
+accounts           (user_id → users.id  ON DELETE CASCADE, password, providerId, ...)
+verifications      (identifier, value, expiresAt)
+two_factors        (user_id → users.id  ON DELETE CASCADE)
+jwks               (public_key, private_key, ...)
+```
+
+```sql title="packages/db/src/schema/*"
+notifications              (user_id → users.id  ON DELETE CASCADE)
+push_tokens                (user_id → users.id  ON DELETE CASCADE)
+notification_preferences   (user_id → users.id  ON DELETE CASCADE)
+audit_logs                 (actor_id → users.id)
+organizations              (owner_id → users.id)
+members                    (user_id, org_id)
+auth_relations             (subject_id, object_id, relation)  -- plain text
+```
+
+And your application code is riddled with references that assume those rows exist
+locally — filters, lookups, cascading deletes, and the helper that turns a user into
+a principal:
+
+```ts
+// apps/server/src/modules/notifications/service.ts
+const conditions: SQL[] = [eq(notifications.userId, userId)];
+
+// apps/server/src/modules/users/service.ts
+db.query.users.findFirst({ where: eq(users.id, id) });
+
+// apps/server/src/modules/auth/instance.ts
+await db.delete(schema.sessions).where(eq(schema.sessions.userId, session.userId));
+
+// apps/server/src/auth/middleware.ts
+const principal = principalFromUser(c.get("user"));
+```
+
+Now Auther wants to run identity. The instinct is to reach for one of two
+shortcuts — and both are traps.
+
+## The two tempting shortcuts (both wrong)
+
+:::caution[Don't drop the `users` table]
+The first reaction is to delete the local `users` table entirely, since Auther owns
+identity now. But you lose every FK cascade, every `INNER JOIN users` in code like
+`apps/server/src/modules/users/handler.ts`, and every `user.name` display lookup.
+The refactor stretches into weeks, and the bug surface is a sea of orphaned rows.
+:::
+
+:::caution[Don't bolt Auther on the side]
+The opposite reaction is to keep everything as-is and run Auther alongside the
+existing database untouched. Now you have two identity stores drifting apart. An
+email changed in Auther? Your app still shows the old one. A user banned in Auther?
+Your app still lets them in on a cached JWT.
+:::
+
+## Frame it as ownership, column by column
+
+The way out is neither "all Auther" nor "all local." The correct framing is
+**ownership**: for each column on the user row, pick a single source of truth. Some
+fields are pure identity and belong to Auther; some are pure product state and stay
+in your app; a few are genuinely split.
+
+| Column                     | Authoritative in | Notes                                                |
+| -------------------------- | ---------------- | ---------------------------------------------------- |
+| `id`                       | Auther           | Local row uses Auther's ID verbatim as PK            |
+| `email`, `emailVerified`   | Auther           | Your app mirrors for joins/display                   |
+| `name`, `image`            | Auther           | Your app mirrors                                     |
+| password / argon2id hash   | Auther           | Your app never stores                                |
+| 2FA secret / backup codes  | Auther           | Your app never stores                                |
+| `status` (active/inactive) | Auther           | Auther's admin plugin (`banned` + `banReason`)       |
+| `failedLoginAttempts`      | Auther           | Auther's login-security plugin                       |
+| `lockedUntil`              | Auther           | Same                                                 |
+| `twoFactorEnabled`         | Auther           | Inferable from Auther's userinfo endpoint            |
+| `onboardingCompletedAt`    | **Your app**     | Pure product state; Auther doesn't know about it     |
+| `notificationPreferences`  | **Your app**     | Your app                                             |
+| `roleSlugs`                | Split            | Platform roles → Auther; app-domain roles → your app |
+| `activeOrganizationId`     | **Your app**     | Tenant selection is an app concern (see the [Edge Cases Catalog](/auther/integration/edge-cases/)) |
+
+:::note[Why this works]
+The mirrored columns (`email`, `name`, `image`) keep your joins and display lookups
+fast and local, while Auther stays the authority that can change them — you just
+have to keep the mirror fresh. The columns marked "Your app" are data Auther has no
+opinion about, so there's nothing to sync. Once every column has exactly one owner,
+schema design, the sync mechanism, and the failure modes all follow mechanically.
+:::
+
+With ownership decided, the next question is structural: should a local `users`
+table exist at all, and if so, what lives in it? That's the subject of the
+[four integration archetypes](/auther/integration/archetypes/).

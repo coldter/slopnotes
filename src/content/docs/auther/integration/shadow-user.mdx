@@ -1,0 +1,192 @@
+---
+title: The Shadow-User Pattern
+description: How a local users table mirrors Auther via JIT provisioning and webhooks, keeping foreign keys intact while identity stays centralized.
+sidebar:
+  order: 12
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps } from "@astrojs/starlight/components";
+
+When you adopt a centralized identity provider, your app no longer owns the user
+record — Auther does. But most applications still have a `users` table that other
+tables point at with foreign keys, that joins rely on, and that cascade deletes walk.
+The shadow-user pattern reconciles those two facts: it keeps a **local mirror** of
+Auther's user, populated and kept current automatically, so every existing FK and
+`INNER JOIN users` keeps working while identity itself lives in Auther.
+
+This page is the mechanism in the abstract — framework-agnostic. The next chapter,
+[Hono Walkthrough — Schema](/auther/integration/hono-schema/), applies it to a
+concrete Drizzle/Hono codebase file by file.
+
+## The four moving parts
+
+A shadow-user integration is four cooperating pieces. Keep the responsibilities
+separate — that separation is what keeps the request hot path fast and the data
+eventually consistent.
+
+1. **Auth middleware** — verifies JWTs on every request and attaches the user
+   principal to the request context.
+2. **JIT provisioner** — on the first request for a user not yet in the shadow
+   table, inserts a shadow row from the JWT claims.
+3. **Webhook receiver** — listens for Auther's lifecycle events, keeps the shadow
+   row current, and cascades deletes.
+4. **Reconciliation job** (optional) — a nightly safety net for any webhooks that
+   were missed.
+
+Visually, identity flows one way: Auther is the source, webhooks (and the
+just-in-time path) keep the shadow copy current, and everything downstream hangs off
+the shadow row's primary key by foreign key.
+
+<Mermaid title="Shadow-user sync" height={420} code={`
+flowchart LR
+  subgraph Auther["Auther (source of truth)"]
+    AU["users<br/>id · email · name"]
+  end
+  subgraph App["Your app (e.g. a Hono server)"]
+    SU["users (shadow)<br/>id = Auther sub<br/>email, name (cache)<br/>+ onboardingDone"]
+    DOWN["notifications · push_tokens<br/>audit_logs · members · ..."]
+  end
+  AU -->|"webhook sync"| SU
+  SU -->|"FK"| DOWN
+`} />
+
+## ID strategy: use Auther's `sub` verbatim
+
+The single most important schema decision is also the most boring one: the shadow
+row's primary key is Auther's user ID, full stop. No local CUID, no separate
+`external_id` column, no mapping table. The `sub` claim from the JWT *is*
+`users.id`.
+
+Three reasons make this worth committing to:
+
+- **Joins stay trivial.** A column like `notifications.user_id` points straight at
+  the shadow row and matches `jwt.sub` in a single step — no indirection.
+- **There is no dual-write problem.** If Auther and your app could ever disagree
+  about a user's ID, that disagreement would be a bug. Using `sub` directly makes
+  the disagreement impossible to express.
+- **Bulk operations stay simple.** `DELETE FROM users WHERE id = ?` keyed on `sub`
+  is the exact same operation as handling a `user.deleted` webhook.
+
+## JIT provisioning
+
+The first time your app sees a valid JWT for a user who isn't in the shadow table
+yet, it inserts them. This is the just-in-time path: it makes a brand-new user
+serviceable on their very first request, before any webhook could have arrived.
+
+The claims you read off the JWT have a fixed shape, and the provisioner is a single
+insert-or-fetch:
+
+```ts title="apps/server/src/modules/auth/shadow.ts"
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { users } from "@repo/db/schema";
+
+export interface AutherClaims {
+  sub: string;
+  iss: string;
+  aud: string | string[];
+  exp: number;
+  iat: number;
+  email?: string;
+  email_verified?: boolean;
+  name?: string;
+  picture?: string;
+  permissions?: Record<string, string[]>;
+  abac_required?: Record<string, string[]>;
+  sid?: string;
+}
+
+export async function ensureShadowUser(claims: AutherClaims) {
+  const existing = await db.query.users.findFirst({
+    where: eq(users.id, claims.sub),
+  });
+  if (existing) return existing;
+
+  const [inserted] = await db
+    .insert(users)
+    .values({
+      id: claims.sub,                                     // ← Auther's ID
+      email: claims.email ?? `${claims.sub}@unknown.local`,
+      name: claims.name ?? claims.email ?? claims.sub,
+      emailVerified: claims.email_verified ?? false,
+      image: claims.picture ?? null,
+    })
+    .onConflictDoNothing()
+    .returning();
+
+  return inserted ?? (await db.query.users.findFirst({
+    where: eq(users.id, claims.sub),
+  }))!;
+}
+```
+
+Three details in that function carry the design:
+
+- **`onConflictDoNothing()`** handles the race where two concurrent first-requests
+  both try to insert the same user. One insert wins; the other falls through to the
+  re-select at the bottom.
+- **Fallback values** keep a request serviceable even if the JWT is missing a claim
+  — note the `${claims.sub}@unknown.local` synthetic email. The next webhook
+  corrects the row.
+- **Insert-only** keeps the hot path fast. The JIT path never updates an existing
+  row; updates belong to webhooks.
+
+## The webhook receiver: three invariants, in order
+
+The JIT path creates the row; webhooks keep it current and cascade deletes. Auther
+delivers `user.created`, `user.updated`, and `user.deleted` events to a receiver
+endpoint in your app. That endpoint is exposed to the internet, so it must validate
+every payload before trusting it — and the validation steps have to run in a strict
+order.
+
+<Steps>
+
+1. **Signature** — verify the HMAC-SHA256 signature with a constant-time compare.
+   Never parse JSON out of an unverified payload.
+2. **Timestamp** — reject anything more than five minutes old. This blocks replay
+   of a captured payload.
+3. **Idempotency** — `SETNX` the `x-webhook-id` in Redis. Auther's QStash retries
+   on any 5xx you return, so deduping is what prevents a retried event from being
+   applied twice.
+
+</Steps>
+
+:::caution[Order matters]
+Each check assumes the previous one passed. Parsing or persisting before the
+signature check trusts attacker-controlled bytes; skipping the timestamp check
+reopens replay; skipping idempotency means a retried delivery double-applies. The
+concrete receiver implementation appears in the Hono walkthrough.
+:::
+
+## Reconciliation
+
+Webhooks drop occasionally — during deploys, on transient database errors, or when
+the idempotency cache is wiped. A nightly reconciliation job (or a manual "resync"
+button) pulls the current state from Auther and fixes any silent drift. It's the
+optional fourth moving part: cheap insurance against the rare missed event rather
+than something the request path depends on.
+
+## Permission sync: read-at-request vs. webhook-sync
+
+Authentication tells you *who* the user is; authorization tells you *what* they can
+do. There are two ways to get permissions into your app, and they aren't mutually
+exclusive.
+
+- **Read from the JWT at request time** (recommended). The token already carries a
+  `permissions` claim. Your middleware attaches it, and routes read from it. No
+  local permissions table is needed.
+- **Webhook-sync into a local table** such as `auth_relations`. This is useful when
+  you need admin-style queries like "list every user with `admin` on org X" that a
+  per-request JWT can't answer. Do this *in addition to* reading from the JWT, not
+  instead of it.
+
+Most apps start with read-at-request and add the local table only when the first
+admin feature actually needs it.
+
+---
+
+This is the pattern in the abstract. With the four parts, the ID rule, and the
+webhook invariants in hand, the next chapter grounds all of it in a real codebase —
+see [Hono Walkthrough — Schema](/auther/integration/hono-schema/) for the
+file-by-file migration.

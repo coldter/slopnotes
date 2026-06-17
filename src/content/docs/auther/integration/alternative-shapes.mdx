@@ -1,0 +1,210 @@
+---
+title: Alternative System Shapes
+description: How to apply the archetype matrix and Shadow-User mechanism to pure APIs, SPAs, meshes, multi-tenant SaaS, mobile, jobs, and legacy migrations.
+sidebar:
+  order: 19
+---
+
+import { Steps } from "@astrojs/starlight/components";
+
+The file-by-file Hono walkthrough is one concrete shape: an FK-heavy monolith that
+already owns its `users` table. Most other applications are a subset or a variation
+of it, and you don't need a new mental model for each one. Pick the right row of the
+[archetype matrix](/auther/integration/archetypes/), then apply the same mechanisms —
+JWT verification, the Shadow-User sync, the API-key exchange — in the proportions
+that shape demands. This page walks through eight common shapes and shows which
+pieces each one keeps and which it drops.
+
+## Pure-API backend (stateless microservice)
+
+A service that reads and writes orders, is called only by other services, never
+renders UI, and has no reason to keep a `users` table. There is nothing to mirror,
+so the Shadow-User table simply disappears.
+
+- **Archetype:** Federated-IDs + Full-Delegation.
+- **Users table:** none.
+- **Middleware:** verify the JWT, then attach `userId` and `permissions` to the
+  request context.
+- **JOINs against users:** they never happen. When a display name is needed, a
+  backend-for-frontend higher up the stack fetches it from Auther's `/userinfo`
+  endpoint.
+- **Code you write:** a single middleware, on the order of 100 lines. That is the
+  whole integration.
+
+```go
+// Works with chi, gin, or echo.
+func JWT(next http.Handler) http.Handler {
+  return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+    claims, err := verifyToken(token) // uses go-jose JWKS auto-refresh
+    if err != nil {
+      http.Error(w, "unauthorized", 401)
+      return
+    }
+    ctx := context.WithValue(r.Context(), "claims", claims)
+    next.ServeHTTP(w, r.WithContext(ctx))
+  })
+}
+```
+
+## SPA with no backend
+
+A pure-browser Vue or React app that calls third-party APIs directly, with no server
+of its own to hold tokens. Without a confidential server, the browser is the client,
+so it runs the public PKCE flow.
+
+- **Archetype:** public PKCE client.
+- **Tokens:** the access token lives in memory; a refresh token only if Auther
+  issues one for public clients.
+- **Silent refresh:** a hidden iframe hitting `/authorize` with `prompt=none` and
+  `response_mode=query`, or the refresh-token flow.
+- **Code you write:** roughly a 150-line `authClient.ts` exposing `login`, `logout`,
+  `getToken`, and `isAuthenticated`. Reach for `oidc-client-ts` rather than
+  hand-rolling it.
+
+## Monolith with FK-heavy user dependencies
+
+This is the shape the rest of Part 2 covers in full: a monolith whose schema is
+threaded with foreign keys back to a local `users` table. The
+[Hono walkthrough](/auther/integration/hono-schema/) is the worked example, from
+shrinking the schema through to the safe cutover, so there is nothing new to add
+here — Shadow-User plus Full-Delegation is the answer.
+
+## Microservice mesh
+
+Three services — billing, inventory, notifications — sharing one Auther, where no
+service owns user rows because they all rely on federated IDs. The interesting
+question is how to verify tokens cheaply when every request fans out across
+services.
+
+- **Archetype:** Federated-IDs in each service + Full-Delegation, backed by a shared
+  verification library.
+- **Shared package:** an `@company/auth-middleware` package that bundles the JWKS
+  cache, the verify step, and the context attach. Every service imports the same one.
+- **API gateway:** an edge gateway (Envoy, Traefik, or a managed API Gateway)
+  validates the JWT once and forwards trusted headers such as `x-user-id` and
+  `x-permissions`. Downstream services trust those headers because the gateway is the
+  only ingress, which saves a JWT verification on every service hop.
+- **Cross-service calls:** relay the user's existing JWT rather than inventing a
+  separate service-to-service scheme. For system-to-system calls that carry no user
+  context, use the API-key exchange flow instead.
+- **Hot-path authorization:** read permissions straight from the JWT claims locally.
+  ABAC decisions go through `/check-permission`, but a well-designed hot path avoids
+  ABAC-gated permissions on principle.
+
+:::caution[Cache-stampede on `/jwks`]
+If every service refreshes JWKS independently, they can stampede Auther's `/jwks`
+endpoint. Set a sensible `cacheMaxAge` and prefer gateway-only verification so the
+fleet shares one cache instead of each node fetching its own.
+:::
+
+## Multi-tenant SaaS
+
+A B2B SaaS where each customer is a tenant with its own users, resources, and
+permission model. The challenge is isolating tenants while keeping the JWT small,
+and Auther's client-scoped entity types and per-tenant authorization models do most
+of the work.
+
+- **Archetype:** Shadow-User + Full-Delegation, with a separate authorization model
+  per tenant inside Auther.
+- **Per-tenant entity types:** scope them to the client, for example
+  `tenant_acme:project`, `tenant_acme:invoice`, and `tenant_acme:report`.
+- **Per-tenant client:** give each tenant its own OAuth client for stronger
+  isolation, or use one shared client with tenant-routed JWT claims for a simpler
+  setup.
+- **Users in multiple tenants:** the JWT `permissions` claim reflects only the
+  currently active tenant, so switching tenants re-issues the token (the new claims
+  are injected by an Auther pipeline). This keeps the token small.
+- **Registration contexts:** one per tenant, keyed to an email domain. A user with
+  an `@acme.com` address who authorizes through the acme client can be auto-granted
+  `tenant_acme:project:viewer` across all projects.
+- **Invites:** lean on Auther's platform invite table, which issues HMAC-signed,
+  email-locked tokens.
+- **Shadow sync:** the ordinary lifecycle webhooks, unchanged.
+
+:::note[A different multi-tenant course]
+This is multi-tenancy *as a client of Auther*. If you're designing multi-tenant
+infrastructure on the edge from scratch, the companion course
+[Multi-Tenant SaaS on Cloudflare](/multi-tenant/overview/) covers a different stack.
+:::
+
+## Mobile app with a backend
+
+An iOS or Android client talking to a Hono-style API. It is the monolith shape with
+device-specific token handling layered on top: PKCE on the device and refresh tokens
+held in secure storage.
+
+- **Archetype:** same as the FK-heavy monolith, plus on-device PKCE and refresh
+  tokens.
+- **Client:** a public PKCE client with a custom-scheme redirect such as
+  `myapp://auth/callback`.
+- **Tokens:** keep the access token in memory or the Keychain; keep the refresh
+  token in the Keychain or EncryptedSharedPreferences.
+- **Rotation:** Auther may rotate the refresh token on each use, so your mobile SDK
+  must persist the new one every time it refreshes.
+- **Offline mode:** cache the last token; if it has expired and there is no network,
+  fall back to a "reconnect" UX.
+- **Biometric gate:** gate reading the refresh token from the Keychain behind a local
+  FaceID or TouchID check. This is entirely on-device — Auther never sees it.
+
+## Background jobs, cron, and CI
+
+A nightly "send weekly summary" job, a CI pipeline that deploys by calling your API,
+or a data pipeline. None of these has an interactive user, so they authenticate as
+machines through the API-key-to-JWT exchange.
+
+- **Archetype:** API key exchanged for a JWT.
+- **One key per job:** name each key for what it does — `cron:weekly-summary`,
+  `ci:deploy-pipeline` — so the audit trail reads clearly.
+- **Minimum tuples:** grant only the access the job needs, for example
+  `(notifications, *, sender, apikey, <id>)`.
+- **In the job code:** exchange the key for a JWT, cache it for about 14 minutes, and
+  refresh on demand.
+- **Audit:** Auther records the API-key activity, and your app's audit log carries
+  the `principal.apiKeyId` alongside it.
+
+## Legacy migration with gradual cutover
+
+A Rails-plus-Devise monolith with 500k users that has to move onto Auther with zero
+downtime. The key is dual-path middleware that accepts both the old and new
+credentials at once, so the cutover is a sequence of safe, reversible phases rather
+than a single switch.
+
+<Steps>
+
+1. **Stand up Auther and bulk-import users.** No user-facing change yet; the new
+   identity provider runs alongside the old one.
+
+2. **Deploy dual-path middleware.** It accepts both a Devise session and an Auther
+   JWT, and you flip the login button to point at Auther.
+
+3. **Monitor and drain.** Let the old Devise sessions expire naturally over the
+   following days while watching the metrics.
+
+4. **Remove the old path.** Delete the Devise middleware, drop the Devise gems, and
+   drop the legacy auth tables.
+
+</Steps>
+
+```ruby
+# Phase 2: middleware accepts either credential.
+def authenticate
+  if (jwt = bearer_token(request))
+    @principal = verify_auther_jwt(jwt) # new path
+  elsif (session = devise_session)
+    @principal = principal_from(session) # legacy path, drained in phase 3
+  else
+    head :unauthorized
+  end
+end
+```
+
+:::tip[Password migration]
+Forcing a password reset by email is the cleanest way to migrate credentials: a
+one-time hit to the user experience, and then it is done forever.
+:::
+
+Every shape on this page is the same exercise — choose the matching row of the
+[archetype matrix](/auther/integration/archetypes/), then apply the mechanisms from
+the [Shadow-User pattern](/auther/integration/shadow-user/) in the proportions that
+shape calls for.

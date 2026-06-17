@@ -1,0 +1,200 @@
+---
+title: DX Stack, Libraries & Testing
+description: The minimal library set, shared-package layout, copy-paste Hono middleware, test strategy, observability, and a rollout flag for integrating Auther.
+sidebar:
+  order: 18
+---
+
+import { FileTree } from "@astrojs/starlight/components";
+
+Integrating a centralized IdP tempts you toward a pile of helper libraries and a
+bespoke "Auther SDK." Resist it. The whole integration is roughly two hundred lines
+of `jose` plus a webhook handler, and the smaller you keep the surface, the less
+there is to drift out of sync with Auther. This page collects the minimal stack that
+gets you to production: the libraries worth depending on, the package layout that
+keeps the code in one place, a copy-paste Hono middleware factory, a test strategy
+that never needs a running Auther, the signals to emit, and a feature flag that lets
+you roll out — and roll back — safely.
+
+## The library set
+
+This is the smallest set that gets you production-ready. Most of these you already
+have in a Hono monorepo; the rest are focused, tree-shakable dependencies rather than
+frameworks.
+
+| Purpose | Library | Why |
+|---------|---------|-----|
+| JWT verification + JWKS cache | `jose` | Auto-rotating, tree-shakable |
+| Web framework | Hono (you already have it) | — |
+| Webhook signature | `node:crypto` (stdlib) | Constant-time compare, no deps |
+| Webhook idempotency | `ioredis` / Upstash Redis | `SETNX` with TTL |
+| Claim schema validation | `zod` (you already have it) | Catches Auther schema drift |
+| OIDC client (SPA/web) | `oidc-client-ts`, `oauth4webapi` | Avoid rolling your own PKCE |
+| Mobile OIDC | AppAuth (iOS/Android) | Platform-native |
+
+:::caution[Do not add these]
+Three "obvious" dependencies are traps — each one wraps something that is already
+small or already done:
+
+- **A dedicated "Auther SDK."** The integration is about two hundred lines of `jose`
+  plus a webhook handler. A wrapper just adds a version to keep in lockstep.
+- **A permissions wrapper over JWT claims.** Read the claim — that *is* the API. The
+  permission map ships inside the verified token; there is nothing to abstract.
+- **A session manager.** You have JWTs. There is no server-side session to manage.
+:::
+
+## A shared integration package
+
+In the Hono monorepo, consolidate every piece of integration code into a single
+package so that `apps/web`, `apps/server`, and your cron workers all import from one
+place. Keeping verification, shadow-user creation, and the webhook router together
+means a change to the claim shape lands in exactly one file.
+
+<FileTree>
+- packages/
+  - auther-client/
+    - src/
+      - verify.ts JWKS + `verifyAutherToken`
+      - shadow.ts `ensureShadowUser` (parameterized over db/table)
+      - webhook.ts reusable webhook router factory
+      - hono.ts `authContextMiddleware` factory for Hono
+      - admin.ts `autherAdmin` (`banUser`, `updateUser`, `impersonate`)
+      - types.ts `AutherClaims`, `WebhookEvent`
+      - env.ts env schema fragment
+    - package.json
+</FileTree>
+
+Each consumer pulls only what it needs: `apps/server` imports `hono`, `webhook`, and
+`admin`; `apps/web` imports `verify` if it does its own token verification; cron jobs
+import `admin`.
+
+## A copy-paste Hono middleware factory
+
+The middleware is the heart of the server-side integration. It reads the `Bearer`
+token, verifies it against the JWKS, resolves (or just-in-time creates) the local
+shadow user, and stashes both the user and a derived session on the Hono context. It
+is generic over your own `User` type — note the backticked `autherAuth<User>`
+signature — so it drops into any schema:
+
+```ts title="packages/auther-client/src/hono.ts"
+import { createMiddleware } from "hono/factory";
+import type { AutherClaims } from "./types";
+import { verifyAutherToken } from "./verify";
+
+export interface AutherMiddlewareOptions<User> {
+  requireAuth?: boolean;
+  getUser: (sub: string) => Promise<User | null>;
+  createUser: (claims: AutherClaims) => Promise<User>;
+}
+
+export function autherAuth<User>(opts: AutherMiddlewareOptions<User>) {
+  return createMiddleware(async (c, next) => {
+    const header = c.req.header("Authorization");
+    if (!header?.startsWith("Bearer ")) {
+      if (opts.requireAuth) return c.json({ error: "unauthenticated" }, 401);
+      c.set("user", null); c.set("session", null);
+      return next();
+    }
+    try {
+      const claims = await verifyAutherToken(header.slice(7));
+      const user = (await opts.getUser(claims.sub)) ?? (await opts.createUser(claims));
+      c.set("user", user);
+      c.set("session", {
+        id: claims.sid ?? claims.sub,
+        userId: claims.sub,
+        permissions: claims.permissions ?? {},
+        abacRequired: claims.abac_required ?? {},
+        expiresAt: new Date(claims.exp * 1000),
+      });
+      return next();
+    } catch {
+      if (opts.requireAuth) return c.json({ error: "invalid token" }, 401);
+      c.set("user", null); c.set("session", null);
+      return next();
+    }
+  });
+}
+```
+
+Wiring it into the app is two lines — pass your own data-access functions for
+resolving and creating the user:
+
+```ts title="apps/server/src/index.ts"
+app.use("/api/*", autherAuth({
+  getUser: (id) => db.query.users.findFirst({ where: eq(users.id, id) }),
+  createUser: (claims) => ensureShadowUser(claims),
+}));
+```
+
+## Testing without a live Auther
+
+The test strategy splits along the same seams as the code. Unit tests should never
+reach the network; integration tests get a real token from a containerized Auther;
+webhook tests forge their own signed payloads.
+
+**Unit tests** mint their own tokens. Generate a local RS256 keypair, sign test
+tokens with `jose.SignJWT`, and stub `createRemoteJWKSet` to return your local public
+key. That gives you deterministic fixtures with no dependency on a running server. A
+small `makeTestToken` helper keeps the call sites clean:
+
+```ts title="apps/server/test/helpers/make-test-token.ts"
+import { SignJWT, generateKeyPair, exportJWK } from "jose";
+
+const { privateKey, publicKey } = await generateKeyPair("RS256");
+const jwk = await exportJWK(publicKey);
+jwk.kid = "test-key-1";
+// In test setup, stub createRemoteJWKSet to return { keys: [jwk] }
+
+export async function makeTestToken(claims: Partial<AutherClaims>) {
+  return new SignJWT({ sub: "usr_test", permissions: { "user": ["read"] }, ...claims })
+    .setProtectedHeader({ alg: "RS256", kid: "test-key-1" })
+    .setIssuedAt().setExpirationTime("1h")
+    .setIssuer(process.env.AUTHER_ISSUER!).setAudience(process.env.AUTHER_AUDIENCE!)
+    .sign(privateKey);
+}
+```
+
+**Integration tests** stand up the real thing: a `docker-compose` with Auther, your
+Hono app, and Postgres. Seed an admin in Auther via script, then obtain a real token
+through the OIDC `password` grant — enabled for test clients only — and exercise your
+endpoints with it.
+
+**Webhook tests** build the raw body and its HMAC locally and POST to
+`/api/auth/webhooks/auther`. Don't rely on a running Auther to emit events; that
+couples your test to Auther's delivery path when all you want to verify is your own
+handler.
+
+## Observability
+
+Emit these signals from Hono (via `apps/server/src/middlewares/otel.ts` or similar)
+so you can see verification cost, just-in-time provisioning, and webhook health at a
+glance:
+
+- `auth.jwt.verify.duration_ms` (histogram)
+- `auth.jwt.verify.result.count{result=ok|expired|signature_bad|kid_unknown}`
+- `auth.shadow.jit.count{action=insert|existing}`
+- `auth.webhook.receive.count{type, result}`
+- `auth.webhook.dedup.count`
+
+Every authenticated request should log `{ user_id, path, status, duration_ms,
+auth_source }`. Wrap each of the three risky operations — JWT verification,
+just-in-time shadow insert, and webhook dispatch — in its own OpenTelemetry span, and
+have the span record the error on a failed verify or failed JIT.
+
+## A feature flag for rollout
+
+Gate the whole integration behind a single environment variable,
+`env.AUTH_MODE`, with three values that control which path the middleware takes:
+
+- `legacy` — your existing local auth, untouched.
+- `dual` — accept both, so you can migrate sessions and catch regressions.
+- `auther` — Auther tokens only.
+
+This gives you an instant rollback. If something explodes after cutover, flip the env
+back to `dual` or `legacy` and redeploy — no code change, no revert.
+
+:::tip[Why a flag and not a branch]
+A deploy-time flag means the rollback path is exercised by the same binary that's
+already running. There's no rebuild, no race against a hotfix branch — the safe path
+is one redeploy away at all times.
+:::

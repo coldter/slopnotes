@@ -1,0 +1,204 @@
+---
+title: ReBAC & the Permission Engine
+description: How Auther answers "can this subject do this action on this entity?" with Zanzibar-style relationship tuples, authorization models, and an eight-step resolver.
+sidebar:
+  order: 3
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+Once a request is authenticated, Auther still has to decide whether it's *allowed*.
+That job belongs to a hybrid authorization engine — relationship-based access
+control (ReBAC) for the structure, with attribute-based checks (ABAC) layered on top
+for the context-dependent rules. The design is inspired by Google's Zanzibar: model
+access as relationships between subjects and entities, then resolve a permission
+question by walking those relationships. This chapter covers the ReBAC half — tuples,
+models, and the resolution engine — and links out to the
+[ABAC layer](/auther/server/abac-groups/) where context-aware policies live.
+
+## Relationship-based access control
+
+The core primitive is the **access tuple**: a single relationship stored in the
+`access_tuples` table (`src/db/rebac-schema.ts`). Every grant in the system is one row
+of this shape:
+
+```text
+(entityType, entityId, relation, subjectType, subjectId)
+```
+
+Read it as "the subject has this relation to the entity." A handful of concrete tuples
+makes the model clearer than any abstract description:
+
+| entityType | entityId | relation | subjectType | subjectId | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `platform` | `*` | `admin` | `user` | `alice_id` | Alice is a platform admin |
+| `users` | `*` | `viewer` | `user` | `bob_id` | Bob can view all users |
+| `oauth_client` | `client_123` | `use` | `group` | `eng_group` | The engineering group can use `client_123` |
+| `client_abc:invoice` | `*` | `editor` | `apikey` | `key_456` | API key 456 can edit all invoices in `client_abc` |
+| `client_abc:invoice` | `inv_789` | `owner` | `user` | `carol_id` | Carol owns invoice `inv_789` in `client_abc` |
+
+A few features make this small shape expressive enough to cover the whole platform:
+
+- **Wildcard entity IDs.** An `entityId` of `*` means "all entities of this type" —
+  the difference between "Bob can view *one* user" and "Bob can view *all* users."
+- **Subject relations** follow the Zanzibar pattern: a subject like
+  `group:admins#member` means "all members of the admins group," so a grant to a group
+  flows to its members without a tuple per person.
+- **Optional Lua conditions** can ride on an individual tuple, giving you tuple-level
+  ABAC for one specific grant.
+- **Entity type ID references.** A tuple can carry an `entityTypeId` foreign key into
+  `authorization_models.id`, a stable reference that survives renaming an entity type.
+
+All reads and writes go through the `TupleRepository`
+(`src/lib/repositories/tuple-repository.ts`), which exposes 18 methods — among them
+`findExact`, `findBySubject`, `findBySubjects`, `findByEntity`, `findByEntityType`,
+`countByRelation`, `createIfNotExists`, and `updateEntityTypeString`. The engine in the
+rest of this chapter is built almost entirely on top of these lookups.
+
+## Authorization models
+
+Tuples say *who relates to what*. An **authorization model** says what relations and
+permissions exist in the first place, and how they connect — it's the schema for a
+slice of the access graph. Models are stored in the `authorization_models` table as
+JSON and validated by the Zod schema in `src/schemas/rebac.ts`.
+
+```json
+{
+  "relations": {
+    "owner": { "union": ["admin"] },
+    "admin": { "union": ["editor"] },
+    "editor": { "union": ["viewer"] },
+    "viewer": []
+  },
+  "permissions": {
+    "read":   { "relation": "viewer" },
+    "write":  { "relation": "editor" },
+    "delete": { "relation": "owner" },
+    "refund": {
+      "relation": "admin",
+      "policyEngine": "lua",
+      "policy": "if context.resource.amount < 1000 then return true else return false end"
+    }
+  }
+}
+```
+
+Four ideas carry the whole model:
+
+- **Relations form a hierarchy** through the `union` field. `"admin": { "union": ["editor"] }`
+  means `admin` implies `editor`; since `editor` implies `viewer`, an `admin`
+  transitively gets `viewer` too. You define the chain once and inheritance follows.
+- **Permissions map a named action to a required relation.** `"read": { "relation": "viewer" }`
+  means anyone with the `viewer` relation — or any relation that implies it — can
+  `read`.
+- **ABAC policies attach to a permission** via `policyEngine: "lua"` and a `policy`
+  script, evaluated at runtime against context about the resource being touched. The
+  `refund` permission above only allows refunds under 1000. The
+  [ABAC chapter](/auther/server/abac-groups/) covers how these scripts run.
+- **A hierarchy flag** lets a relation declare `subjectParams: { hierarchy: true }`,
+  which turns on recursive subject expansion for cases like nested groups.
+
+Models aren't free to mutate carelessly. The `AuthorizationModelService`
+(`src/lib/auth/authorization-model-service.ts`) enforces **dependency safety**: before
+removing a relation, it checks that no active tuples or registration-context grants
+still reference it. A tempting shortcut is to just drop the relation and let dangling
+references sort themselves out, but that silently breaks live grants — so the service
+rejects the update with a descriptive error instead.
+
+## The permission resolution engine
+
+Everything above exists to answer one runtime question: *can subject S do action A on
+entity E?* `PermissionService.checkPermission()` in
+`src/lib/auth/permission-service.ts` is the resolver. It runs a fixed pipeline —
+short-circuiting on an admin bypass, expanding subjects and relations breadth-first,
+matching tuples, and only then consulting any ABAC policy before it allows or denies.
+
+<Mermaid title="checkPermission() resolution" height={620} code={`
+flowchart TB
+  Start(["checkPermission(S, A, E)"]) --> Admin{"subjectType is user<br/>and user.role === admin?"}
+  Admin -->|"yes"| Allow1(["ALLOW (admin bypass)"])
+  Admin -->|"no"| Model{"authorization model<br/>for entity type exists?"}
+  Model -->|"no"| Deny1(["DENY"])
+  Model -->|"yes"| Perm{"permission A defined<br/>in the model?"}
+  Perm -->|"no"| Deny2(["DENY"])
+  Perm -->|"yes"| ExpandS["Expand subjects (BFS)<br/>user → groups → nested groups"]
+  ExpandS --> ExpandR["Expand relations (BFS)<br/>required relation + relations that imply it"]
+  ExpandR --> Match{"tuple matches?<br/>direct, or wildcard entityId *"}
+  Match -->|"no match"| Deny3(["DENY"])
+  Match -->|"match"| Policy{"ABAC policy?<br/>tuple condition > permission policy"}
+  Policy -->|"no policy"| Allow2(["ALLOW"])
+  Policy -->|"policy passes"| Allow3(["ALLOW"])
+  Policy -->|"policy fails"| Deny4(["DENY"])
+`} />
+
+Walking the same pipeline in words:
+
+- **Step 0 — Admin bypass.** If the subject is a `user` and `user.role === "admin"`,
+  allow immediately. Platform admins skip the rest of the resolver.
+- **Step 1 — Load the model.** Find the authorization model for the entity type. No
+  model means there's nothing to check against, so deny.
+- **Step 2 — Resolve the required relation.** Look up which relation the requested
+  permission needs. If the permission isn't defined in the model, deny.
+- **Step 3 — Expand subjects (BFS).** Starting from the subject, discover every group
+  and hierarchy they belong to: user → user-groups (the legacy table) → nested groups
+  via hierarchy tuples. The result is a list of `(subjectType, subjectId)` pairs to
+  check.
+- **Step 4 — Expand relations (BFS).** Starting from the required relation, discover
+  every relation that implies it. If `viewer` is needed, also check `editor`, `admin`,
+  and `owner` along the `union` chains.
+- **Step 5 — Check tuples.** For each expanded subject crossed with each expanded
+  relation, look for a direct match `(entityType, entityId, relation, subjectType, subjectId)`
+  or a wildcard match `(entityType, "*", relation, subjectType, subjectId)`.
+- **Step 6 — Evaluate the ABAC policy (if a tuple was found).** Priority runs
+  tuple-level condition first, then permission-level policy, then no policy (allow).
+  Policies execute via the `LuaPolicyEngine` with the supplied runtime context.
+- **Step 7 — No tuple found, deny.** The default answer is always no.
+
+:::note[Everything is measured]
+Every permission check is instrumented with metrics: `authz.check.duration_ms`,
+`authz.decision.count` (tagged with result and source), `authz.rebac.traversal_depth`,
+and `authz.rebac.subjects_expanded`. The BFS expansions are the parts most worth
+watching, since deep group nesting is what grows traversal cost.
+:::
+
+## Two permission layers
+
+The same engine answers questions at two distinct scopes, and keeping them straight
+matters: one governs Auther itself, the other governs the applications that consume it.
+
+### Layer A — Platform permissions
+
+These control who can manage the Auther platform: its users, clients, webhooks, keys,
+and so on. They're defined by **9 system models** in `src/lib/auth/system-models.ts`:
+
+| Entity Type | Description | Relations | Key Permissions |
+| --- | --- | --- | --- |
+| `platform` | Core access levels | `super_admin > admin > member` | `manage_platform` |
+| `users` | User management | `admin > viewer` | view, create, update, delete, ban, impersonate |
+| `groups` | Group management | `admin > editor > viewer` | view, create, update, delete, manage_members |
+| `clients` | OAuth client management | `admin > viewer` | view, create, update, delete, manage_access |
+| `webhooks` | Webhook configuration | `editor > viewer` | view, create, update, delete, test |
+| `pipelines` | Pipeline management | `editor > viewer` | view, create, update, delete, execute |
+| `api_keys` | API key management | `admin` | view_all, revoke |
+| `keys` | Signing key management | `admin` | view, rotate |
+| `sessions` | Session management | `admin` | view_all, revoke_all |
+
+These system models are hardcoded fallbacks. If no database record exists for an entity
+type, the system model is used instead — which keeps the platform functional before any
+models have been created, including on a fresh install.
+
+### Layer B — Client-scoped permissions
+
+These define what users can do *within* a specific client application. They're custom
+authorization models that administrators create, with entity types prefixed by the
+client ID so they can't collide across clients:
+
+```text
+client_abc:invoice
+client_abc:report
+client_abc:payment
+```
+
+Client-scoped permissions are embedded in the JWTs Auther issues to users, which lets
+the consuming application enforce fine-grained access control on its own resources
+without calling back to Auther on every request.

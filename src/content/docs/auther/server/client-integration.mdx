@@ -1,0 +1,480 @@
+---
+title: Client Integration (Scenarios A–D)
+description: Step-by-step OAuth2, PKCE, and API-key flows for wiring server apps, SPAs, machine clients, and mobile apps into Auther.
+sidebar:
+  order: 7
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps } from "@astrojs/starlight/components";
+
+Everything in Part 1 so far has described what Auther does on the inside. This page
+flips to the outside view: how a real client app actually talks to it. Because Auther
+is a standard OAuth2/OIDC provider that signs tokens with RS256, integration is
+mostly a matter of following the right handshake for your app's shape — and then
+verifying the resulting JWT against the published JWKS. Four common shapes cover most
+adopters: a server-side web app, a browser SPA, a machine-to-machine client, and a
+mobile app. Each is a four-step flow below.
+
+Two scenarios beyond these — multi-tenant SaaS with per-tenant permissions, and the
+ABAC-aware permission patterns — live on the next page,
+[Advanced Integration](/auther/server/advanced-integration/).
+
+## Scenario A: Server-Side Web App (Confidential Client)
+
+This is the classic case: a Next.js, Rails, Django, or Express backend that wants SSO
+login powered by Auther. Because the backend can keep a secret, it acts as a
+*confidential client* and runs the full authorization-code flow with a client secret.
+
+At a glance, the four steps form one redirect-and-exchange round trip:
+
+<Mermaid title="Server-side authorization-code flow" height={460} code={`
+sequenceDiagram
+  participant U as User
+  participant App as Your backend
+  participant Auth as Auther
+  U->>App: clicks "Sign In"
+  App->>Auth: redirect to /oauth2/authorize (state)
+  Auth->>U: login + consent
+  U->>App: redirect to /auth/callback (code, state)
+  App->>Auth: POST /oauth2/token (code + Basic creds)
+  Auth-->>App: access_token + id_token
+  Note over App: verify id_token vs JWKS, create local session
+  App-->>U: redirect to /dashboard
+`} />
+
+**Step 1: Register your client.** Through the admin UI at
+`/admin/clients/register`, create a confidential client with name "My Backend App",
+type `web`, redirect URL `https://myapp.example.com/auth/callback`, token-endpoint
+auth method `client_secret_basic`, and grant type `authorization_code`. You'll
+receive a `client_id` and `client_secret` — store them securely in your app's
+environment. Alternatively, set them via environment variables in Auther's config as
+trusted clients, the same way the Payload clients are declared in `src/lib/auth.ts`.
+
+**Step 2: Redirect users to Auther.** When a user clicks "Sign In", build the
+authorize URL with a freshly generated `state` value for CSRF protection and send the
+browser there:
+
+```ts title="your-app/src/auth/login.ts"
+function redirectToAuther() {
+  const state = crypto.randomUUID(); // CSRF protection
+  // Store state in session/cookie for verification later
+
+  const authorizeUrl = new URL("https://auth.example.com/api/auth/oauth2/authorize");
+  authorizeUrl.searchParams.set("client_id", process.env.AUTHER_CLIENT_ID);
+  authorizeUrl.searchParams.set("redirect_uri", "https://myapp.example.com/auth/callback");
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("scope", "openid email profile");
+  authorizeUrl.searchParams.set("state", state);
+
+  redirect(authorizeUrl.toString());
+}
+```
+
+**Step 3: Handle the callback.** After the user authenticates at Auther, they're
+redirected back to your callback URL with `?code=...&state=...`. Verify the `state`,
+exchange the code for tokens using HTTP Basic auth (`Base64(client_id:client_secret)`),
+then verify the returned `id_token` against Auther's JWKS:
+
+```ts title="your-app/src/app/auth/callback/route.ts" {21}
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+
+  // 1. Verify the state matches what you stored (CSRF protection)
+  const storedState = getStoredState(); // from session/cookie
+  if (state !== storedState) throw new Error("CSRF state mismatch");
+
+  // 2. Exchange the authorization code for tokens
+  const tokenResponse = await fetch(
+    "https://auth.example.com/api/auth/oauth2/token",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        // client_secret_basic: Base64(client_id:client_secret)
+        Authorization: `Basic ${Buffer.from(
+          `${process.env.AUTHER_CLIENT_ID}:${process.env.AUTHER_CLIENT_SECRET}`
+        ).toString("base64")}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "https://myapp.example.com/auth/callback",
+      }),
+    }
+  );
+
+  const { access_token, id_token } = await tokenResponse.json();
+
+  // 3. The id_token is a JWT signed with RS256.
+  //    Verify it using Auther's JWKS endpoint.
+  const JWKS = createRemoteJWKSet(
+    new URL("https://auth.example.com/api/auth/jwks")
+  );
+  const { payload } = await jwtVerify(id_token, JWKS, {
+    issuer: "https://auth.example.com",
+    audience: "your-audience",
+  });
+
+  // 4. payload now contains:
+  //    payload.sub          -> user ID
+  //    payload.email        -> user email
+  //    payload.permissions  -> { "client_abc:invoice": ["read", "write"] }
+  //    payload.abac_required -> { "client_abc:invoice": ["refund"] }
+
+  // 5. Create a session in your app
+  await createLocalSession(payload);
+
+  return redirect("/dashboard");
+}
+```
+
+The verified `payload` carries the user's identity plus the two permission maps
+Auther packs into every token: `payload.permissions`
+(`{ "client_abc:invoice": ["read", "write"] }`) and `payload.abac_required`
+(`{ "client_abc:invoice": ["refund"] }`).
+
+**Step 4: Enforce permissions in your app.** With the JWKS cached client-side, a
+permission check never touches Auther on the hot path — unless the permission is
+flagged `abac_required`, in which case you must fall back to a live check (covered in
+[Advanced Integration](/auther/server/advanced-integration/)):
+
+```ts title="your-app/src/lib/permissions.ts"
+import { jwtVerify, createRemoteJWKSet } from "jose";
+
+const JWKS = createRemoteJWKSet(
+  new URL("https://auth.example.com/api/auth/jwks")
+);
+
+export async function checkPermission(
+  token: string,
+  entityType: string,
+  permission: string
+): Promise<boolean> {
+  const { payload } = await jwtVerify(token, JWKS, {
+    issuer: "https://auth.example.com",
+    audience: "your-audience",
+  });
+
+  const perms = payload.permissions as Record<string, string[]>;
+  const abacRequired = payload.abac_required as Record<string, string[]>;
+
+  // Check if the permission exists in the JWT
+  const entityPerms = perms[entityType];
+  if (!entityPerms?.includes(permission)) return false;
+
+  // Check if this permission requires ABAC evaluation
+  const needsAbac = abacRequired?.[entityType]?.includes(permission);
+  if (!needsAbac) return true; // Static permission, JWT is sufficient
+
+  // For ABAC permissions, call Auther's check-permission endpoint
+  // (see "Working with ABAC Policies")
+  return false; // must call check-permission with resource context
+}
+```
+
+## Scenario B: Single-Page Application (Public PKCE Client)
+
+A React, Vue, or Angular SPA needs browser-based login but can't keep a client
+secret — anything shipped to the browser is public. PKCE (Proof Key for Code
+Exchange) solves this: instead of a secret, the client proves it started the flow by
+sending the original `code_verifier` whose SHA-256 hash it committed to up front.
+
+<Mermaid title="SPA PKCE flow" height={480} code={`
+sequenceDiagram
+  participant U as User
+  participant SPA as SPA (browser)
+  participant Auth as Auther
+  Note over SPA: generate verifier + challenge (S256)
+  SPA->>Auth: redirect to /oauth2/authorize (state, code_challenge)
+  Auth->>U: login + consent
+  U->>SPA: redirect to /auth/callback (code, state)
+  Note over SPA: verify state matches stored value
+  SPA->>Auth: POST /oauth2/token (code + code_verifier)
+  Auth-->>SPA: access_token + id_token
+  Note over SPA: keep tokens in memory, not localStorage
+`} />
+
+**Step 1: Register your client.** Through the admin UI, create a public client with
+name "My SPA", type `spa` (public), redirect URL
+`https://spa.example.com/auth/callback`, token-endpoint auth method `none`, and grant
+type `authorization_code`. You'll receive only a `client_id` — there is no secret.
+
+**Step 2: Implement PKCE login.** Generate a `verifier`/`challenge` pair, stash both
+the `state` and the `verifier` in `sessionStorage` (cleared on tab close), and
+redirect with the `code_challenge`:
+
+```ts title="spa/src/auth.ts"
+// Generate PKCE challenge
+async function generatePKCE() {
+  const verifier = crypto.randomUUID() + crypto.randomUUID(); // 72 chars
+  const encoder = new TextEncoder();
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(verifier));
+  const challenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return { verifier, challenge };
+}
+
+async function login() {
+  const state = crypto.randomUUID();
+  const { verifier, challenge } = await generatePKCE();
+
+  // Store state and verifier in sessionStorage (cleared on tab close)
+  sessionStorage.setItem("auth_state", state);
+  sessionStorage.setItem("auth_verifier", verifier);
+
+  const authorizeUrl = new URL("https://auth.example.com/api/auth/oauth2/authorize");
+  authorizeUrl.searchParams.set("client_id", "my-spa-client-id");
+  authorizeUrl.searchParams.set("redirect_uri", "https://spa.example.com/auth/callback");
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("scope", "openid email profile");
+  authorizeUrl.searchParams.set("state", state);
+  authorizeUrl.searchParams.set("code_challenge", challenge);
+  authorizeUrl.searchParams.set("code_challenge_method", "S256");
+
+  window.location.href = authorizeUrl.toString();
+}
+```
+
+**Step 3: Handle the callback.** On return, verify the `state`, then exchange the
+code with the stored `code_verifier` standing in for the missing client secret:
+
+```ts title="spa/src/auth-callback.ts"
+async function handleCallback() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get("code");
+  const state = params.get("state");
+
+  // Verify state
+  if (state !== sessionStorage.getItem("auth_state")) {
+    throw new Error("CSRF state mismatch");
+  }
+
+  const verifier = sessionStorage.getItem("auth_verifier");
+
+  // Exchange code for tokens (no client secret, PKCE verifier instead)
+  const tokenResponse = await fetch(
+    "https://auth.example.com/api/auth/oauth2/token",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "https://spa.example.com/auth/callback",
+        client_id: "my-spa-client-id",
+        code_verifier: verifier, // PKCE proof
+      }),
+    }
+  );
+
+  const { access_token, id_token } = await tokenResponse.json();
+
+  // Store tokens in memory (not localStorage for security)
+  tokenStore.setTokens({ access_token, id_token });
+
+  // Clean up PKCE state
+  sessionStorage.removeItem("auth_state");
+  sessionStorage.removeItem("auth_verifier");
+
+  // Read permissions from the ID token (it's a JWT you can decode client-side)
+  const payload = JSON.parse(atob(id_token.split(".")[1]));
+  console.log("User permissions:", payload.permissions);
+
+  window.location.href = "/dashboard";
+}
+```
+
+:::caution[Keep tokens in memory]
+Store the tokens in memory (or a non-persistent store), not `localStorage`. Tokens in
+`localStorage` are readable by any script on the page and survive across tab restores,
+which widens the blast radius of an XSS bug.
+:::
+
+**Step 4: Make authenticated API calls.** Attach the `id_token` as a bearer token on
+each request:
+
+```ts title="spa/src/api.ts"
+async function fetchInvoices() {
+  const { id_token } = tokenStore.getTokens();
+
+  const response = await fetch("https://api.example.com/invoices", {
+    headers: {
+      Authorization: `Bearer ${id_token}`,
+    },
+  });
+
+  return response.json();
+}
+```
+
+## Scenario C: Machine-to-Machine via API Keys
+
+A cron job, CI/CD pipeline, or backend service needs programmatic access with no
+browser in the loop. For that, Auther issues API keys that you can either exchange for
+short-lived JWTs or use directly against the permission-check endpoint.
+
+**Step 1: Create an API key.** Through the admin UI at `/admin/keys`, or
+programmatically via better-auth's API:
+
+```bash
+curl -X POST https://auth.example.com/api/auth/api-key/create \
+  -H "Authorization: Bearer <admin_session_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "CI/CD Pipeline Key", "expiresIn": 2592000}'
+```
+
+**Step 2: Assign permissions to the API key.** Through the admin UI's access-control
+panel, create ReBAC tuples that bind the key to the relations it should hold. Each
+tuple is `(entity, object, relation, subject_type, subject_id)`:
+
+```text
+(client_abc:deployment, *, editor, apikey, <api_key_id>)
+(client_abc:config,     *, viewer, apikey, <api_key_id>)
+```
+
+This gives the API key editor access to all deployments and viewer access to all
+configs within `client_abc`.
+
+**Step 3: Use the API key.** There are two patterns. Exchanging the key for a JWT is
+the better choice when you'll make many calls, since the JWT is verified locally
+afterward:
+
+```python
+# python example — Option A: Exchange for JWT (recommended for multiple calls)
+import requests
+
+# Exchange API key for a short-lived JWT
+exchange = requests.post(
+    "https://auth.example.com/api/auth/api-key/exchange",
+    json={"apiKey": "ak_live_xxxxxxxxxxxx"}
+)
+jwt_token = exchange.json()["token"]  # Valid for 15 minutes
+
+# Use the JWT for subsequent API calls
+headers = {"Authorization": f"Bearer {jwt_token}"}
+deployments = requests.get("https://api.example.com/deployments", headers=headers)
+```
+
+For a single operation, a direct permission check against the API key avoids the
+exchange round trip entirely:
+
+```python
+# python example — Option B: Direct permission check (for single operations)
+result = requests.post(
+    "https://auth.example.com/api/auth/check-permission",
+    headers={"x-api-key": "ak_live_xxxxxxxxxxxx"},
+    json={
+        "entityType": "client_abc:deployment",
+        "entityId": "deploy_123",
+        "permission": "edit",
+        "resource": {
+            "attributes": {"environment": "staging"}
+        }
+    }
+)
+print(result.json())  # {"allowed": true, ...}
+```
+
+**Step 4: Handle token refresh.** JWTs from API-key exchange expire after 15
+minutes, so a long-running client should refresh automatically. A small wrapper that
+caches the token and re-exchanges shortly before expiry keeps the call sites clean:
+
+```python
+class AutherClient:
+    def __init__(self, api_key: str, base_url: str):
+        self.api_key = api_key
+        self.base_url = base_url
+        self._token = None
+        self._token_expires_at = None
+
+    def _get_token(self) -> str:
+        now = datetime.utcnow()
+        if self._token and self._token_expires_at and now < self._token_expires_at:
+            return self._token
+
+        response = requests.post(
+            f"{self.base_url}/api/auth/api-key/exchange",
+            json={"apiKey": self.api_key}
+        )
+        data = response.json()
+        self._token = data["token"]
+        # Refresh 60 seconds before expiry
+        self._token_expires_at = (
+            datetime.fromisoformat(data["expiresAt"].replace("Z", "+00:00"))
+            - timedelta(seconds=60)
+        )
+        return self._token
+
+    def request(self, method: str, url: str, **kwargs) -> requests.Response:
+        token = self._get_token()
+        headers = kwargs.pop("headers", {})
+        headers["Authorization"] = f"Bearer {token}"
+        return requests.request(method, url, headers=headers, **kwargs)
+```
+
+## Scenario D: Mobile Application
+
+An iOS or Android app authenticates users the same way an SPA does: as a public
+client running PKCE. The only real difference is the redirect target and the browser
+surface — mobile apps hand off to the system or in-app browser rather than navigating
+the page itself.
+
+<Steps>
+
+1. **Register a public client.** Same as Scenario B, but the redirect URI uses a
+   custom URL scheme (`myapp://auth/callback`) or an App Links / Universal Links
+   association (`https://myapp.example.com/.well-known/assetlinks.json`).
+
+2. **Implement PKCE login.** The flow is identical to the SPA PKCE flow, but it runs
+   through the system or in-app browser tab — `ASWebAuthenticationSession` on iOS,
+   Custom Tabs on Android — so the OS owns the login surface and any existing session
+   cookies.
+
+3. **Store tokens securely.** Use the platform's secure storage: Keychain Services on
+   iOS, and `EncryptedSharedPreferences` or the Android Keystore on Android.
+
+</Steps>
+
+The iOS version launches an `ASWebAuthenticationSession` against the authorize URL,
+then resumes on the custom-scheme callback to finish the code exchange with the
+`verifier`:
+
+```swift
+// iOS example (Swift)
+import AuthenticationServices
+
+func login() {
+    let verifier = generateCodeVerifier()  // Random 43-128 char string
+    let challenge = generateCodeChallenge(from: verifier)  // SHA-256 + Base64url
+
+    var components = URLComponents(string: "https://auth.example.com/api/auth/oauth2/authorize")!
+    components.queryItems = [
+        URLQueryItem(name: "client_id", value: "my-mobile-client-id"),
+        URLQueryItem(name: "redirect_uri", value: "myapp://auth/callback"),
+        URLQueryItem(name: "response_type", value: "code"),
+        URLQueryItem(name: "scope", value: "openid email profile"),
+        URLQueryItem(name: "state", value: UUID().uuidString),
+        URLQueryItem(name: "code_challenge", value: challenge),
+        URLQueryItem(name: "code_challenge_method", value: "S256"),
+    ]
+
+    let session = ASWebAuthenticationSession(
+        url: components.url!,
+        callbackURLScheme: "myapp"
+    ) { callbackURL, error in
+        guard let url = callbackURL else { return }
+        // Extract code from url, exchange with code_verifier
+        self.exchangeCode(url: url, verifier: verifier)
+    }
+    session.start()
+}
+```
+
+## Where to go next
+
+Scenarios E and F — multi-tenant SaaS with per-tenant authorization models, plus the
+ABAC-aware `check-permission` patterns referenced above — are covered in
+[Advanced Integration](/auther/server/advanced-integration/).

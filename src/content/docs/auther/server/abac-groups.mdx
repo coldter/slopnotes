@@ -1,0 +1,257 @@
+---
+title: ABAC, Guards, Groups & Invites
+description: Runtime Lua policies, server-side guards, group hierarchies, registration contexts, invites, escalation, and reusable policy templates.
+sidebar:
+  order: 4
+---
+
+import { Steps } from "@astrojs/starlight/components";
+
+Relationship tuples decide *who is related to what*, but some access decisions only make sense at the moment of the request: the amount on an invoice, the time of day, whether the actor owns the resource. This chapter covers the layers Auther stacks on top of [ReBAC](/auther/server/rebac/) to capture that context — runtime Lua policies, the ergonomic server-side guard layer, group hierarchies, the sign-up and invite machinery that seeds permissions, the escalation flow for requesting access, and the reusable templates that bundle it all up.
+
+## ABAC: attribute-based access control
+
+Pure relationship checks answer yes/no from stored tuples, but they cannot express rules like "admins can only refund invoices under $1,000" or "users can only edit resources they own." Those depend on attributes that are only known at request time. ABAC fills that gap by running a small Lua script against a context object whenever a relationship match needs a second opinion.
+
+There are two levels at which a policy can attach, and they compose predictably:
+
+1. **Permission-level policy** lives in the authorization model's permission definition and applies to *every* check for that permission. It is the broad rule.
+
+   ```json
+   {
+     "refund": {
+       "relation": "admin",
+       "policyEngine": "lua",
+       "policy": "if context.resource.amount < 1000 then return true else return false end"
+     }
+   }
+   ```
+
+2. **Tuple-level condition** is a Lua script attached to one specific access tuple, so it only fires when that exact tuple is the match. A tuple-level condition takes priority over the permission-level policy, letting you carve out a narrower rule for a single grant.
+
+   ```sql
+   -- Bob can edit invoices, but only while they are in draft status
+   INSERT INTO access_tuples (entityType, entityId, relation, subjectType, subjectId, condition)
+   VALUES ('client_abc:invoice', '*', 'editor', 'user', 'bob_id',
+           'return context.resource.status == "draft"');
+   ```
+
+### The Lua policy context
+
+Every policy runs against a `context` object assembled in `src/lib/auth/abac-context.ts`. It exposes the resource being touched, the actor, the action, and the current time:
+
+```lua
+-- context.resource: the resource being accessed
+context.resource.id         -- "invoice_123"
+context.resource.type       -- "invoice"
+context.resource.amount     -- 500
+context.resource.status     -- "draft"
+context.resource.owner_id   -- "user_456"
+context.resource.department -- "sales"
+
+-- context.user: the actor performing the action
+context.user.id             -- "user_789"
+context.user.name           -- "Alice"
+context.user.email          -- "alice@example.com"
+context.user.role           -- "admin"
+context.user.department     -- "finance"
+
+-- context.action: the permission being checked
+context.action              -- "refund"
+
+-- context.timestamp: current time (ISO string)
+context.timestamp           -- "2025-01-15T10:30:00.000Z"
+```
+
+With that object in hand, policies stay short and readable. A few representative examples:
+
+```lua
+-- Only allow refunds under $1000
+if context.resource.amount < 1000 then return true else return false end
+
+-- Only allow editing your own resources
+return context.resource.owner_id == context.user.id
+
+-- Time-based: only during business hours (UTC)
+local hour = tonumber(os.date("!%H"))
+return hour >= 9 and hour < 17
+
+-- Department-based: finance can refund anything, others are capped at $500
+if context.user.department == "finance" then return true end
+return context.resource.amount < 500
+```
+
+### Keeping user-authored Lua safe
+
+Because these scripts are written by operators rather than baked into the server, the engine has to treat them as untrusted code on the hot path. The policy engine (`src/lib/auth/policy-engine.ts`) and the pooled runtime (`lua-engine-pool.ts`) enforce hard limits so a slow or oversized script cannot stall a check or exhaust memory:
+
+| Safety measure | Value |
+| --- | --- |
+| Execution timeout | 1 second |
+| Max script size | 10 KB |
+| Engine pool size | 20 engines |
+| Engine TTL | 5 minutes |
+| Max concurrent | 20 |
+| Burst support | Yes (engines created beyond the pool are not reused) |
+
+:::note[Auditing every decision]
+Every ABAC evaluation is written to the `abac_audit_logs` table with the entity, permission, subject, policy source, result (allowed/denied/error), a snapshot of the context, and the execution time. Policy changes themselves are tracked separately in the `policy_versions` table, so you can answer both "what did we decide" and "what rule was in force at the time."
+:::
+
+## The platform guard
+
+Inside Auther's own admin surface, you do not want to hand-write a permission check before every server action. `src/lib/auth/platform-guard.ts` wraps the permission engine in a small, ergonomic layer with two flavors.
+
+For server actions, the throwing guards short-circuit unauthorized calls with a `Permission denied` error:
+
+```ts title="src/app/admin/actions/create-user.ts"
+import { guards } from "@/lib/auth/platform-guard";
+
+// In a server action that creates a user:
+export async function createUser(data: CreateUserInput) {
+  await guards.users.create(); // throws "Permission denied" if unauthorized
+  // ... create user logic
+}
+```
+
+For conditional UI — say, hiding a button a user can't act on — the non-throwing checks return a boolean instead:
+
+```ts title="src/app/admin/users/page.tsx"
+import { canUser } from "@/lib/auth/platform-guard";
+
+// In a server component:
+const showCreateButton = await canUser.users.create(); // returns boolean
+```
+
+Both forms share the same set of guard namespaces: `platform`, `users`, `webhooks`, `pipelines`, `clients`, `keys`, `groups`, `sessions`, and `apiKeys`.
+
+## Groups and hierarchies
+
+Granting permissions one user at a time does not scale, so Auther lets you organize users into groups (the `user_group` table) with memberships recorded in `group_membership`. The important design choice is that **groups are first-class subjects in ReBAC** — a tuple can name a group exactly where it would name a user:
+
+```text
+-- The Engineering group can use client_123
+(oauth_client, client_123, use, group, eng_group_id)
+
+-- Alice is a member of Engineering
+group_membership: (alice_id, eng_group_id)
+```
+
+When the engine resolves Alice's permissions, the `expandSubjects()` method in `PermissionService` walks outward from her with a breadth-first traversal:
+
+<Steps>
+
+1. Start with Alice (the `user` subject).
+
+2. Find Alice's groups through the `group_membership` table (retained for legacy support).
+
+3. Find hierarchical memberships through tuples that use `hierarchy: true` relations.
+
+4. Repeat for each newly discovered group, which is what makes nested groups work.
+
+</Steps>
+
+The payoff is inheritance: if Engineering is a subgroup of Product, and Product has access to a client, then every Engineering member inherits that access without an extra tuple.
+
+## Registration contexts and invites
+
+Most new users should not arrive with zero permissions and wait for an admin. Registration contexts solve the bootstrapping problem by attaching automatic grants to a sign-up flow.
+
+A registration context (the `registration_contexts` table) describes who is signing up and what they should get:
+
+```json
+{
+  "slug": "blog-commenter",
+  "name": "Blog Commenter",
+  "clientId": "blog_client_id",
+  "grants": [
+    { "entityTypeId": "model_123", "relation": "commenter" }
+  ],
+  "allowedOrigins": ["https://blog.example.com"],
+  "allowedDomains": ["example.com"],
+  "enabled": true
+}
+```
+
+When a user signs up or first authorizes through a client that has registration contexts configured, the matching permission tuples are created for them automatically. This is wired up by `applyRegistrationContextGrants()` in `src/lib/pipelines/registration-grants.ts`, backed by the `RegistrationContextService` in `src/lib/services/registration-context-service.ts`.
+
+Contexts come in two kinds, distinguished by whether `clientId` is set:
+
+- **Client contexts** (`clientId` set) grant client-specific permissions and apply when a user authorizes through that client.
+- **Platform contexts** (`clientId` null) grant platform-level permissions and apply to every new user.
+
+### HMAC-signed invites
+
+When access should be gated rather than open, platform invites (the `platform_invites` table) issue one-time, HMAC-signed tokens. A client redeems one by posting it back to the verification endpoint:
+
+```http
+POST /api/auth/verify-invite
+Content-Type: application/json
+
+{ "token": "signed_token_here", "email": "alice@example.com" }
+```
+
+The endpoint runs the token through a strict sequence before it trusts anything:
+
+<Steps>
+
+1. Validate the HMAC-SHA256 signature.
+
+2. Confirm the invite has not already been consumed and has not expired.
+
+3. Optionally check that the supplied email matches the invite's locked email.
+
+4. Queue the associated registration-context grants for after the user is created.
+
+5. Also queue every enabled global platform context.
+
+</Steps>
+
+Once the user actually creates their account, the queued grants are applied automatically — so an invited user lands fully provisioned.
+
+## Permission request escalation
+
+Not every permission can be granted up front. Auther lets users *request* access they don't yet have, and the `PermissionRequestService` (`src/lib/services/permission-request-service.ts`) drives the full lifecycle.
+
+When a user submits a request, the service runs a series of gates before deciding what to do with it:
+
+- Is there already a pending request for this? (Prevents duplicates.)
+- Is the permission marked `selfRequestable` in the `permission_rules` table? (If not, the request is rejected outright.)
+- Does the auto-reject Lua condition match? (If so, reject immediately.)
+- Does the auto-approve Lua condition match? (If so, approve immediately and create the tuple.)
+- Otherwise the request moves to `require_approval`, awaiting an admin.
+
+From there an admin either **approves** the request — which creates the granting tuple — or **rejects** it with an optional note.
+
+The per-relation behavior of all of this is configured by the `permission_rules` table:
+
+```json
+{
+  "clientId": null,
+  "relation": "viewer",
+  "selfRequestable": true,
+  "autoApproveCondition": "return context.user.email:match('@example.com$')",
+  "defaultAction": "require_approval",
+  "approverRelation": "admin"
+}
+```
+
+:::note[Lua here too]
+The auto-approve and auto-reject conditions are the same kind of Lua policy used by ABAC, evaluated against the same `context` object — so "anyone with an `@example.com` address gets the `viewer` relation automatically" is a one-line rule rather than a code change.
+:::
+
+## Policy templates
+
+Assigning the same cluster of relations to user after user is tedious and error-prone, so Auther bundles common permission sets into reusable policy templates (the `policy_templates` table). The `PolicyTemplateService` (`src/lib/services/policy-template-service.ts`) ships seven built-in system templates:
+
+| Template | Permissions granted |
+| --- | --- |
+| Super Administrator | `platform:super_admin` plus all admin relations |
+| Platform Administrator | `platform:admin` plus all admin/editor relations |
+| User Manager | `users:admin` only |
+| Webhook Operator | `webhooks:editor` only |
+| Pipeline Developer | `pipelines:editor` only |
+| Read-Only Access | all viewer relations |
+| API Key Self-Service | `api_keys` viewer plus create permissions |
+
+Applying a template with `applyTemplateToUser(templateId, userId)` creates all the corresponding access tuples in one step, and administrators can define custom templates of their own when the built-ins don't fit.

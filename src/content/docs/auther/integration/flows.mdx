@@ -1,0 +1,224 @@
+---
+title: End-to-End Flows
+description: Six runtime traces — signup, mobile login, a domain request, a ban, a GDPR delete, and a cron digest — that show the shadow-user template working.
+sidebar:
+  order: 16
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps } from "@astrojs/starlight/components";
+
+With the schema, auth core, and server internals all in place, the fastest way to
+confirm your mental model is to watch the pieces move. Each of the six traces below
+follows one real request from the browser (or cron) through Auther, the webhook
+handler, and the Hono server's auth-context middleware. Where a flow surfaces a
+failure mode worth hardening against, it points to the
+[Edge Cases Catalog](/auther/integration/edge-cases/).
+
+## Alice signs up on the web
+
+**What this proves:** the webhook and just-in-time (JIT) shadow-row insert converge
+on the same `users` row no matter which arrives first, so a new account is never lost
+in the race between Auther and your server.
+
+<Mermaid title="Web signup — confidential client + webhook fan-out" height={560} code={`
+sequenceDiagram
+  participant B as Browser
+  participant BFF as Web BFF
+  participant Auth as Auther
+  participant H as Hono server
+  B->>BFF: clicks "Sign up"
+  BFF->>Auth: redirect to /oauth2/authorize (state, code_challenge)
+  Note over Auth: Alice not logged in → renders /sign-in (→ /sign-up)
+  Auth->>Auth: create account (email + password)<br/>hash, write user row, send verify email via Resend
+  Auth->>Auth: fire after_signup pipeline hook<br/>emit user.created webhook
+  Auth->>H: POST /api/auth/webhooks/auther<br/>x-webhook-{id,signature,timestamp}
+  Note over H: verify sig → dedup → INSERT INTO users (id usr_xyz)
+  Auth->>BFF: redirect to /auth/callback (code)
+  BFF->>Auth: POST /oauth2/token (client_secret_basic)
+  Auth-->>BFF: access_token + id_token + refresh_token
+  Note over BFF: set httpOnly session cookie, store tokens server-side
+  B->>H: API call (Authorization: Bearer token via BFF)
+  Note over H: authContextMiddleware verifies JWT<br/>lookup users.id usr_xyz → found → attach user + session
+`} />
+
+The webhook body is `{ type: "user.created", payload: { id: "usr_xyz", email, ... } }`,
+signed with the `x-webhook-{id,signature,timestamp}` headers. Once verified and
+de-duplicated, the handler inserts the shadow row keyed on the Auther user id.
+
+:::note[The race is already handled]
+Between the webhook fan-out and Alice's first API call, she might reach the Hono
+server *before* the webhook does (unlikely, but possible). The middleware lookup then
+misses, JIT fires, and the row is inserted with `ON CONFLICT DO NOTHING`. The webhook
+arrives seconds later, tries the same `INSERT`, conflicts, and no-ops. Either ordering
+is safe — see the [first-login race](/auther/integration/edge-cases/).
+:::
+
+## Alice logs in on mobile
+
+**What this proves:** a mobile public client runs exactly the same PKCE handshake as
+an SPA, and because the shadow row already exists from signup, the first API call
+needs no fresh insert.
+
+<Steps>
+
+1. The mobile app opens an `ASWebAuthenticationSession` (iOS) pointed at
+   `auth.example.com/api/auth/oauth2/authorize` with `client_id=hono-mobile`,
+   `redirect_uri=com.myapp://auth/callback`, `response_type=code`, a `code_challenge`,
+   and `scope=openid email profile offline_access`.
+2. Auther shows the sign-in screen; Alice enters her password (plus 2FA if enabled).
+3. Auther redirects to `com.myapp://auth/callback?code=...`.
+4. The system browser returns control to the app, which extracts the `code`.
+5. The app exchanges it: `POST /api/auth/oauth2/token` with
+   `grant_type=authorization_code`, the `code`, the `code_verifier`, and
+   `client_id=hono-mobile` — no client secret, because this is a public client.
+6. Auther returns `access_token` (1h), `refresh_token` (7d), and `id_token` (1h).
+7. The app stores the `refresh_token` in the OS Keychain and keeps the `access_token`
+   in memory.
+8. The app calls the Hono API with `Authorization: Bearer <access_token>`. The
+   middleware validates the token, finds Alice already in the shadow table (inserted
+   during web signup), attaches her, and the request proceeds.
+9. When the access token expires, the app calls `POST /token` with
+   `grant_type=refresh_token` to get a new access token — and a rotated refresh
+   token, which it must store in place of the old one.
+
+</Steps>
+
+## Alice sends a notification
+
+**What this proves:** adopting Auther changes only the *source* of a principal's
+roles, not the request flow — authorization now reads JWT `permissions` instead of a
+local `users.roleSlugs` column.
+
+<Mermaid title="Domain request — POST /api/notifications/send" height={460} code={`
+sequenceDiagram
+  participant B as Browser
+  participant BFF as Web BFF
+  participant H as Hono server
+  participant DB as Postgres
+  B->>BFF: POST /api/notifications/send (Bearer jwt)
+  BFF->>H: forward request
+  Note over H: authContextMiddleware<br/>jwtVerify vs JWKS → claims { sub usr_alice, permissions }
+  Note over H: ensureShadowUser → found Alice → attach user + session
+  Note over H: authorize("notifications", "send")<br/>resolvePrincipal → registry.can → allowed → next()
+  Note over H: handler validates body (zod) → notificationService.send
+  H->>DB: insert notifications (FK to users.id)
+  Note over H: enqueue delivery job
+  H-->>B: { id: "ntf_abc", status: "pending" }
+`} />
+
+Structurally nothing about the request changed. The route still resolves a principal,
+runs `authorize("notifications", "send")`, validates the body with zod, and writes a
+`notifications` row whose foreign key to `users.id` still resolves. The only shift is
+that the principal's roles now come from the JWT `permissions` claim rather than from
+`users.roleSlugs`.
+
+## An admin bans Alice
+
+**What this proves:** revocation is inherently two-stage — Auther bans upstream, your
+webhook syncs locally, and Alice's in-flight token only dies when it expires or you
+deny-list it — so you must choose a TTL-versus-deny-list policy deliberately.
+
+<Mermaid title="Admin ban — POST /api/users/:userId/deactivate" height={520} code={`
+sequenceDiagram
+  participant Adm as Admin
+  participant H as Hono server
+  participant Auth as Auther
+  Adm->>H: POST /api/users/usr_alice/deactivate (admin_jwt)
+  Note over H: authContextMiddleware validates, attaches admin
+  Note over H: authorize("user", "deactivate") → JWT claim allows → next()
+  Note over H: userService.deactivate → autherAdmin.banUser(...)
+  H->>Auth: POST /api/admin/users/usr_alice/ban<br/>(exchange AUTHER_ADMIN_API_KEY for cached JWT)
+  Note over Auth: set banned=true, invalidate sessions in Auther DB
+  Auth->>H: user.updated webhook (+ possible access.revoked)
+  Note over H: UPDATE users SET ... (shadow stays; she's banned upstream)
+`} />
+
+Alice's in-flight JWT stays valid for its remaining TTL (roughly 5–60 minutes). To
+close that window you have two levers, used alone or together:
+
+- A short access-token TTL plus refusing refresh for banned users — Auther rejects the
+  refresh, so the token simply expires.
+- A `jti` deny-list — the admin endpoint puts Alice's active sessions on a Redis
+  block-list that the auth middleware checks and rejects on the next request.
+
+:::caution[Revocation is not instant]
+The two-stage flow — Auther bans, your webhook syncs, and Alice's token expires — is
+normal and expected. Decide how strict your revocation needs to be and pick the right
+TTL-versus-deny-list combination; the tradeoffs are catalogued in the
+[Edge Cases Catalog](/auther/integration/edge-cases/).
+:::
+
+## Alice is deleted (GDPR request)
+
+**What this proves:** a hard delete upstream can let a still-valid token re-create the
+very row you just removed — a "zombie user" — unless you tombstone the id.
+
+<Mermaid title="GDPR delete — autherAdmin.deleteUser('usr_alice')" height={520} code={`
+sequenceDiagram
+  participant Adm as Admin
+  participant H as Hono server
+  participant Auth as Auther
+  participant B as Alice's client
+  Adm->>H: "Delete Alice"
+  H->>Auth: autherAdmin.deleteUser("usr_alice")
+  Note over Auth: DELETE auther.user → cascade to session, etc.
+  Auth->>H: user.deleted webhook
+  Note over H: tx: scrub audit_logs actor_email = <deleted><br/>DELETE FROM users WHERE id usr_alice<br/>FK cascade: notifications, push_tokens, prefs, members
+  B->>H: first request after webhook (still-valid JWT)
+  Note over H: jwtVerify succeeds<br/>ensureShadowUser → not found → JIT INSERT → ZOMBIE
+`} />
+
+The delete webhook handler runs in a single transaction: it scrubs denormalized
+identity fields (for example `UPDATE audit_logs SET actor_email = '<deleted>'`, since
+the foreign key was already broken when the row left `users`), deletes the `users`
+row, and lets the foreign-key cascade clean up `notifications`, `push_tokens`,
+`notification_preferences`, and `members`.
+
+:::danger[Zombie user]
+Alice's remaining JWT is still signature-valid for a few minutes after the delete. The
+first request she makes passes `jwtVerify`, misses the now-deleted shadow row, and the
+JIT path happily re-inserts it — resurrecting the account you just erased, and
+potentially violating the GDPR request you were fulfilling.
+
+The pragmatic recipe: a short access token (5 minutes for admin or sensitive routes,
+15 minutes otherwise), a tombstone table, and a rule that refuses JIT inserts for
+tombstoned ids within 24 hours. See the
+[Edge Cases Catalog](/auther/integration/edge-cases/) for the tombstone pattern.
+:::
+
+## Cron job: nightly notification digest
+
+**What this proves:** a browserless service authenticates with the same Bearer-token
+machinery as a user — the API key's JWT carries a service-user `sub` and tuple-granted
+permissions, so the digest route needs no special-casing.
+
+<Steps>
+
+1. The cron service fires at 2am.
+2. The job calls `getJobToken()`: if the cache is warm it reuses the token, otherwise
+   it exchanges `AUTHER_API_KEY` for a JWT (valid 15 minutes).
+3. For each user to notify, the job calls the digest endpoint with the job token:
+
+   ```ts title="jobs/digest.ts"
+   await fetch(`${HONO_URL}/api/notifications/digest`, {
+     method: "POST",
+     headers: { Authorization: `Bearer ${jobToken}` },
+     body: JSON.stringify({ userId, payload }),
+   });
+   ```
+
+4. The Hono server treats it like any other request: the JWT validates (its `sub` is
+   the service user associated with the API key), JIT may create a shadow row for that
+   service user the very first time the cron ever runs, and
+   `authorize("notifications", "send")` passes because the API key holds the tuple
+   `(notifications, *, editor, apikey, <id>)`.
+5. The notification is delivered exactly as in the domain-request flow above.
+
+</Steps>
+
+:::tip[Make the audit trail name the key]
+For audit clarity, have your audit-log writer record a `principal.apiKeyId`. The JWT
+already carries it; the audit record should too, so a digest run is traceable to the
+specific key that authorized it.
+:::

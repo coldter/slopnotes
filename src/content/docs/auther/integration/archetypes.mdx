@@ -1,0 +1,130 @@
+---
+title: Four Integration Archetypes
+description: The two-axis decision matrix that picks where your user row and your permissions live when adopting a centralized IdP.
+sidebar:
+  order: 11
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+Once you've decided who owns each user column, the next question is structural: should
+a local `users` table exist at all, and if so, what belongs in it? Every integration is
+one of four shapes, and each shape is an answer to that question. Naming the shape up
+front tells you what your schema, your sync logic, and your failure modes will look
+like — so this page is the decision you make before writing any code.
+
+The four archetypes sort along two independent axes, and getting them straight is what
+keeps the rest of the integration mechanical rather than improvised.
+
+## A. Shadow-User — a local table that mirrors Auther
+
+A local `users` table still exists, but it stops being the source of truth for identity.
+Its primary key is literally Auther's user ID (the JWT `sub`), and it gets populated two
+ways:
+
+1. **Just-In-Time (JIT)** — on the first valid JWT carrying a `sub` you've never seen, you
+   insert a shadow row from the claims.
+2. **Webhooks** — Auther's lifecycle events (`user.created`, `user.updated`,
+   `user.deleted`) keep that row current and cascade deletions.
+
+Because the row still exists with the same primary key, all of your existing foreign
+keys keep working. `INNER JOIN users` still works. Cascade deletes still work. The only
+thing that changes is that you stop *writing* to the identity columns yourself — email,
+name, and the rest now flow in from Auther, and your row caches them.
+
+<Mermaid title="Shadow-User sync" height={360} code={`
+flowchart LR
+  subgraph Auther
+    AU["users<br/>id, email, name"]
+  end
+  subgraph App["Your app (Hono server)"]
+    SU["users (shadow)<br/>id = auther sub<br/>email, name (cache)<br/>+ onboardingDone"]
+  end
+  AU -->|"webhook sync"| SU
+  SU -->|"FK"| Down["notifications, push_tokens,<br/>audit_logs, members, ..."]
+`} />
+
+This is the right shape whenever `users.id` is referenced by a foreign key from several
+other tables, or whenever joins on the user row are common in your queries. The Hono
+template — the running example throughout Part 2 — hits exactly that: its `users.id` is
+referenced by `sessions`, `accounts`, `two_factors`, `notifications`, `push_tokens`,
+`notification_preferences`, `members`, and `audit_logs`. With that much foreign-key
+coupling, dropping the table is not worth the rewrite.
+
+:::tip[Start here]
+For an FK-heavy monolith, Shadow-User is the default. It preserves referential integrity
+and your existing joins while still ceding identity ownership to the IdP.
+:::
+
+## B. Federated-IDs — no local users table
+
+The opposite shape: drop the `users` table entirely. Every downstream table keeps a
+`user_id` column, but it's plain text with no foreign key behind it. When you need
+profile data — a display name, an email — you fetch it from Auther's `/userinfo`
+endpoint and cache the result.
+
+The appeal is that there's a single source of truth and no sync logic to maintain. The
+cost is that you give up foreign-key integrity, you lose `INNER JOIN users`, and every
+query that needs to *display* a user now requires an external lookup.
+
+That tradeoff pays off for stateless services that never join on a user — microservices,
+event processors, and data pipelines that only ever carry an opaque ID through. It is the
+wrong shape for the Hono template, which leans on those joins constantly.
+
+## C. Identity-Only — Auther for authN, your own authZ
+
+This axis is about authorization, not the user row. In the Identity-Only shape, Auther
+issues tokens and you trust them for *authentication* — you extract `sub` and `email`
+from the JWT — but every permission decision runs through your app's own authorization
+system.
+
+This is almost always combined with Shadow-User, and that pairing is the whole point of
+two axes: "where does the user row live?" (Shadow vs Federated) and "where do permissions
+live?" (Identity-Only vs Full-Delegation) are orthogonal questions. You answer them
+separately.
+
+The Hono template already ships `packages/authorization` — a working ReBAC-style engine
+with `createAuthorize`, `registry.can()`, principals, and resource loaders. Keeping that
+engine and feeding it an identity from Auther is precisely Identity-Only.
+
+## D. Full-Delegation — Auther runs authN and authZ
+
+The other end of the authorization axis: let Auther resolve permissions too. The JWT
+carries a `permissions` claim with pre-resolved permissions per entity type, and your app
+simply reads those claims. For the permissions that depend on runtime context — the
+ABAC-gated ones that can't be baked into a token — your app calls
+`/api/auth/check-permission` instead.
+
+Full-Delegation shines when centralized authorization is the explicit goal: a multi-app
+SaaS where every product should share one permission model. It also works for the Hono
+template *if* you want to retire `packages/authorization` and let Auther own that
+responsibility — but that's a deliberate choice to delete working code, not a default.
+
+## The two-axis decision matrix
+
+The two axes are independent, so an integration is a point on a grid rather than a pick
+from a menu. The left column says where the user row lives; the right column says where
+permissions are decided.
+
+| Situation | Users table | Authorization |
+| --- | --- | --- |
+| **Hono template (this course's main example)** | **Shadow** | **Identity-Only** (keep the package) |
+| Monolith with deep FK user dependencies | Shadow | Identity-Only |
+| Stateless API microservice | Federated | Full-Delegation |
+| Multi-tenant SaaS with per-tenant models | Shadow | Full-Delegation |
+| Microservice mesh, each service owns its domain | Federated | Full-Delegation + local hot cache |
+| Existing app with complex custom authz | Shadow | Identity-Only |
+| Greenfield app, minimum code | Shadow | Full-Delegation |
+
+For the Hono template, the answer is **Shadow + Identity-Only**: you have deep foreign-key
+coupling *and* a working local authorization package. Throwing away either one buys you
+nothing, so don't.
+
+:::note[The recommended path versus the alternatives]
+The rest of Part 2 follows the recommended default in depth — see
+[The Shadow-User Pattern](/auther/integration/shadow-user/) for JIT provisioning,
+lifecycle webhooks, and the full Hono walkthrough. If your system is one of the other
+shapes — an SPA, a microservice mesh, mobile, or a legacy migration — see
+[Alternative System Shapes](/auther/integration/alternative-shapes/) for how the same
+ideas apply.
+:::

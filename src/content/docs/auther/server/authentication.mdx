@@ -1,0 +1,299 @@
+---
+title: Authentication System
+description: How Auther configures better-auth — its OIDC surface, two session models, JWKS rotation, pre-registered clients, signup gating, and email flows.
+sidebar:
+  order: 2
+---
+
+import { Steps } from "@astrojs/starlight/components";
+
+Authentication is the half of Auther that proves *who* a request is from. Before any
+permission can be computed, a user has to sign in, exchange a code for a token, and
+have that token signed by a key the rest of the world can trust. This chapter walks
+through how Auther wires all of that together with `better-auth`, and the handful of
+deliberate choices that keep it secure and edge-friendly.
+
+## Better-auth configuration
+
+The central auth configuration lives in one file. Everything Auther does at the
+authentication layer — email/password, usernames, admin roles, API keys, JWT
+issuance, the OIDC provider surface — is assembled by composing `better-auth`
+plugins into a single `betterAuth()` instance.
+
+```ts title="src/lib/auth.ts"
+betterAuth({
+  // ...plugins listed below
+});
+```
+
+| Plugin | Purpose |
+| --- | --- |
+| `emailAndPassword` | Traditional email/password sign-in with email verification |
+| `username` | Adds username field to user accounts |
+| `admin` | Admin role management (role field on user table) |
+| `apiKey` | First-class API key management (create, verify, revoke, rate-limit) |
+| `jwt` | JWT issuance with configurable issuer and audience |
+| `oidcProvider` | Full OIDC provider surface (authorize, token, userinfo, jwks) |
+| `oAuthProxy` | Handles URL differences between dev/staging/production deployments |
+| `nextCookies` | Cookie-based session management for the Next.js admin UI |
+
+Every auth endpoint is served through a single catch-all route handler at
+`src/app/api/auth/[...betterAuth]/route.ts`. That one route does two extra jobs
+beyond delegating to better-auth: it wraps every request with CORS headers derived
+from the configured trusted origins, and it records metrics — latency and request
+counts — broken down by OIDC route type (`authorize`, `token`, `userinfo`, `jwks`,
+`sign-in`, `sign-up`, `sign-out`). Centralizing this means CORS and observability are
+handled once rather than re-implemented per endpoint.
+
+## OIDC provider surface
+
+What makes Auther an identity provider rather than just a login form is the
+`oidcProvider` plugin. It exposes the standard OAuth2/OIDC endpoints that any
+conforming client knows how to talk to, so adopting Auther doesn't require a custom
+client SDK.
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/auth/oauth2/authorize` | GET | OAuth2 authorization endpoint. Redirects the user to sign-in if not authenticated, then redirects back to the client with an authorization code. |
+| `/api/auth/oauth2/token` | POST | Token exchange. Accepts authorization codes (with an optional PKCE verifier) and returns access tokens and ID tokens (JWTs). |
+| `/api/auth/oauth2/userinfo` | GET | Returns authenticated user profile data. Requires a valid access token. |
+| `/api/auth/jwks` | GET | JSON Web Key Set. Exposes the public keys for JWT signature verification, so consuming apps can validate tokens without sharing secrets. |
+| `/api/auth/oauth2/register` | POST | Dynamic client registration. Protected by the internal signup secret. |
+
+The provider is configured in the same central auth file:
+
+```ts title="src/lib/auth.ts"
+oidcProvider({
+  loginPage: "/sign-in",
+  allowDynamicClientRegistration: true,
+  useJWTPlugin: true,
+  metadata: {
+    issuer: env.JWT_ISSUER, // e.g., "https://auth.example.com"
+  },
+  trustedClients: [payloadAdminClient, payloadSPAClient],
+}),
+```
+
+Three options carry most of the meaning. `loginPage: "/sign-in"` is where an
+unauthenticated user landing on the authorize endpoint gets redirected.
+`allowDynamicClientRegistration: true` lets new OAuth clients register themselves
+programmatically — guarded by the signup secret so it isn't an open door.
+`useJWTPlugin: true` routes ID-token signing through the JWT plugin, which means
+RS256 with JWKS-managed keys rather than a shared symmetric secret.
+
+## Session management
+
+Auther carries two distinct session models at once, because two very different kinds
+of caller need to be authenticated: operators clicking around the admin dashboard,
+and external applications consuming tokens over HTTP.
+
+### Cookie sessions (admin UI)
+
+Users interacting with the admin dashboard directly are authenticated with
+cookie-based sessions. A small set of helpers makes the three common checks
+ergonomic, all built on `auth.api.getSession()`, which reads the session cookie from
+the incoming request headers.
+
+```ts title="src/lib/session.ts"
+// Get current session (returns null if not authenticated)
+const session = await getSession();
+
+// Require authentication (throws if not logged in)
+const session = await requireAuth();
+
+// Require admin role (throws if not admin)
+const session = await requireAdmin();
+```
+
+### Route protection middleware
+
+A second layer protects whole route trees. `src/proxy.ts` runs as Next.js edge
+middleware and intercepts requests to `/admin/*` and `/dashboard/*`: if there's no
+session cookie and the route is protected, the request is redirected to sign-in with
+the original path preserved as `redirectTo`.
+
+```ts title="src/proxy.ts"
+const AUTH_ROUTES = ["/admin", "/dashboard"];
+
+// If no session cookie and route is protected, redirect to sign-in
+if (!sessionCookie && isProtected) {
+  const signInUrl = new URL("/sign-in", request.url);
+  signInUrl.searchParams.set("redirectTo", pathname);
+  return NextResponse.redirect(signInUrl);
+}
+```
+
+:::note[Why it doesn't redirect away from `/sign-in`]
+A tempting addition is to also bounce *authenticated* users away from `/sign-in`.
+The middleware deliberately does not do this. A stale-but-present session cookie
+would otherwise trigger an infinite redirect loop — cookie says "logged in", the page
+says "go away, you're logged in", round and round. Leaving `/sign-in` reachable lets
+an expired session resolve itself cleanly.
+:::
+
+### JWT / token sessions (external clients)
+
+External applications never get a cookie. They receive JWTs through the OIDC flow,
+signed with RS256 using rotating JWKS keys, and those tokens carry embedded
+permissions so the consuming app can authorize most requests without calling back to
+Auther. How those permissions are computed and embedded is the subject of
+[ReBAC & the Permission Engine](/auther/server/rebac/).
+
+## JWKS key rotation
+
+Signing keys are a single point of failure: anyone who steals the private key can
+forge tokens for every client. Auther limits that blast radius by rotating its RS256
+keys on a schedule, implemented in `src/lib/jwks-rotation.ts`.
+
+| Parameter | Value | Constant |
+| --- | --- | --- |
+| Rotation interval | 30 days | `JWKS_ROTATION_INTERVAL_MS` |
+| Retention window | 60 days | `JWKS_RETENTION_WINDOW_MS` |
+
+The rotation itself is driven by a cron job:
+
+<Steps>
+
+1. A cron job calls `POST /api/internal/rotate-jwks`, protected by `CRON_SECRET`.
+
+2. `rotateJwksIfNeeded()` checks the age of the latest key.
+
+3. If that key is older than 30 days (or none exists yet), a fresh RS256 key pair is
+   generated.
+
+4. Keys older than 60 days are pruned from the database.
+
+5. Private keys are encrypted at rest with AES-256-GCM, using `BETTER_AUTH_SECRET` as
+   the encryption key.
+
+6. The `jwks` table stores both the encrypted private key and the public key.
+
+</Steps>
+
+The 60-day retention window is the reason rotation doesn't break live clients: a
+token signed by the previous key stays verifiable through the overlap period.
+
+:::tip[Cache the JWKS endpoint, but not for too long]
+Consuming apps should cache the JWKS endpoint to avoid a fetch on every verification,
+but the cache TTL must be shorter than the 30-day rotation interval — otherwise a
+client can keep trusting a key that has already aged out.
+:::
+
+From the application's perspective the JWKS repository
+(`src/lib/repositories/jwks-repository.ts`) is read-only. It offers `findAll()`,
+`findAllWithStatus()` — which computes each key's age and an "ok"/"breached" status —
+and `findLatest()`. Actually minting new keys is handled internally by better-auth's
+`createJwk()` during rotation, so application code never creates keys directly.
+
+## Pre-registered OAuth clients
+
+Most clients can register dynamically, but the two reference clients ship
+pre-configured from environment variables in `src/lib/auth.ts`. They're worth
+studying because they illustrate the two ends of the OAuth client spectrum: a
+server-side confidential client that can keep a secret, and a browser-side public
+client that can't.
+
+The confidential client is for server-side apps that can safely store a secret:
+
+```ts title="src/lib/auth.ts"
+const payloadAdminClient = {
+  clientId: env.PAYLOAD_CLIENT_ID,
+  clientSecret: env.PAYLOAD_CLIENT_SECRET,
+  type: "web",
+  name: "Payload Admin (Confidential)",
+  redirectURLs: [env.PAYLOAD_REDIRECT_URI],
+  metadata: {
+    tokenEndpointAuthMethod: "client_secret_basic",
+    grantTypes: ["authorization_code"],
+  },
+  skipConsent: true,
+};
+```
+
+It authenticates with `client_secret_basic` — a Base64-encoded `client_id:client_secret`
+sent in the `Authorization` header as `` `Basic ${creds}` `` — and uses the
+authorization code flow. Setting `skipConsent: true` means users aren't shown an
+approval prompt; once authenticated they're redirected straight back to the client.
+
+The public client is for SPAs and other browser apps, which cannot hide a secret:
+
+```ts title="src/lib/auth.ts"
+const payloadSPAClient = {
+  clientId: env.PAYLOAD_SPA_CLIENT_ID,
+  type: "public",
+  name: "Payload SPA (PKCE)",
+  redirectURLs: env.PAYLOAD_SPA_REDIRECT_URIS,
+  metadata: {
+    tokenEndpointAuthMethod: "none",
+    grantTypes: ["authorization_code"],
+    postLogoutRedirectUris: env.PAYLOAD_SPA_LOGOUT_URIS,
+  },
+  skipConsent: true,
+};
+```
+
+Because it has no secret, this client enforces PKCE (Proof Key for Code Exchange).
+The browser generates a `code_verifier`/`code_challenge` pair, sends the challenge
+during authorization, and proves possession of the verifier during token exchange.
+That binding is what stops an attacker who intercepts the authorization code from
+redeeming it.
+
+Beyond these two, additional clients can be registered at runtime through the
+`/api/auth/oauth2/register` endpoint or via the admin UI at
+`/admin/clients/register`.
+
+## Signup restrictions
+
+Auther is a centralized IdP for known applications, not a public sign-up service, so
+open self-registration would be a liability. By default, public user registration is
+restricted. A `createAuthMiddleware` before-hook in `src/lib/auth.ts` runs ahead of
+every auth request and gates the registration paths:
+
+```ts title="src/lib/auth.ts"
+validateInternalSignupAccess(
+  request,
+  relativePath,
+  restrictedSignupPaths,  // Set(["/sign-up/email", "/oauth2/register"])
+  env.PAYLOAD_CLIENT_SECRET
+);
+```
+
+The `validateInternalSignupAccess()` function in
+`src/lib/utils/auth-middleware.ts` checks that requests to `/sign-up/email` and
+`/oauth2/register` carry an `x-internal-signup-secret` header matching
+`PAYLOAD_CLIENT_SECRET`. If it's missing or wrong, the request gets a 403 Forbidden.
+
+In practice this means:
+
+- Users cannot self-register unless the calling application supplies the internal secret.
+- New users are typically created through the admin UI, invite links, or an
+  authorized backend service.
+
+:::caution[The signup secret is the client secret]
+The internal signup secret is the *same* value as the confidential client secret.
+The practical consequence: any app that can authenticate as a client can also create
+users. Treat that secret accordingly, and rotate it as you would any credential that
+can mint accounts.
+:::
+
+## Email verification and password reset
+
+Two transactional emails round out the authentication lifecycle. Both are sent
+through Resend (`src/lib/email/send.ts`) using React Email templates in
+`src/lib/email/templates/`:
+
+- **Verification email** — sent on sign-up via `sendVerificationEmail()`, from the
+  `email-verification.tsx` template.
+- **Password reset email** — sent via `sendPasswordResetEmail()`, from the
+  `password-reset.tsx` template.
+
+Both functions follow the same shape: render the React Email template to HTML with
+`render()`, send it through the Resend API, and record metrics (duration,
+success/error counts, rate-limit detection). For tests, a `SKIP_EMAIL_SENDING`
+environment variable short-circuits actual delivery.
+
+The relevant configuration:
+
+- `RESEND_API_KEY` — the Resend API key.
+- `EMAIL_FROM` — the sender address, e.g. `noreply@example.com`.
+- `EMAIL_FROM_NAME` — the sender display name, e.g. `"Auther"`.

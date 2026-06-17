@@ -1,0 +1,536 @@
+---
+title: Security
+description: The multi-tenant threat model — two identity domains, the isolation invariants, and a named mitigation for each attack.
+sidebar:
+  order: 9
+---
+
+import { Badge, Steps } from "@astrojs/starlight/components";
+
+Multi-tenancy is mostly a security problem wearing an architecture costume. Every
+decision in the earlier chapters — host-only cookies, per-tenant JWT claims, the
+separate admin worker — exists to keep one tenant's users, sessions, and secrets out
+of another tenant's reach, and to keep operators out of tenant data unless they leave
+an audit trail. This chapter lays out the threat model explicitly: who the attackers
+are, what isolation invariants must always hold, and a concrete mitigation for each
+named attack.
+
+Throughout, each threat carries a status: <Badge text="closed" variant="success" />
+means the design fully addresses it, <Badge text="mitigated" variant="note" /> means
+the risk is reduced but not eliminated, and <Badge text="accepted" variant="caution" />
+means the residual risk is understood and tolerated for v1.
+
+## Two identity domains
+
+The system has two completely separate populations of identity, and they must never
+mix:
+
+- **Tenant users** — customers. They live in Better Auth's `users` table and are
+  managed by tenant admins.
+- **Operators** — SaaS staff. They live in the `global_admins` table and are gated
+  by Cloudflare Access, never by a tenant session.
+
+The attackers the design defends against follow from those two domains:
+
+- A tenant admin trying to escalate to global admin, or to read another tenant's data.
+- An unauthenticated attacker registering sensitive slugs or custom hostnames they
+  don't own.
+- A malicious tenant pointing an attacker-controlled OIDC provider at the system to
+  harvest cross-tenant identities.
+- A compromised IdP at the Cloudflare Access layer issuing tokens for unauthorized
+  operators.
+- A former operator with a still-valid Cloudflare Access session.
+- An authenticated tenant user calling a global-admin endpoint.
+- A compromised Postgres backup leaking SSO client secrets.
+
+## Identity isolation invariants
+
+These are the load-bearing guarantees. Every one is enforced by a concrete mechanism,
+not by convention, and a reviewer touching the multi-tenancy surface should check that
+none of them have been weakened.
+
+| Invariant | Mechanism |
+| --- | --- |
+| Operators are never in the `users` table | `global_admins` is a separate table; gates check it specifically |
+| Tenant cookies never cross hosts | `Domain` attribute unset (host-only); `crossSubDomainCookies: false` |
+| Cross-tenant CSRF is blocked | Host-only cookies + explicit `Origin`/CSRF enforcement on every state-changing route |
+| A JWT minted for tenant A is never accepted by tenant B | Per-host `aud` + `iss`; `org.host`, `org.id`, `org.sessionVersion` claims |
+| An operator session never shares state with a tenant session | The admin worker has no cookie session; the CF Access JWT is verified per request |
+| An operator action is always visible to the affected tenant | `auditLogService.createDualScope` writes to both views |
+| `audit_logs` is append-only | A Postgres trigger raises on UPDATE/DELETE |
+| Self-serve sign-up is disabled | `disableSignUp: true` globally; users arrive only via invitation |
+| Better Auth's `organization.create` always rejects | An unconditional `before` hook |
+| Tenants are creatable only by operators | `AdminApiEntrypoint.createTenantOnBehalfOf` is the only public path |
+
+## Cookie isolation
+
+Isolation between tenant subdomains starts at the cookie. The whole model is *per-host
+cookies plus explicit CSRF/origin enforcement*, and it's worth understanding why the
+obvious shortcut — leaning on `SameSite` — doesn't carry the weight.
+
+- The session cookie carries no `Domain` attribute, so the browser scopes it to the
+  exact host that set it.
+- Sibling tenant subdomains share a registrable domain, so the browser treats them as
+  *same-site*. That means `SameSite=strict` does **not**, on its own, stop
+  tenant-to-tenant CSRF.
+- The main auth/session cookies stay `SameSite=lax` so OAuth/OIDC callback and
+  state-cookie flows keep working. `Strict` can still be useful for selected non-OAuth
+  cookies, but it is not the tenant-isolation boundary.
+- `crossSubDomainCookies` stays off.
+- Better Auth's `secondaryStorage` (KV) caches session state by token, not by domain,
+  so there's no cross-host leakage through the cache either.
+
+:::caution[The isolation boundary]
+Because sibling subdomains are same-site, the real defense is that every
+state-changing tenant or admin endpoint enforces `Origin` against the resolved public
+origin, and custom mutation endpoints require a non-simple request shape (for example
+JSON plus a custom header). Better Auth already performs CSRF/origin checks on its own
+auth endpoints; the new tenancy and admin routes must do the same.
+:::
+
+## JWT scoping
+
+Cross-tenant token forgery is the central attack in a shared-database SaaS, so every
+JWT is scoped to exactly one host and one org, and every consumer verifies all five
+scoping properties.
+
+On the mint side, Better Auth's `jwt` plugin issues per-tenant claims:
+
+```ts
+{
+  iss: "https://acme.app.example.com",
+  aud: "https://acme.app.example.com",
+  sub: user.id,
+  email, roleSlugs, platform,
+  org: { id: orgId, host: "acme.app.example.com", sessionVersion: 5 },
+  exp: now + 15min,
+}
+```
+
+On the verifier side, every consumer checks all five of:
+
+1. `aud === "https://${expectedHost}"` (tenant-host scoping)
+2. `iss === "https://${expectedHost}"`
+3. `org.host === expectedHost`
+4. `org.id === expectedOrgId`
+5. `org.sessionVersion >= db.organization.session_version`
+
+After the deep-module consolidation, all five checks live behind
+`verifyTenantJwt(token, opts)` so consumers never re-derive them — see
+[Deep Modules](/multi-tenant/deep-modules/#auth-tokens-package).
+
+:::note[Why all five]
+Omitting any one re-opens cross-tenant token forgery. `aud`/`iss` alone aren't enough:
+in principle they could be spoofed by anyone who controls the mint side — which an
+attacker can't, since they lack Better Auth's JWKS private key, but defense in depth
+assumes they might. The `org` claim ties the JWT to a specific organization, and
+`org.sessionVersion` allows immediate revocation when a tenant is suspended.
+:::
+
+## SSO callback validation before token exchange
+
+When a tenant self-registers its own OIDC provider, the callback URL becomes an
+attack surface. The `ssoCallbackGuardPlugin` runs on `/sign-in/sso/callback/*`
+*before* Better Auth exchanges the authorization code:
+
+```ts
+hooks: {
+  before: createAuthMiddleware(async (ctx) => {
+    if (!ctx.path.startsWith("/sign-in/sso/callback/")) return;
+    const providerId = ctx.path.split("/").pop();
+    const provider = await db.query.ssoProviders.findFirst({
+      where: { providerId: { eq: providerId } },
+      columns: { organizationId: true },
+    });
+    if (!provider || provider.organizationId !== tenant.organizationId) {
+      throw new APIError("FORBIDDEN", { message: "Provider does not belong to this tenant" });
+    }
+  }),
+}
+```
+
+:::caution[Why it must run before]
+Rejecting in `provisionUser` is too late: by then the authorization code has already
+been spent at the IdP. In a confused-deputy attack, an Acme IdP's response is replayed
+at globex's callback URL. Without the guard, Better Auth exchanges the code and mints a
+session for the wrong tenant.
+:::
+
+## SSO email-link account takeover
+
+<Badge text="closed" variant="success" />
+
+:::danger[Account takeover]
+Because tenants self-register their own OIDC providers, a tenant admin (or a
+compromised one) can configure a provider whose `id_token` returns
+`email = victim@bigcorp.com`. Their IdP is fully under their control. They sign in via
+"their" SSO, and with default account linking Better Auth would attach the session to
+the existing victim user — letting the attacker take over the victim's account,
+including the victim's memberships in *other* organizations.
+:::
+
+The `provisionUser` hook requires three conditions before any link proceeds:
+
+1. `userInfo.email_verified === true` — the IdP attests the email.
+2. The existing user is already a member of *this* org — no cross-org linking.
+3. The SSO provider's `domainVerified === true` — the IdP's ownership of the email
+   domain was verified via a DNS TXT record.
+
+`account.accountLinking.trustedProviders: []` is left empty, so default linking only
+proceeds when `provisionUser` passes.
+
+## Operator account takeover via IdP race
+
+<Badge text="closed" variant="success" />
+
+:::danger[Operator takeover]
+Without enrollment tokens, suppose operator `alice@company.com` is provisioned with
+`cf_access_sub = NULL`, and the CF Access policy allows the `@company.com` email
+domain via OTP. An attacker registers a different identity (a different IdP account
+asserting the same email) and signs in *first*. Email-fallback matching writes the
+attacker's `sub` to Alice's row — a silent takeover.
+:::
+
+The mitigation is to have **no email fallback**. `globalAdminMiddleware` only matches
+by `cf_access_sub`, and first-login binding requires a one-time `enrollment_token`
+(24h TTL) issued out-of-band by a `super_admin`:
+
+<Steps>
+
+1. A super-admin POSTs `/api/admin/global-admins { email, name, role }`. The server
+   returns the enrollment token (shown once).
+2. The super-admin shares the token with the new operator out-of-band (Slack, a
+   password manager).
+3. The operator authenticates via Cloudflare Access and presents an
+   `x-admin-enrollment-token` header on their first request.
+4. The middleware atomically claims the row with
+   `UPDATE ... WHERE cf_access_sub IS NULL` (race-safe).
+
+</Steps>
+
+An email cross-check at redemption catches the case where the IdP returned a different
+email than expected.
+
+## Custom hostname squatting
+
+<Badge text="closed" variant="success" />
+
+:::caution[Resource abuse]
+Anyone with a tenant admin role could POST
+`/api/tenancy/hostnames { hostname: "app.competitor.com" }`. If the system registered
+that with Cloudflare immediately, it would burn quota and potentially trigger
+Cloudflare abuse-flagging on the zone.
+:::
+
+The fix is a two-step flow:
+
+1. The POST creates a `tenant_custom_hostnames` row with a `verification_token` and
+   makes **no** Cloudflare API call yet. The tenant must add a TXT record
+   (`_app-example-verify.<host>` = token).
+2. A verify endpoint resolves the TXT via DNS-over-HTTPS; only after success does the
+   system call Cloudflare.
+
+Per-org rate limits back this up: at most 10 pending hostnames at a time and 50 per
+day, plus a hard refusal on hostnames whose apex resolves to an IP the system doesn't
+control unless the TXT record is present.
+
+## Slug squatting and tombstones
+
+<Badge text="closed" variant="success" />
+
+:::caution[Impersonation and inheritance]
+An attacker could register confusing or impersonating slugs like `admin`, `api`,
+`oauth`, or `support`. Or they could register an org, delete it, and later re-register
+the same slug to inherit links, cookies, and JWTs that still reference the prior org's
+users.
+:::
+
+The mitigations harden slug allocation at both ends:
+
+- A reserved-slug denylist (around 50 entries) covers system names, common admin
+  paths, marketing surfaces, DNS reserved labels, and common subdomains.
+- A DNS-label-safe slug regex: `^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$`.
+- The `xn--` Punycode prefix is rejected — no IDN tenants in v1.
+- Slugs are lowercased and NFC-normalized before validation.
+- On org soft-delete, the slug is moved to the `reserved_slugs` table with
+  `reason: "deleted_org"` and is never reissued.
+
+See [Tenant Resolution](/multi-tenant/tenant-resolution/) for how slugs are resolved
+and tombstoned.
+
+## SSO client secret encryption
+
+<Badge text="closed" variant="success" />
+
+:::danger[Pivot into systems you don't own]
+A Postgres backup leak — a common breach scenario — would otherwise yield every
+tenant's IdP `client_secret`. The attacker could then act *as* the SaaS against every
+tenant's IdP, impersonating any user the IdP issues for the registered `client_id`.
+That's far more damaging than a normal DB leak because it pivots into systems the SaaS
+doesn't own.
+:::
+
+Secrets are protected with `pgcrypto` column-level encryption. The decryption key
+lives in Cloudflare Secrets Store — not in the database and not in environment
+variables. Better Auth's SSO plugin reads from a `sso_providers_decrypted` view that
+decrypts on read, with `SET LOCAL app.sso_key = '...'` per session. Application code
+reads `sso_providers` (raw, encrypted) by default and uses `withDecryptedSecret(...)`
+scoped closures when it needs plaintext.
+
+As defense in depth, the logger middleware redacts any field named `secret`,
+`clientSecret`, or `enrollmentToken` from structured log output.
+
+## CF API token blast radius
+
+<Badge text="mitigated" variant="note" />
+
+`CLOUDFLARE_API_TOKEN` is scoped to the SaaS zone only, with three permissions —
+`Zone:Read`, `SSL and Certificates:Edit`, and `Custom Hostnames:Edit` — never
+account-wide. It's stored as a Cloudflare Secret with quarterly rotation in the
+runbook. A v2 hardening is to split read and write tokens, so the reconciler uses a
+read token and admin actions use a write token.
+
+## workers.dev bypass
+
+<Badge text="closed" variant="success" />
+
+:::caution[Perimeter bypass]
+Cloudflare Access binds at the hostname level. The default
+`<name>.<account>.workers.dev` URL is not behind Access, so anyone who guesses it gets
+the worker with no JWT validation.
+:::
+
+Every worker (`apps/admin`, `apps/auth`, `apps/server`, `apps/app`) sets
+`"workers_dev": false` and `"preview_urls": false`. As defense in depth — and to catch
+misrouted traffic — each worker's first middleware also rejects any request whose
+`Host` header isn't its configured public hostname.
+
+## trustedOrigins echo abuse
+
+<Badge text="closed" variant="success" />
+
+:::caution[Trusting spoofable input]
+A naive `trustedOrigins` callback that returns `https://${new URL(request.url).host}`
+would trust whatever `Host` arrived. If `Host` were ever spoofable, an attacker could
+mark any URL as trusted.
+:::
+
+Better Auth's `allowedHosts` list is explicit and is automatically added to
+`trustedOrigins`. The extra `trustedOrigins` callback is reserved only for local-dev
+origins and the short-lived, validated IdP discovery origins needed during SSO
+provider registration.
+
+## Forwarded-header confusion at the auth boundary
+
+<Badge text="closed" variant="success" />
+
+:::caution[Header spoofing across workers]
+Better Auth's dynamic `baseURL` resolution can consult `x-forwarded-host` and
+`x-forwarded-proto` before `host`. If `apps/server` forwarded the raw request or
+headers into the auth worker, a spoofed forwarded header could distort callback-URL
+generation or trusted-origin checks.
+:::
+
+Every call from `apps/server` to `apps/auth` reconstructs the request and headers, sets
+`host` to the already-validated public host, and strips or overwrites
+`x-forwarded-host` and `x-forwarded-proto`. Tenant resolution itself still trusts only
+the Cloudflare-delivered `Host` header.
+
+## Tenant suspension revokes sessions
+
+<Badge text="closed" variant="success" />
+
+:::caution[Revocation lag]
+When a tenant is suspended for a ToS violation, cookie expiry of 1 hour to 7 days would
+otherwise let the suspended tenant's users keep operating during that window.
+:::
+
+`tenantOperations.suspend(...)` closes the gap in a single transaction:
+
+```sql
+UPDATE organization
+   SET suspended_at = now(),
+       session_version = session_version + 1
+ WHERE id = $1;
+
+DELETE FROM session WHERE active_organization_id = $1;
+```
+
+JWT verifiers then reject any claim where
+`org.sessionVersion < db.organization.session_version`, so existing tokens stop working
+immediately.
+
+## Operator privilege escalation
+
+<Badge text="closed" variant="success" />
+
+:::danger[Privilege escalation]
+A `support` operator could try to promote themselves to `super_admin`, or cover their
+tracks by deleting audit-log rows.
+:::
+
+Several controls stack here:
+
+- The `OPERATOR_PERMISSIONS` matrix gates `platform.manage_global_admins` to
+  `super_admin` only.
+- Only a `super_admin` can grant `super_admin` to another operator (an extra check in
+  the handler).
+- `support` cannot read `admin.*` audit events; the `security` role has read-only
+  access.
+- The `audit_logs` Postgres trigger blocks UPDATE/DELETE, so even a DB-credentialed
+  engineer can't quietly rewrite history.
+- An operator cannot deactivate themselves, and the system never lets the active
+  `super_admin` count drop to zero.
+
+## Cross-tenant operator queries
+
+<Badge text="mitigated" variant="note" />
+
+:::caution[Data exfiltration]
+A curious or malicious operator could scrape user data across all tenants for
+marketing or exfiltration.
+:::
+
+Cross-tenant reads are allowed but tightly controlled:
+
+- `admin.support.query` is classified **CRITICAL** — its audit write is transactional,
+  not bufferable.
+- A hard row cap of 100 per query; pagination beyond that requires separate, separately
+  audited calls.
+- A per-operator rate limit via a RateLimiter Durable Object partition
+  `(globalAdminId, "support_query")`, 60 per hour.
+- The audit row records the SQL predicate digest plus the row count.
+
+## CSRF on tenancy and admin endpoints
+
+<Badge text="closed" variant="success" />
+
+All Better Auth endpoints have built-in CSRF protection (an origin check plus a custom
+header). New admin and tenancy mutation endpoints add the same `Origin` header check —
+the value must equal the configured public hostname. Host-only cookies plus explicit
+origin/CSRF enforcement are the primary defense here; `SameSite` is additional
+hardening only.
+
+## Open redirect
+
+<Badge text="mitigated" variant="note" />
+
+`signIn.sso({ callbackURL })` and similar calls rely on Better Auth's existing
+`trustedOrigins` check, which restricts `callbackURL` to the dynamic per-host set.
+Combined with the host validation in `trustedOrigins` described above, an attacker
+cannot redirect to `https://evil.com`.
+
+## Information disclosure on /api/tenancy/current
+
+<Badge text="accepted" variant="caution" />
+
+This endpoint is publicly accessible — no auth required, because the login page needs
+it. It returns:
+
+```ts
+{ organizationId, slug, enforceSSO, providers: [{ providerId, label }], branding }
+```
+
+It's rate-limited aggressively per source IP (for example 60/min/IP across all hosts)
+and returns minimal information: `providerId` and `label` only, with no internal IDs
+and no IdP issuer URL leaked. This is treated as acceptable disclosure for v1.
+
+## MFA gap
+
+<Badge text="accepted" variant="caution" />
+
+:::caution[Un-mitigatable in v1]
+The Cloudflare Access JWT does not include an `amr` claim, so the worker has no way to
+verify that a token was issued via MFA.
+:::
+
+For v1, MFA enforcement leans on two layers:
+
+1. A CF Access policy of `Require: Authentication Method ∈ {mfa, swk, hwk, otp}` — which
+   can be bypassed if the policy is misconfigured.
+2. IdP-side MFA enforcement (Google Workspace 2SV, Okta MFA policy).
+
+The v2 plan is to call the CF Access Identity API server-side, verify the AMR value,
+and cache it by `identity_nonce`.
+
+## Logout
+
+<Badge text="closed" variant="success" />
+
+Logout differs by identity domain:
+
+- **Tenant**: Better Auth's `signOut` endpoint clears the session cookie and revokes
+  the session row.
+- **Operator**: `https://admin.example.com/cdn-cgi/access/logout`, which is
+  Cloudflare-managed. Per-app revocation propagates within about 30 seconds.
+
+## CF Access logout CSRF
+
+<Badge text="accepted" variant="caution" />
+
+A malicious tenant could embed `<img src="https://admin.example.com/cdn-cgi/access/logout">`
+on a tenant page. An operator browsing the page during support would get logged out — a
+nuisance, not an exfiltration. The endpoint is Cloudflare-controlled, so CSRF tokens
+can't be added to it. The operator runbook recommends a separate browser profile for
+admin access.
+
+## Local-dev surface hardening
+
+<Badge text="closed" variant="success" />
+
+Development conveniences are double-gated so they can never leak into production:
+
+- The dev tenant header (`X-Dev-Tenant-Slug`) is behind a two-factor gate:
+  `NODE_ENV === "development"` **and** `ALLOW_DEV_TENANT_HEADER === "true"` (a
+  Cloudflare Secret). A CI guard rejects deploys to staging or prod where the merged
+  config has `NODE_ENV !== "production"`.
+- The admin email fallback (`LOCAL_DEV_ADMIN_EMAIL`) uses the same pattern:
+  `NODE_ENV === "development"` **and** `ALLOW_DEV_ADMIN_AUTH === "true"`. A
+  misconfigured production deploy fails hard rather than silently authenticating.
+
+## Audit log immutability
+
+<Badge text="closed" variant="success" />
+
+A Postgres trigger blocks UPDATE/DELETE on `audit_logs`, and application code never
+issues UPDATE/DELETE against the table — the trigger is the invariant, not a
+convention. The DB role the workers use holds only `INSERT, SELECT` on `audit_logs`; the
+migration role separately holds the DDL permissions needed to install the trigger.
+
+## Reserved-slug enforcement at the DB level
+
+<Badge text="closed" variant="success" />
+
+A UNIQUE constraint on `organization.slug` and a UNIQUE constraint on
+`reserved_slugs.slug` make slug collisions impossible at the database level. The
+application also checks both before insert; the UNIQUE constraint catches the second
+writer in a race.
+
+## Threat ↔ mitigation matrix
+
+The capstone view: every named attack, its mitigation, and where the relevant
+mechanism is documented.
+
+| Threat | Mitigation | Where |
+| --- | --- | --- |
+| Cross-tenant JWT forgery | Per-tenant `aud`/`iss` + `org` claim + `sessionVersion` | [Auth & SSO](/multi-tenant/auth-sso/#part-3-jwt-and-sessions) |
+| SSO email-link account takeover | `provisionUser` membership + `email_verified` + `domainVerified` | [Auth & SSO](/multi-tenant/auth-sso/#part-2-sso-plugin) |
+| SSO callback to wrong tenant | `ssoCallbackGuardPlugin` before token exchange | [Auth & SSO](/multi-tenant/auth-sso/#ssocallbackguardplugin) |
+| Operator account takeover via IdP race | Enrollment-token first-login (no email fallback) | [Admin Panel & Operators](/multi-tenant/admin-panel/#globaladminmiddleware) |
+| Cross-tenant CSRF | Host-only cookies + explicit origin/CSRF checks | [Auth & SSO](/multi-tenant/auth-sso/#cookie-isolation) |
+| `workers.dev` bypass | `workers_dev: false` + Host-header guard | [Architecture & Topology](/multi-tenant/architecture/#routing-rules) |
+| `trustedOrigins` echo | Explicit `allowedHosts`; minimal extra trusted origins | [Auth & SSO](/multi-tenant/auth-sso/) |
+| Forwarded host confusion | Reconstruct request/headers before crossing the server → auth boundary | [Auth & SSO](/multi-tenant/auth-sso/) |
+| OIDC client secret leak | `pgcrypto` + Postgres view + log redaction | [Deep Modules](/multi-tenant/deep-modules/#sso-provider-repository) |
+| CF API token blast radius | Single zone, 3 permissions, secret store, quarterly rotation | [Custom Hostnames](/multi-tenant/custom-hostnames/#cloudflare-api-token) |
+| `/api/tenancy/current` enumeration | Aggressive rate-limit, minimal info | This page |
+| Cross-tenant data bleed via shared user table | `provisionUser` membership gate; v2 considers tenant-scoped identity | [Auth & SSO](/multi-tenant/auth-sso/) |
+| Slug squatting / Punycode | Denylist + NFC + `xn--` reject + format regex | [Tenant Resolution](/multi-tenant/tenant-resolution/) |
+| Subdomain takeover after deletion | Tombstone in `reserved_slugs` | [Tenant Resolution](/multi-tenant/tenant-resolution/#tombstoned-slugs) |
+| Apex `tenant === null` route abuse | Default-deny: only login picker + `/api/tenancy/current` allowed | [Tenant Resolution](/multi-tenant/tenant-resolution/) |
+| Tenant suspension lag | `session_version` bump + session DELETE in the same tx | [Auth & SSO](/multi-tenant/auth-sso/#tenant-suspension-revokes-sessions) |
+| Operator privilege escalation | Matrix gate + `audit_logs` immutability | [Admin Panel & Operators](/multi-tenant/admin-panel/#operator-roles) |
+| Operator data exfiltration | CRITICAL audit + row cap + rate limit | [Admin Panel & Operators](/multi-tenant/admin-panel/#cross-tenant-operator-queries) |
+| Custom hostname squatting | Two-step TXT pre-verification | [Custom Hostnames](/multi-tenant/custom-hostnames/#tenant-onboarding-flow) |
+| Audit log tampering | Postgres trigger blocks UPDATE/DELETE | [Schema & Migrations](/multi-tenant/schema-migrations/#audit_logs) |
+| MFA bypass via misconfigured Access policy | Un-mitigatable in v1 (no `amr` claim); IdP-side MFA + policy review | [Admin Panel & Operators](/multi-tenant/admin-panel/#risk-mitigations) |

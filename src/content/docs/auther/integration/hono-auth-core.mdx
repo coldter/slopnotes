@@ -1,0 +1,449 @@
+---
+title: Hono Walkthrough — Auth Core
+description: Deleting the local better-auth instance and rebuilding the auth layer around Auther — JWT verification, the webhook receiver, and a server-to-server admin client.
+sidebar:
+  order: 14
+---
+
+import { FileTree } from "@astrojs/starlight/components";
+
+The [schema changes](/auther/integration/hono-schema/) from the previous page surface
+a lot of dead code in `apps/server`. Once Auther owns identity, every file that used
+to run authentication locally — the better-auth instance, the password helpers, the
+rate-limit constants — has nothing left to do. This page walks the auth module
+file-by-file: what to delete, and what to write in its place. The end state is a
+server that trusts a verified Auther JWT, keeps a thin shadow user in sync over
+webhooks, and reaches back to Auther only for privileged admin actions.
+
+## Delete the local better-auth instance
+
+The current `apps/server/src/modules/auth/instance.ts` (roughly 15 kB) instantiates
+`betterAuth()` with a Drizzle adapter and wires up plugins, `databaseHooks`,
+`rateLimit`, `emailAndPassword`, the session config, and the `create session before`
+hook that deletes existing sessions, detects new-device logins, and resolves the
+active-org membership.
+
+All of it goes away. Auther runs these flows remotely now, so the whole file can be
+deleted. A few pieces inside it are still useful and just need a new home:
+
+- **`detectPlatform(userAgent)`** moves to `apps/server/src/utils/platform.ts`. It is
+  still handy for things like rendering mobile-friendly push-notification content.
+- **The new-device login notification** (logic that lived in the existing
+  `instance.ts`) needs somewhere to go. Either let Auther own it — write an
+  `after_signin` pipeline hook in Auther's admin UI that detects a new device and
+  emits a `security.new_device_login` webhook event, which your Hono server's webhook
+  receiver (below) turns into a `notificationService.send(...)` call — or, if Auther's
+  built-in login-security plugin is good enough, drop the feature entirely.
+- **Active-org resolution on session create** moves into the auth-context middleware
+  (below): on any incoming JWT, look up the user's most recent `members` row and
+  attach it to the request context. Alternatively, switch to URL-path tenancy and
+  delete the lookup altogether.
+
+## What else to delete
+
+The rest of the auth module follows. Most of it is identity logic that Auther now
+owns; what survives is whatever is genuinely app-specific.
+
+| File | Fate |
+| --- | --- |
+| `instance.ts` | Delete |
+| `handler.ts` | Delete — no `/api/auth/*` routes mounted locally |
+| `constants.ts` (RATE_LIMIT, 2FA) | Delete — Auther owns both |
+| `auth-notifications.ts` | Delete — auth emails come from Auther; new-device webhook from Auther |
+| `helpers/argon2id.ts` | Delete — no passwords stored locally |
+| `plugins/admin.ts` | Delete — use Auther's admin UI, or proxy through the admin API |
+| `plugins/login-security.ts` | Delete — replaced by Auther's login-security plugin |
+| `plugins/user-status.ts` | Delete — covered by Auther admin plugin's `banned` + `banReason` |
+| `roles/*` | Move if app-specific; delete if it's an identity role |
+
+In their place, four new files carry the integration:
+
+| File | Purpose |
+| --- | --- |
+| `apps/server/src/modules/auth/verify.ts` | Shared JWKS + `verifyAutherToken` (jose) |
+| `apps/server/src/modules/auth/shadow.ts` | `ensureShadowUser` (the just-in-time provisioning helper) |
+| `apps/server/src/modules/auth/webhook.ts` | Inbound webhook receiver |
+| `apps/server/src/modules/auth/admin-client.ts` | Server-to-server calls to Auther's admin endpoints |
+
+<FileTree>
+- apps/server/src/modules/auth/
+  - verify.ts **shared JWKS + token verification**
+  - shadow.ts `ensureShadowUser` JIT provisioning
+  - webhook.ts inbound webhook receiver
+  - admin-client.ts server-to-server admin calls
+</FileTree>
+
+## Rewrite the auth-context middleware
+
+This middleware runs on every request and decides who the caller is. In the old
+world it asked the local better-auth instance for a session. In the new world there
+is no local session store: the caller arrives with an Auther-signed JWT, and the
+middleware's whole job is to verify that token against Auther's JWKS and turn its
+claims into the request context. This is the single most important rewrite in the
+module, so it is worth seeing both versions side by side.
+
+The old middleware delegated entirely to the local instance's `getSession`:
+
+```ts title="apps/server/src/middlewares/auth-context.ts (before — getSession)"
+import { createMiddleware } from "hono/factory";
+import type { Env } from "@/lib/context";
+import { auth } from "@/modules/auth/instance";
+
+export const authContextMiddleware = createMiddleware<Env>(async (c, next) => {
+  const session = (await auth.api.getSession({
+    headers: c.req.raw.headers,
+  })) as typeof auth.$Infer.Session | null;
+
+  if (!session) {
+    c.set("user", null);
+    c.set("session", null);
+    return next();
+  }
+  c.set("user", session.user);
+  c.set("session", session.session);
+  return next();
+});
+```
+
+The new middleware verifies a `Bearer` token against a cached remote JWKS, then
+provisions a shadow user just-in-time from the verified claims:
+
+```ts title="apps/server/src/middlewares/auth-context.ts (after — jose verify + JIT)" {7-10,17,21-26,40}
+import { createMiddleware } from "hono/factory";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import type { Env } from "@/lib/context";
+import { env } from "@/env";
+import { ensureShadowUser, type AutherClaims } from "@/modules/auth/shadow";
+
+const JWKS = createRemoteJWKSet(new URL(`${env.AUTHER_URL}/api/auth/jwks`), {
+  cacheMaxAge: 12 * 60 * 60 * 1000,   // shorter than Auther's 30d rotation
+  cooldownDuration: 10 * 1000,        // throttle re-fetch on unknown kid
+});
+
+export const authContextMiddleware = createMiddleware<Env>(async (c, next) => {
+  const header = c.req.header("Authorization");
+  if (!header?.startsWith("Bearer ")) {
+    c.set("user", null);
+    c.set("session", null);
+    return next();
+  }
+
+  let claims: AutherClaims;
+  try {
+    const { payload } = await jwtVerify(header.slice(7), JWKS, {
+      issuer: env.AUTHER_ISSUER,
+      audience: env.AUTHER_AUDIENCE,
+      clockTolerance: 30,
+    });
+    claims = payload as AutherClaims;
+  } catch {
+    c.set("user", null);
+    c.set("session", null);
+    return next();          // let route handler decide 401 vs continue
+  }
+
+  const user = await ensureShadowUser(claims);
+  c.set("user", user);
+  c.set("session", {
+    id: claims.sid ?? claims.sub,
+    userId: claims.sub,
+    permissions: claims.permissions ?? {},
+    abacRequired: claims.abac_required ?? {},
+    expiresAt: new Date(claims.exp * 1000),
+  });
+  return next();
+});
+```
+
+A few details earn their place. The `JWKS` set is created once at module load and
+cached: `cacheMaxAge` is deliberately set well below Auther's 30-day key-rotation
+window so a rotated key is picked up promptly, and `cooldownDuration` throttles
+re-fetches when a request arrives with an unknown `kid`, so a flood of bad tokens
+cannot hammer the JWKS endpoint. On a verification failure the middleware does not
+throw — it clears the context and continues, leaving the route handler to decide
+whether a missing identity means `401` or "carry on as anonymous." Finally, the
+synthesized session is no longer a better-auth row; it is built straight from the
+claims, with `claims.sid ?? claims.sub` standing in for a session id and the two
+permission maps (`permissions` and `abac_required`) carried through verbatim.
+
+Because the session shape changed, the `Env` type in
+`apps/server/src/lib/context.ts` has to change with it. The user is now a plain
+Drizzle row rather than better-auth's inferred session user, and the session becomes
+the small hand-built object the middleware sets:
+
+```ts title="apps/server/src/lib/context.ts (before)"
+import type { auth } from "@/modules/auth/instance";
+export type Env = {
+  Variables: {
+    user: typeof auth.$Infer.Session["user"] | null;
+    session: typeof auth.$Infer.Session["session"] | null;
+  };
+};
+```
+
+```ts title="apps/server/src/lib/context.ts (after)"
+import type { users } from "@repo/db/schema";
+export type Env = {
+  Variables: {
+    user: typeof users.$inferSelect | null;
+    session: {
+      id: string;
+      userId: string;
+      permissions: Record<string, string[]>;
+      abacRequired: Record<string, string[]>;
+      expiresAt: Date;
+    } | null;
+  };
+};
+```
+
+Both permission maps are typed `Record<string, string[]>` — the same `entity → list
+of permissions` shape Auther packs into every token.
+
+## The webhook receiver
+
+Verifying a JWT tells you who the caller is right now, but it does not keep your
+shadow `users` table fresh when a profile changes at Auther, when an account is
+deleted, or when Auther's login-security plugin spots a new device. That is what the
+inbound webhook receiver is for: Auther pushes lifecycle events, and this handler
+applies them to the local database. The handler does three things before it touches
+any data — verify the signature, reject stale deliveries, and dedupe retries — and
+only then dispatches the event.
+
+```ts title="apps/server/src/modules/auth/webhook.ts" {21-25,30-31,38-43,55}
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { OpenAPIHono } from "@hono/zod-openapi";
+import { eq } from "drizzle-orm";
+import { redis } from "@/lib/redis";
+import { logger } from "@/lib/logger";
+import { db } from "@/db";
+import { users } from "@repo/db/schema";
+import type { Env } from "@/lib/context";
+import { env } from "@/env";
+
+type EventUserCreated = { type: "user.created"; payload: { id: string; email: string; name?: string; emailVerified: boolean; image?: string | null } };
+type EventUserUpdated = { type: "user.updated"; payload: { id: string; email?: string; name?: string; emailVerified?: boolean; image?: string | null } };
+type EventUserDeleted = { type: "user.deleted"; payload: { id: string } };
+type EventUserVerified = { type: "user.verified"; payload: { id: string } };
+type EventSecurityNewDevice = { type: "security.new_device_login"; payload: { userId: string; ipAddress: string | null; userAgent: string | null; at: string } };
+type AutherEvent = EventUserCreated | EventUserUpdated | EventUserDeleted | EventUserVerified | EventSecurityNewDevice;
+
+const app = new OpenAPIHono<Env>();
+
+app.post("/webhooks/auther", async (c) => {
+  const raw = await c.req.raw.text();
+  const sig = c.req.header("x-webhook-signature");
+  const tsHeader = c.req.header("x-webhook-timestamp");
+  const id = c.req.header("x-webhook-id");
+
+  if (!sig || !tsHeader || !id) return c.text("missing headers", 400);
+
+  // 1. Signature — constant-time compare
+  const expected = createHmac("sha256", env.AUTHER_INBOUND_WEBHOOK_SECRET).update(raw).digest("hex");
+  const a = Buffer.from(sig, "hex");
+  const b = Buffer.from(expected, "hex");
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return c.text("bad signature", 401);
+
+  // 2. Timestamp — 5 minute replay window
+  const ts = parseInt(tsHeader, 10);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > 5 * 60 * 1000) {
+    return c.text("stale", 401);
+  }
+
+  // 3. Idempotency — SETNX Redis
+  const ok = await redis.set(`webhook:auther:${id}`, "1", { nx: true, ex: 7 * 24 * 60 * 60 });
+  if (!ok) return c.json({ deduped: true });
+
+  const evt = JSON.parse(raw) as AutherEvent;
+  try {
+    await dispatch(evt);
+    return c.json({ ok: true });
+  } catch (err) {
+    logger.error({ err, evt, id }, "auther webhook dispatch failed");
+    // Return 5xx so QStash retries; the idempotency key is deleted below so the retry can run.
+    await redis.del(`webhook:auther:${id}`);
+    return c.text("dispatch failed", 500);
+  }
+});
+
+async function dispatch(evt: AutherEvent) {
+  switch (evt.type) {
+    case "user.created":
+      await db
+        .insert(users)
+        .values({
+          id: evt.payload.id,
+          email: evt.payload.email,
+          name: evt.payload.name ?? evt.payload.email,
+          emailVerified: evt.payload.emailVerified,
+          image: evt.payload.image ?? null,
+        })
+        .onConflictDoNothing();
+      return;
+
+    case "user.updated":
+    case "user.verified": {
+      const patch: Partial<typeof users.$inferInsert> = {};
+      if ("email" in evt.payload && evt.payload.email !== undefined) patch.email = evt.payload.email;
+      if ("name" in evt.payload && evt.payload.name !== undefined) patch.name = evt.payload.name;
+      if ("emailVerified" in evt.payload && evt.payload.emailVerified !== undefined) patch.emailVerified = evt.payload.emailVerified;
+      if ("image" in evt.payload) patch.image = evt.payload.image ?? null;
+      if (evt.type === "user.verified") patch.emailVerified = true;
+      if (Object.keys(patch).length > 0) {
+        await db.update(users).set(patch).where(eq(users.id, evt.payload.id));
+      }
+      return;
+    }
+
+    case "user.deleted":
+      await db.delete(users).where(eq(users.id, evt.payload.id));
+      // FK cascade takes care of notifications, push_tokens, notification_preferences, memberships.
+      // audit_logs usually break the FK and scrub PII instead of cascading.
+      return;
+
+    case "security.new_device_login":
+      // Replaces the old apps/server/src/modules/auth/auth-notifications.ts flow.
+      await import("@/modules/notifications").then(async ({ notificationService }) => {
+        await notificationService.send({
+          userId: evt.payload.userId,
+          type: "security.login_new_device",
+          channels: ["email", "push"],
+          props: {
+            ipAddress: evt.payload.ipAddress,
+            userAgent: evt.payload.userAgent,
+            at: evt.payload.at,
+          },
+        });
+      });
+      return;
+  }
+}
+
+export default app;
+```
+
+The receiver is mounted under the `/api/auth` prefix in `server.ts`, which lands the
+route at `POST /api/auth/webhooks/auther`:
+
+```ts title="apps/server/src/server.ts (fragment)"
+import autherWebhook from "@/modules/auth/webhook";
+
+app.route("/api/auth", autherWebhook);
+// now reachable at POST /api/auth/webhooks/auther
+```
+
+:::caution[The idempotency-key-on-failure subtlety]
+On a dispatch failure the handler deletes the idempotency key before returning `5xx`.
+Without that delete, QStash retries the same `x-webhook-id` but the handler would
+immediately dedup-reply `{ deduped: true }` with a `200` — masking the failure
+forever. Deleting the key on failure lets the retry actually re-run. If that makes
+you nervous, use a two-phase key instead: write `webhook:auther:<id>:claimed` on
+entry and `webhook:auther:<id>:done` on success, and reject only on the latter.
+:::
+
+## A shared JWKS for both consumers
+
+The middleware and the webhook handler both need to verify Auther tokens, and you do
+not want two independently configured `createRemoteJWKSet` calls drifting apart.
+Centralizing the JWKS setup and the `verifyAutherToken` helper in one file keeps the
+verification parameters — issuer, audience, clock tolerance, cache windows —
+identical everywhere:
+
+```ts title="apps/server/src/modules/auth/verify.ts"
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import { env } from "@/env";
+import type { AutherClaims } from "./shadow";
+
+export const JWKS = createRemoteJWKSet(new URL(`${env.AUTHER_URL}/api/auth/jwks`), {
+  cacheMaxAge: 12 * 60 * 60 * 1000,
+  cooldownDuration: 10 * 1000,
+});
+
+export async function verifyAutherToken(token: string): Promise<AutherClaims> {
+  const { payload } = await jwtVerify(token, JWKS, {
+    issuer: env.AUTHER_ISSUER,
+    audience: env.AUTHER_AUDIENCE,
+    clockTolerance: 30,
+  });
+  return payload as AutherClaims;
+}
+```
+
+:::tip[Prefer the shared helper]
+Once `verify.ts` exists, the middleware's inline `createRemoteJWKSet` can import
+`JWKS` (or call `verifyAutherToken`) from here rather than redeclaring it. One source
+of truth for the verification parameters means a single place to change when Auther's
+issuer or rotation policy moves.
+:::
+
+## The server-to-server admin client
+
+Some actions can't be expressed as a token verification — when your own admin UI
+bans a user, it has to *tell Auther* to ban them, since Auther owns the identity. The
+admin client is the outbound counterpart to everything above: it exchanges a stored
+API key for a short-lived admin token (caching it until shortly before expiry) and
+uses that token to call Auther's privileged endpoints.
+
+```ts title="apps/server/src/modules/auth/admin-client.ts" {5-17}
+import { env } from "@/env";
+
+const cache = { token: null as string | null, exp: 0 };
+
+async function getAdminToken(): Promise<string> {
+  if (cache.token && Date.now() < cache.exp - 60_000) return cache.token;
+  const r = await fetch(`${env.AUTHER_URL}/api/auth/api-key/exchange`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiKey: env.AUTHER_ADMIN_API_KEY }),
+  });
+  if (!r.ok) throw new Error(`auther admin token exchange failed: ${r.status}`);
+  const data = (await r.json()) as { token: string; expiresAt: string };
+  cache.token = data.token;
+  cache.exp = new Date(data.expiresAt).getTime();
+  return cache.token;
+}
+
+export const autherAdmin = {
+  async banUser(userId: string, reason: string, by: string) {
+    const token = await getAdminToken();
+    const r = await fetch(`${env.AUTHER_URL}/api/admin/users/${userId}/ban`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ reason, by }),
+    });
+    if (!r.ok) throw new Error(`ban failed: ${r.status}`);
+    // The webhook user.updated event will sync the shadow row.
+  },
+
+  async updateUser(userId: string, patch: { name?: string; email?: string }) {
+    const token = await getAdminToken();
+    const r = await fetch(`${env.AUTHER_URL}/api/admin/users/${userId}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) throw new Error(`update failed: ${r.status}`);
+  },
+
+  async impersonationToken(userId: string) {
+    const token = await getAdminToken();
+    const r = await fetch(`${env.AUTHER_URL}/api/admin/users/${userId}/impersonate`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await r.json();
+    return data as { token: string };
+  },
+};
+```
+
+Note the deliberate one-way flow: when `banUser` calls Auther, it does not also patch
+the local row. The resulting `user.updated` webhook does that, so the shadow table
+stays in sync through exactly one path rather than two that could disagree. The token
+cache refreshes 60 seconds before expiry (`cache.exp - 60_000`), so a long-running
+server never makes a call with a token that's about to lapse mid-flight.
+
+With the auth core in place, the remaining work is wiring this context into the rest
+of the server — the principal derivation, the authorization middleware, and the route
+handlers. That's covered next in
+[Hono Walkthrough — Server Internals](/auther/integration/hono-server-internals/).

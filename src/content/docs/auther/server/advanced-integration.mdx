@@ -1,0 +1,473 @@
+---
+title: Advanced Integration (Scenarios E–F)
+description: Wiring Auther into a multi-tenant SaaS and a microservice mesh, plus the practical how-tos for permission checks, ABAC policies, and webhooks.
+sidebar:
+  order: 8
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps } from "@astrojs/starlight/components";
+
+The earlier scenarios covered single-application clients. The two patterns here are
+what you reach for once a single app is no longer the whole picture: a SaaS that
+serves many tenants from one Auther instance, and a fleet of services that all need
+to trust the same identities. Both lean on the same idea — verify the token locally,
+and only call back to Auther when a policy genuinely needs runtime context. If you
+have not yet seen the basic client patterns, start with
+[Client Integration (Scenarios A–D)](/auther/server/client-integration/).
+
+## Scenario E: Multi-tenant SaaS with per-tenant permissions
+
+A multi-tenant SaaS gives each tenant (organization) its own resources and its own
+permission structure. Auther models this with one authorization model per tenant, so
+"member of Acme" and "member of Globex" are entirely separate worlds even though they
+share a single auth server.
+
+### Define an authorization model per tenant
+
+Through the admin UI or API, create a client-scoped authorization model. For a project
+management SaaS where the tenant `acme_corp` has projects and tasks, the entity type
+`acme_corp:project` defines its relations and the permissions they grant. Note that
+`archive` carries a Lua ABAC policy, so it is only resolved with the resource in hand:
+
+```jsonc title="Entity type: acme_corp:project"
+{
+  "relations": {
+    "owner":  { "union": ["admin"] },
+    "admin":  { "union": ["member"] },
+    "member": { "union": ["viewer"] },
+    "viewer": []
+  },
+  "permissions": {
+    "read":   { "relation": "viewer" },
+    "create": { "relation": "member" },
+    "update": { "relation": "admin" },
+    "delete": { "relation": "owner" },
+    "manage_members": { "relation": "admin" },
+    "archive": {
+      "relation": "admin",
+      "policyEngine": "lua",
+      "policy": "return context.resource.status ~= 'active' or context.user.role == 'admin'"
+    }
+  }
+}
+```
+
+### Assign users to tenant resources
+
+Relationships are expressed as tuples. A user can own or join a specific project, and
+a whole group can be granted access to every project with a wildcard:
+
+```text
+-- Alice owns Project Alpha in acme_corp
+(acme_corp:project, proj_alpha, owner, user, alice_id)
+
+-- Bob is a member of Project Alpha
+(acme_corp:project, proj_alpha, member, user, bob_id)
+
+-- Engineering group can view all projects
+(acme_corp:project, *, viewer, group, eng_group_id)
+```
+
+### Check permissions in your backend
+
+Your backend trusts the JWT for the common case and only calls Auther when the model
+marks a permission as needing ABAC. The middleware below verifies the token, reads the
+static permissions, and escalates to `/api/auth/check-permission` only when
+`abac_required` lists the permission for that entity:
+
+```ts title="your-saas/src/middleware/auth.ts" {6,17}
+async function authorizeRequest(req: Request, entityType: string, entityId: string, permission: string) {
+  const token = req.headers.get("Authorization")?.replace("Bearer ", "");
+  const { payload } = await jwtVerify(token, JWKS, { issuer: AUTHER_URL });
+
+  const perms = payload.permissions as Record<string, string[]>;
+  const abacRequired = payload.abac_required as Record<string, string[]>;
+
+  // 1. Check static permissions from the JWT.
+  //    A wildcard grant is keyed by entityType; otherwise by `${entityType}:${entityId}`.
+  const key = entityType;
+  const entityPerms = perms[key] || perms[`${entityType}:${entityId}`] || [];
+  if (!entityPerms.includes(permission)) {
+    throw new Error("Forbidden");
+  }
+
+  // 2. If ABAC is required, call Auther with the resource context.
+  if (abacRequired?.[key]?.includes(permission)) {
+    const resource = await loadResourceForAbac(entityType, entityId);
+    const check = await fetch(`${AUTHER_URL}/api/auth/check-permission`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        entityType,
+        entityId,
+        permission,
+        resource: {
+          id: resource.id,
+          type: entityType.split(":")[1],
+          attributes: {
+            status: resource.status,
+            owner_id: resource.ownerId,
+            created_at: resource.createdAt,
+          },
+        },
+      }),
+    });
+
+    const result = await check.json();
+    if (!result.allowed) throw new Error("Forbidden by ABAC policy");
+  }
+}
+```
+
+:::note[On the wildcard key]
+The source code computed the lookup key with a ternary whose branches were identical,
+so it always resolved to `entityType`. The behavior above keeps the real logic — try
+the wildcard key first, then the specific `` `${entityType}:${entityId}` `` key — and
+drops the no-op branch.
+:::
+
+### Set up registration contexts for tenant onboarding
+
+A registration context ties self-service signup to a tenant. Create one per tenant's
+onboarding, scoping it to the tenant's client and email domains:
+
+```json
+{
+  "slug": "acme-new-member",
+  "name": "Acme Corp New Member",
+  "clientId": "acme_corp_client_id",
+  "grants": [
+    { "entityTypeId": "model_id_for_acme_project", "relation": "viewer" }
+  ],
+  "allowedDomains": ["acmecorp.com"]
+}
+```
+
+With this in place, anyone with an `@acmecorp.com` email who signs up through the Acme
+client automatically gets `viewer` access to all Acme projects — no manual tuple
+creation per user.
+
+## Scenario F: Microservice mesh with shared auth
+
+When several microservices — billing, inventory, notifications — all need to verify
+the same user identities and permissions, Auther becomes the single source of truth.
+Each service fetches the JWKS once and verifies tokens locally, so authentication
+never costs a network round trip. Only ABAC-protected permissions reach back to
+Auther's `/check-permission` endpoint.
+
+<Mermaid title="Microservice mesh with shared auth" height={420} code={`
+flowchart TB
+  Auther["Auther (OIDC)<br/>auth.example.com"]
+  Auther -->|"JWKS endpoint"| Billing["Billing Service"]
+  Auther -->|"JWKS endpoint"| Inventory["Inventory Service"]
+  Auther -->|"/check-permission"| Notification["Notification Service"]
+`} />
+
+The mesh is wired so that every service can validate a token offline against the
+cached JWKS, while the `/check-permission` endpoint is reserved for the runtime ABAC
+calls that a static JWT cannot answer.
+
+### Each service validates JWTs independently
+
+Every microservice caches the JWKS and validates tokens locally — there is no network
+call to Auther for basic authentication. The Go example uses `go-jose` and refreshes
+the key set on a timer:
+
+```go title="auth/jwks.go"
+// Go example using go-jose
+package auth
+
+import (
+    "github.com/go-jose/go-jose/v4"
+    "github.com/go-jose/go-jose/v4/jwt"
+)
+
+var jwksURL = "https://auth.example.com/api/auth/jwks"
+var jwks *jose.JSONWebKeySet
+
+func init() {
+    // Fetch and cache JWKS (refresh every 12 hours)
+    jwks = fetchJWKS(jwksURL)
+    go refreshJWKSPeriodically(12 * time.Hour)
+}
+
+func ValidateToken(tokenString string) (*Claims, error) {
+    token, err := jwt.ParseSigned(tokenString, []jose.SignatureAlgorithm{jose.RS256})
+    if err != nil {
+        return nil, err
+    }
+
+    claims := &Claims{}
+    if err := token.Claims(jwks, claims); err != nil {
+        return nil, err
+    }
+
+    // Verify standard claims
+    expected := jwt.Expected{
+        Issuer:   "https://auth.example.com",
+        Audience: jwt.Audience{"your-audience"},
+    }
+    if err := claims.Validate(expected); err != nil {
+        return nil, err
+    }
+
+    return claims, nil
+}
+```
+
+### Services read permissions from the JWT
+
+The same `permissions` and `abac_required` claims that the TypeScript middleware reads
+are available here as typed maps. A simple membership test answers the static case:
+
+```go title="auth/permissions.go"
+type Claims struct {
+    jwt.Claims
+    Permissions  map[string][]string `json:"permissions"`
+    ABACRequired map[string][]string `json:"abac_required"`
+}
+
+func HasPermission(claims *Claims, entityType, permission string) bool {
+    perms, ok := claims.Permissions[entityType]
+    if !ok {
+        return false
+    }
+    for _, p := range perms {
+        if p == permission {
+            return true
+        }
+    }
+    return false
+}
+```
+
+### Only call Auther for ABAC-protected permissions
+
+When a permission is listed in `abac_required`, the service makes a single POST to
+`/check-permission` with the resource attributes:
+
+```go title="auth/abac.go"
+func CheckABACPermission(token, entityType, entityId, permission string, resource Resource) (bool, error) {
+    body, _ := json.Marshal(map[string]interface{}{
+        "entityType": entityType,
+        "entityId":   entityId,
+        "permission": permission,
+        "resource": map[string]interface{}{
+            "id":   resource.ID,
+            "type": resource.Type,
+            "attributes": resource.Attributes,
+        },
+    })
+
+    req, _ := http.NewRequest("POST", "https://auth.example.com/api/auth/check-permission", bytes.NewReader(body))
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return false, err
+    }
+    defer resp.Body.Close()
+
+    var result struct{ Allowed bool }
+    json.NewDecoder(resp.Body).Decode(&result)
+    return result.Allowed, nil
+}
+```
+
+## Working with permissions in your app
+
+The two scenarios above share one mechanism, worth understanding on its own: the shape
+of the JWT and the decision it drives.
+
+### Understanding the JWT payload
+
+Every JWT issued by Auther includes a `permissions` object and, optionally, an
+`abac_required` object. The first lists what the user can do; the second flags which of
+those permissions still need a runtime check:
+
+```json
+{
+  "sub": "user_123",
+  "iss": "https://auth.example.com",
+  "aud": "your-audience",
+  "permissions": {
+    "platform": ["member"],
+    "users": ["view"],
+    "client_abc:invoice": ["read", "write", "refund"],
+    "client_abc:report": ["read"]
+  },
+  "abac_required": {
+    "client_abc:invoice": ["refund"]
+  }
+}
+```
+
+### The per-check decision tree
+
+For any single permission check, the client follows the same three-way decision: deny
+outright if the permission is absent, allow immediately if it is present and not
+ABAC-gated, and otherwise call Auther for the contextual verdict.
+
+<Mermaid title="Permission-check decision tree" height={460} code={`
+flowchart TB
+  Start["Permission check"] --> InPerms{"In jwt.permissions[entityType]?"}
+  InPerms -->|"No"| Deny1["DENY<br/>user lacks this permission"]
+  InPerms -->|"Yes"| AbacReq{"In jwt.abac_required[entityType]?"}
+  AbacReq -->|"No"| Allow1["ALLOW<br/>static permission, JWT is source of truth"]
+  AbacReq -->|"Yes"| Call["POST /api/auth/check-permission<br/>with resource context"]
+  Call --> Result{"allowed?"}
+  Result -->|"true"| Allow2["ALLOW"]
+  Result -->|"false"| Deny2["DENY"]
+`} />
+
+The point of this two-tier approach is latency. Most checks are simple "does the user
+have role X" questions that need no runtime context, so embedding them in the JWT makes
+the common case a zero-latency local check. Only permissions backed by an ABAC policy —
+the ones whose verdict depends on the actual resource — pay for a network call to
+Auther.
+
+## Working with ABAC policies
+
+Attribute-based access control is for the rules that a role alone cannot express —
+anything that depends on the resource, the user's attributes, the amount, or the time:
+
+- "Users can only edit their own resources" (ownership check).
+- "Admins can refund up to $1,000; only super-admins above that" (amount threshold).
+- "Draft documents can be edited by editors; published documents are read-only"
+  (status-based).
+- "API calls are only allowed during business hours" (time-based).
+- "Users from the finance department can access billing data" (attribute-based).
+
+Setting up an ABAC policy is two steps in the model plus a contextual check at the call
+site:
+
+<Steps>
+
+1. Define the permission in your authorization model with a Lua policy. The script
+   receives `context` and returns a boolean:
+
+   ```jsonc
+   {
+     "refund": {
+       "relation": "admin",
+       "policyEngine": "lua",
+       "policy": "if context.resource.amount < 1000 then return true end\nif context.user.department == 'finance' then return true end\nreturn false"
+     }
+   }
+   ```
+
+2. When checking this permission, provide the resource context so the policy has
+   something to evaluate against:
+
+   ```ts
+   const result = await fetch("https://auth.example.com/api/auth/check-permission", {
+     method: "POST",
+     headers: {
+       "Authorization": `Bearer ${userToken}`,
+       "Content-Type": "application/json",
+     },
+     body: JSON.stringify({
+       entityType: "client_abc:invoice",
+       entityId: "inv_456",
+       permission: "refund",
+       resource: {
+         id: "inv_456",
+         type: "invoice",
+         attributes: {
+           amount: 750,
+           status: "paid",
+           owner_id: "user_789",
+           department: "sales",
+         },
+       },
+     }),
+   });
+
+   const { allowed } = await result.json();
+   // allowed = true (amount 750 < 1000)
+   ```
+
+3. The policy engine evaluates the Lua script against the context and returns the
+   decision. Every evaluation is recorded in the `abac_audit_logs` table for debugging
+   and compliance.
+
+</Steps>
+
+## Webhook integration
+
+Webhooks let your app react to identity events — provisioning a user, syncing a
+profile, logging a login — without polling Auther. Setting up delivery is a register-
+then-receive flow:
+
+<Steps>
+
+1. Register a webhook endpoint through the admin UI at `/admin/webhooks`:
+   - **URL**: `https://myapp.example.com/webhooks/auther`
+   - **Events**: select which events to receive (for example `user.created`,
+     `user.updated`, `session.created`).
+   - **Retry policy**: `standard` (3 retries with exponential backoff).
+
+2. Implement a webhook receiver in your app. Verify the HMAC-SHA256 signature, reject
+   stale timestamps to block replays, then dispatch on the event type:
+
+   ```ts title="your-app/src/app/api/webhooks/auther/route.ts"
+   import crypto from "crypto";
+
+   const WEBHOOK_SECRET = process.env.AUTHER_WEBHOOK_SECRET;
+
+   export async function POST(request: Request) {
+     const body = await request.text();
+     const signature = request.headers.get("x-webhook-signature");
+     const timestamp = request.headers.get("x-webhook-timestamp");
+     const webhookId = request.headers.get("x-webhook-id");
+
+     // Verify signature (HMAC-SHA256)
+     const expectedSignature = crypto
+       .createHmac("sha256", WEBHOOK_SECRET)
+       .update(body)
+       .digest("hex");
+
+     if (signature !== expectedSignature) {
+       return new Response("Invalid signature", { status: 401 });
+     }
+
+     // Verify the timestamp is recent (prevent replay attacks)
+     const timestampMs = parseInt(timestamp);
+     if (Date.now() - timestampMs > 5 * 60 * 1000) {
+       return new Response("Stale timestamp", { status: 401 });
+     }
+
+     // Process the event
+     const event = JSON.parse(body);
+
+     switch (event.type) {
+       case "user.created":
+         await provisionUserInMyApp(event.payload);
+         break;
+       case "user.updated":
+         await syncUserProfile(event.payload);
+         break;
+       case "session.created":
+         await logLoginEvent(event.payload);
+         break;
+     }
+
+     return new Response("OK", { status: 200 });
+   }
+   ```
+
+3. Events are delivered asynchronously via QStash. Failed deliveries are retried
+   automatically, and delivery status and history are viewable in the admin UI.
+
+</Steps>
+
+:::caution[Verify before you trust the payload]
+The signature and timestamp checks are not optional. Skipping the HMAC comparison lets
+anyone POST forged events to your receiver, and skipping the timestamp window lets a
+captured request be replayed. Both run before you parse or act on the event body.
+:::

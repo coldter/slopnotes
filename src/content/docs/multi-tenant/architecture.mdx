@@ -1,0 +1,240 @@
+---
+title: Architecture & Topology
+description: The three-worker, two-SPA topology of the multi-tenant system, the service bindings between them, and five request flows that show it working.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps } from "@astrojs/starlight/components";
+
+The system is **three Workers plus two static SPAs**, sharing one Postgres via
+Hyperdrive and one Better Auth instance. The boundaries between them aren't
+incidental — they *are* the security model: tenants and operators never share a
+session, never share a worker, and never share a cookie domain. Getting the topology
+right is what makes every later chapter's isolation guarantees hold.
+
+## Worker topology
+
+<Mermaid title="Worker topology" height={540} code={`
+flowchart TB
+  AdminHost["admin.example.com"] --> Access["Cloudflare Access<br/>(per-application policy)"]
+  Access -->|"Cf-Access-Jwt-Assertion"| Admin["apps/admin (Hono Worker)<br/>+ serves apps/admin-ui static<br/>+ cron: 90-day inactivity"]
+  Admin -->|"AUTH binding"| Auth["apps/auth<br/>(Hono + Better Auth)<br/>AuthEntrypoint (typed RPC)"]
+  Admin -->|"API binding"| Server["apps/server (Hono)<br/>+ STATIC_ASSETS → apps/app<br/>+ cron: hostname reconciler 60s"]
+  Server -->|"AUTH binding"| Auth
+  Server -.->|"STATIC_ASSETS"| App["apps/app (SPA)"]
+  Auth --> DB["PostgreSQL via Hyperdrive<br/>(shared by all workers)"]
+`} />
+
+## What each worker owns
+
+**`apps/auth`** holds the single Better Auth instance, factoried per request via
+`createAuth(db, env, ctx, options)`. It owns the identity tables — `users`,
+`sessions`, `accounts`, `organization`, `member`, `invitation`, `sso_providers`,
+`verifications`, `two_factors`, `jwks` — and exposes an `AuthEntrypoint` RPC
+(`getSession`, `handleAuthRequest`, `getToken`, `createUser`, `signInEmail`,
+`acceptInvitation`, `invalidateTenant`). It is **not publicly reachable**; only other
+workers reach it, over a service binding.
+
+**`apps/server`** is the public tenant-facing API on `.app.example.com` and on tenant
+custom hostnames. It owns the tenancy module (custom-hostname CRUD), the org-admin
+SSO-config module, the invitation-acceptance orchestration, and within-org reads of
+users, audit logs, notifications, and roles. It holds the Cloudflare API token for
+hostname provisioning, runs the 60-second reconciler cron, and serves the tenant SPA
+by proxying non-API paths to `apps/app` through its `STATIC_ASSETS` binding.
+
+**`apps/admin`** is the operator-facing API on `admin.example.com`. Every request is
+gated twice: Cloudflare Access verifies the operator's JWT at the perimeter, then a
+`global_admins` table lookup gates at the database. It owns the `global_admins`
+table, exposes tenant CRUD and cross-tenant queries, serves `apps/admin-ui`, and runs
+a daily inactivity-sweep cron.
+
+**`apps/app`** and **`apps/admin-ui`** are static-assets workers — no business logic.
+`apps/app` is reachable only through `apps/server`'s `STATIC_ASSETS` binding, with
+`not_found_handling: "single-page-application"` so client-side routes resolve to
+`index.html`. `apps/admin-ui` is built by Vite and served by `apps/admin`'s `ASSETS`
+binding; it has no separate deployable.
+
+## Routing rules
+
+The zone is configured once, as a runbook: a proxied fallback origin
+(`fallback.example.com`) pointed at `apps/server`, a proxied wildcard
+(`*.app.example.com`) at `apps/server`, a published CNAME target
+(`customers.example.com`) that tenants point their custom domains at, the Cloudflare
+for SaaS fallback origin set at the zone level, and a Cloudflare Access application
+on `admin.example.com`.
+
+The tenant worker matches its three hostnames explicitly:
+
+```json title="apps/server/wrangler — routes"
+"routes": [
+  { "pattern": "*.app.example.com/*",    "zone_name": "example.com" },
+  { "pattern": "app.example.com/*",       "zone_name": "example.com" },
+  { "pattern": "fallback.example.com/*",  "zone_name": "example.com" }
+]
+```
+
+Custom hostnames like `app.acme.com` need **no** per-tenant route entries — they land
+on the worker through the SaaS zone's fallback origin. The admin worker, by contrast,
+binds as an exact custom domain rather than a route pattern:
+
+```json title="apps/admin/wrangler — routes"
+"routes": [{ "pattern": "admin.example.com", "custom_domain": true }]
+```
+
+`apps/app` has no public routes at all; it's reached only via the `STATIC_ASSETS`
+binding.
+
+:::caution[Critical: `workers_dev: false` + `preview_urls: false` on every worker]
+Cloudflare Access binds to *hostnames*, not workers. Without `workers_dev: false`,
+the admin worker would also be reachable at `admin.<account>.workers.dev` and bypass
+Access entirely. The same risk applies to `apps/auth` (a sensitive surface) and
+`apps/server` (tenant data). As defense in depth, each worker's first middleware also
+rejects any request whose `Host` header isn't its configured public hostname.
+:::
+
+## Service bindings
+
+Workers talk to each other over typed RPC, not HTTP — the binding *is* the internal
+security perimeter, since none of these entrypoints are publicly routable.
+
+| From | To | Entrypoint | Purpose |
+|------|----|-----------| --------|
+| `apps/server` | `apps/auth` | `AuthEntrypoint` | Auth proxy + RPC for session/token/user operations |
+| `apps/server` | `apps/app` | (default fetch) | `STATIC_ASSETS` for non-API paths |
+| `apps/auth` | `apps/server` | `ApiEntrypoint` | Auth lifecycle hooks + `invalidateTenant` |
+| `apps/admin` | `apps/server` | `AdminApiEntrypoint` | Tenant creation, cross-tenant queries, hostname lifecycle |
+| `apps/admin` | `apps/auth` | `AuthEntrypoint` | Operator-initiated user creation + accept-invitation |
+
+There is deliberately **no** binding from `apps/auth` to `apps/admin`. The admin
+worker is asymmetric: it fans out to its peers, and they never call it back.
+Auth-side cache invalidation flows the other way, through
+`apps/auth → apps/server.invalidateTenant(...)` on the existing binding.
+
+## Request flows
+
+Five traces make the topology concrete. Start with an ordinary authenticated API
+call from a tenant:
+
+<Mermaid title="Tenant API request — GET https://acme.app.example.com/api/users" height={420} code={`
+sequenceDiagram
+  participant B as Browser
+  participant S as apps/server
+  participant A as apps/auth
+  participant DB as Postgres
+  B->>S: GET /api/users
+  Note over S: tenantMiddleware<br/>host → tenant {organizationId, slug, kind}
+  Note over S: dbMiddleware opens per-request pg client
+  S->>A: getSession(headers, tenant)
+  A-->>S: session + principal
+  Note over S: authorize(user, list)
+  S->>DB: select where organizationId = ...
+  DB-->>S: rows
+  S-->>B: rows scoped to the org
+`} />
+
+A first-load on a custom domain shows why the static SPA is served *through*
+`apps/server` rather than directly:
+
+<Mermaid title="Tenant SPA asset — GET https://app.acme.com/dashboard" height={360} code={`
+sequenceDiagram
+  participant B as Browser
+  participant CF as CF edge
+  participant S as apps/server
+  participant App as apps/app (SPA)
+  B->>CF: GET /dashboard
+  CF->>S: custom hostname → fallback origin
+  Note over S: tenantMiddleware<br/>tenant {kind: custom}
+  S->>App: not /api/* → STATIC_ASSETS.fetch
+  App-->>B: index.html (SPA hydrates)
+  Note over B: TanStack Router resolves /dashboard
+`} />
+
+SSO sign-in is where the auth proxy earns its keep — it rebuilds a sanitized request
+before forwarding, and the auth worker validates the provider against the tenant
+*before* the OIDC token exchange:
+
+<Mermaid title="SSO sign-in" height={460} code={`
+sequenceDiagram
+  participant B as Browser
+  participant S as apps/server
+  participant A as apps/auth
+  B->>S: POST /api/auth/sso/...
+  Note over S: tenantMiddleware resolves tenant
+  Note over S: rebuild request<br/>pin host, strip forwarded host/proto
+  S->>A: forward sanitized request
+  Note over A: ssoCallbackGuard<br/>provider.org === tenant.org (before exchange)
+  Note over A: provisionUser<br/>email_verified + membership + domainVerified
+  Note over A: session.create.before sets activeOrganizationId
+  A-->>B: Set-Cookie (host-only to acme.app.example.com)
+`} />
+
+Operator-led tenant creation crosses the perimeter into the admin worker, which
+creates the org via a direct transactional insert and a dual-scope audit:
+
+<Mermaid title="Operator creates a tenant" height={460} code={`
+sequenceDiagram
+  participant B as Operator browser
+  participant Acc as CF Access
+  participant Ad as apps/admin
+  participant S as apps/server
+  B->>Acc: POST /api/admin/tenants
+  Acc->>Ad: validated (IdP + MFA)
+  Note over Ad: cfAccessMiddleware verifies JWT vs team JWKS
+  Note over Ad: globalAdminMiddleware lookup by cf_access_sub
+  Note over Ad: requireOperator(tenant.create)
+  Ad->>S: createTenantOnBehalfOf(operator.id, payload)
+  Note over S: tx: insert organization + invitation<br/>+ dual-scope audit
+  S-->>Ad: {orgId, invitationId, hostedAt}
+  Ad-->>B: 201 + invitation email sent
+`} />
+
+Finally, invitation acceptance is the one public route that creates a session. It's
+worth reading as an ordered procedure because each step guards the next:
+
+<Steps>
+
+1. `tenantMiddleware` resolves the tenant from the host.
+2. Load the invitation and guard it: pending, not expired, org matches the tenant.
+3. `AUTH.createUser(...)` server-side — this bypasses `disableSignUp`. Catching
+   `USER_ALREADY_EXISTS` and looking up the existing user makes the step an
+   idempotent retry.
+4. `AUTH.signInEmail(...)` returns a session and its `Set-Cookie` headers.
+5. `AUTH.acceptInvitation({ headers, invitationId })` writes the membership row.
+6. Mark the invitation `accepted`, forward the `Set-Cookie` to the browser, and
+   return `{ redirectTo: "/dashboard" }`.
+
+</Steps>
+
+## What's intentionally left out
+
+Several "obvious" pieces are deliberately absent, and the reasons matter:
+
+- **No queue for cache invalidation.** Cloudflare Queues are work-distribution (one
+  consumer per queue), not pub/sub. The design uses service-binding RPC fan-out plus
+  KV cache versioning instead — see [Tenant Resolution](/multi-tenant/tenant-resolution/#cache-invalidation).
+- **No shared secret** between the admin and auth workers to gate Better Auth's
+  `organization.create`. That endpoint always rejects; the admin worker creates orgs
+  via direct Drizzle inserts in `AdminApiEntrypoint`.
+- **No HMAC-signed header** for tenant context between workers. The typed RPC
+  parameter (`AuthEntrypoint.getSession(headers, tenant)`) is the carrier.
+- **No JWT for the admin panel.** Cloudflare Access provides the durable session;
+  every admin request re-validates the CF Access JWT plus the `global_admins` row.
+- **No cross-subdomain cookies.** `crossSubDomainCookies` stays `false`; isolation
+  comes from host-only cookies plus explicit CSRF/origin enforcement.
+
+## Why three workers, not two or four
+
+Splitting `apps/admin` from `apps/server` follows Cloudflare Access's grain — one
+Access application per hostname is the clean integration, and a separate worker means
+operator bugs can't touch tenant traffic and operator deploys stay independent. The
+admin surface doesn't belong in `apps/auth` either: that worker is binding-only with
+no public surface, whereas the admin worker *is* the public operator surface. And
+`apps/app` stays a pure static-assets worker rather than its own logic worker —
+the tenant API lives in `apps/server` because that's where `tenantMiddleware` runs
+and where the authentication context is established; splitting it out would duplicate
+auth middleware and complicate the cookie-domain story.
+
+The worker boundaries are one axis; the package boundaries are a separate one, covered
+in [Deep Modules](/multi-tenant/deep-modules/).

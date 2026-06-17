@@ -1,0 +1,478 @@
+---
+title: Hono Walkthrough — Server Internals
+description: Re-wiring principals, authorization, admin flows, tenancy, audit logs, and a dual-mode cutover when adopting Auther in a Hono server.
+sidebar:
+  order: 15
+---
+
+import { Tabs, TabItem, Steps } from "@astrojs/starlight/components";
+
+With the schema reshaped and the auth core verifying Auther's JWTs (see
+[Hono Walkthrough — Auth Core](/auther/integration/hono-auth-core/)), the rest of
+the server has to follow. The good news is that most of it barely moves: the trick
+is to keep your existing route guards, services, and notification code intact and
+change only where their inputs come from. This page walks file by file through that
+re-wiring — the principal, the authorization registry, admin flows, sign-up,
+notifications, organizations, audit logs, env, the web client, and finally the
+ordered migration that ties it all together.
+
+## Re-wiring the principal
+
+Everything downstream of authentication consumes a single `Principal` object derived
+from the request context. It is the input to `packages/authorization`'s
+`authorize(...)` middleware, so getting its shape right is what lets every guarded
+route keep working unchanged. The only real difference after integration is that the
+principal's authority comes from the verified JWT instead of a local user table.
+
+Before — the principal reads `roleSlugs` off the local user row:
+
+```ts title="apps/server/src/auth/principal.ts (before)"
+import type { Context } from "hono";
+
+export function principalFromContext(c: Context) {
+  const user = c.get("user");
+  if (!user) return null;
+  return {
+    userId: user.id,
+    email: user.email,
+    roleSlugs: user.roleSlugs,       // from local user table
+    sessionPlatform: c.get("session")?.platform,
+  };
+}
+
+export function isValidRole(r: string): boolean {
+  return ALL_ROLES.includes(r);
+}
+```
+
+After — the principal carries the permission maps the verifier put on the context:
+
+```ts title="apps/server/src/auth/principal.ts (after)"
+import type { Context } from "hono";
+import type { Env } from "@/lib/context";
+
+export interface Principal {
+  userId: string;
+  email: string;
+  permissions: Record<string, string[]>;   // from JWT
+  abacRequired: Record<string, string[]>;  // from JWT
+  impersonator?: string;                   // if present in JWT
+}
+
+export function principalFromContext(c: Context<Env>): Principal | null {
+  const user = c.get("user");
+  const session = c.get("session");
+  if (!user || !session) return null;
+  return {
+    userId: user.id,
+    email: user.email,
+    permissions: session.permissions,
+    abacRequired: session.abacRequired,
+  };
+}
+```
+
+The optional `impersonator` field carries through when an admin is acting as another
+user; it lines up with the audit-log `impersonatorId` column added below.
+
+## Keep `packages/authorization`, register an Auther-aware principal
+
+`packages/authorization/src/hono.ts` exposes a `resolvePrincipal: (c) => Principal | null`
+hook. Today the template wires that to the local user's `roleSlugs`; after
+integration it wires to the JWT permissions instead. Because the registry only ever
+sees the resolved principal, the swap happens in exactly one place and no route file
+changes.
+
+```ts title="apps/server/src/auth/registry.ts" {7,12-15}
+import { createAuthorize } from "@repo/authorization";
+import { principalFromContext } from "./principal";
+import { registry } from "./capabilities";      // your existing app-domain resources
+
+export const authorize = createAuthorize(registry, {
+  resolvePrincipal: (c) => {
+    const p = principalFromContext(c);
+    if (!p) return null;
+
+    // Map JWT permissions → the shape your registry's `can()` expects.
+    // Your registry decides what to do with permissions; here we translate.
+    return {
+      id: p.userId,
+      email: p.email,
+      // Flatten JWT perms into the role vocab used by your registry.
+      // e.g. permissions["notifications"] = ["read","write"]
+      //   →  ["notifications:read", "notifications:write"]
+      roles: Object.entries(p.permissions).flatMap(([entity, perms]) =>
+        perms.map((perm) => `${entity}:${perm}`),
+      ),
+    };
+  },
+});
+```
+
+Every route that already declares `guard: [authorize("user", "list")]` keeps
+working. Only the *source* of the principal's roles changes — from a local table to
+a JWT claim — for zero route-file edits.
+
+## Admin flows: ban, unban, update
+
+A representative admin mutation is deactivating a user. Before integration this was a
+local write against the `users` table:
+
+```ts title="apps/server/src/modules/users/service.ts (before)"
+async function deactivate(userId: string, actorId: string, reason: string) {
+  await db.update(users).set({
+    status: "inactive",
+    deactivatedAt: new Date(),
+    deactivatedBy: actorId,
+    deactivatedReason: reason,
+  }).where(eq(users.id, userId));
+}
+```
+
+After integration the mutation goes to Auther, which is now the source of truth for
+account status. The local table no longer owns the `inactive` flag:
+
+```ts title="apps/server/src/modules/users/service.ts (after)"
+import { autherAdmin } from "@/modules/auth/admin-client";
+
+async function deactivate(userId: string, actorId: string, reason: string) {
+  await autherAdmin.banUser(userId, reason, actorId);
+  // No local write. The user.updated webhook will (optionally) reflect Auther's
+  // banned flag. If you need banned-ness locally for query performance, add a
+  // local `deactivatedAt` column and update it from the webhook handler — but
+  // treat Auther as the source of truth.
+}
+```
+
+The route declaration is untouched — the guard still gates on the same capability:
+
+```ts title="apps/server/src/modules/users/routes.ts"
+deactivateUser: createRouteConfig({
+  operationId: "deactivateUser",
+  method: "post",
+  path: "/{userId}/deactivate",
+  guard: [authorize("user", "deactivate")],
+  tags: ["users"],
+  request: {
+    params: userParamsSchema,
+    body: { content: { "application/json": { schema: deactivateUserBodySchema } } },
+  },
+  responses: { 200: {/* … */}, /* …commonErrorResponses */ },
+}),
+```
+
+## Sign-up and sign-in: delete local, defer to Auther
+
+The Hono template ships `apps/server/src/modules/users/handler.ts` with a
+`createUser` endpoint that calls better-auth's signup directly. Delete it. After
+integration, account creation happens in one of two places.
+
+For self-signup — typically mobile onboarding — the client calls Auther's sign-up
+endpoint, authenticated with the internal-signup-secret header (Auther's
+`PAYLOAD_CLIENT_SECRET`):
+
+```ts title="client (mobile/web) — direct sign-up"
+await fetch(`${AUTHER_URL}/api/auth/sign-up/email`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    // only for trusted clients
+    "x-internal-signup-secret": process.env.AUTHER_SIGNUP_SECRET,
+  },
+  body: JSON.stringify({ email, password, name }),
+});
+```
+
+For mobile this is safe because the secret lives on the mobile app's *backend*, not
+in the binary. The mobile app talks to your Hono server, which proxies the sign-up:
+
+```ts title="apps/server/src/modules/users/service.ts (proxy helper)"
+async function proxySignUp(input: { email: string; password: string; name: string }) {
+  const r = await fetch(`${env.AUTHER_URL}/api/auth/sign-up/email`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-internal-signup-secret": env.AUTHER_SIGNUP_SECRET,
+    },
+    body: JSON.stringify(input),
+  });
+  if (!r.ok) throw new Error(`signup failed: ${r.status}`);
+  // Auther emits a user.created webhook; the shadow row is created automatically.
+  return r.json() as Promise<{ userId: string }>;
+}
+```
+
+For OIDC-based sign-up on the web, the web app simply redirects to Auther's sign-in
+page, which carries a "Sign up" link — no Hono-side proxy is needed. Sign-in then
+follows the standard OAuth2 authorization-code flow (see
+[Client Integration](/auther/server/client-integration/), scenarios A and B). The
+Hono server never sees a password.
+
+## Notifications: same data flow, new call site
+
+The `notificationService` layered on top of the `notifications`, `push_tokens`, and
+`notification_preferences` tables does not change at all. Its queries key on
+`userId`, and because the shadow row carries the same ID, every existing query still
+resolves. What moves is only the *trigger* for auth-lifecycle notifications.
+
+Before, the new-device notification fired from a local better-auth database hook:
+
+```ts title="apps/server/src/modules/auth/auth-notifications.ts (before)"
+export async function notifyLoginNewDevice(input: {
+  userId: string;
+  ipAddress: string | null;
+  userAgent: string | null;
+  platform: string;
+}) {
+  await notificationService.send({
+    userId: input.userId,
+    type: "security.login_new_device",
+    // …
+  });
+}
+// called from databaseHooks.session.create inside instance.ts
+```
+
+After, delete `auth-notifications.ts`. The same `notificationService.send(...)` call
+now fires from one of two remote triggers:
+
+- An Auther pipeline script (the `after_signin` hook) that emits a webhook event, or
+- Your Hono webhook receiver's `security.new_device_login` branch, which calls the
+  identical `notificationService.send(...)`.
+
+The emission code is unchanged; only the trigger moved from a local hook to a remote
+webhook.
+
+## Organizations and the active org
+
+The template stores `sessions.activeOrganizationId` and `sessions.activeOrgRole`,
+populated inside `databaseHooks.session.create` by querying `members` for the most
+recent membership. JWTs have no session table, so this "which org am I acting in"
+state has to live somewhere else. There are two ways to carry it, and they are a
+genuine pick-one decision:
+
+<Tabs syncKey="tenancy">
+  <TabItem label="URL-path tenancy (recommended)">
+
+  The org slug lives in the path, so there is no session state to track. Switching
+  active org is just navigating to a different URL — bookmarkable, shareable, and
+  stateless:
+
+  ```text
+  /api/orgs/acme/notifications
+  ```
+
+  A middleware extracts `:orgSlug`, checks membership, and attaches the result to the
+  context:
+
+  ```ts title="apps/server/src/middlewares/org-context.ts"
+  import { createMiddleware } from "hono/factory";
+  import { and, eq } from "drizzle-orm";
+  import { db } from "@/db";
+  import { members, organizations } from "@repo/db/schema";
+
+  export const orgContextMiddleware = createMiddleware(async (c, next) => {
+    const slug = c.req.param("orgSlug");
+    if (!slug) return c.json({ error: "org required" }, 400);
+    const user = c.get("user");
+    if (!user) return c.json({ error: "unauthenticated" }, 401);
+
+    const [membership] = await db
+      .select({ orgId: organizations.id, role: members.role })
+      .from(members)
+      .innerJoin(organizations, eq(organizations.id, members.organizationId))
+      .where(and(eq(members.userId, user.id), eq(organizations.slug, slug)))
+      .limit(1);
+
+    if (!membership) return c.json({ error: "not a member" }, 403);
+
+    c.set("activeOrg", { id: membership.orgId, slug, role: membership.role });
+    return next();
+  });
+
+  // mount per org-scoped router
+  app.use("/api/orgs/:orgSlug/*", authContextMiddleware, orgContextMiddleware);
+  ```
+
+  </TabItem>
+  <TabItem label="JWT-claim tenancy">
+
+  Auther's `token_build` pipeline hook injects an `active_org` claim into the JWT.
+  This binds the tenant into the token itself, but switching orgs now requires
+  re-issuing the token — a round trip through Auther. It is less ergonomic, so reach
+  for it only when you genuinely need the tenant bound inside the token.
+
+  </TabItem>
+</Tabs>
+
+Either way, delete the old `additionalFields.activeOrgRole` from `instance.ts` — that
+field, and the file itself, are gone after integration.
+
+## Audit logs: break the FK, keep the history
+
+The template defines `audit_logs` with `actor_id` referencing `users.id`. That
+foreign key is a liability once Auther owns users: when Auther deletes a user, your
+`CASCADE` quietly removes their audit history — almost always the wrong outcome for
+compliance.
+
+The fix is to drop the FK while keeping the column, then scrub PII on delete rather
+than cascading the rows away:
+
+```ts title="packages/db/src/schema/audit-logs.ts" {3}
+export const auditLogs = pgTable("audit_logs", {
+  id: varchar("id", { length: 255 }).primaryKey().$defaultFn(/* … */),
+  actorId: varchar("actor_id", { length: 255 }).notNull(),       // no .references()
+  impersonatorId: varchar("impersonator_id", { length: 255 }),   // new column
+  action: text("action").notNull(),
+  subject: text("subject"),
+  createdAt: timestamp(/* … */).defaultNow().notNull(),
+  // … existing columns
+});
+```
+
+In the webhook dispatcher's `user.deleted` branch, scrub the actor's PII-like fields
+but leave the rows in place:
+
+```ts title="apps/server/src/modules/auth/webhook.ts (user.deleted branch)"
+await db.transaction(async (tx) => {
+  // Keep audit rows; scrub PII-like fields on the actor's rows
+  await tx.update(auditLogs)
+    .set({ actorEmail: "<deleted>", actorName: "<deleted>" })   // if you have these
+    .where(eq(auditLogs.actorId, evt.payload.id));
+  await tx.delete(users).where(eq(users.id, evt.payload.id));
+});
+```
+
+:::caution[Cascading deletes erase compliance history]
+A `references()` with the default cascade behavior on `actor_id` means a user
+deletion in Auther can wipe that user's entire audit trail. Drop the FK and retain
+the rows; scrub only the personally identifying columns.
+:::
+
+## Environment variables
+
+The server gains a handful of Auther-related variables and sheds the better-auth
+ones it no longer runs. Validate the additions in the Zod env schema:
+
+```ts title="apps/server/src/env.ts"
+const envSchema = z.object({
+  // …existing
+  AUTHER_URL: z.string().url(),                    // e.g. https://auth.example.com
+  AUTHER_ISSUER: z.string().url(),                 // usually same as AUTHER_URL
+  AUTHER_AUDIENCE: z.string(),                     // matches your OAuth client audience
+  AUTHER_INBOUND_WEBHOOK_SECRET: z.string().min(32),
+  AUTHER_SIGNUP_SECRET: z.string().min(32),        // proxy sign-up endpoint
+  AUTHER_ADMIN_API_KEY: z.string(),                // service API key for admin ops
+});
+```
+
+Remove the now-dead variables: `BETTER_AUTH_SECRET`, the better-auth rate-limit
+configs, and anything else that only existed to run the local auth instance.
+
+## The `apps/web` OIDC client
+
+Your web app — Next.js or otherwise — becomes an OAuth client. There are two ways to
+hold the tokens, and this is a real pick-one decision driven by your threat model.
+The Hono server doesn't care which one you choose; it only validates JWTs.
+
+<Tabs syncKey="webclient">
+  <TabItem label="BFF (recommended)">
+
+  In the Backend-For-Frontend pattern, a confidential client holds the tokens
+  server-side and the browser never touches them:
+
+  - The web app's backend (Next.js route handlers, or a dedicated small BFF service)
+    acts as a confidential OAuth client.
+  - On login: browser redirects to Auther, back to the BFF callback, the BFF
+    exchanges the code for tokens, then sets an `httpOnly` cookie holding a *session
+    reference* that maps to the JWT stored in Redis (or encrypted in the cookie).
+  - Every browser-to-BFF-to-Hono call: the BFF adds the JWT as
+    `Authorization: Bearer`.
+  - XSS-safe — no token in browser-accessible storage — and transparent token
+    refresh works.
+
+  </TabItem>
+  <TabItem label="Direct token">
+
+  Simpler, but weaker. The browser is a public PKCE client that holds the token
+  itself:
+
+  - The browser holds the access token in memory; a refresh token lives in an
+    `httpOnly` cookie if Auther issues one.
+  - Every call goes browser-to-Hono directly with `Authorization: Bearer`.
+  - Vulnerable to an XSS theft of the token. Use only with a strict CSP and zero
+    third-party scripts.
+
+  </TabItem>
+</Tabs>
+
+## The `rpc-client.ts` contract
+
+The template's `rpc-client.ts` generates a typed client from the OpenAPI spec.
+Nothing about the contract changes — the generated client simply needs to pass
+`Authorization: Bearer <token>` on every call. Its consumers (web, mobile) obtain the
+token from their respective auth flows.
+
+## The ordered migration sequence
+
+The single most important rule for adopting a centralized IdP is to run the old and
+new systems side by side and converge gradually. A dual-mode middleware that accepts
+both the legacy cookie and the new JWT is what makes that possible.
+
+:::caution[Never big-bang an auth system]
+Flipping every client to a new identity provider at once leaves you no safe rollback
+and risks locking out your entire user base on a single bad deploy. Migrate behind a
+dual-mode middleware and drain the old traffic over time.
+:::
+
+<Steps>
+
+1. **Stand up Auther in production**, but point no one at it yet. Seed a test admin.
+
+2. **Create the OAuth clients in Auther**:
+   - `hono-web` — confidential or PKCE depending on the web-client choice above.
+   - `hono-mobile` — public PKCE.
+   - `hono-admin` — an API key for server-to-server admin calls.
+
+3. **Bulk-import users** into Auther via the admin signup endpoint, preserving the
+   existing IDs so shadow rows line up.
+
+4. **Deploy dual-mode middleware** to Hono. It accepts both old better-auth cookies
+   and Auther JWTs: when a JWT is present, use it; otherwise fall back to the cookie
+   session.
+
+   ```ts title="apps/server/src/middlewares/auth-context.ts (dual mode)"
+   export const authContextMiddleware = createMiddleware<Env>(async (c, next) => {
+     const authHeader = c.req.header("Authorization");
+     if (authHeader?.startsWith("Bearer ")) {
+       // Auther path
+       return autherPath(c, next, authHeader.slice(7));
+     }
+     // Legacy better-auth cookie path
+     return legacyPath(c, next);
+   });
+   ```
+
+5. **Flip the web app's login button** to Auther. New logins issue JWTs; old cookies
+   keep working.
+
+6. **Watch the metrics**: `auth.jwt.verify.result.count`, `auth.shadow.jit.count`,
+   webhook delivery counts, and error rates.
+
+7. **Drain.** Over the duration of your longest session TTL (7 days for mobile),
+   cookie traffic converges to zero.
+
+8. **Remove dual-mode**: delete `legacyPath`, delete
+   `apps/server/src/modules/auth/instance.ts`, and run the Drizzle migration to drop
+   the now-unused tables.
+
+</Steps>
+
+The rollback plan for steps 1 through 7 is simply to revert the deployment. The
+Drizzle migration in step 8 is the one irreversible step — run it only after several
+days of clean, Auther-only traffic.
+
+With every file re-wired and the cutover sequenced, the last thing worth doing is
+tracing what actually happens at runtime end to end. The
+[End-to-End Flows](/auther/integration/flows/) page walks those traces — sign-up,
+sign-in, permission checks, and webhook delivery — to confirm your mental model.

@@ -1,0 +1,377 @@
+---
+title: Edge Cases Catalog
+description: Thirty integration edge cases — races, revocation, token lifecycle, migration, and ops — each with the situation and the fix.
+sidebar:
+  order: 17
+---
+
+Once the happy path works, the integration's real cost lives in the corners: two
+requests racing to create the same shadow user, a webhook that never lands, a JWT
+that outlives the account it belongs to. This page is a scannable catalog of thirty
+such cases, grouped by *when* they bite. Each entry is the situation in one line plus
+the fix. Examples are specific to the Hono template where possible.
+
+## Races & sync
+
+These bite when two writers touch the same shadow user, or when the local row drifts
+from Auther's copy of the truth.
+
+### First-login race
+
+Two requests arrive simultaneously for Alice, whose shadow row doesn't exist yet.
+Both run just-in-time provisioning, both try to INSERT. `ON CONFLICT DO NOTHING`
+followed by a re-SELECT resolves it cleanly: one writer wins, the other reads the
+winner's row. No deadlock, no 500.
+
+### Webhook arrives before JIT
+
+`user.created` fires the instant Alice signs up, and she may not have hit the Hono
+server yet. The webhook handler INSERTs with `ON CONFLICT DO NOTHING`, which is
+idempotent against JIT provisioning. Whichever path runs first wins, and both produce
+the same row.
+
+### JIT inserts before the webhook
+
+The common ordering: Alice signs in, hits Hono, and JIT creates her shadow row from
+the JWT claims. The `user.created` webhook arrives seconds later and its UPDATE is
+idempotent — it fills in any fields JIT couldn't derive (Auther may include fields in
+the webhook payload that never appear in the JWT).
+
+### Webhook never arrives
+
+A webhook can be lost outright: the endpoint was down during a deploy, the QStash
+queue was exhausted, the idempotency cache was wiped mid-retry, or your receiver
+500'd on a bug and burned through its retries. Defend in layers — QStash already
+retries roughly three times with exponential backoff, you can manually replay a
+single event (`DEL webhook:auther:<id>` in Redis, then re-trigger from Auther's admin
+UI), and a nightly reconciliation job sweeps the gap:
+
+```ts title="apps/server/src/workers/reconcile-users.ts"
+// run via cron service
+export async function reconcileUsers() {
+  const localUsers = await db.select().from(users);
+  for (const local of localUsers) {
+    const remote = await fetchAutherUser(local.id); // /api/admin/users/:id
+    if (!remote) {
+      await db.delete(users).where(eq(users.id, local.id));
+      continue;
+    }
+    if (remote.email !== local.email || remote.name !== local.name || remote.emailVerified !== local.emailVerified || (remote.image ?? null) !== local.image) {
+      await db.update(users).set({
+        email: remote.email, name: remote.name, emailVerified: remote.emailVerified, image: remote.image,
+      }).where(eq(users.id, local.id));
+    }
+  }
+}
+```
+
+An admin "resync" button can trigger the same routine for a single user on demand.
+
+### Email change propagation
+
+Alice changes her email in Auther. Auther sends verification to the new address, and
+on verify a `user.updated` webhook fires with the new email and `emailVerified: true`.
+The shadow row updates, and any local user-profile cache (Redis) must be invalidated.
+
+:::caution[Stale claims in flight]
+The old JWT in Alice's browser still carries the old email. That's harmless for
+identity — `sub` is stable — but if anywhere in your app you render
+`session.claims.email` directly, you'll show stale data. Always read from
+`c.get("user").email` (the shadow row) for display; use the JWT's `email` only for
+identity-level decisions where staleness is acceptable.
+:::
+
+### Audit correlation across systems
+
+To trace a single action across Auther and your app, pass `x-request-id`
+end-to-end and include `user_id` on every log line. Webhook events carry their own
+IDs — log them on receipt. Dashboards can then join on a `(user_id, 5-minute window)`
+key.
+
+## Revocation & deletion
+
+These bite when access must end *now* but a stateless token says otherwise.
+
+### User deletion cascade surprises
+
+The default foreign-key CASCADE removes notifications and audit logs along with the
+user. For audit compliance, break the audit FK, keep the rows, and scrub PII on
+delete. For notifications, cascade is usually fine.
+
+### User deletion with in-flight tokens
+
+Alice is deleted at t=0, but her JWT stays valid until t=900s — without mitigation she
+keeps access for fifteen minutes. Pick a recipe to match the risk:
+
+- **Short TTL** — 5 min for admin or sensitive routes, 15–60 min for normal traffic.
+  Trades more refreshes for faster revocation.
+- **`jti` deny-list** — on `user.deleted`, push her session `jti`s to Redis with
+  `TTL = remaining JWT lifetime`. The middleware checks
+  `if (await redis.exists('denylist:' + claims.jti)) return 401`. A small latency cost
+  buys real revocation.
+- **Tombstone table** — record the deletion and refuse to re-provision from a stale
+  JWT:
+
+  ```ts title="tombstone.ts"
+  await db.insert(deletedUsers).values({ id: userId, deletedAt: new Date() });
+  // In ensureShadowUser:
+  const tomb = await db.query.deletedUsers.findFirst({ where: and(eq(deletedUsers.id, sub), gt(deletedUsers.deletedAt, sub24h)) });
+  if (tomb) throw new Error("user recently deleted");
+  ```
+
+  This prevents a zombie row being re-created from a token issued before the delete.
+- **Fail-closed on sensitive ops** — for money-moving actions, synchronously call
+  `GET ${AUTHER_URL}/api/admin/users/:id`; on a 404, reject.
+
+Most apps are fine with a short TTL. Banking-grade flows want short TTL plus a
+deny-list plus fail-closed on high-risk routes.
+
+### Permission demotion mid-session
+
+An admin revokes Alice's `users:admin` in Auther, but her in-flight JWT still claims
+it — up to fifteen minutes of over-permission. The options mirror deletion: a short
+TTL, a permission-revision counter (a custom `permissions_rev` claim set via an Auther
+pipeline), or a forced `/check-permission` call for sensitive operations.
+
+### Sign-out
+
+A JWT is stateless, so you cannot "invalidate" one without a deny-list. On sign-out,
+clear client-side storage (drop the BFF cookie, drop the mobile tokens), redirect to
+Auther's `/api/auth/sign-out` (which ends Auther's session cookie, forcing a full
+re-auth at the next `/authorize`), revoke the refresh token via `/revoke` if one was
+issued, and rely on the short access-token TTL for the residual window.
+
+:::caution[Don't overpromise revocation]
+Don't promise "instant global revocation" unless you've actually built the deny-list.
+A stateless token remains valid until it expires.
+:::
+
+## Tokens & keys
+
+These bite around the token lifecycle — signing keys, clocks, claims, and the OIDC
+surface.
+
+### JWKS cache staleness during rotation
+
+Auther rotates signing keys every 30 days and keeps old keys for 60. A
+`createRemoteJWKSet` configured with `cacheMaxAge: 12h` handles the overlap. If
+Auther's `/jwks` is unreachable, jose keeps the stale cache rather than rejecting
+every token — the correct fail-mode.
+
+### Clock skew
+
+Container clocks drift, producing `"exp" claim timestamp check failed` or `"iat"
+claim in the future`. jose's `clockTolerance: 30` grants 30 seconds of slack.
+
+:::caution[Don't widen the tolerance]
+Don't raise `clockTolerance` beyond a small value — it directly weakens expiration
+enforcement. Persistent skew means an NTP problem in your infrastructure; fix that
+instead.
+:::
+
+### Impersonation
+
+An admin logs in "as" Alice. Auther's admin plugin issues a token where `sub =
+usr_alice` while the session records `impersonatedBy = usr_admin`, and a pipeline
+`token_build` node can inject that as an `impersonator` claim. Your audit logger must
+honor it:
+
+```ts title="apps/server/src/modules/audit-logs/service.ts"
+async function log(principal: Principal, action: string, subject: string) {
+  await db.insert(auditLogs).values({
+    actorId: principal.userId,                      // Alice
+    impersonatorId: principal.impersonator ?? null, // admin (if set)
+    action, subject, createdAt: new Date(),
+  });
+}
+```
+
+:::caution[Without the impersonator field]
+Without `impersonatorId`, post-incident you can't answer "who actually did this?"
+:::
+
+### 2FA step-up for sensitive ops
+
+A user about to transfer money should be re-challenged. Redirect to Auther with
+`prompt=login&acr_values=mfa`; Auther forces 2FA and returns a fresh token carrying
+`acr: "mfa"` and a new `auth_time`. The route checks both the method and its recency:
+
+```ts
+function requireRecentMfa(maxAgeSec: number) {
+  return async (c: Context<Env>, next: Next) => {
+    const session = c.get("session");
+    const claims = /* extracted */;
+    if (claims?.acr !== "mfa" || (Date.now() / 1000 - claims.auth_time) > maxAgeSec) {
+      return c.json({ error: "mfa_required", redirectTo: "/step-up" }, 403);
+    }
+    return next();
+  };
+}
+```
+
+### Offline mobile
+
+Three decisions cover the offline matrix: a cached access token that hasn't expired
+is used as-is; a cached-but-expired token with network available triggers a silent
+refresh via the refresh token; with no network at all, show "reconnect to continue"
+rather than pretending the user is authenticated.
+
+:::caution[Never extend the TTL forever]
+Do not extend the access-token TTL to infinity to paper over offline mode — that
+defeats expiration entirely.
+:::
+
+### OIDC discovery
+
+Auther exposes `/.well-known/openid-configuration` via better-auth. Mobile SDKs
+(AppAuth) and server libraries use it to auto-configure their endpoints. Point them at
+`${AUTHER_URL}/api/auth/.well-known/openid-configuration` (confirm the exact path
+against Auther's current better-auth config).
+
+### Webhook versioning
+
+Don't break old payload shapes. Add fields, never remove them. If a removal is truly
+unavoidable, version the event type instead — `user.updated.v2`.
+
+### Secret rotation
+
+Rotate every shared secret with an overlap window so nothing breaks mid-flight:
+
+- **Webhook signing secret** — add the new secret to Auther, have your receiver accept
+  both for a window, then remove the old one.
+- **Client secret** — rotate in Auther's admin UI, then redeploy Hono with the new
+  value.
+- **Admin API key** — create the new key, migrate the cron jobs onto it, then revoke
+  the old one.
+
+### Custom JWT claims
+
+Need `department`, `tenant`, or a feature-flag bucket in the token? Write an Auther
+pipeline `token_build` node:
+
+```lua
+-- Auther pipeline: token_build node
+local user = context.user
+return {
+  custom_claims = {
+    department = user.department,        -- if stored in Auther user profile
+    tenant = context.outputs.active_tenant or nil,
+  }
+}
+```
+
+Keep claims small — every request carries them as header bytes over the wire.
+
+## Migration & onboarding
+
+These bite once, on day one, when you move an existing user base into Auther.
+
+### Backfill on day one
+
+Bulk-import your existing Hono users by calling
+`POST ${AUTHER_URL}/api/auth/sign-up/email` with an `x-internal-signup-secret`, one
+user at a time (or batched via Auther's admin bulk endpoint if it's exposed). Preserve
+IDs if Auther's signup or admin endpoints accept `id` — the Hono template already uses
+`usr_*` CUIDs, which Auther can adopt. For passwords:
+
+- **Exact-hash import** — if Auther's better-auth config matches Hono's argon2id
+  params, dump `accounts.password` and re-insert it into Auther's account table. This
+  must go through Auther's DB, not its API.
+- **Force reset** (recommended for most) — bulk-invite all existing users with a
+  password-reset link via Auther.
+- **Dual-read transition** — accept both the old local auth and the new Auther auth for
+  a window; users migrate naturally as they log in.
+
+### Email verification divergence
+
+Pre-migration verified users should be imported with `emailVerified: true` in Auther.
+Don't re-send verification emails to thousands of already-verified accounts.
+
+## Ops & compliance
+
+These bite in production operations — tenancy, rate limits, CORS, logging, and the
+legal surface.
+
+### Multi-tenant with active org
+
+On stateless infrastructure, path-based tenancy (`/api/orgs/:slug/...`) beats
+session-based tenancy: it carries no server-side org state and survives across
+instances.
+
+### Background jobs, cron, and CI
+
+Give each job its own API key with scoped tuples, and cache the `exchange` result for
+about 14 minutes.
+
+:::caution[Never borrow a human's token]
+Never reuse a human's JWT for a cron job. When that person leaves or their permissions
+change, the job breaks silently.
+:::
+
+### Rate limits
+
+Auther owns sign-in rate limiting through its better-auth config, so remove the
+`rateLimit` and `loginSecurityPlugin` configuration from
+`apps/server/src/modules/auth/instance.ts` (which is going away regardless). Your
+app-endpoint rate limits in `apps/server/src/middlewares/rate-limit.ts` stay — they're
+unrelated to auth.
+
+### Local dev
+
+Both projects ship a docker-compose. Run Auther's stack on its default ports and
+Hono's on different ports, and share a docker network so Hono can reach Auther without
+`host.docker.internal` tricks:
+
+```yaml title="docker-compose.dev.yaml"
+# Hono project, fragment
+services:
+  auther:
+    image: ghcr.io/you/auther:local
+    ports: ["4000:3000"]
+    environment:
+      BETTER_AUTH_DATABASE_URL: http://auther-db:8080
+      # ...
+    networks: [app]
+  auther-db:
+    image: ghcr.io/tursodatabase/libsql-server:latest
+    networks: [app]
+networks:
+  app: {}
+```
+
+Seed test users in Auther (`pnpm user:create` in its scripts) and use them from Hono
+in dev.
+
+### CORS
+
+CORS only enters the picture on direct browser-to-Auther fetches. A browser *redirect*
+to Auther is navigation, not CORS; the callback returns to your web origin; a BFF's
+token exchange is server-side. Only a SPA fetching Auther directly triggers CORS — add
+the SPA origin to Auther's `CORS_ORIGIN`. Your Hono server's CORS origins are just the
+origins that call *it* (the web BFF, mobile); Auther isn't one of them.
+
+### Admin UIs that manage users
+
+Either redirect admins to Auther's `/admin` UI (simplest), or proxy through your Hono
+app's admin UI using `autherAdmin`.
+
+:::caution[Don't run a parallel user store]
+Don't maintain a second, parallel user-management surface — it will drift from Auther.
+:::
+
+### PII in logs
+
+Sanitize `Authorization` headers, full emails, and IPs. For OpenTelemetry export, add
+a redaction processor — Auther's metrics service already sanitizes tags, so follow suit
+in your Hono OpenTelemetry config (`apps/server/src/middlewares/otel.ts`).
+
+### GDPR right-to-erasure
+
+Erasure flows as a chain: Auther delete → webhook → Hono cascade → internal event →
+downstream services. Document the chain for auditors, and state the backup policy
+explicitly: removed from live within X days, from backups within Y per retention.
+
+### Consent and ToS
+
+Set `skipConsent: true` for B2B or trusted-client setups. Turn on per-client consent
+for B2C GDPR flows.

@@ -1,0 +1,278 @@
+---
+title: Tenant Resolution
+description: Mapping host to organizationId on every request, and caching it safely across colos with a two-tier strategy.
+sidebar:
+  order: 2
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+Every request to a tenant worker (`apps/server` or `apps/auth`) has to turn
+`request.host` into an `organizationId` before any business logic runs. This is the
+system's hottest path — it executes on every single API call — so it has to be both
+correct and fast. Getting it wrong leaks data across tenants; getting it slow taxes
+every endpoint. The shape of the solution is a pure classifier, a thin middleware,
+and a two-tier cache.
+
+## Hostname shapes
+
+There are three valid host patterns, plus a hard rejection for everything else.
+Knowing which bucket a host falls into is the first decision the system makes.
+
+| Pattern | Example | Where the org lives |
+| --- | --- | --- |
+| Default subdomain | `acme.app.example.com` | `organization.slug = "acme"` |
+| Tenant custom domain | `app.acme.com` | `tenant_custom_hostnames.hostname` (status `active`) |
+| Apex (marketing) | `app.example.com` | No tenant — serves the marketing / find-your-team page |
+| Admin host | `admin.example.com` | A different worker entirely; `tenantMiddleware` rejects it with 404 |
+
+Slugs are constrained at org-creation time: a reserved-slug list, a Punycode
+(`xn--`) reject, and the regex `^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$`. That keeps
+the subdomain space clean and predictable, which matters because the classifier below
+trusts it.
+
+## The pure classifier
+
+The classification logic lives in a single pure function, `parseHostname`, in
+`packages/shared/src/tenant.ts` (or `@repo/tenancy` after the Phase C consolidation —
+see [Deep Modules](/multi-tenant/deep-modules/#tenancy-package)). Keeping it pure
+means it's trivially testable and has no I/O on the hot path.
+
+```ts title="packages/shared/src/tenant.ts"
+export const WILDCARD_SUFFIX = ".app.example.com"; // env-configurable
+export const ADMIN_HOST = "admin.example.com";
+
+export function parseHostname(host: string, suffix: string, adminHost: string):
+  | { kind: "subdomain"; slug: string }
+  | { kind: "apex" }
+  | { kind: "custom"; hostname: string }
+  | { kind: "admin" }
+  | { kind: "invalid" } {
+  const normalized = host.toLowerCase().normalize("NFC").replace(/\.$/, "");
+  if (!/^[a-z0-9.-]+$/.test(normalized)) return { kind: "invalid" };
+  if (normalized.includes("*") || normalized.includes(" ")) return { kind: "invalid" };
+  if (normalized === adminHost) return { kind: "admin" };
+  if (normalized === suffix.slice(1)) return { kind: "apex" };
+  if (normalized.endsWith(suffix)) {
+    const slug = normalized.slice(0, -suffix.length);
+    return slug.includes(".") ? { kind: "invalid" } : { kind: "subdomain", slug };
+  }
+  return { kind: "custom", hostname: normalized };
+}
+```
+
+The order of these checks is load-bearing. The admin host is matched first, before
+any wildcard or custom-host classification — otherwise `admin.example.com` would fall
+through to a `custom` tenant lookup and leak a 404 timing oracle for "is this an
+admin host?" queries. The apex case is matched next, then the wildcard suffix, and
+only then does anything unrecognized become a `custom` hostname to look up in the
+database.
+
+:::caution[Trust only the edge `Host` header]
+Never read `X-Forwarded-Host` for tenant resolution. The `Host` header set by
+Cloudflare's edge is the only trustworthy source for the host-to-tenant mapping; a
+forwarded header is attacker-controlled. Separately, on the server/auth proxy path,
+forwarded host and proto headers must be stripped or overwritten before invoking
+Better Auth, because Better Auth's dynamic `baseURL` logic can consult them.
+:::
+
+## Tenant middleware
+
+The middleware is deliberately thin: classify the host, short-circuit the cases that
+need no database, and otherwise resolve through the cache. It sets `tenant` on the
+request context for everything downstream to read.
+
+```ts title="apps/server/src/middlewares/tenant-context.ts"
+export const tenantMiddleware = createMiddleware<AppEnv>(async (c, next) => {
+  const rawHost = c.req.header("host");
+  if (!rawHost) return c.text("Bad Request", 400);
+
+  const parsed = parseHostname(rawHost, c.env.WILDCARD_SUFFIX, c.env.ADMIN_HOST);
+  if (parsed.kind === "invalid" || parsed.kind === "admin") return c.notFound();
+  if (parsed.kind === "apex") {
+    c.set("tenant", null);
+    return next();
+  }
+
+  const tenant = await resolveCached(parsed, c);
+  if (!tenant) return c.notFound();
+  c.set("tenant", tenant);
+  return next();
+});
+```
+
+`apps/auth` runs the same middleware. It has to execute before the Better Auth
+handler so that SSO discovery and the session hooks already see the tenant context
+by the time they run.
+
+Two things about the `apex` branch are easy to get wrong. First, it's a real,
+legitimate request: the marketing / find-your-team page on `app.example.com` hits
+`apps/server` with `tenant === null`, not an error. Second, because of that, any
+route that requires a tenant must default-deny when `c.var.tenant === null`. The
+codebase keeps an explicit allowlist of routes that are valid on apex — the login
+picker and the public marketing endpoints — and everything else rejects.
+
+:::note[One consistent host source]
+The `host` derived from `c.req.url` (via `URL.host`) comes from the same `Host`
+header. Use one source consistently throughout the request; don't mix `c.req.header("host")`
+with another derivation, or the classifier and downstream code can disagree.
+:::
+
+## Cache strategy
+
+A Postgres lookup on every API call would be wasteful, so the result is cached. The
+constraint that shapes the design is that this cache is security-sensitive: when a
+tenant is suspended or a slug is renamed, stale entries must clear quickly and
+everywhere. That rules out the obvious single-tier choices.
+
+The system uses **two tiers**: Cloudflare's Cache API for the per-colo hot path, and
+KV for cross-colo cache versioning.
+
+A tempting shortcut is to use KV directly as the lookup cache, but KV's cross-colo
+eventual-consistency window (around 60 seconds) is too long for security-sensitive
+operations like tenant suspension. The Cache API, by contrast, gives sub-millisecond
+reads in-colo with strong same-colo consistency on invalidation — exactly what the
+hot path wants. KV is then used only for a small, infrequently-changing version
+counter that lets the whole fleet invalidate at once.
+
+The cache key embeds that version prefix, which the admin worker bumps on a slug
+rename or a suspension:
+
+```ts
+const version = (await c.env.CACHE.get("tenant_cache_version")) ?? "v0";
+const cacheKey = new Request(
+  `https://tenant-cache.internal/${version}/${parsed.kind}/${
+    parsed.kind === "subdomain" ? parsed.slug : parsed.hostname
+  }`
+);
+```
+
+Bumping the version invalidates every cache entry under the old version, fleet-wide,
+on the next read — a single coarse lever for the rare, broad invalidations.
+
+### Resolve order on a miss
+
+On the cold path the middleware walks a short, fixed sequence:
+
+<Mermaid title="Resolve order (cold path)" height={420} code={`
+flowchart TB
+  Start["request host"] --> Cache["Cache API lookup<br/>(versioned key)"]
+  Cache -->|"hit (positive or negative)"| Return["return cached tenant"]
+  Cache -->|"miss"| Kind{"parsed.kind?"}
+  Kind -->|"subdomain"| QSub["SELECT organizations<br/>WHERE slug = ? AND deleted_at IS NULL"]
+  Kind -->|"custom"| QCust["SELECT tenant_custom_hostnames<br/>WHERE hostname = ? AND lifecycle_status = 'active'<br/>join organizations (deleted_at IS NULL)"]
+  QSub --> Put["ctx.waitUntil(cache.put)<br/>positive TTL 60s / negative TTL 5s"]
+  QCust --> Put
+  Put --> Return
+`} />
+
+The asymmetric TTLs are deliberate. A positive result is cached for 60 seconds; a
+negative ("tenant not found") result for only 5 seconds. The short negative TTL means
+a freshly-created tenant becomes visible within about 5 seconds in any colo that had
+previously cached the negative result — deletes and creations propagate fast without
+making the common positive case chatty.
+
+## Cache invalidation
+
+The Cache API is per-colo and per-worker. A `cache.delete()` in `apps/admin`'s
+isolate does nothing for the matching entry in `apps/server`'s isolate, let alone in
+another colo. Targeted invalidation therefore needs two cooperating mechanisms.
+
+The first is service-binding RPC fan-out for invalidating a specific tenant. Each
+tenant worker exposes the operation on its entrypoint:
+
+```ts title="apps/server/src/entrypoint.ts"
+// (apps/auth/src/entrypoint.ts is identical)
+async invalidateTenant(spec: { kind: "subdomain" | "custom"; key: string }) {
+  await caches.default.delete(`https://tenant-cache.internal/${currentVersion}/${spec.kind}/${spec.key}`);
+}
+async bumpTenantCacheVersion() {
+  await this.env.CACHE.put("tenant_cache_version", String(Date.now()), { expirationTtl: 86400 });
+}
+```
+
+The second is the admin worker, which orchestrates the fan-out across its peers:
+
+```ts title="apps/admin/src/lib/cache-fanout.ts"
+export async function invalidateTenant(env: AdminEnv, spec) {
+  await Promise.all([
+    env.API.invalidateTenant(spec),
+    env.AUTH.invalidateTenant(spec),
+  ]);
+}
+```
+
+The fan-out is asymmetric on purpose: `apps/auth` has no binding back to
+`apps/admin`. When the auth worker itself triggers an invalidation — for example on a
+session-version bump — it calls the existing `apps/auth → apps/server.invalidateTenant(...)`
+binding, while the admin worker remains the orchestrator for global invalidations.
+After Phase C this whole pattern lives behind `@repo/tenancy`'s `Invalidator` and
+`FanOutInvalidator` types; see [Deep Modules](/multi-tenant/deep-modules/#tenancy-package).
+
+:::note[The per-colo limit is accepted, not solved]
+Even with RPC fan-out, `cache.delete()` only purges the colo where the consumer ran.
+The 60-second positive TTL is the durability backstop for any residual stale entry in
+a colo that wasn't touched. For a security-critical revocation — a compromised tenant,
+say — bump the version counter instead: every colo's cache becomes invalid on its
+next read.
+:::
+
+:::caution[Don't reach for the version hammer routinely]
+The cache version is a global signal. Bumping it is the right call for slug renames
+and suspensions, but it's coarse — it invalidates the whole fleet's cache. Don't bump
+it on every routine update, or you forfeit the cache's value.
+:::
+
+## Local development
+
+In local dev, `window.location.host` is `localhost:3000`, which matches neither the
+wildcard suffix nor any custom host — so the middleware would 404. A dev-only header
+provides an escape hatch, behind a deliberately strict two-factor gate:
+
+```ts
+if (c.env.NODE_ENV === "development" && c.env.ALLOW_DEV_TENANT_HEADER === "true") {
+  const devSlug = c.req.header("x-dev-tenant-slug");
+  if (devSlug) {
+    // resolve as if host were `${devSlug}.app.example.com`
+  }
+}
+```
+
+Both conditions must hold: `NODE_ENV` (a wrangler `var`) and `ALLOW_DEV_TENANT_HEADER`
+(a Cloudflare Secret that exists only in `.dev.vars`). A CI guard rejects any deploy
+to staging or production where `NODE_ENV !== "production"`, so the header can't slip
+into a real environment. The tenant SPA (`apps/app`) sends `X-Dev-Tenant-Slug: acme`
+from `VITE_DEV_TENANT_SLUG=acme` in `.env.development`.
+
+## Tombstoned slugs
+
+When an organization is soft-deleted, its slug must never be reissued. If it were, a
+future tenant with the same slug would inherit confusion across links, cookies, JWTs,
+and audit logs. The soft-delete therefore does two things in a single transaction
+(decisions D16 and D37):
+
+1. `UPDATE organization SET deleted_at = now(), deleted_by = ?, slug = NULL WHERE id = ?`
+2. `INSERT INTO reserved_slugs (slug, reason: "deleted_org", organization_id)`
+
+Tenant creation then checks both the active `organization.slug` UNIQUE constraint and
+the `reserved_slugs` table, so a tombstoned slug can never be handed out again.
+
+## The soft-delete invariant
+
+Because organizations are never hard-deleted, every query against the `organization`
+table must filter `deleted_at IS NULL`. Forgetting that filter is a quiet way to
+resurrect a deleted tenant. The rule is documented in `CLAUDE.md` and enforced in code
+review: every PR touching an `organization` query is checked for the filter. A future
+Drizzle helper, `activeOrganizations`, may make the filter the default; until then it's
+applied by hand and verified at review.
+
+## Performance targets
+
+These are the budgets the design holds itself to:
+
+- **Cache hit, warm isolate:** under 1ms for the cache lookup itself; total middleware
+  overhead under 2ms at p99.
+- **Cache miss, cold path:** roughly 5–10ms for the KV version lookup plus the
+  Hyperdrive query plus the cache write.
+- **Cache miss with a cold isolate:** roughly 50–100ms, a one-time cost per isolate
+  boot.
