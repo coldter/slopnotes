@@ -12,21 +12,24 @@ head:
 
 ## What this is
 
-**slopnotes** is a personal home for AI-generated learning material. Good
-explanations from a model usually end up buried in a chat history and are never
-seen again. slopnotes is where those notes get saved, organized, and given a
-reading experience worth coming back to.
+**slopnotes** is where I keep the learning material I generate with AI.
 
-The name is a wink at the source: a lot of the content starts as AI "slop" —
-then gets curated into something genuinely useful to learn from.
+The way I learn new things now: instead of sitting through hours of videos and
+documentation, I spawn a handful of research agents and have them survey a topic
+for me — in my taste, in the format I like to read, with plenty of examples. I
+end up with a stack of documents, then convert them into the clean, searchable
+pages you see here (Markdown / MDX).
 
-## Why it exists
+## Why it's called slop
 
-- **Keep the good stuff.** Chat logs are disposable; courses are not.
-- **Read anywhere.** A responsive, dark/light, search-enabled site beats
-  scrolling a transcript on a phone.
-- **Stay portable.** Everything is plain Markdown/MDX — no lock-in, easy to
-  paste, refine, and version with git.
+Because that's what it is, and I'd rather be honest about it. This isn't a
+high-effort, meticulously-cited project — it's a fast, low-effort way to get
+started on a new topic or technology.
+
+I don't always know the exact source behind every detail, and I won't claim it's
+100% correct — it's right maybe 99% of the time. But the results are good. For
+how I like to learn, it beats ~95% of the material already out there. That's
+enough for me.
 
 ## How it is organized
 

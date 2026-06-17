@@ -1,0 +1,648 @@
+---
+title: Backup & Monitoring
+description: Backups, S3 offsite copies, disaster-recovery runbooks, and a Prometheus/Grafana monitoring stack for production ScoopJoy.
+sidebar:
+  order: 29
+---
+
+import { FileTree } from "@astrojs/starlight/components";
+
+Data protection and observability are not optional — they are core operational
+requirements. This chapter covers everything from basic backup commands to a
+complete disaster-recovery plan and a production monitoring stack for your
+ScoopJoy deployment.
+
+## Bench backup: what gets backed up
+
+The `bench backup` command creates three files:
+
+| File | Contents | Format |
+|------|----------|--------|
+| `*-database.sql.gz` | Full MariaDB database dump | Compressed SQL |
+| `*-files.tar` | Public files (uploads, images) | Tar archive |
+| `*-private-files.tar` | Private files (attachments, PDFs) | Tar archive |
+
+```bash
+# Basic backup
+bench --site scoopjoy.com backup
+
+# Backup with files (recommended)
+bench --site scoopjoy.com backup --with-files
+
+# Backup all sites
+bench backup-all-sites
+
+# Backup specific site with compression
+bench --site scoopjoy.com backup --with-files --compress
+```
+
+Backup files are stored in `sites/<site-name>/private/backups/` by default.
+
+:::danger[Always back up with --with-files]
+The database alone is **incomplete**. Uploaded documents, images, and private
+attachments live on the filesystem, not in the database. A database-only backup
+will restore to a site with missing files — data loss you won't notice until a
+user opens an invoice with a vanished attachment.
+:::
+
+## Automated backups
+
+### Using bench (built-in)
+
+When you run `bench setup production`, a crontab entry is automatically added
+that runs backups every 6 hours:
+
+```bash
+# View the auto-configured backup schedule
+crontab -l | grep backup
+```
+
+### Custom cron schedule
+
+```bash
+# Edit crontab for the frappe user
+crontab -e
+
+# Backup every 6 hours with files
+0 */6 * * * cd ~/frappe-bench && ~/frappe-bench/env/bin/bench --site scoopjoy.com backup --with-files >> ~/frappe-bench/logs/backup.log 2>&1
+
+# Backup all sites at 2 AM daily
+0 2 * * * cd ~/frappe-bench && ~/frappe-bench/env/bin/bench backup-all-sites --with-files >> ~/frappe-bench/logs/backup-all.log 2>&1
+```
+
+## Offsite backup to S3
+
+### Built-in S3 backup configuration
+
+Frappe has built-in support for S3 backups via the **S3 Backup Settings**
+DocType. Configure it through the web UI or via bench:
+
+```bash
+bench --site scoopjoy.com set-config backup_s3_bucket "scoopjoy-erp-backups"
+bench --site scoopjoy.com set-config backup_s3_region "us-east-1"
+bench --site scoopjoy.com set-config backup_s3_access_key "AKIA..."
+bench --site scoopjoy.com set-config backup_s3_secret_key "your-secret-key"
+```
+
+### Automated S3 backup script with rotation
+
+For complete control — multiple sites, local rotation, and S3 lifecycle — use a
+custom backup script. It backs up each site, uploads to S3 (including
+`site_config.json`), then prunes both local and remote copies past their
+retention windows.
+
+```bash title="~/scripts/backup-to-s3.sh"
+#!/bin/bash
+# Automated backup with S3 upload and local rotation
+
+set -euo pipefail
+
+# ─── Configuration ───────────────────────────────────
+BENCH_PATH="$HOME/frappe-bench"
+SITES=("scoopjoy.com" "outlet1.scoopjoy.com" "outlet2.scoopjoy.com")
+S3_BUCKET="s3://scoopjoy-erp-backups"
+S3_REGION="us-east-1"
+LOCAL_RETENTION_DAYS=7
+S3_RETENTION_DAYS=90
+LOG_FILE="${BENCH_PATH}/logs/s3-backup.log"
+DATE=$(date +%Y-%m-%d_%H-%M-%S)
+
+# ─── Functions ───────────────────────────────────────
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+backup_site() {
+    local site=$1
+    log "Starting backup for ${site}"
+
+    cd "$BENCH_PATH"
+
+    # Create the backup
+    ./env/bin/bench --site "$site" backup --with-files 2>> "$LOG_FILE"
+
+    if [ $? -ne 0 ]; then
+        log "ERROR: Backup failed for ${site}"
+        return 1
+    fi
+
+    # Find the latest backup files
+    local backup_dir="${BENCH_PATH}/sites/${site}/private/backups"
+    local latest_db=$(ls -t "${backup_dir}"/*-database.sql.gz 2>/dev/null | head -1)
+    local latest_files=$(ls -t "${backup_dir}"/*-files.tar 2>/dev/null | head -1)
+    local latest_private=$(ls -t "${backup_dir}"/*-private-files.tar 2>/dev/null | head -1)
+
+    # Upload to S3
+    local s3_path="${S3_BUCKET}/${site}/${DATE}"
+
+    if [ -n "$latest_db" ]; then
+        aws s3 cp "$latest_db" "${s3_path}/" --region "$S3_REGION" 2>> "$LOG_FILE"
+        log "Uploaded database backup: $(basename "$latest_db")"
+    fi
+
+    if [ -n "$latest_files" ]; then
+        aws s3 cp "$latest_files" "${s3_path}/" --region "$S3_REGION" 2>> "$LOG_FILE"
+        log "Uploaded files backup: $(basename "$latest_files")"
+    fi
+
+    if [ -n "$latest_private" ]; then
+        aws s3 cp "$latest_private" "${s3_path}/" --region "$S3_REGION" 2>> "$LOG_FILE"
+        log "Uploaded private files backup: $(basename "$latest_private")"
+    fi
+
+    # Also backup site_config.json (holds the encryption key)
+    aws s3 cp "${BENCH_PATH}/sites/${site}/site_config.json" \
+        "${s3_path}/site_config.json" --region "$S3_REGION" 2>> "$LOG_FILE"
+
+    log "Backup complete for ${site}"
+}
+
+cleanup_local() {
+    log "Cleaning up local backups older than ${LOCAL_RETENTION_DAYS} days"
+    for site in "${SITES[@]}"; do
+        find "${BENCH_PATH}/sites/${site}/private/backups" \
+            -type f -mtime "+${LOCAL_RETENTION_DAYS}" -delete 2>> "$LOG_FILE"
+    done
+}
+
+cleanup_s3() {
+    log "Cleaning up S3 backups older than ${S3_RETENTION_DAYS} days"
+    local cutoff_date=$(date -d "-${S3_RETENTION_DAYS} days" +%Y-%m-%d)
+    for site in "${SITES[@]}"; do
+        aws s3 ls "${S3_BUCKET}/${site}/" --region "$S3_REGION" | \
+            while read -r line; do
+                local dir_date=$(echo "$line" | awk '{print $2}' | cut -d'_' -f1 | tr -d '/')
+                if [[ "$dir_date" < "$cutoff_date" ]]; then
+                    local dir_name=$(echo "$line" | awk '{print $2}')
+                    aws s3 rm "${S3_BUCKET}/${site}/${dir_name}" \
+                        --recursive --region "$S3_REGION" 2>> "$LOG_FILE"
+                    log "Removed old S3 backup: ${site}/${dir_name}"
+                fi
+            done
+    done
+}
+
+# ─── Main ────────────────────────────────────────────
+log "========================================="
+log "Starting backup run"
+
+for site in "${SITES[@]}"; do
+    backup_site "$site"
+done
+
+cleanup_local
+cleanup_s3
+
+log "Backup run complete"
+log "========================================="
+```
+
+```bash
+# Make executable and schedule
+chmod +x ~/scripts/backup-to-s3.sh
+
+# Run every 6 hours
+crontab -e
+# Add:
+0 */6 * * * ~/scripts/backup-to-s3.sh
+```
+
+## Restoring from backup
+
+```bash
+# Basic restore (database only)
+bench --site scoopjoy.com --force restore \
+  /path/to/20260320_120000-scoopjoy-database.sql.gz
+
+# Full restore with all files
+bench --site scoopjoy.com --force restore \
+  /path/to/20260320_120000-scoopjoy-database.sql.gz \
+  --with-public-files /path/to/20260320_120000-scoopjoy-files.tar \
+  --with-private-files /path/to/20260320_120000-scoopjoy-private-files.tar
+
+# After restore: run migrations and clear cache
+bench --site scoopjoy.com migrate
+bench --site scoopjoy.com clear-cache
+bench build
+bench restart
+```
+
+:::danger[Restore the encryption key, or lose your secrets]
+After restoring from backup, copy the original site's `encryption_key` from the
+backed-up `site_config.json` into the new site's config. Without the correct
+encryption key, encrypted fields (passwords, API keys) will fail to decrypt —
+permanently inaccessible even though the rows are intact.
+:::
+
+### Restoring from S3 in Docker
+
+This is the same restore flow as a [Docker deployment](/erpnext/26-docker/),
+just driven through `docker compose exec` into the `backend` container.
+
+```bash
+# Download backup files from S3
+aws s3 cp s3://scoopjoy-erp-backups/scoopjoy.com/2026-03-20_02-00-00/ ./restore/ --recursive
+
+# Restore inside the Docker container
+docker compose exec backend bench --site scoopjoy.com --force restore \
+  /home/frappe/frappe-bench/sites/restore/20260320-database.sql.gz \
+  --with-public-files /home/frappe/frappe-bench/sites/restore/20260320-files.tar \
+  --with-private-files /home/frappe/frappe-bench/sites/restore/20260320-private-files.tar
+
+docker compose exec backend bench --site scoopjoy.com migrate
+docker compose exec backend bench --site scoopjoy.com clear-cache
+```
+
+## Disaster recovery strategy
+
+### RPO and RTO planning
+
+| Metric | Target | Implementation |
+|--------|--------|----------------|
+| **RPO** (Recovery Point Objective) | 6 hours | Backup every 6 hours to S3 |
+| **RTO** (Recovery Time Objective) | 2 hours | Documented runbook + tested restore |
+
+### Database replication
+
+For near-zero RPO, configure MariaDB replication. Start with the primary:
+
+```ini title="/etc/mysql/mariadb.conf.d/99-replication.cnf (primary)"
+[mysqld]
+server-id              = 1
+log_bin                = /var/log/mysql/mariadb-bin
+binlog_format          = ROW
+expire_logs_days       = 7
+max_binlog_size        = 100M
+binlog_do_db           = _scoopjoy_com
+binlog_do_db           = _outlet1_scoopjoy_com
+```
+
+```sql
+-- On primary: create the replication user
+CREATE USER 'replication'@'%' IDENTIFIED BY 'secure-repl-password';
+GRANT REPLICATION SLAVE ON *.* TO 'replication'@'%';
+FLUSH PRIVILEGES;
+SHOW MASTER STATUS;
+```
+
+Then point the replica at it:
+
+```ini title="/etc/mysql/mariadb.conf.d/99-replication.cnf (replica)"
+[mysqld]
+server-id              = 2
+relay_log              = /var/log/mysql/relay-bin
+read_only              = 1
+```
+
+```sql
+-- On replica: configure replication
+CHANGE MASTER TO
+  MASTER_HOST='primary-db.example.com',
+  MASTER_USER='replication',
+  MASTER_PASSWORD='secure-repl-password',
+  MASTER_LOG_FILE='mariadb-bin.000001',
+  MASTER_LOG_POS=XXX;
+START SLAVE;
+SHOW SLAVE STATUS\G
+```
+
+### Complete disaster-recovery runbook
+
+When something breaks at 2 AM, you want a checklist, not a brainstorm. Keep this
+runbook printed and tested — an untested backup is just a hope.
+
+```text title="DISASTER RECOVERY RUNBOOK — ScoopJoy ERP"
+SCENARIO 1: Application server failure (OS/hardware)
+─────────────────────────────────────────────────────
+1. Provision new Ubuntu 24.04 server
+2. Run production-setup.sh (see Chapter 27)
+3. Download latest S3 backup:
+   aws s3 cp s3://scoopjoy-erp-backups/scoopjoy.com/LATEST/ ./restore/ --recursive
+4. Restore each site:
+   bench --site scoopjoy.com --force restore ./restore/*database.sql.gz \
+     --with-public-files ./restore/*files.tar \
+     --with-private-files ./restore/*private-files.tar
+5. Copy encryption_key from backed-up site_config.json
+6. bench --site scoopjoy.com migrate
+7. bench restart
+8. Update DNS to point to new server IP
+9. Setup SSL: sudo -H bench setup lets-encrypt scoopjoy.com
+
+ESTIMATED TIME: 1-2 hours
+
+SCENARIO 2: Database corruption
+──────────────────────────────
+1. Stop all bench processes: sudo supervisorctl stop all
+2. Download latest S3 database backup
+3. bench --site scoopjoy.com --force restore ./restore/*database.sql.gz
+4. bench --site scoopjoy.com migrate
+5. bench --site scoopjoy.com clear-cache
+6. sudo supervisorctl start all
+7. Verify data integrity through spot checks
+
+ESTIMATED TIME: 30-60 minutes
+
+SCENARIO 3: Accidental data deletion by user
+─────────────────────────────────────────────
+1. Identify the most recent backup BEFORE the deletion occurred
+2. Create a temporary recovery site:
+   bench new-site recovery.localhost --mariadb-root-password XXX
+3. Restore the backup to the recovery site
+4. Use bench console to extract the deleted records
+5. Re-create the records on the production site
+6. Drop the recovery site:
+   bench drop-site recovery.localhost --force
+
+ESTIMATED TIME: 1-3 hours depending on data volume
+
+SCENARIO 4: Complete infrastructure failure
+──────────────────────────────────────────
+1. Follow Scenario 1 steps on a new provider
+2. If using K8s: redeploy Helm chart to new cluster
+3. Restore database from S3
+4. Restore files from S3
+5. Update DNS records (TTL should be low: 300s)
+6. Verify all sites and services
+
+ESTIMATED TIME: 2-4 hours
+```
+
+:::tip[Pro tip]
+Scenario 1 references `production-setup.sh` from
+[Chapter 27: Production Deployment](/erpnext/27-production-deployment/), and the
+K8s redeploy in Scenario 4 uses the Helm chart from
+[Chapter 28: Scaling with Kubernetes](/erpnext/28-kubernetes/). Keep those
+artifacts in version control so a clean-slate recovery is a script, not
+archaeology.
+:::
+
+## Monitoring
+
+### bench doctor: quick health check
+
+```bash
+bench doctor
+```
+
+This checks that background workers are running, the scheduler is active, and
+there are no stuck jobs.
+
+### Prometheus + Grafana
+
+Set up Prometheus to scrape the Frappe stack components. Use `node_exporter` for
+system metrics and dedicated exporters for MariaDB, Redis, and Nginx, plus
+Frappe's own ping endpoint.
+
+```yaml title="/etc/prometheus/prometheus.yml"
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # Node-level metrics (CPU, memory, disk)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'scoopjoy-erp-server'
+
+  # MariaDB metrics
+  - job_name: 'mariadb'
+    static_configs:
+      - targets: ['localhost:9104']
+
+  # Redis metrics
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['localhost:9121']
+
+  # Nginx metrics
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['localhost:9113']
+
+  # Custom Frappe health endpoint
+  - job_name: 'frappe'
+    metrics_path: /api/method/ping
+    static_configs:
+      - targets: ['localhost:8000']
+```
+
+Install the exporters:
+
+```bash
+# Node exporter (system metrics)
+sudo apt install prometheus-node-exporter
+
+# MariaDB exporter — create a monitoring user first:
+#   CREATE USER 'exporter'@'localhost' IDENTIFIED BY 'password';
+#   GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'localhost';
+docker run -d --name mariadb-exporter \
+  -p 9104:9104 \
+  -e DATA_SOURCE_NAME="exporter:password@(localhost:3306)/" \
+  prom/mysqld-exporter
+
+# Redis exporter
+docker run -d --name redis-exporter \
+  -p 9121:9121 \
+  oliver006/redis_exporter \
+  --redis.addr=redis://localhost:6379
+```
+
+Once metrics are flowing, point Grafana at Prometheus and graph queue depth with
+a PromQL query like this:
+
+```text title="PromQL — pending RQ jobs"
+redis_key_size{key=~"rq:queue:.*"}
+```
+
+### Key metrics to monitor
+
+| Metric | Source | Alert Threshold |
+|--------|--------|-----------------|
+| Response time (P95) | Nginx access log | > 5 seconds |
+| Worker queue depth | Redis `rq:queue:default` | > 100 pending jobs |
+| Active users | Frappe session store | Informational |
+| Database size | MariaDB `information_schema` | > 80% disk usage |
+| CPU usage | node_exporter | > 85% sustained |
+| Memory usage | node_exporter | > 90% |
+| Disk I/O wait | node_exporter | > 20% |
+| SSL certificate expiry | blackbox_exporter | < 14 days |
+| Failed login attempts | Frappe Activity Log | > 50/hour |
+| Background job failures | Redis / worker logs | > 10/hour |
+
+### Log management
+
+Frappe generates several log files. Knowing where each one lives turns a 3 AM
+incident into a quick `tail`:
+
+<FileTree>
+- frappe-bench/
+  - logs/
+    - web.log Gunicorn access/error logs
+    - web.error.log Gunicorn errors
+    - worker-short.log short queue worker logs
+    - worker-default.log default queue worker logs
+    - worker-long.log long queue worker logs
+    - schedule.log scheduler logs
+    - socketio.log Socket.IO server logs
+    - backup.log backup operation logs
+  - sites/
+    - **&lt;site-name&gt;**/
+      - logs/
+        - frappe.log application-level logs (from `frappe.log()`)
+</FileTree>
+
+Centralize logs with a log shipper such as Filebeat into ELK/OpenSearch:
+
+```yaml title="/etc/filebeat/filebeat.yml"
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /home/frappe/frappe-bench/logs/*.log
+    fields:
+      service: frappe-bench
+    multiline:
+      pattern: '^\['
+      negate: true
+      match: after
+
+  - type: log
+    enabled: true
+    paths:
+      - /home/frappe/frappe-bench/sites/*/logs/frappe.log
+    fields:
+      service: frappe-app
+    multiline:
+      pattern: '^Traceback'
+      negate: true
+      match: after
+
+output.elasticsearch:
+  hosts: ["https://elasticsearch.example.com:9200"]
+  index: "frappe-logs-%{+yyyy.MM.dd}"
+```
+
+### Sentry integration for error tracking
+
+The `frappe-sentry` community app sends application errors to Sentry. Install and
+configure it:
+
+```bash
+# Install the Sentry integration app
+bench get-app https://github.com/ParsimonyGit/frappe-sentry
+bench --site scoopjoy.com install-app frappe_sentry
+```
+
+Configure it in `site_config.json`:
+
+```json title="sites/scoopjoy.com/site_config.json"
+{
+  "sentry_dsn": "https://abc123@o123456.ingest.sentry.io/789",
+  "sentry_environment": "production",
+  "sentry_release": "scoopjoy-erp@v16.10.10",
+  "sentry_traces_sample_rate": 0.1
+}
+```
+
+:::tip[Pro tip]
+Set `sentry_traces_sample_rate` to `0.1` (10%) in production to balance
+observability with Sentry quota usage. Increase it to `1.0` in staging for full
+trace coverage.
+:::
+
+### Health-check script for cron-based monitoring
+
+If you don't want a full Prometheus stack, a lightweight cron script gets you 80%
+of the value: it pings the web server, checks Supervisor, queue depth, disk,
+MariaDB, Redis, and SSL expiry, then alerts to Slack on failure.
+
+```bash title="~/scripts/health-check.sh"
+#!/bin/bash
+# Lightweight health check with Slack alerting
+
+set -euo pipefail
+
+SITE="scoopjoy.com"
+BENCH_PATH="$HOME/frappe-bench"
+SLACK_WEBHOOK="${SLACK_WEBHOOK_URL:-}"
+ALERT_FILE="/tmp/frappe-alert-state"
+
+alert() {
+    local level=$1
+    local message=$2
+    echo "[$(date)] ${level}: ${message}"
+
+    if [ -n "$SLACK_WEBHOOK" ]; then
+        local color="danger"
+        [ "$level" = "WARNING" ] && color="warning"
+        [ "$level" = "OK" ] && color="good"
+
+        curl -s -X POST "$SLACK_WEBHOOK" \
+            -H 'Content-type: application/json' \
+            -d "{\"attachments\":[{\"color\":\"${color}\",\"title\":\"ERPNext Health: ${level}\",\"text\":\"${message}\",\"footer\":\"${SITE}\"}]}" \
+            > /dev/null 2>&1
+    fi
+}
+
+# Check 1: Web server responding
+HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8000/api/method/ping" || echo "000")
+if [ "$HTTP_CODE" != "200" ]; then
+    alert "CRITICAL" "Web server not responding (HTTP ${HTTP_CODE})"
+fi
+
+# Check 2: Supervisor processes running
+STOPPED=$(sudo supervisorctl status | grep -c "STOPPED\|FATAL\|EXITED" || true)
+if [ "$STOPPED" -gt 0 ]; then
+    STOPPED_NAMES=$(sudo supervisorctl status | grep "STOPPED\|FATAL\|EXITED" | awk '{print $1}')
+    alert "CRITICAL" "Supervisor processes down: ${STOPPED_NAMES}"
+fi
+
+# Check 3: Worker queue depth
+QUEUE_DEPTH=$(cd "$BENCH_PATH" && ./env/bin/python -c "
+import redis
+r = redis.Redis()
+depth = r.llen('rq:queue:default') + r.llen('rq:queue:short') + r.llen('rq:queue:long')
+print(depth)
+" 2>/dev/null || echo "0")
+
+if [ "$QUEUE_DEPTH" -gt 100 ]; then
+    alert "WARNING" "Worker queue depth is high: ${QUEUE_DEPTH} jobs pending"
+fi
+
+# Check 4: Disk usage
+DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | tr -d '%')
+if [ "$DISK_USAGE" -gt 85 ]; then
+    alert "WARNING" "Disk usage at ${DISK_USAGE}%"
+fi
+
+# Check 5: MariaDB running
+if ! systemctl is-active --quiet mariadb; then
+    alert "CRITICAL" "MariaDB is not running"
+fi
+
+# Check 6: Redis running
+if ! systemctl is-active --quiet redis-server; then
+    alert "CRITICAL" "Redis is not running"
+fi
+
+# Check 7: SSL certificate expiry
+CERT_EXPIRY=$(echo | openssl s_client -servername "$SITE" -connect "$SITE":443 2>/dev/null | \
+    openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+if [ -n "$CERT_EXPIRY" ]; then
+    DAYS_LEFT=$(( ( $(date -d "$CERT_EXPIRY" +%s) - $(date +%s) ) / 86400 ))
+    if [ "$DAYS_LEFT" -lt 14 ]; then
+        alert "WARNING" "SSL certificate expires in ${DAYS_LEFT} days"
+    fi
+fi
+```
+
+```bash
+# Run every 5 minutes
+chmod +x ~/scripts/health-check.sh
+crontab -e
+# Add:
+*/5 * * * * SLACK_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ" ~/scripts/health-check.sh >> ~/frappe-bench/logs/health-check.log 2>&1
+```

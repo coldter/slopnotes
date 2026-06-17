@@ -1,0 +1,355 @@
+---
+title: "Script Report: Franchise Scorecard"
+description: Build a Script Report with filters, summary cards, charts, and tier ranking for ScoopJoy outlet performance.
+sidebar:
+  order: 2
+---
+
+import { LinkCard, Steps } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a comprehensive Script Report for ScoopJoy franchise outlets —
+one that combines filters, a chart, summary cards, and per-outlet performance
+tiers, with drill-down detail.
+
+**Solution:** A Script Report has two halves: a Python `execute()` that returns the
+data, and a JS file that defines filters and formatting. The Python side runs a
+single aggregation query (plus one batch query for the top item), computes derived
+fields like achievement percentage and tier, and returns a chart spec and summary
+cards alongside the table.
+
+## Step 1: Create the report
+
+`bench new-report` scaffolds the Python, JS, and JSON files under the module's
+`report/` folder.
+
+```bash
+cd frappe-bench
+bench new-report "Franchise Performance Scorecard" \
+  --module "ScoopJoy" \
+  --type "Script Report" \
+  --doctype "Sales Invoice"
+```
+
+## Step 2: Report Python backend
+
+The heart of the report. `execute()` orchestrates everything and returns the five
+values Frappe expects. `get_data()` runs the main aggregation with `frappe.qb`,
+then enriches each row with a batched top-item lookup and the derived
+achievement/tier fields.
+
+```python title="scoopjoy/scoopjoy/report/franchise_performance_scorecard/franchise_performance_scorecard.py" {15}
+import frappe
+from frappe import _
+from frappe.query_builder.functions import Sum, Count, Avg
+from frappe.query_builder import CustomFunction
+
+Month = CustomFunction("MONTH", ["date"])
+Year = CustomFunction("YEAR", ["date"])
+
+
+def execute(filters=None):
+    filters = frappe._dict(filters or {})
+    validate_filters(filters)
+
+    columns = get_columns(filters)
+    data = get_data(filters)
+    chart = get_chart(data, filters)
+    report_summary = get_report_summary(data)
+
+    return columns, data, None, chart, report_summary
+
+
+def validate_filters(filters):
+    if not filters.get("from_date") or not filters.get("to_date"):
+        frappe.throw(_("From Date and To Date are required"))
+
+    if filters.get("from_date") > filters.get("to_date"):
+        frappe.throw(_("From Date cannot be after To Date"))
+
+
+def get_columns(filters):
+    return [
+        {"fieldname": "outlet", "label": _("Outlet"), "fieldtype": "Link", "options": "Franchise Outlet", "width": 180},
+        {"fieldname": "outlet_name", "label": _("Outlet Name"), "fieldtype": "Data", "width": 200},
+        {"fieldname": "region", "label": _("Region"), "fieldtype": "Data", "width": 120},
+        {"fieldname": "order_count", "label": _("Orders"), "fieldtype": "Int", "width": 80},
+        {"fieldname": "total_revenue", "label": _("Revenue"), "fieldtype": "Currency", "width": 140},
+        {"fieldname": "avg_order_value", "label": _("Avg Order Value"), "fieldtype": "Currency", "width": 140},
+        {"fieldname": "total_items_sold", "label": _("Items Sold"), "fieldtype": "Int", "width": 100},
+        {"fieldname": "top_item", "label": _("Top Selling Item"), "fieldtype": "Data", "width": 180},
+        {"fieldname": "target", "label": _("Target"), "fieldtype": "Currency", "width": 140},
+        {"fieldname": "achievement_pct", "label": _("Achievement %"), "fieldtype": "Percent", "width": 120},
+        {"fieldname": "performance_tier", "label": _("Tier"), "fieldtype": "Data", "width": 100},
+    ]
+
+
+def get_data(filters):
+    SI = frappe.qb.DocType("Sales Invoice")
+    SII = frappe.qb.DocType("Sales Invoice Item")
+    Outlet = frappe.qb.DocType("Franchise Outlet")
+
+    # --- Main aggregation query ---
+    query = (
+        frappe.qb.from_(SI)
+        .join(Outlet).on(SI.franchise_outlet == Outlet.name)
+        .join(SII).on(SII.parent == SI.name)
+        .select(
+            Outlet.name.as_("outlet"),
+            Outlet.outlet_name,
+            Outlet.region,
+            Count(SI.name).as_("order_count"),
+            Sum(SI.grand_total).as_("total_revenue"),
+            Avg(SI.grand_total).as_("avg_order_value"),
+            Sum(SII.qty).as_("total_items_sold"),
+            Outlet.monthly_target.as_("target"),
+        )
+        .where(SI.docstatus == 1)
+        .where(SI.posting_date.between(filters.from_date, filters.to_date))
+        .groupby(Outlet.name)
+        .orderby(Sum(SI.grand_total), order=frappe.qb.desc)
+    )
+
+    # Dynamic filters
+    if filters.get("outlet"):
+        query = query.where(SI.franchise_outlet == filters.outlet)
+    if filters.get("region"):
+        query = query.where(Outlet.region == filters.region)
+
+    data = query.run(as_dict=True)
+
+    # --- Enrich with top item per outlet (batch query, not N+1) ---
+    outlet_names = [d.outlet for d in data]
+    top_items = _get_top_items_by_outlet(outlet_names, filters)
+
+    # --- Compute derived fields ---
+    for row in data:
+        row["top_item"] = top_items.get(row["outlet"], "N/A")
+
+        if row.get("target") and row["target"] > 0:
+            row["achievement_pct"] = (row["total_revenue"] / row["target"]) * 100
+        else:
+            row["achievement_pct"] = 0
+
+        # Performance tier
+        pct = row["achievement_pct"]
+        if pct >= 120:
+            row["performance_tier"] = "Gold"
+        elif pct >= 100:
+            row["performance_tier"] = "Silver"
+        elif pct >= 80:
+            row["performance_tier"] = "Bronze"
+        else:
+            row["performance_tier"] = "Needs Attention"
+
+    return data
+
+
+def _get_top_items_by_outlet(outlet_names, filters):
+    """Batch-fetch the top selling item per outlet. Single query, no N+1."""
+    if not outlet_names:
+        return {}
+
+    result = frappe.db.sql("""
+        SELECT ranked.franchise_outlet, ranked.item_name
+        FROM (
+            SELECT
+                si.franchise_outlet,
+                sii.item_name,
+                SUM(sii.qty) as total_qty,
+                ROW_NUMBER() OVER (
+                    PARTITION BY si.franchise_outlet
+                    ORDER BY SUM(sii.qty) DESC
+                ) as rn
+            FROM `tabSales Invoice Item` sii
+            JOIN `tabSales Invoice` si ON sii.parent = si.name
+            WHERE si.docstatus = 1
+              AND si.posting_date BETWEEN %(from_date)s AND %(to_date)s
+              AND si.franchise_outlet IN %(outlets)s
+            GROUP BY si.franchise_outlet, sii.item_name
+        ) ranked
+        WHERE ranked.rn = 1
+    """, {
+        "from_date": filters.from_date,
+        "to_date": filters.to_date,
+        "outlets": outlet_names,
+    }, as_dict=True)
+
+    return {r.franchise_outlet: r.item_name for r in result}
+
+
+def get_chart(data, filters):
+    if not data:
+        return None
+
+    # Bar chart: top 15 outlets by revenue
+    chart_data = sorted(data, key=lambda x: x.get("total_revenue", 0), reverse=True)[:15]
+
+    return {
+        "data": {
+            "labels": [d["outlet_name"] for d in chart_data],
+            "datasets": [
+                {"name": _("Revenue"), "values": [d["total_revenue"] for d in chart_data]},
+                {"name": _("Target"), "values": [d.get("target", 0) for d in chart_data]},
+            ],
+        },
+        "type": "bar",
+        "colors": ["#5e64ff", "#ffa00a"],
+        "barOptions": {"stacked": False},
+    }
+
+
+def get_report_summary(data):
+    if not data:
+        return []
+
+    total_revenue = sum(d.get("total_revenue", 0) for d in data)
+    total_orders = sum(d.get("order_count", 0) for d in data)
+    avg_per_outlet = total_revenue / len(data) if data else 0
+    top_outlet = data[0]["outlet_name"] if data else "N/A"
+    gold_count = sum(1 for d in data if d.get("performance_tier") == "Gold")
+
+    return [
+        {"value": total_revenue, "label": _("Total Revenue"), "datatype": "Currency", "indicator": "Green" if total_revenue > 0 else "Red"},
+        {"value": total_orders, "label": _("Total Orders"), "datatype": "Int", "indicator": "Blue"},
+        {"value": avg_per_outlet, "label": _("Avg Revenue / Outlet"), "datatype": "Currency", "indicator": "Blue"},
+        {"value": top_outlet, "label": _("Top Outlet"), "datatype": "Data", "indicator": "Green"},
+        {"value": gold_count, "label": _("Gold Tier Outlets"), "datatype": "Int", "indicator": "Orange"},
+    ]
+```
+
+The aggregation joins `Sales Invoice` to `Franchise Outlet` and `Sales Invoice
+Item`, groups by outlet, and orders by revenue. The top-item enrichment uses a
+single windowed SQL query with `ROW_NUMBER() OVER (PARTITION BY ...)` so you get
+one query for all outlets instead of one per outlet.
+
+:::tip[Pro tip]
+The line `return columns, data, None, chart, report_summary` is the contract.
+Frappe's report renderer expects exactly five values: `columns`, `data`,
+`message`, `chart`, and `report_summary`. Pass `None` for the message slot when you
+have nothing to show there.
+:::
+
+## Step 3: Report JS frontend (filters)
+
+The JS file defines the filters that appear above the report, color-codes the tier
+and achievement columns with a `formatter`, and adds a custom export button via
+`onload`.
+
+```javascript title="scoopjoy/scoopjoy/report/franchise_performance_scorecard/franchise_performance_scorecard.js"
+frappe.query_reports["Franchise Performance Scorecard"] = {
+    filters: [
+        {
+            fieldname: "from_date",
+            label: __("From Date"),
+            fieldtype: "Date",
+            default: frappe.datetime.add_months(frappe.datetime.get_today(), -1),
+            reqd: 1,
+        },
+        {
+            fieldname: "to_date",
+            label: __("To Date"),
+            fieldtype: "Date",
+            default: frappe.datetime.get_today(),
+            reqd: 1,
+        },
+        {
+            fieldname: "outlet",
+            label: __("Franchise Outlet"),
+            fieldtype: "Link",
+            options: "Franchise Outlet",
+        },
+        {
+            fieldname: "region",
+            label: __("Region"),
+            fieldtype: "Link",
+            options: "Territory",
+        },
+    ],
+
+    formatter: function (value, row, column, data, default_formatter) {
+        value = default_formatter(value, row, column, data);
+
+        // Color-code performance tier
+        if (column.fieldname === "performance_tier") {
+            if (data.performance_tier === "Gold") {
+                value = `<span style="color: #d4a017; font-weight: bold;">${value}</span>`;
+            } else if (data.performance_tier === "Silver") {
+                value = `<span style="color: #888;">${value}</span>`;
+            } else if (data.performance_tier === "Needs Attention") {
+                value = `<span style="color: #e24c4c; font-weight: bold;">${value}</span>`;
+            }
+        }
+
+        // Color-code achievement percentage
+        if (column.fieldname === "achievement_pct") {
+            if (data.achievement_pct >= 100) {
+                value = `<span style="color: green;">${value}</span>`;
+            } else if (data.achievement_pct < 80) {
+                value = `<span style="color: red;">${value}</span>`;
+            }
+        }
+
+        return value;
+    },
+
+    // Enable tree-view drill-down (outlet -> items)
+    initial_depth: 0,
+
+    onload: function (report) {
+        report.page.add_inner_button(__("Export with Details"), function () {
+            // Custom export including child data
+            frappe.call({
+                method:
+                    "scoopjoy.scoopjoy.report.franchise_performance_scorecard.franchise_performance_scorecard.get_detailed_export",
+                args: { filters: report.get_values() },
+                callback: function (r) {
+                    if (r.message) {
+                        frappe.tools.downloadify(
+                            r.message.data,
+                            r.message.columns,
+                            "Franchise Performance Detail"
+                        );
+                    }
+                },
+            });
+        });
+    },
+};
+```
+
+## Step 4: Permission setup
+
+Merge the role list into the auto-generated report JSON so only the right managers
+can run it.
+
+```json title="scoopjoy/scoopjoy/report/franchise_performance_scorecard/franchise_performance_scorecard.json"
+{
+    "add_total_row": 1,
+    "disabled": 0,
+    "doctype": "Report",
+    "is_standard": "Yes",
+    "module": "ScoopJoy",
+    "name": "Franchise Performance Scorecard",
+    "ref_doctype": "Sales Invoice",
+    "report_type": "Script Report",
+    "roles": [
+        { "role": "Franchise Manager" },
+        { "role": "Accounts Manager" },
+        { "role": "System Manager" }
+    ]
+}
+```
+
+:::note[Why this works]
+The `execute()` function returns exactly five values: `columns`, `data`, `message`,
+`chart`, and `report_summary`. Frappe's report renderer picks up each one. The
+`report_summary` list renders as colored cards above the data table, and the
+`chart` dict renders a Frappe Chart (built on their in-house charting lib).
+:::
+
+:::caution[Common mistake]
+Returning `report_summary` as a dict instead of a list-of-dicts. It must be a
+list, even for a single summary card.
+:::

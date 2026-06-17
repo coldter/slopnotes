@@ -2,10 +2,19 @@
 
 [![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
 
-A personal home for **AI-generated learning material**. Good explanations from a
-model usually get buried in a chat log and never seen again — slopnotes is where
-those notes get saved, organized as courses, and given a clean, searchable,
-responsive reading experience.
+A place to keep the learning material I generate with AI.
+
+Here's how I pick up new stuff these days: instead of grinding through hours of
+videos and docs, I spawn a bunch of research agents and have them survey a topic
+the way I actually want to read it — my taste, my format, lots of examples. That
+gives me a pile of documents, and I convert them into clean pages here (Markdown
+/ MDX, rich formatting, searchable).
+
+The "slop" in the name is honest. This isn't a high-effort, carefully-sourced
+project — it's a quick, low-effort way to get up to speed on something new. I
+don't always know exactly where every detail came from, and it's not guaranteed
+100% correct (call it ~99%). But for my taste the output is genuinely good,
+better than ~95% of what's already out there. That's the whole thing.
 
 Built on [Astro](https://astro.build/) + [Starlight](https://starlight.astro.build/).
 

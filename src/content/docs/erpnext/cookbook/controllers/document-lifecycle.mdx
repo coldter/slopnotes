@@ -1,0 +1,273 @@
+---
+title: Document Lifecycle Orchestration
+description: Provision and tear down all of a franchise's infrastructure from submit, cancel, and trash hooks — idempotently and inside one transaction.
+sidebar:
+  order: 2
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** When a ScoopJoy Franchise Agreement is submitted, you need to
+auto-create everything the new outlet depends on — a Warehouse, a Cost Center, a
+POS Profile, a default Price List, and a User account for the franchise manager.
+On cancel, all of it should be deactivated (never deleted), and on trash the link
+references should be cleaned up.
+
+**Solution:** Drive the whole thing from Frappe's submittable-document lifecycle
+hooks. `on_submit` provisions the infrastructure, `on_cancel` deactivates it, and
+`on_trash` cleans up — each creation step idempotent via `frappe.db.exists`, and
+all of it wrapped in Frappe's single per-request transaction.
+
+## The lifecycle hooks
+
+A submittable DocType moves through three `docstatus` values, and Frappe fires a
+distinct hook at each transition. Orchestrate side effects by attaching the right
+work to the right hook.
+
+<Mermaid title="Submittable document lifecycle" height={360} code={`
+stateDiagram-v2
+  [*] --> Draft: insert
+  Draft --> Draft: validate()
+  Draft --> Submitted: submit() / on_submit()
+  Submitted --> Cancelled: cancel() / on_cancel()
+  Draft --> [*]: delete / on_trash()
+  Cancelled --> [*]: delete / on_trash()
+  note right of Submitted: create Warehouse, Cost Center,\\nPrice List, POS Profile, User
+  note right of Cancelled: deactivate User + POS Profile\\n(never delete)
+`} />
+
+The `FranchiseAgreement` controller continues from the validation chain in
+[Recipe 2.1](/erpnext/cookbook/controllers/validation-chain/) — same class, now
+with the lifecycle methods added.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py" {15-22,24-34,36-44}
+import frappe
+from frappe import _
+from frappe.model.document import Document
+from frappe.utils import getdate, today, date_diff, flt, random_string
+
+
+class FranchiseAgreement(Document):
+    def validate(self):
+        self.validate_dates()
+        self.validate_franchise_fee()
+        self.validate_territory_uniqueness()
+        self.validate_date_overlap()
+        self.validate_parent_company_settings()
+        self.validate_state_transitions()
+
+    # ── on_submit: create all franchise infrastructure ──────────────
+    def on_submit(self):
+        self.create_franchise_warehouse()
+        self.create_franchise_cost_center()
+        self.create_franchise_price_list()
+        self.create_franchise_pos_profile()
+        self.create_franchise_user()
+        self.db_set("agreement_status", "Active")
+
+    # ── on_cancel: deactivate, never delete ────────────────────────
+    def on_cancel(self):
+        self.deactivate_franchise_user()
+        self.deactivate_pos_profile()
+        self.db_set("agreement_status", "Terminated")
+        frappe.msgprint(
+            _("Franchise infrastructure for {0} has been deactivated. No records were deleted.").format(
+                frappe.bold(self.franchise_name)
+            ),
+            indicator="orange",
+            alert=True,
+        )
+
+    # ── on_trash: cleanup link references ──────────────────────────
+    def on_trash(self):
+        if self.docstatus == 1:
+            frappe.throw(_("Cannot delete a submitted Franchise Agreement. Cancel it first."))
+
+        linked_doctypes = ["Warehouse", "Cost Center", "POS Profile", "Price List"]
+        for dt in linked_doctypes:
+            linked = frappe.db.get_value(dt, {"custom_franchise_agreement": self.name})
+            if linked:
+                frappe.db.set_value(dt, linked, "custom_franchise_agreement", "")
+```
+
+### Idempotent creation methods
+
+Each creation method does the same dance: build the deterministic name, check
+`frappe.db.exists` first, and bail early (just re-link the existing record) if it's
+already there. That makes a re-submit safe and keeps the orchestration replayable.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py" {5-7}
+    # ── Idempotent Warehouse creation ──────────────────────────────
+    def create_franchise_warehouse(self):
+        warehouse_name = f"{self.franchise_name} - {self.territory}"
+        abbr = frappe.db.get_value("Company", self.company, "abbr")
+        full_warehouse_name = f"{warehouse_name} - {abbr}"
+
+        if frappe.db.exists("Warehouse", full_warehouse_name):
+            self.db_set("franchise_warehouse", full_warehouse_name)
+            return
+
+        wh = frappe.get_doc(
+            {
+                "doctype": "Warehouse",
+                "warehouse_name": warehouse_name,
+                "company": self.company,
+                "parent_warehouse": f"Stores - {abbr}",
+                "warehouse_type": "Franchise",
+                "custom_franchise_agreement": self.name,
+            }
+        )
+        wh.insert(ignore_permissions=True)
+        self.db_set("franchise_warehouse", wh.name)
+
+    # ── Idempotent Cost Center creation ────────────────────────────
+    def create_franchise_cost_center(self):
+        cc_name = f"{self.franchise_name} - {self.territory}"
+        abbr = frappe.db.get_value("Company", self.company, "abbr")
+        full_cc_name = f"{cc_name} - {abbr}"
+
+        if frappe.db.exists("Cost Center", full_cc_name):
+            self.db_set("franchise_cost_center", full_cc_name)
+            return
+
+        cc = frappe.get_doc(
+            {
+                "doctype": "Cost Center",
+                "cost_center_name": cc_name,
+                "company": self.company,
+                "parent_cost_center": f"{self.company} - {abbr}",
+                "is_group": 0,
+                "custom_franchise_agreement": self.name,
+            }
+        )
+        cc.insert(ignore_permissions=True)
+        self.db_set("franchise_cost_center", cc.name)
+
+    # ── Idempotent Price List creation ─────────────────────────────
+    def create_franchise_price_list(self):
+        pl_name = f"ScoopJoy {self.territory} Selling"
+
+        if frappe.db.exists("Price List", pl_name):
+            self.db_set("franchise_price_list", pl_name)
+            return
+
+        pl = frappe.get_doc(
+            {
+                "doctype": "Price List",
+                "price_list_name": pl_name,
+                "selling": 1,
+                "buying": 0,
+                "currency": "INR",
+                "custom_franchise_agreement": self.name,
+            }
+        )
+        pl.insert(ignore_permissions=True)
+        self.db_set("franchise_price_list", pl.name)
+```
+
+The POS Profile ties the previous three records together — it references the
+warehouse, cost center, and price list that were just provisioned, plus the
+manager's payment modes and applicable users.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py"
+    # ── Idempotent POS Profile creation ────────────────────────────
+    def create_franchise_pos_profile(self):
+        profile_name = f"ScoopJoy POS - {self.franchise_name}"
+
+        if frappe.db.exists("POS Profile", profile_name):
+            self.db_set("franchise_pos_profile", profile_name)
+            return
+
+        abbr = frappe.db.get_value("Company", self.company, "abbr")
+
+        pos = frappe.get_doc(
+            {
+                "doctype": "POS Profile",
+                "name": profile_name,
+                "company": self.company,
+                "warehouse": self.franchise_warehouse,
+                "cost_center": self.franchise_cost_center,
+                "selling_price_list": self.franchise_price_list,
+                "currency": "INR",
+                "write_off_account": f"Write Off - {abbr}",
+                "write_off_cost_center": self.franchise_cost_center,
+                "custom_franchise_agreement": self.name,
+                "payments": [
+                    {"mode_of_payment": "Cash", "default": 1},
+                    {"mode_of_payment": "UPI", "default": 0},
+                ],
+                "applicable_for_users": [
+                    {"user": self.franchise_manager_email, "default": 1}
+                ],
+            }
+        )
+        pos.insert(ignore_permissions=True)
+        self.db_set("franchise_pos_profile", pos.name)
+
+    # ── Idempotent User creation ───────────────────────────────────
+    def create_franchise_user(self):
+        if frappe.db.exists("User", self.franchise_manager_email):
+            user = frappe.get_doc("User", self.franchise_manager_email)
+            if not user.enabled:
+                user.enabled = 1
+                user.save(ignore_permissions=True)
+            self.db_set("franchise_user", user.name)
+            return
+
+        temp_password = random_string(12)
+
+        user = frappe.get_doc(
+            {
+                "doctype": "User",
+                "email": self.franchise_manager_email,
+                "first_name": self.franchise_manager_name,
+                "send_welcome_email": 1,
+                "user_type": "System User",
+                "roles": [
+                    {"role": "Franchise Manager"},
+                    {"role": "POS User"},
+                    {"role": "Stock User"},
+                ],
+                "new_password": temp_password,
+            }
+        )
+        user.insert(ignore_permissions=True)
+        self.db_set("franchise_user", user.name)
+```
+
+### Deactivation helpers
+
+The cancel path never deletes — it flips the manager's `User` to disabled and the
+POS Profile to `disabled`, leaving an audit trail intact.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py"
+    # ── Deactivation helpers (on_cancel) ───────────────────────────
+    def deactivate_franchise_user(self):
+        if self.franchise_user and frappe.db.exists("User", self.franchise_user):
+            frappe.db.set_value("User", self.franchise_user, "enabled", 0)
+
+    def deactivate_pos_profile(self):
+        if self.franchise_pos_profile and frappe.db.exists(
+            "POS Profile", self.franchise_pos_profile
+        ):
+            frappe.db.set_value(
+                "POS Profile", self.franchise_pos_profile, "disabled", 1
+            )
+```
+
+:::note[Why this works]
+Every creation method checks `frappe.db.exists` first, making it idempotent. If
+step 4 (the POS Profile) fails, the entire `on_submit` transaction rolls back
+automatically — Frappe wraps the whole lifecycle in a single DB transaction. The
+`db_set` calls write directly to the database column without triggering another
+save cycle.
+:::
+
+:::caution[Common mistake]
+Calling `doc.save()` inside `on_submit` to store the references. That triggers
+`validate()` again, potentially causing infinite loops. Use
+`self.db_set("field", value)` for direct column writes within lifecycle hooks.
+:::

@@ -1,0 +1,736 @@
+---
+title: Notification Engine
+description: Build six franchise notification channels in Frappe — email digests, system alerts, SMS OTP, Slack, WhatsApp, and real-time push.
+sidebar:
+  order: 3
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** ScoopJoy operations need to reach people through six different
+channels — weekly email digests to franchise owners, system bell alerts for low
+stock, SMS OTP for manager login, a Slack daily summary, WhatsApp order
+confirmations, and in-app real-time push. Each channel has its own delivery
+mechanism.
+
+**Solution:** Frappe ships most of these out of the box: `frappe.sendmail` for
+email, the `Notification Log` DocType for the bell icon, `frappe.publish_realtime`
+for WebSocket push, and SMS Settings for SMS gateways. Slack and WhatsApp are plain
+`requests` calls to external APIs. Each channel below is a self-contained pattern,
+and the last block wires the periodic ones into `scheduler_events`.
+
+### a) Email: Weekly Franchise Performance Digest
+
+A scheduled task gathers each franchise's weekly sales and top items, then renders
+them into an HTML email template. Note there is no `now=True` on `frappe.sendmail`
+— the messages go through the email queue so the loop never blocks (see the common
+mistake below).
+
+```python title="scoopjoy/scoopjoy/tasks.py"
+def send_weekly_franchise_digest():
+    """Send weekly performance digest to each franchise owner.
+    Runs via scheduler_events weekly.
+    """
+    franchises = frappe.get_all(
+        "Customer",
+        filters={"customer_group": "Franchise", "disabled": 0},
+        fields=["name", "customer_name", "territory"],
+    )
+
+    for franchise in franchises:
+        # Gather performance data
+        week_start = frappe.utils.add_days(frappe.utils.today(), -7)
+        sales_data = frappe.db.sql(
+            """
+            SELECT
+                SUM(grand_total) as total_sales,
+                COUNT(*) as order_count,
+                AVG(grand_total) as avg_order_value
+            FROM `tabSales Invoice`
+            WHERE customer = %s
+              AND posting_date >= %s
+              AND docstatus = 1
+            """,
+            (franchise.name, week_start),
+            as_dict=True,
+        )[0]
+
+        top_items = frappe.db.sql(
+            """
+            SELECT
+                sii.item_name,
+                SUM(sii.qty) as qty,
+                SUM(sii.amount) as revenue
+            FROM `tabSales Invoice Item` sii
+            JOIN `tabSales Invoice` si ON si.name = sii.parent
+            WHERE si.customer = %s
+              AND si.posting_date >= %s
+              AND si.docstatus = 1
+            GROUP BY sii.item_code
+            ORDER BY revenue DESC
+            LIMIT 5
+            """,
+            (franchise.name, week_start),
+            as_dict=True,
+        )
+
+        # Get franchise owner email
+        owner_email = frappe.db.get_value(
+            "Dynamic Link",
+            {"link_doctype": "Customer", "link_name": franchise.name, "parenttype": "Contact"},
+            "parent",
+        )
+        if not owner_email:
+            continue
+
+        contact = frappe.get_doc("Contact", owner_email)
+        recipient = contact.email_id
+        if not recipient:
+            continue
+
+        frappe.sendmail(
+            recipients=[recipient],
+            subject=f"ScoopJoy Weekly Digest - {franchise.customer_name}",
+            template="weekly_franchise_digest",
+            args={
+                "franchise_name": franchise.customer_name,
+                "territory": franchise.territory,
+                "week_start": frappe.utils.formatdate(week_start),
+                "week_end": frappe.utils.formatdate(frappe.utils.today()),
+                "total_sales": frappe.format_value(
+                    sales_data.total_sales or 0, {"fieldtype": "Currency"}
+                ),
+                "order_count": sales_data.order_count or 0,
+                "avg_order_value": frappe.format_value(
+                    sales_data.avg_order_value or 0, {"fieldtype": "Currency"}
+                ),
+                "top_items": top_items,
+            },
+        )
+```
+
+The `template="weekly_franchise_digest"` argument resolves to a Jinja file under
+the app's email templates folder. The `args` dict becomes the template context, so
+every key (like `{{ franchise_name }}` or the `{{ top_items }}` list) is available
+inside the HTML.
+
+```html title="scoopjoy/scoopjoy/templates/emails/weekly_franchise_digest.html"
+<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+  <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 24px; border-radius: 8px 8px 0 0;">
+    <h2 style="color: white; margin: 0;">ScoopJoy Weekly Digest</h2>
+    <p style="color: #e0e0e0; margin: 8px 0 0;">{{ franchise_name }} | {{ territory }}</p>
+    <p style="color: #e0e0e0; margin: 4px 0 0;">{{ week_start }} - {{ week_end }}</p>
+  </div>
+
+  <div style="padding: 24px; background: #ffffff; border: 1px solid #e0e0e0;">
+    <!-- KPI Cards -->
+    <table style="width: 100%; border-collapse: collapse; margin-bottom: 24px;">
+      <tr>
+        <td style="text-align: center; padding: 16px; background: #f8f9fa; border-radius: 4px; width: 33%;">
+          <div style="font-size: 24px; font-weight: bold; color: #2196F3;">{{ total_sales }}</div>
+          <div style="font-size: 12px; color: #666; margin-top: 4px;">Total Sales</div>
+        </td>
+        <td style="width: 8px;"></td>
+        <td style="text-align: center; padding: 16px; background: #f8f9fa; border-radius: 4px; width: 33%;">
+          <div style="font-size: 24px; font-weight: bold; color: #4CAF50;">{{ order_count }}</div>
+          <div style="font-size: 12px; color: #666; margin-top: 4px;">Orders</div>
+        </td>
+        <td style="width: 8px;"></td>
+        <td style="text-align: center; padding: 16px; background: #f8f9fa; border-radius: 4px; width: 33%;">
+          <div style="font-size: 24px; font-weight: bold; color: #FF9800;">{{ avg_order_value }}</div>
+          <div style="font-size: 12px; color: #666; margin-top: 4px;">Avg Order</div>
+        </td>
+      </tr>
+    </table>
+
+    <!-- Top Items Table -->
+    {% if top_items %}
+    <h3 style="margin: 0 0 12px; color: #333;">Top 5 Products</h3>
+    <table style="width: 100%; border-collapse: collapse;">
+      <thead>
+        <tr style="background: #f5f5f5;">
+          <th style="text-align: left; padding: 8px; border-bottom: 2px solid #ddd;">Item</th>
+          <th style="text-align: right; padding: 8px; border-bottom: 2px solid #ddd;">Qty</th>
+          <th style="text-align: right; padding: 8px; border-bottom: 2px solid #ddd;">Revenue</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in top_items %}
+        <tr>
+          <td style="padding: 8px; border-bottom: 1px solid #eee;">{{ item.item_name }}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: right;">{{ item.qty }}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: right;">{{ frappe.format_value(item.revenue, {"fieldtype": "Currency"}) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+
+  <div style="padding: 16px; background: #f8f9fa; border-radius: 0 0 8px 8px; text-align: center; border: 1px solid #e0e0e0; border-top: none;">
+    <p style="margin: 0; color: #999; font-size: 12px;">ScoopJoy Franchise Operations</p>
+  </div>
+</div>
+```
+
+### b) System Notification: Real-Time Stock Alert
+
+The bell-icon notifications are just `Notification Log` documents. This task scans
+bins against reorder levels, deduplicates against today's alerts, picks the right
+recipients (warehouse manager, falling back to the Stock Manager role), and also
+fires a `frappe.publish_realtime` `msgprint` so the alert pops up live.
+
+```python title="scoopjoy/scoopjoy/stock_alerts.py"
+import frappe
+
+
+def check_reorder_levels():
+    """Check stock levels and send system notifications.
+    Called via scheduler_events every 30 minutes.
+    """
+    low_stock_items = frappe.db.sql(
+        """
+        SELECT
+            b.item_code,
+            b.item_name,
+            b.warehouse,
+            b.actual_qty,
+            ir.warehouse_reorder_level as reorder_level,
+            ir.warehouse_reorder_qty as reorder_qty
+        FROM `tabBin` b
+        JOIN `tabItem Reorder` ir
+            ON ir.parent = b.item_code AND ir.warehouse = b.warehouse
+        WHERE b.actual_qty <= ir.warehouse_reorder_level
+          AND ir.warehouse_reorder_level > 0
+        """,
+        as_dict=True,
+    )
+
+    for item in low_stock_items:
+        # Deduplicate: check if notification was already sent today
+        existing = frappe.db.exists("Notification Log", {
+            "subject": ("like", f"%{item.item_code}%reorder%"),
+            "creation": (">=", frappe.utils.today()),
+        })
+        if existing:
+            continue
+
+        # Get warehouse managers
+        warehouse_doc = frappe.get_doc("Warehouse", item.warehouse)
+        notify_users = []
+
+        if warehouse_doc.custom_warehouse_manager:
+            notify_users.append(warehouse_doc.custom_warehouse_manager)
+        else:
+            # Fall back to Stock Manager role
+            notify_users = frappe.get_all(
+                "Has Role",
+                filters={"role": "Stock Manager", "parenttype": "User"},
+                pluck="parent",
+                limit=5,
+            )
+
+        for user in notify_users:
+            # System notification (appears in bell icon)
+            notification = frappe.get_doc({
+                "doctype": "Notification Log",
+                "for_user": user,
+                "type": "Alert",
+                "document_type": "Item",
+                "document_name": item.item_code,
+                "subject": (
+                    f"Low Stock Alert: {item.item_name} ({item.item_code}) "
+                    f"at {item.warehouse} - reorder needed"
+                ),
+                "email_content": (
+                    f"<p>Current stock: <strong>{item.actual_qty}</strong></p>"
+                    f"<p>Reorder level: <strong>{item.reorder_level}</strong></p>"
+                    f"<p>Suggested reorder qty: <strong>{item.reorder_qty}</strong></p>"
+                ),
+            })
+            notification.insert(ignore_permissions=True)
+
+            # Also push real-time alert
+            frappe.publish_realtime(
+                "msgprint",
+                {
+                    "message": (
+                        f"Low Stock: {item.item_name} at {item.warehouse} "
+                        f"({item.actual_qty} remaining)"
+                    ),
+                    "indicator": "orange",
+                    "title": "Stock Alert",
+                },
+                user=user,
+                after_commit=True,
+            )
+
+    frappe.db.commit()
+```
+
+### c) SMS: OTP for Franchise Manager Login
+
+A two-method flow over Frappe's SMS Settings: `send_login_otp` generates a 6-digit
+code, rate-limits requests, and caches the code with a 5-minute expiry; verification
+checks it with brute-force protection and then logs the user in. Note both methods
+return the same message whether or not the phone is registered, to avoid leaking
+account existence.
+
+```python title="scoopjoy/scoopjoy/sms_otp.py"
+import frappe
+import random
+import string
+from frappe.utils import cint, now_datetime, add_to_date
+
+
+@frappe.whitelist(allow_guest=True)
+def send_login_otp(phone):
+    """Send OTP via SMS gateway for franchise manager login.
+
+    Usage:
+        POST /api/method/scoopjoy.scoopjoy.sms_otp.send_login_otp
+        Body: {"phone": "+919876543210"}
+    """
+    # Validate phone exists in system
+    user = frappe.db.get_value("User", {"phone": phone, "enabled": 1}, "name")
+    if not user:
+        # Don't reveal if user exists -- always return success
+        return {"message": "OTP sent if phone is registered"}
+
+    # Rate limit: max 5 OTPs per hour
+    recent_count = frappe.db.count("OTP Log", {
+        "phone": phone,
+        "creation": (">=", add_to_date(now_datetime(), hours=-1)),
+    })
+    if recent_count >= 5:
+        frappe.throw("Too many OTP requests. Please try again later.", frappe.RateLimitExceededError)
+
+    # Generate 6-digit OTP
+    otp = "".join(random.choices(string.digits, k=6))
+
+    # Store OTP with expiry (5 minutes)
+    frappe.cache.set_value(
+        f"login_otp:{phone}",
+        {"otp": otp, "user": user, "attempts": 0},
+        expires_in_sec=300,
+    )
+
+    # Send via SMS Settings (configured in ERPNext)
+    send_sms(phone, f"Your ScoopJoy login OTP is: {otp}. Valid for 5 minutes.")
+
+    # Log for audit
+    frappe.get_doc({
+        "doctype": "OTP Log",
+        "phone": phone,
+        "user": user,
+        "status": "Sent",
+    }).insert(ignore_permissions=True)
+    frappe.db.commit()
+
+    return {"message": "OTP sent if phone is registered"}
+
+
+@frappe.whitelist(allow_guest=True)
+def verify_login_otp(phone, otp):
+    """Verify OTP and return login credentials.
+
+    Usage:
+        POST /api/method/scoopjoy.scoopjoy.sms_otp.verify_login_otp
+        Body: {"phone": "+919876543210", "otp": "123456"}
+    """
+    cached = frappe.cache.get_value(f"login_otp:{phone}")
+    if not cached:
+        frappe.throw("OTP expired or not found. Request a new one.")
+
+    # Brute force protection
+    if cached["attempts"] >= 3:
+        frappe.cache.delete_value(f"login_otp:{phone}")
+        frappe.throw("Too many failed attempts. Request a new OTP.")
+
+    if cached["otp"] != otp:
+        cached["attempts"] += 1
+        frappe.cache.set_value(f"login_otp:{phone}", cached, expires_in_sec=300)
+        frappe.throw("Invalid OTP")
+
+    # OTP valid -- clear it and log in the user
+    frappe.cache.delete_value(f"login_otp:{phone}")
+    user = cached["user"]
+
+    frappe.local.login_manager.login_as(user)
+
+    return {
+        "message": "Login successful",
+        "user": user,
+        "sid": frappe.session.sid,
+    }
+
+
+def send_sms(phone, message):
+    """Send SMS using Frappe's built-in SMS Settings.
+    Ensure SMS Settings is configured in Setup > SMS Settings.
+    """
+    from frappe.core.doctype.sms_settings.sms_settings import send_sms as frappe_send_sms
+
+    frappe_send_sms([phone], message)
+```
+
+### d) Slack: Daily Sales Summary
+
+A `daily_long` job aggregates yesterday's sales by territory and posts a Slack Block
+Kit message to an incoming webhook stored in `ScoopJoy Settings`. The territory rows
+include a text progress bar built from block characters, and failures are captured
+with `frappe.log_error` rather than raised.
+
+```python title="scoopjoy/scoopjoy/integrations/slack_notify.py"
+import frappe
+import requests
+import json
+
+
+def post_daily_sales_summary():
+    """Post daily sales summary to Slack channel.
+    Runs via scheduler_events daily_long.
+    """
+    webhook_url = frappe.db.get_single_value("ScoopJoy Settings", "slack_webhook_url")
+    if not webhook_url:
+        frappe.log_error("Slack webhook URL not configured in ScoopJoy Settings")
+        return
+
+    yesterday = frappe.utils.add_days(frappe.utils.today(), -1)
+
+    # Aggregate sales data
+    summary = frappe.db.sql(
+        """
+        SELECT
+            si.territory,
+            COUNT(DISTINCT si.name) as invoice_count,
+            SUM(si.grand_total) as total_sales,
+            SUM(si.total_qty) as total_qty
+        FROM `tabSales Invoice` si
+        WHERE si.posting_date = %s AND si.docstatus = 1
+        GROUP BY si.territory
+        ORDER BY total_sales DESC
+        """,
+        yesterday,
+        as_dict=True,
+    )
+
+    grand_total = sum(row.total_sales or 0 for row in summary)
+    total_invoices = sum(row.invoice_count or 0 for row in summary)
+
+    # Build Slack Block Kit message
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"ScoopJoy Daily Sales - {frappe.utils.formatdate(yesterday)}",
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Total Revenue:*\n{frappe.format_value(grand_total, {'fieldtype': 'Currency'})}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Total Orders:*\n{total_invoices}",
+                },
+            ],
+        },
+        {"type": "divider"},
+    ]
+
+    # Add territory breakdown
+    for row in summary[:10]:  # Top 10 territories
+        pct = (row.total_sales / grand_total * 100) if grand_total else 0
+        bar = _progress_bar(pct)
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{row.territory}*\n"
+                    f"{bar} {pct:.1f}%\n"
+                    f"{frappe.format_value(row.total_sales, {'fieldtype': 'Currency'})} "
+                    f"| {row.invoice_count} orders"
+                ),
+            },
+        })
+
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": f"Generated at {frappe.utils.now_datetime().strftime('%H:%M')} IST",
+            }
+        ],
+    })
+
+    payload = {"blocks": blocks}
+
+    response = requests.post(
+        webhook_url,
+        data=json.dumps(payload),
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+
+    if response.status_code != 200:
+        frappe.log_error(
+            title="Slack notification failed",
+            message=f"Status: {response.status_code}, Body: {response.text}",
+        )
+
+
+def _progress_bar(percentage, width=10):
+    """Generate a text-based progress bar for Slack."""
+    filled = round(percentage / 100 * width)
+    empty = width - filled
+    return "█" * filled + "░" * empty
+```
+
+### e) WhatsApp: Order Confirmation to Customer
+
+Triggered from a Sales Order `on_submit` hook, this resolves the customer's primary
+mobile number, normalizes it, and sends a pre-approved template message through the
+WhatsApp Business Cloud API. The access token is read with `settings.get_password`
+so it stays encrypted at rest, and a successful send is recorded as a Comment on the
+order.
+
+```python title="scoopjoy/scoopjoy/integrations/whatsapp_notify.py"
+import frappe
+import requests
+import json
+from frappe.utils import cint
+
+
+def send_order_confirmation(sales_order_name):
+    """Send WhatsApp order confirmation via WhatsApp Business Cloud API.
+
+    Called from Sales Order on_submit hook.
+    """
+    settings = frappe.get_single("ScoopJoy Settings")
+    if not settings.whatsapp_enabled:
+        return
+
+    so = frappe.get_doc("Sales Order", sales_order_name)
+
+    # Get customer phone
+    phone = frappe.db.get_value("Contact Phone", {
+        "parent": frappe.db.get_value(
+            "Dynamic Link",
+            {"link_doctype": "Customer", "link_name": so.customer, "parenttype": "Contact"},
+            "parent",
+        ),
+        "is_primary_mobile_no": 1,
+    }, "phone")
+
+    if not phone:
+        frappe.log_error(f"No WhatsApp phone for customer {so.customer}")
+        return
+
+    # Format phone: remove spaces, ensure country code
+    phone = phone.replace(" ", "").replace("-", "")
+    if not phone.startswith("+"):
+        phone = "+91" + phone  # Default India
+
+    # WhatsApp Cloud API call using pre-approved template
+    api_url = f"https://graph.facebook.com/v21.0/{settings.whatsapp_phone_number_id}/messages"
+
+    headers = {
+        "Authorization": f"Bearer {settings.get_password('whatsapp_access_token')}",
+        "Content-Type": "application/json",
+    }
+
+    # Build item summary for template variable
+    items_text = ", ".join(
+        f"{item.item_name} x{cint(item.qty)}" for item in so.items[:5]
+    )
+    if len(so.items) > 5:
+        items_text += f" + {len(so.items) - 5} more"
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone.lstrip("+"),
+        "type": "template",
+        "template": {
+            "name": "order_confirmation",  # Pre-approved template in Meta Business
+            "language": {"code": "en"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": so.customer_name},
+                        {"type": "text", "text": so.name},
+                        {"type": "text", "text": items_text},
+                        {
+                            "type": "text",
+                            "text": frappe.format_value(
+                                so.grand_total, {"fieldtype": "Currency"}
+                            ),
+                        },
+                        {
+                            "type": "text",
+                            "text": frappe.utils.formatdate(so.delivery_date),
+                        },
+                    ],
+                }
+            ],
+        },
+    }
+
+    response = requests.post(api_url, headers=headers, json=payload, timeout=15)
+
+    if response.status_code != 200:
+        frappe.log_error(
+            title=f"WhatsApp send failed for {so.name}",
+            message=response.text,
+        )
+    else:
+        # Log successful send
+        frappe.get_doc({
+            "doctype": "Comment",
+            "comment_type": "Info",
+            "reference_doctype": "Sales Order",
+            "reference_name": so.name,
+            "content": f"WhatsApp order confirmation sent to {phone}",
+        }).insert(ignore_permissions=True)
+```
+
+### f) Push Notification: In-App Real-Time Alerts
+
+The cheapest channel: `frappe.publish_realtime` emits a custom event over the
+WebSocket layer, and a small client script listens for it. Here a closed POS shift
+and a hit monthly target each broadcast an event, and the browser shows an alert (or
+a celebratory `frappe.msgprint` with a dashboard action).
+
+```python title="scoopjoy/scoopjoy/realtime_alerts.py"
+import frappe
+
+
+def publish_pos_closing_alert(outlet, shift, total_sales):
+    """Push real-time alert when a POS shift is closed.
+    Called from POS Closing Entry on_submit.
+    """
+    # Notify all users with Franchise Manager role
+    frappe.publish_realtime(
+        event="scoopjoy_pos_closed",
+        message={
+            "outlet": outlet,
+            "shift": shift,
+            "total_sales": total_sales,
+            "timestamp": frappe.utils.now_datetime().isoformat(),
+        },
+        after_commit=True,
+    )
+
+
+def publish_target_achievement(franchise, percentage):
+    """Push real-time celebration when a franchise hits target."""
+    if percentage >= 100:
+        frappe.publish_realtime(
+            event="scoopjoy_target_achieved",
+            message={
+                "franchise": franchise,
+                "percentage": percentage,
+                "message": f"{franchise} has achieved {percentage:.0f}% of monthly target!",
+            },
+            after_commit=True,
+        )
+```
+
+The matching client script subscribes with `frappe.realtime.on` and reacts to each
+event:
+
+```javascript title="scoopjoy/public/js/scoopjoy_realtime.js"
+// Listen for POS closing alerts
+frappe.realtime.on("scoopjoy_pos_closed", (data) => {
+    frappe.show_alert(
+        {
+            message: `POS Closed: ${data.outlet} (${data.shift}) - ${format_currency(
+                data.total_sales
+            )}`,
+            indicator: "blue",
+        },
+        10
+    );
+});
+
+// Listen for target achievements with celebration
+frappe.realtime.on("scoopjoy_target_achieved", (data) => {
+    frappe.show_alert(
+        {
+            message: data.message,
+            indicator: "green",
+        },
+        15
+    );
+
+    // Show a more prominent notification
+    frappe.msgprint({
+        title: "Target Achieved!",
+        message: `<div style="text-align:center;">
+            <h2 style="color: #4CAF50;">${data.percentage.toFixed(0)}%</h2>
+            <p><strong>${data.franchise}</strong> has hit the monthly target!</p>
+        </div>`,
+        indicator: "green",
+        primary_action: {
+            label: "View Dashboard",
+            action: () => frappe.set_route("query-report", "Franchise Performance"),
+        },
+    });
+});
+```
+
+Register the client script in `hooks.py` so Desk loads it:
+
+```python title="scoopjoy/hooks.py"
+app_include_js = [
+    "/assets/scoopjoy/js/scoopjoy_realtime.js",
+]
+```
+
+### Scheduler Registration for All Notification Jobs
+
+The periodic channels — stock alerts, the Slack summary, and the weekly digest —
+are wired into `scheduler_events`. Frappe registers them after `bench migrate`.
+
+```python title="scoopjoy/hooks.py"
+scheduler_events = {
+    "cron": {
+        "*/30 * * * *": [
+            "scoopjoy.scoopjoy.stock_alerts.check_reorder_levels",
+        ],
+    },
+    "hourly": [
+        "scoopjoy.scoopjoy.tasks.escalate_pending_approvals",
+    ],
+    "daily_long": [
+        "scoopjoy.scoopjoy.integrations.slack_notify.post_daily_sales_summary",
+    ],
+    "weekly": [
+        "scoopjoy.scoopjoy.tasks.send_weekly_franchise_digest",
+    ],
+}
+```
+
+:::note[Why this works]
+Frappe provides multiple notification channels out of the box: `frappe.sendmail` for
+email, `Notification Log` for system bell notifications, `frappe.publish_realtime`
+for WebSocket push, and SMS Settings for SMS gateways. WhatsApp and Slack require
+external API calls but integrate cleanly through `requests`. The `scheduler_events`
+hook in `hooks.py` ensures periodic jobs are registered after `bench migrate`.
+:::
+
+:::caution[Common mistake]
+Using `frappe.sendmail(..., now=True)` in tight loops. This sends emails
+synchronously and blocks the request. For bulk notifications, omit `now=True` to let
+the email queue handle delivery, or use `frappe.enqueue` to offload the entire batch.
+:::
+

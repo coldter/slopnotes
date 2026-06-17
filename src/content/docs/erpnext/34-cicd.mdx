@@ -1,0 +1,657 @@
+---
+title: CI/CD Pipeline
+description: Pre-commit hooks, GitHub Actions testing, and staging-to-production deployment for a Frappe app.
+sidebar:
+  order: 34
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, Tabs, TabItem, Aside } from "@astrojs/starlight/components";
+
+A reliable CI/CD pipeline keeps code quality high, catches regressions early, and
+lets you ship with confidence. Coming from Node.js you've probably wired up Husky +
+ESLint + a GitHub Actions matrix before — the moving parts here are the same, only
+the tooling is Frappe-flavoured: Ruff for Python, `bench` for spinning up a test
+site, and an SSH-based promotion script for staging → production.
+
+This chapter walks through pre-commit hooks for local quality, GitHub Actions for
+automated testing, and a deployment pipeline for promoting `scoopjoy` from staging
+to production.
+
+<Mermaid title="CI/CD pipeline" height={420} code={`
+flowchart LR
+  Dev["git commit"] --> PC["Pre-commit<br/>Ruff · Prettier · ESLint"]
+  PC --> Push["git push / PR"]
+  Push --> Lint["CI: Lint job"]
+  Push --> Test["CI: Tests job<br/>bench run-tests"]
+  Lint --> Merge["Merge to main"]
+  Test --> Merge
+  Merge --> Stage["Deploy: Staging"]
+  Stage --> Tag["Tag v*"]
+  Tag --> Prod["Deploy: Production<br/>(human approval)"]
+`} />
+
+## Pre-commit hooks
+
+Pre-commit hooks run automatically before every `git commit`, catching formatting
+issues, lint errors, and common mistakes before they ever enter the repository —
+the same role Husky plays in a Node project.
+
+### Modern Frappe stack: Ruff + Prettier + ESLint
+
+The Frappe core team has consolidated Python tooling into **Ruff** (replacing Black,
+isort, and flake8 as separate tools). For JavaScript, **Prettier** and **ESLint**
+remain the standard.
+
+```yaml title=".pre-commit-config.yaml"
+repos:
+  # General hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0  # Run 'pre-commit autoupdate' to get the latest versions
+    hooks:
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-ast
+      - id: debug-statements
+      - id: no-commit-to-branch
+        args: ["--branch", "main", "--branch", "develop"]
+
+  # Python: Ruff (linting + formatting + import sorting)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.1
+    hooks:
+      # Import sorting (replaces isort)
+      - id: ruff
+        name: ruff-isort
+        args: ["--select=I", "--fix"]
+
+      # Linting (replaces flake8, pylint, bandit, etc.)
+      - id: ruff
+        name: ruff-lint
+
+      # Formatting (replaces black)
+      - id: ruff-format
+
+  # JavaScript/Vue/SCSS: Prettier
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        types_or: [javascript, vue, scss]
+        additional_dependencies:
+          - prettier@3.5.2
+        exclude: |
+          (?x)^(
+            scoopjoy/public/dist/.*|
+            node_modules/.*
+          )$
+
+  # JavaScript: ESLint
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v8.57.0
+    hooks:
+      - id: eslint
+        args: ["--quiet"]
+        types: [javascript]
+        additional_dependencies:
+          - eslint@8.57.0
+        exclude: |
+          (?x)^(
+            scoopjoy/public/dist/.*|
+            node_modules/.*
+          )$
+```
+
+### Ruff configuration
+
+Ruff reads its settings from `pyproject.toml`. Note `indent-style = "tab"` — that's
+the Frappe convention, not a typo.
+
+```toml title="pyproject.toml" {5,28}
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "I",      # isort (import sorting)
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "S",      # flake8-bandit (security)
+    "RUF",    # ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B017",   # assertRaises(Exception) — common in Frappe tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_*.py" = ["S101"]  # allow assert in tests
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "tab"  # Frappe convention
+```
+
+### Installing pre-commit
+
+<Steps>
+
+1. Install the `pre-commit` tool:
+
+   ```bash
+   pip install pre-commit
+   ```
+
+2. Install the hooks into your app's git repo:
+
+   ```bash
+   cd apps/scoopjoy
+   pre-commit install
+   ```
+
+3. Run against all files (do this the first time, and in CI):
+
+   ```bash
+   pre-commit run --all-files
+   ```
+
+4. Periodically refresh hook versions:
+
+   ```bash
+   pre-commit autoupdate
+   ```
+
+</Steps>
+
+## GitHub Actions for Frappe apps
+
+The tricky part of CI for a Frappe app isn't the test runner — it's standing up a
+working bench inside the runner: checkout frappe and erpnext at the right branch,
+provision MariaDB and two Redis instances as services, create a fresh test site,
+then run the suite.
+
+### Complete CI workflow
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  linters:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: pre-commit/action@v3.0.1
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=2s
+          --health-retries=3
+
+      redis-cache:
+        image: redis:7-alpine
+        ports:
+          - 13000:6379
+      redis-queue:
+        image: redis:7-alpine
+        ports:
+          - 11000:6379
+
+    steps:
+      - name: Checkout frappe
+        uses: actions/checkout@v4
+        with:
+          repository: frappe/frappe
+          ref: version-16
+          path: frappe-bench/apps/frappe
+
+      - name: Checkout erpnext
+        uses: actions/checkout@v4
+        with:
+          repository: frappe/erpnext
+          ref: version-16
+          path: frappe-bench/apps/erpnext
+
+      - name: Checkout scoopjoy
+        uses: actions/checkout@v4
+        with:
+          path: frappe-bench/apps/scoopjoy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install bench
+        run: pip install frappe-bench
+
+      - name: Initialize bench
+        working-directory: frappe-bench
+        run: |
+          bench init --skip-redis-config-generation --skip-assets \
+            --frappe-path apps/frappe .
+        env:
+          CI: true
+
+      - name: Configure bench
+        working-directory: frappe-bench
+        run: |
+          bench set-config -g db_host 127.0.0.1
+          bench set-config -gp db_port 3306
+          bench set-config -g redis_cache redis://127.0.0.1:13000
+          bench set-config -g redis_queue redis://127.0.0.1:11000
+
+      - name: Create test site
+        working-directory: frappe-bench
+        run: |
+          bench new-site test_site \
+            --mariadb-root-password root \
+            --admin-password admin \
+            --no-mariadb-socket
+
+      - name: Install apps
+        working-directory: frappe-bench
+        run: |
+          bench --site test_site install-app erpnext
+          bench --site test_site install-app scoopjoy
+          bench --site test_site set-config allow_tests true
+
+      - name: Build assets
+        working-directory: frappe-bench
+        run: bench build --app scoopjoy
+
+      - name: Run tests
+        working-directory: frappe-bench
+        run: |
+          bench --site test_site run-tests \
+            --app scoopjoy \
+            --junit-xml-output /tmp/test-results.xml \
+            --failfast
+        env:
+          CI: true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: /tmp/test-results.xml
+```
+
+The two Redis services map host ports `13000` and `11000` to container port `6379`,
+matching the `redis_cache` and `redis_queue` URLs set in the configure step. The
+matrix `${{ matrix.python-version }}` is just one entry here, but the structure lets
+you fan out across versions later.
+
+<Aside type="tip" title="Pro tip">
+The `bench new-app` scaffolder in v16 asks "GitHub Workflow: Type `y` to
+auto-generate a CI/CD test workflow file" — use that as a starting point and
+customize it rather than writing the YAML from scratch.
+</Aside>
+
+### Running linters in CI
+
+The `pre-commit/action@v3.0.1` step in the `linters` job runs all your pre-commit
+hooks against the entire codebase. This ensures no unformatted or unlinted code
+makes it past pull request review — the same hooks that run locally, enforced in CI.
+
+## Deployment pipelines
+
+### Staging-to-production promotion
+
+This script is the heart of the deploy: it backs up first, drops the site into
+maintenance mode, pulls the right branch (`main` for production, `develop` for
+staging), migrates, rebuilds assets, restarts, and finishes with a health check that
+hits `/api/method/ping` and rolls forward only on HTTP 200.
+
+```bash title="deploy.sh" {30,33,49-54}
+#!/bin/bash
+# deploy.sh — Staging to Production deployment script
+# Usage: ./deploy.sh staging|production
+
+set -euo pipefail
+
+ENVIRONMENT="${1:?Usage: ./deploy.sh staging|production}"
+BENCH_DIR="/home/frappe/frappe-bench"
+BACKUP_DIR="/home/frappe/backups"
+APP_NAME="scoopjoy"
+SITE_NAME="${ENVIRONMENT}.scoopjoy.com"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# Step 1: Pre-deployment backup
+log "Creating pre-deployment backup..."
+mkdir -p "${BACKUP_DIR}/${TIMESTAMP}"
+cd "$BENCH_DIR"
+bench --site "$SITE_NAME" backup --with-files \
+    --backup-path "${BACKUP_DIR}/${TIMESTAMP}"
+
+# Step 2: Enable maintenance mode
+log "Enabling maintenance mode..."
+bench --site "$SITE_NAME" set-maintenance-mode on
+
+# Step 3: Pull latest code
+log "Pulling latest code for ${APP_NAME}..."
+cd "${BENCH_DIR}/apps/${APP_NAME}"
+
+if [ "$ENVIRONMENT" = "production" ]; then
+    git fetch origin
+    git checkout main
+    git pull origin main
+else
+    git fetch origin
+    git checkout develop
+    git pull origin develop
+fi
+
+# Step 4: Install dependencies
+log "Installing dependencies..."
+cd "$BENCH_DIR"
+bench setup requirements --python
+bench setup requirements --node
+
+# Step 5: Run migrations
+log "Running database migrations..."
+bench --site "$SITE_NAME" migrate
+
+# Step 6: Build assets
+log "Building frontend assets..."
+bench build --app "$APP_NAME"
+
+# Step 7: Clear cache
+log "Clearing cache..."
+bench --site "$SITE_NAME" clear-cache
+bench --site "$SITE_NAME" clear-website-cache
+
+# Step 8: Restart services
+log "Restarting services..."
+bench restart
+
+# Step 9: Disable maintenance mode
+log "Disabling maintenance mode..."
+bench --site "$SITE_NAME" set-maintenance-mode off
+
+# Step 10: Health check
+log "Running health check..."
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://${SITE_NAME}/api/method/ping")
+if [ "$HTTP_STATUS" -eq 200 ]; then
+    log "Deployment successful. Site is healthy."
+else
+    log "WARNING: Health check failed (HTTP ${HTTP_STATUS}). Consider rolling back."
+    exit 1
+fi
+
+log "Deployment to ${ENVIRONMENT} complete."
+```
+
+### Rollback script
+
+When a deploy fails the health check, this script restores the pre-deployment
+backup — database first, then files — and runs `migrate` afterwards to guarantee
+schema consistency.
+
+```bash title="rollback.sh"
+#!/bin/bash
+# rollback.sh — Restore from backup after a failed deployment
+# Usage: ./rollback.sh <backup_timestamp> <site_name>
+
+set -euo pipefail
+
+TIMESTAMP="${1:?Usage: ./rollback.sh <timestamp> <site_name>}"
+SITE_NAME="${2:?Usage: ./rollback.sh <timestamp> <site_name>}"
+BENCH_DIR="/home/frappe/frappe-bench"
+BACKUP_DIR="/home/frappe/backups/${TIMESTAMP}"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+if [ ! -d "$BACKUP_DIR" ]; then
+    log "ERROR: Backup directory not found: ${BACKUP_DIR}"
+    exit 1
+fi
+
+log "Starting rollback for ${SITE_NAME} from backup ${TIMESTAMP}..."
+
+cd "$BENCH_DIR"
+
+# Find backup files
+DB_BACKUP=$(find "$BACKUP_DIR" -name "*-database.sql.gz" | head -1)
+FILES_BACKUP=$(find "$BACKUP_DIR" -name "*-files.tar" | head -1)
+
+if [ -z "$DB_BACKUP" ]; then
+    log "ERROR: Database backup not found in ${BACKUP_DIR}"
+    exit 1
+fi
+
+# Enable maintenance mode
+bench --site "$SITE_NAME" set-maintenance-mode on
+
+# Restore database
+log "Restoring database..."
+bench --site "$SITE_NAME" restore "$DB_BACKUP"
+
+# Restore files if backup exists
+if [ -n "$FILES_BACKUP" ]; then
+    log "Restoring files..."
+    SITE_DIR="${BENCH_DIR}/sites/${SITE_NAME}"
+    tar -xf "$FILES_BACKUP" -C "$SITE_DIR"
+fi
+
+# Run migrate to ensure consistency
+log "Running post-restore migration..."
+bench --site "$SITE_NAME" migrate
+
+# Restart and bring site back up
+bench restart
+bench --site "$SITE_NAME" set-maintenance-mode off
+
+log "Rollback complete. Site restored to ${TIMESTAMP} backup."
+```
+
+### GitHub Actions deployment pipeline
+
+The deploy workflow reuses `ci.yml` as a gate, then promotes over SSH. Staging fires
+on a push to `main`; production fires only on a `v*` tag — and routes through a
+GitHub Environment with required reviewers. The `concurrency` group keyed on
+`${{ github.ref }}` prevents two deploys of the same ref from racing.
+
+```yaml title=".github/workflows/deploy.yml"
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    # Run the full CI test suite first (reuse ci.yml)
+    uses: ./.github/workflows/ci.yml
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Deploy to staging server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /home/frappe/frappe-bench
+            bash deploy.sh staging
+
+  deploy-production:
+    name: Deploy to Production
+    needs: [test, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Deploy to production server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /home/frappe/frappe-bench
+            bash deploy.sh production
+```
+
+<Aside type="caution">
+Always use GitHub Environments with required reviewers for production deployments.
+Never deploy to production without human approval — the `environment: production`
+gate above is what enforces that pause.
+</Aside>
+
+## Docker / Kubernetes deployment
+
+For containerized deployments, Frappe provides official Docker images. You layer
+your custom app on top via an `APPS_JSON` build arg. See
+[Chapter 26](/erpnext/26-docker/) and [Chapter 28](/erpnext/28-kubernetes/) for the
+full container and orchestration story.
+
+```yaml title="docker-compose.override.yml"
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FRAPPE_VERSION: v16
+        ERPNEXT_VERSION: v16
+        APPS_JSON: |
+          [
+            {
+              "url": "https://github.com/frappe/erpnext",
+              "branch": "version-16"
+            },
+            {
+              "url": "https://github.com/your-org/scoopjoy",
+              "branch": "main"
+            }
+          ]
+```
+
+```dockerfile title="Dockerfile"
+# Custom app image (extends frappe_docker)
+FROM frappe/bench:latest
+
+ARG APPS_JSON
+RUN echo "$APPS_JSON" > /home/frappe/frappe-bench/sites/apps.json
+
+RUN bench get-app --resolve-deps /home/frappe/frappe-bench/sites/apps.json
+RUN bench build
+```
+
+## Release management
+
+### Semantic versioning
+
+Follow semantic versioning for custom apps:
+
+```text
+MAJOR.MINOR.PATCH
+  │      │     └── Bug fixes, security patches (1.2.3 → 1.2.4)
+  │      └──────── New features, backward-compatible (1.2.4 → 1.3.0)
+  └─────────────── Breaking changes (1.3.0 → 2.0.0)
+```
+
+Update the version in your app's `__init__.py` and tag releases:
+
+```python title="scoopjoy/__init__.py"
+__version__ = "1.3.0"
+```
+
+```bash
+# Tag a release
+git tag -a v1.3.0 -m "Release v1.3.0: Add royalty calculation module"
+git push origin v1.3.0
+```
+
+### CHANGELOG.md
+
+Keep a human-readable changelog so each tagged release maps to a clear set of
+Added / Changed / Fixed entries:
+
+```markdown title="CHANGELOG.md"
+# Changelog
+
+## [1.3.0] - 2025-06-15
+
+### Added
+- Franchise royalty calculator with automatic monthly computation
+- Outlet performance dashboard with real-time charts
+- WhatsApp notification integration for agreement approvals
+
+### Changed
+- Franchise Outlet status field now uses Workflow instead of manual selection
+- Improved stock reorder logic to consider batch expiry dates
+
+### Fixed
+- Inter-company stock transfer not updating target warehouse correctly
+- Royalty calculation rounding error for amounts under INR 100
+
+## [1.2.0] - 2025-05-01
+
+### Added
+- Franchise Agreement DocType (submittable)
+- POS Profile auto-creation on agreement approval
+- Outlet-wise profit and loss report
+```

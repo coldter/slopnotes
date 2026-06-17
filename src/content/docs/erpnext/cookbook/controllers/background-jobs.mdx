@@ -1,0 +1,235 @@
+---
+title: Background Job Patterns
+description: Run a long stock sync as a resilient background job — chunked commits, progress reporting, deduplication, and job chaining.
+sidebar:
+  order: 3
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Sync stock for 500 ScoopJoy franchise outlets as a background job — with
+progress reporting, error resilience, deduplication, and job chaining — so a single
+bad outlet doesn't sink the whole batch and a crash mid-run doesn't lose everything.
+
+**Solution:** Push the work onto a Frappe queue with `frappe.enqueue`, process outlets
+in chunks, `commit` after each chunk, report progress over realtime, and chain a
+follow-up report job when the sync finishes.
+
+## Step 1: Enqueue with deduplication
+
+`enqueue_stock_sync` is the entry point called from the UI or scheduler. A stable
+`job_id` plus `deduplicate=True` means re-clicking "Sync" while a run is already in
+flight won't queue a second copy. `enqueue_after_commit=True` waits for the current
+request's transaction to land before the worker picks it up.
+
+```python title="apps/scoopjoy/scoopjoy/stock_sync.py" {4,11-13}
+import frappe
+from frappe import _
+from frappe.utils import now_datetime, cint
+
+
+def enqueue_stock_sync(outlet_group=None):
+    """Enqueue stock sync with deduplication. Called from UI or scheduler."""
+    job_id = f"scoopjoy_stock_sync::{outlet_group or 'all'}"
+
+    frappe.enqueue(
+        "scoopjoy.stock_sync.process_stock_sync",
+        queue="long",
+        timeout=1800,
+        job_id=job_id,
+        deduplicate=True,
+        enqueue_after_commit=True,
+        outlet_group=outlet_group,
+        now=frappe.flags.in_test,
+    )
+
+    return {"job_id": job_id, "message": _("Stock sync job enqueued.")}
+```
+
+The `long` queue with a 30-minute `timeout` fits a heavy batch; `now=frappe.flags.in_test`
+runs the job inline under tests so assertions see the result immediately.
+
+## Step 2: Process in chunks with progress
+
+This is the worker function. It pulls active outlets, walks them in chunks of 50,
+catches per-outlet failures so one bad record can't abort the batch, publishes
+progress after each item, and commits after each chunk.
+
+```python title="apps/scoopjoy/scoopjoy/stock_sync.py" {25,38-43,46,55-63}
+def process_stock_sync(outlet_group=None):
+    """
+    Main sync function. Runs as a background job.
+    - Processes outlets in chunks of 50
+    - Individual failures don't kill the batch
+    - Reports progress via realtime
+    - Commits after each chunk
+    """
+    filters = {"docstatus": 1, "agreement_status": "Active"}
+    if outlet_group:
+        filters["outlet_group"] = outlet_group
+
+    outlets = frappe.get_all(
+        "Franchise Agreement",
+        filters=filters,
+        fields=["name", "franchise_name", "franchise_warehouse", "territory"],
+        order_by="territory asc",
+    )
+
+    total = len(outlets)
+    if total == 0:
+        frappe.logger("scoopjoy").info("Stock sync: no active outlets found.")
+        return
+
+    chunk_size = 50
+    success_count = 0
+    error_count = 0
+    errors = []
+
+    for i in range(0, total, chunk_size):
+        chunk = outlets[i : i + chunk_size]
+
+        for idx, outlet in enumerate(chunk, start=i + 1):
+            try:
+                sync_single_outlet(outlet)
+                success_count += 1
+            except Exception as e:
+                error_count += 1
+                error_msg = f"{outlet.franchise_name}: {str(e)}"
+                errors.append(error_msg)
+                frappe.logger("scoopjoy").error(
+                    f"Stock sync failed for {outlet.name}: {str(e)}"
+                )
+
+            # Publish progress after each item
+            frappe.publish_progress(
+                percent=cint((idx / total) * 100),
+                title=_("Stock Sync"),
+                description=_("Processing {0} ({1}/{2})").format(
+                    outlet.franchise_name, idx, total
+                ),
+            )
+
+        # Commit after each chunk — this is allowed in background jobs
+        frappe.db.commit()
+```
+
+`frappe.publish_progress` drives the progress bar in Desk; the `try`/`except` around
+`sync_single_outlet` is what keeps a single failure from taking down all 500.
+
+## Step 3: Publish completion and chain a report
+
+After the loop, publish a summary over realtime and — if anything succeeded — enqueue
+a second job to generate the run's report. Chaining jobs (rather than doing the report
+inline) keeps each job small and lets the report run on the lighter `short` queue.
+
+```python title="apps/scoopjoy/scoopjoy/stock_sync.py" {2-12,15-16}
+    # Publish completion summary
+    frappe.publish_realtime(
+        event="scoopjoy_stock_sync_complete",
+        message={
+            "total": total,
+            "success": success_count,
+            "errors": error_count,
+            "error_details": errors[:20],
+        },
+        after_commit=True,
+    )
+
+    # Chain: trigger report generation after sync completes
+    if success_count > 0:
+        enqueue_sync_report(outlet_group)
+
+    frappe.logger("scoopjoy").info(
+        f"Stock sync complete: {success_count}/{total} succeeded, {error_count} failed."
+    )
+```
+
+## Step 4: The per-outlet worker and the chained report
+
+`sync_single_outlet` does the actual work for one outlet — and raises on bad data so
+the batch loop can record it. `enqueue_sync_report` and `generate_sync_report` are the
+chained follow-up job that logs a summary document.
+
+```python title="apps/scoopjoy/scoopjoy/stock_sync.py"
+def sync_single_outlet(outlet):
+    """Sync stock for a single franchise outlet from its POS terminal data."""
+    warehouse = outlet.franchise_warehouse
+    if not warehouse:
+        raise ValueError(f"No warehouse configured for {outlet.franchise_name}")
+
+    pos_entries = frappe.get_all(
+        "POS Invoice",
+        filters={
+            "set_warehouse": warehouse,
+            "docstatus": 1,
+            "custom_stock_synced": 0,
+        },
+        fields=["name"],
+        limit=100,
+    )
+
+    for entry in pos_entries:
+        frappe.db.set_value("POS Invoice", entry.name, "custom_stock_synced", 1)
+
+
+def enqueue_sync_report(outlet_group=None):
+    """Chain job: generate sync summary report after stock sync."""
+    job_id = f"scoopjoy_sync_report::{outlet_group or 'all'}"
+
+    frappe.enqueue(
+        "scoopjoy.stock_sync.generate_sync_report",
+        queue="short",
+        timeout=300,
+        job_id=job_id,
+        deduplicate=True,
+        outlet_group=outlet_group,
+    )
+
+
+def generate_sync_report(outlet_group=None):
+    """Generate a log document summarizing the sync run."""
+    report_doc = frappe.get_doc(
+        {
+            "doctype": "Stock Sync Log",
+            "sync_datetime": now_datetime(),
+            "outlet_group": outlet_group or "All",
+            "status": "Completed",
+        }
+    )
+    report_doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+```
+
+## Step 5: Client-side listener
+
+A small client script listens for the completion event and shows a Desk alert. In an
+Express app you'd open a WebSocket and handle a message; in Frappe `frappe.realtime.on`
+wires straight into the same Socket.IO channel the job published to.
+
+```javascript title="apps/scoopjoy/scoopjoy/public/js/stock_sync_listener.js"
+frappe.realtime.on("scoopjoy_stock_sync_complete", (data) => {
+    let message = `Stock sync finished: ${data.success}/${data.total} outlets synced.`;
+    if (data.errors > 0) {
+        message += ` ${data.errors} errors.`;
+    }
+    frappe.show_alert({
+        message: message,
+        indicator: data.errors > 0 ? "orange" : "green",
+    }, 10);
+});
+```
+
+:::note[Why this works]
+`deduplicate=True` with a unique `job_id` prevents the same sync from being queued
+twice. Chunked processing with `frappe.db.commit()` after each batch prevents the
+transaction from growing unbounded. Individual outlet failures are caught and logged
+without aborting the entire batch.
+:::
+
+:::caution[Common mistake]
+Forgetting `frappe.db.commit()` in a long-running background job. Unlike `doc_events`,
+background jobs run outside the request lifecycle. If you process 500 items without
+committing, a crash at item 499 loses everything. Commit after each chunk.
+:::

@@ -1,0 +1,259 @@
+---
+title: Form Script Communication Patterns
+description: Wire up debounced lookups, optimistic UI, concurrency checks, and cross-page navigation in Frappe form scripts.
+sidebar:
+  order: 7
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** A ScoopJoy outlet form needs rich behavior — debounced PIN code
+lookups, an optimistic tier switch that rolls back if the server rejects it, a
+guard against concurrent edits, custom print buttons, and links that pre-fill the
+next page. Doing all of this without hammering the API or clobbering another
+user's edit takes a handful of well-known patterns.
+
+**Solution:** Frappe's client framework ships the primitives for each one:
+`frappe.utils.debounce`, `frappe.xcall`, `frappe.dom.freeze`, the
+`frappe.validated` flag, and `frappe.route_options`. The form script below layers
+six patterns onto the Franchise Outlet form.
+
+## The form script
+
+Each pattern is an event handler (or helper function) on the same form. They share
+one DocType, so they live in a single client script file.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+// These patterns extend the form script from Recipe 3.3.
+frappe.ui.form.on('Franchise Outlet', {
+
+    // Pattern 1: DEBOUNCED SERVER LOOKUPS — don't hammer the API on every keystroke
+    setup(frm) {
+        // Create a debounced version of the pincode lookup
+        frm._debounced_pincode_lookup = frappe.utils.debounce((pincode) => {
+            if (!pincode || pincode.length !== 6) return;
+
+            frappe.xcall('scoopjoy.api.geo.lookup_pincode', { pincode })
+                .then(result => {
+                    if (result) {
+                        frm.set_value('city', result.city);
+                        frm.set_value('state', result.state);
+                        frm.set_value('district', result.district);
+                        frappe.show_alert({
+                            message: `Found: ${result.city}, ${result.state}`,
+                            indicator: 'green',
+                        });
+                    }
+                })
+                .catch(() => {
+                    frappe.show_alert({
+                        message: 'PIN code not found',
+                        indicator: 'orange',
+                    });
+                });
+        }, 500);  // 500ms debounce
+    },
+
+    pincode(frm) {
+        // Fires on every change; the debounce ensures the server
+        // call only happens 500ms after the user stops typing
+        frm._debounced_pincode_lookup(frm.doc.pincode);
+    },
+
+    // Pattern 2: OPTIMISTIC UI UPDATES — update UI immediately, then validate server-side
+    async franchise_tier_override(frm) {
+        const new_tier = frm.doc.franchise_tier_override;
+        if (!new_tier) return;
+
+        // Optimistic: update UI instantly
+        const old_type = frm.doc.franchise_type;
+        frm.set_value('franchise_type', new_tier);
+        frappe.show_alert({ message: `Tier updated to ${new_tier}`, indicator: 'blue' });
+
+        // Server validation
+        try {
+            const valid = await frappe.xcall(
+                'scoopjoy.api.franchise.validate_tier_change',
+                { outlet: frm.doc.name, new_tier: new_tier }
+            );
+            if (!valid.allowed) {
+                // Rollback on failure
+                frm.set_value('franchise_type', old_type);
+                frm.set_value('franchise_tier_override', '');
+                frappe.msgprint({
+                    title: 'Tier Change Denied',
+                    indicator: 'red',
+                    message: valid.reason,
+                });
+            }
+        } catch (e) {
+            // Rollback on error
+            frm.set_value('franchise_type', old_type);
+            frm.set_value('franchise_tier_override', '');
+        }
+    },
+
+    // Pattern 3: FREEZE/UNFREEZE FOR LONG OPERATIONS
+    async generate_franchise_report(frm) {
+        frappe.dom.freeze(__('Generating report... This may take a moment.'));
+        try {
+            const result = await frappe.xcall(
+                'scoopjoy.api.reports.generate_franchise_report',
+                { outlet: frm.doc.name }
+            );
+            frappe.dom.unfreeze();
+
+            // Show progress for multi-step operations
+            frappe.show_progress('Processing Report', 100, 100, 'Report ready!');
+
+            // Download the generated file
+            if (result.file_url) {
+                window.open(result.file_url);
+            }
+        } catch (e) {
+            frappe.dom.unfreeze();
+            frappe.msgprint({ title: 'Error', indicator: 'red', message: e.message });
+        }
+    },
+
+    // Pattern 4: VERSION CHECK BEFORE SAVE — handle concurrent edits gracefully
+    async before_save(frm) {
+        if (frm.is_new()) return;
+
+        // Check if someone else modified this doc since we loaded it
+        const server_modified = await frappe.xcall('frappe.client.get_value', {
+            doctype: 'Franchise Outlet',
+            filters: frm.doc.name,
+            fieldname: 'modified',
+        });
+
+        if (server_modified && server_modified.modified !== frm.doc.modified) {
+            frappe.validated = false;  // Prevent save
+            frappe.msgprint({
+                title: 'Concurrent Edit Detected',
+                indicator: 'orange',
+                message: __('This document was modified by another user at {0}. Please reload before saving.',
+                    [frappe.datetime.str_to_user(server_modified.modified)]),
+                primary_action: {
+                    label: 'Reload',
+                    action: () => frm.reload_doc(),
+                }
+            });
+        }
+    },
+
+    // Pattern 5: CUSTOM PRINT / PDF DOWNLOAD
+    refresh(frm) {
+        if (!frm.is_new()) {
+            frm.add_custom_button(__('Download Certificate'), () => {
+                // Generate PDF using a specific print format
+                const print_format = 'Franchise Certificate';
+                const url = `/api/method/frappe.utils.print_format.download_pdf?`
+                    + `doctype=${encodeURIComponent(frm.doctype)}`
+                    + `&name=${encodeURIComponent(frm.doc.name)}`
+                    + `&format=${encodeURIComponent(print_format)}`
+                    + `&no_letterhead=0`;
+
+                // Open in new tab (triggers download)
+                window.open(url, '_blank');
+            }, __('Print'));
+
+            frm.add_custom_button(__('Email Certificate'), async () => {
+                // Uses Frappe's built-in email dialog
+                const dialog = new frappe.views.CommunicationComposer({
+                    doc: frm.doc,
+                    frm: frm,
+                    subject: `Franchise Certificate - ${frm.doc.franchise_name}`,
+                    recipients: frm.doc.contact_email,
+                    attach_document_print: true,
+                    print_format: 'Franchise Certificate',
+                });
+            }, __('Print'));
+        }
+    },
+});
+
+
+// Pattern 6: frappe.route_options — PASSING DATA BETWEEN PAGES
+
+// Navigate to a new Sales Invoice pre-filled with outlet data
+function create_sale_for_outlet(outlet_name, customer) {
+    // Method 1: frappe.route_options (applied when target form loads)
+    frappe.route_options = {
+        custom_franchise_outlet: outlet_name,
+        customer: customer,
+        selling_price_list: `${outlet_name} Menu`,
+    };
+    frappe.set_route('Form', 'Sales Invoice', 'new');
+
+    // Method 2: frappe.new_doc (cleaner, auto-applies values)
+    // frappe.new_doc('Sales Invoice', {
+    //     custom_franchise_outlet: outlet_name,
+    //     customer: customer,
+    // });
+}
+
+// Navigate to a filtered list view
+function view_outlet_invoices(outlet_name) {
+    frappe.set_route('List', 'Sales Invoice', {
+        custom_franchise_outlet: outlet_name,
+        docstatus: 1,
+    });
+}
+
+// Navigate to a report with preset filters
+function view_outlet_report(outlet_name) {
+    frappe.set_route('query-report', 'Franchise Sales Summary', {
+        franchise_outlet: outlet_name,
+        from_date: frappe.datetime.month_start(),
+        to_date: frappe.datetime.nowdate(),
+    });
+}
+```
+
+The `pincode` handler fires on every change, but it only forwards the value to the
+debounced wrapper created in `setup` — so the actual `frappe.xcall` runs 500ms
+after the user stops typing. The tier override updates `franchise_type` instantly
+for a snappy feel, then awaits server validation and reverts both fields if the
+change is denied. `before_save` re-reads the server's `modified` timestamp and, on
+mismatch, sets `frappe.validated = false` to abort the save and offer a reload.
+
+The whitelisted backend method behind the debounced lookup is a thin wrapper over a
+PIN code master:
+
+```python title="scoopjoy/scoopjoy/api/geo.py"
+import frappe
+
+
+@frappe.whitelist()
+def lookup_pincode(pincode: str) -> dict | None:
+    """Look up city/state from PIN code master."""
+    result = frappe.db.get_value(
+        "Pincode",
+        {"pincode": pincode},
+        ["city", "state", "district"],
+        as_dict=True,
+    )
+    return result
+```
+
+:::note[Why this works]
+`frappe.utils.debounce` wraps a function so it only executes after the specified
+delay since the last call, which keeps API requests off every keystroke. The
+optimistic UI pattern updates the form instantly then validates asynchronously,
+rolling back if the server rejects the change. Setting `frappe.validated = false`
+in `before_save` aborts the save cycle. `frappe.route_options` is a one-shot object
+consumed by the target page on load.
+:::
+
+:::caution[Common mistake]
+Forgetting that `frappe.route_options` is consumed once and then cleared. If you
+set it before `frappe.set_route` but a redirect happens or the user navigates
+elsewhere first, the options are lost — use `frappe.new_doc` with an options object
+for more reliable pre-filling. Also, an async `before_save` requires setting
+`frappe.validated = false` *synchronously* (and then calling `frm.save()` again
+after validation passes), or using the promise-based approach shown above where the
+async handler sets `frappe.validated` before returning.
+:::

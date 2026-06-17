@@ -1,0 +1,829 @@
+---
+title: Payment Gateways
+description: Wire ERPNext to Razorpay, Stripe, and custom UPI gateways — Payment Requests, webhooks, and the Payment Entry accounting flow.
+sidebar:
+  order: 22
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Tabs, TabItem, Steps, Aside } from "@astrojs/starlight/components";
+
+Payment processing is the lifeblood of any business. ERPNext provides a
+well-architected payment flow that routes transactions through a standardized
+pipeline: **Payment Request → Payment Gateway → Payment Entry**. The separate
+**Payments** app (`frappe/payments`) handles gateway orchestration, while
+ERPNext owns the accounting entries.
+
+In Express you'd reach for a Stripe SDK and write the charge, webhook, and
+ledger logic yourself. In Frappe, the gateway plumbing, the integration log, and
+the double-entry accounting are all DocTypes the framework already understands —
+your job is to wire ScoopJoy's invoices to them.
+
+## Payment Architecture Overview
+
+The ERPNext payment flow involves several DocTypes working together:
+
+<Mermaid title="ERPNext payment pipeline" height={460} code={`
+flowchart TB
+  SI["Sales Invoice / Sales Order"] --> PR["Payment Request<br/>(manual or via portal)"]
+  PR --> PG["Payment Gateway<br/>Razorpay · Stripe · PayPal …"]
+  PG --> IR["Integration Request<br/>logs the external transaction"]
+  IR --> PE["Payment Entry<br/>accounting record in ERPNext"]
+`} />
+
+**Key DocTypes:**
+
+| DocType | Role |
+|---------|------|
+| `Payment Request` | Initiates a payment — links to an invoice/order and a gateway |
+| `Payment Gateway` | Registry entry mapping a gateway name to its Settings DocType |
+| `Payment Gateway Account` | Links a Payment Gateway to a Company's bank/payment account |
+| `Integration Request` | Logs every external API interaction (request/response) |
+| `Payment Entry` | The final accounting document that records money movement |
+
+### Installing the Payments App
+
+The Payments app is a separate Frappe app, not bundled with ERPNext core:
+
+<Steps>
+
+1. Get and install the app on your site:
+
+   ```bash
+   bench get-app payments
+   bench --site icecream.localhost install-app payments
+   ```
+
+2. Verify it shows up alongside `frappe` and `erpnext`:
+
+   ```bash
+   bench --site icecream.localhost list-apps
+   # frappe, erpnext, payments
+   ```
+
+</Steps>
+
+## Razorpay Integration
+
+Razorpay is the most common payment gateway for INR-based transactions. It
+supports UPI, cards, net banking, and wallets — the default choice for
+ScoopJoy's India-based outlets.
+
+### Razorpay Settings Configuration
+
+Navigate to **Razorpay Settings** in the Desk, or configure programmatically:
+
+```python title="Configure Razorpay Settings via the API"
+import frappe
+
+razorpay_settings = frappe.get_doc({
+    "doctype": "Razorpay Settings",
+    "api_key": "rzp_test_xxxxxxxxxxxxxxx",
+    "api_secret": "your_test_secret_key",
+    "currency": "INR"
+})
+razorpay_settings.insert(ignore_permissions=True)
+frappe.db.commit()
+```
+
+On saving Razorpay Settings, the system automatically:
+
+1. Creates a **Payment Gateway** record named "Razorpay".
+2. Creates an **Account** head with account type "Bank" in your Chart of Accounts.
+
+### Setting Up Payment Gateway Account
+
+Link the Razorpay gateway to your franchise company's bank account. The
+`default_payment_request_message` is a Jinja template — note the `{{ doc.customer_name }}`,
+`{{ doc.grand_total }}`, `{{ doc.name }}`, and `{{ payment_url }}` placeholders
+that get rendered per request:
+
+```python title="Create a Payment Gateway Account for the franchise company"
+gateway_account = frappe.get_doc({
+    "doctype": "Payment Gateway Account",
+    "payment_gateway": "Razorpay",
+    "payment_account": "Razorpay - FIC",  # Your bank/payment account
+    "currency": "INR",
+    "default_payment_request_message": (
+        "Dear {{ doc.customer_name }},\n\n"
+        "Please click the link below to pay {{ doc.grand_total }} "
+        "for invoice {{ doc.name }}.\n\n"
+        "{{ payment_url }}\n\n"
+        "Thank you,\nScoopJoy Franchise"
+    )
+})
+gateway_account.insert(ignore_permissions=True)
+frappe.db.commit()
+```
+
+### Example 1: Customer Pays a Franchise Invoice Online
+
+Create a Payment Request against a Sales Invoice so the customer gets a payment
+link. Submitting (`docstatus 1`) the request is what triggers the email and
+generates the gateway URL:
+
+```python title="scoopjoy/scoopjoy/api/razorpay_payments.py" {35-36}
+import frappe
+
+def create_razorpay_payment_request(sales_invoice_name):
+    """Create a payment request so the customer can pay online."""
+    si = frappe.get_doc("Sales Invoice", sales_invoice_name)
+
+    payment_request = frappe.get_doc({
+        "doctype": "Payment Request",
+        "payment_request_type": "Inward",
+        "transaction_date": frappe.utils.today(),
+        "party_type": "Customer",
+        "party": si.customer,
+        "reference_doctype": "Sales Invoice",
+        "reference_name": si.name,
+        "grand_total": si.outstanding_amount,
+        "currency": si.currency,
+        "email_to": si.contact_email or frappe.get_value(
+            "Customer", si.customer, "email_id"
+        ),
+        "payment_gateway_account": "Razorpay - INR",
+        "subject": f"Payment for {si.name}",
+        "message": (
+            f"Dear {si.customer_name},<br><br>"
+            f"Please pay <b>{si.currency} {si.outstanding_amount}</b> "
+            f"for invoice <b>{si.name}</b>.<br><br>"
+            f"Thank you,<br>ScoopJoy Franchise"
+        )
+    })
+    payment_request.insert(ignore_permissions=True)
+    payment_request.submit()
+
+    return payment_request.name
+```
+
+The same thing via the REST API — handy when an external system kicks off the
+payment:
+
+```bash title="Create a Payment Request via REST"
+curl -X POST https://icecream.localhost/api/resource/Payment%20Request \
+  -H "Authorization: token api_key:api_secret" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "payment_request_type": "Inward",
+    "transaction_date": "2026-03-20",
+    "party_type": "Customer",
+    "party": "CUST-DOWNTOWN-001",
+    "reference_doctype": "Sales Invoice",
+    "reference_name": "ACC-SINV-2026-00042",
+    "grand_total": 4500.00,
+    "currency": "INR",
+    "email_to": "downtown@scoopjoy.com",
+    "payment_gateway_account": "Razorpay - INR",
+    "subject": "Payment for ACC-SINV-2026-00042",
+    "docstatus": 1
+  }'
+```
+
+### Razorpay Webhook Handling
+
+Razorpay confirms payment status asynchronously by calling a webhook. Configure
+the webhook URL in your Razorpay Dashboard, pointing at a whitelisted endpoint:
+
+<Mermaid title="Razorpay webhook → Payment Entry" height={460} code={`
+sequenceDiagram
+  participant C as Customer
+  participant R as Razorpay
+  participant F as Frappe webhook
+  participant E as ERPNext
+  C->>R: Pays via UPI / card
+  R->>F: POST payment.captured (signed)
+  F->>F: Verify HMAC-SHA256 signature
+  F->>E: Create Integration Request (Completed)
+  F->>E: Create + submit Payment Entry
+  F-->>R: 200 {"status":"ok"}
+`} />
+
+The Payments app handles the standard Razorpay webhook flow automatically. For
+franchise-specific logic, here is a custom handler. Note the signature check on
+lines 17-18 — never trust a webhook payload you haven't verified:
+
+```python title="scoopjoy/scoopjoy/api/razorpay_webhooks.py" {17-18}
+import frappe
+import hmac
+import hashlib
+import json
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def handle_razorpay_webhook():
+    """Custom Razorpay webhook handler for franchise-specific logic."""
+    payload = frappe.request.data
+    signature = frappe.get_request_header("X-Razorpay-Signature")
+
+    # Verify webhook signature
+    razorpay_settings = frappe.get_single("Razorpay Settings")
+    webhook_secret = razorpay_settings.get_password("webhook_secret")
+
+    expected_signature = hmac.new(
+        webhook_secret.encode("utf-8"),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected_signature):
+        frappe.throw("Invalid webhook signature", frappe.AuthenticationError)
+
+    data = json.loads(payload)
+    event = data.get("event")
+
+    if event == "payment.captured":
+        handle_payment_captured(data["payload"]["payment"]["entity"])
+    elif event == "payment.failed":
+        handle_payment_failed(data["payload"]["payment"]["entity"])
+
+    return {"status": "ok"}
+
+
+def handle_payment_captured(payment):
+    """Process a successful Razorpay payment."""
+    order_id = payment.get("notes", {}).get("sales_invoice")
+
+    if not order_id:
+        frappe.logger().warning(f"Razorpay payment {payment['id']} has no linked invoice")
+        return
+
+    # Log the integration request
+    frappe.get_doc({
+        "doctype": "Integration Request",
+        "integration_type": "Remote",
+        "integration_request_service": "Razorpay",
+        "status": "Completed",
+        "data": json.dumps(payment),
+        "reference_doctype": "Sales Invoice",
+        "reference_docname": order_id
+    }).insert(ignore_permissions=True)
+
+    # Create Payment Entry
+    create_payment_entry_from_razorpay(order_id, payment)
+    frappe.db.commit()
+
+
+def create_payment_entry_from_razorpay(invoice_name, razorpay_payment):
+    """Create a Payment Entry from Razorpay payment confirmation."""
+    si = frappe.get_doc("Sales Invoice", invoice_name)
+    amount = razorpay_payment["amount"] / 100  # Razorpay sends amount in paise
+
+    pe = frappe.get_doc({
+        "doctype": "Payment Entry",
+        "payment_type": "Receive",
+        "posting_date": frappe.utils.today(),
+        "company": si.company,
+        "party_type": "Customer",
+        "party": si.customer,
+        "paid_amount": amount,
+        "received_amount": amount,
+        "target_exchange_rate": 1,
+        "paid_to": "Razorpay - FIC",
+        "paid_from": "Debtors - FIC",
+        "reference_no": razorpay_payment["id"],
+        "reference_date": frappe.utils.today(),
+        "references": [{
+            "reference_doctype": "Sales Invoice",
+            "reference_name": si.name,
+            "allocated_amount": amount
+        }],
+        "remarks": f"Razorpay Payment {razorpay_payment['id']}"
+    })
+    pe.insert(ignore_permissions=True)
+    pe.submit()
+
+    frappe.logger().info(
+        f"Payment Entry {pe.name} created for Razorpay payment {razorpay_payment['id']}"
+    )
+    return pe.name
+```
+
+:::note
+Razorpay sends amounts in **paise**, so divide by 100 (`razorpay_payment["amount"] / 100`)
+to get rupees before creating the Payment Entry.
+:::
+
+### Testing in Sandbox Mode
+
+```python title="Assert you're in Razorpay sandbox mode"
+# Test card: 4111 1111 1111 1111, Expiry: any future date, CVV: any 3 digits
+# Test UPI: success@razorpay
+
+razorpay_settings = frappe.get_single("Razorpay Settings")
+assert razorpay_settings.api_key.startswith("rzp_test_"), (
+    "You are NOT in sandbox mode! Switch to test keys."
+)
+```
+
+:::caution[Never ship live keys to non-prod]
+Never use live API keys in development or staging. Razorpay test keys start with
+`rzp_test_` and live keys start with `rzp_live_`. The Payments app does **not**
+enforce this distinction, so double-check your settings before going to
+production.
+:::
+
+## Stripe Integration
+
+Stripe is the preferred gateway for international (multi-currency) payments — the
+right choice if ScoopJoy starts shipping merchandise abroad.
+
+### Stripe Settings Configuration
+
+```python title="Configure Stripe Settings via the API"
+import frappe
+
+stripe_settings = frappe.get_doc({
+    "doctype": "Stripe Settings",
+    "publishable_key": "pk_test_xxxxxxxxxxxxxxxxxxxxxxxx",
+    "secret_key": "sk_test_xxxxxxxxxxxxxxxxxxxxxxxx",
+    "currency": "USD"
+})
+stripe_settings.insert(ignore_permissions=True)
+frappe.db.commit()
+```
+
+### Example 2: Stripe Webhook Handler for Payment Confirmation
+
+Stripe signs each webhook with a timestamped HMAC over `{timestamp}.{payload}`,
+which `verify_stripe_signature` reconstructs. A dispatch table maps event types
+(`payment_intent.succeeded`, `charge.refunded`, …) to handlers:
+
+```python title="scoopjoy/scoopjoy/api/stripe_webhooks.py" {18-22}
+import frappe
+import json
+import hmac
+import hashlib
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def handle_stripe_webhook():
+    """Handle Stripe webhook events for payment confirmation."""
+    payload = frappe.request.data
+    sig_header = frappe.get_request_header("Stripe-Signature")
+
+    stripe_settings = frappe.get_single("Stripe Settings")
+    endpoint_secret = stripe_settings.get_password("webhook_secret")
+
+    # Verify Stripe signature
+    if not verify_stripe_signature(payload, sig_header, endpoint_secret):
+        frappe.throw("Invalid Stripe signature", frappe.AuthenticationError)
+
+    event = json.loads(payload)
+    event_type = event["type"]
+
+    handlers = {
+        "payment_intent.succeeded": handle_payment_succeeded,
+        "payment_intent.payment_failed": handle_payment_failed,
+        "charge.refunded": handle_charge_refunded,
+    }
+
+    handler = handlers.get(event_type)
+    if handler:
+        handler(event["data"]["object"])
+    else:
+        frappe.logger().info(f"Unhandled Stripe event: {event_type}")
+
+    return {"status": "ok"}
+
+
+def verify_stripe_signature(payload, sig_header, secret):
+    """Verify Stripe webhook signature using the v1 scheme."""
+    elements = dict(
+        item.split("=", 1)
+        for item in sig_header.split(",")
+        if "=" in item
+    )
+
+    timestamp = elements.get("t")
+    signature = elements.get("v1")
+
+    if not timestamp or not signature:
+        return False
+
+    signed_payload = f"{timestamp}.".encode() + payload
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        signed_payload,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
+
+
+def handle_payment_succeeded(payment_intent):
+    """Process successful Stripe payment."""
+    metadata = payment_intent.get("metadata", {})
+    invoice_name = metadata.get("sales_invoice")
+    company = metadata.get("company", "ScoopJoy Foods Pvt Ltd")
+
+    if not invoice_name:
+        frappe.logger().warning(
+            f"Stripe PaymentIntent {payment_intent['id']} has no linked invoice"
+        )
+        return
+
+    si = frappe.get_doc("Sales Invoice", invoice_name)
+    amount = payment_intent["amount_received"] / 100  # Stripe sends cents
+
+    pe = frappe.get_doc({
+        "doctype": "Payment Entry",
+        "payment_type": "Receive",
+        "posting_date": frappe.utils.today(),
+        "company": company,
+        "party_type": "Customer",
+        "party": si.customer,
+        "paid_amount": amount,
+        "received_amount": amount,
+        "paid_to": "Stripe - FIC",
+        "paid_from": "Debtors - FIC",
+        "reference_no": payment_intent["id"],
+        "reference_date": frappe.utils.today(),
+        "references": [{
+            "reference_doctype": "Sales Invoice",
+            "reference_name": si.name,
+            "allocated_amount": amount
+        }]
+    })
+    pe.insert(ignore_permissions=True)
+    pe.submit()
+
+    frappe.db.commit()
+    frappe.logger().info(
+        f"Stripe payment {payment_intent['id']} -> Payment Entry {pe.name}"
+    )
+
+
+def handle_payment_failed(payment_intent):
+    """Log failed Stripe payments."""
+    frappe.get_doc({
+        "doctype": "Integration Request",
+        "integration_type": "Remote",
+        "integration_request_service": "Stripe",
+        "status": "Failed",
+        "data": json.dumps(payment_intent),
+        "error": payment_intent.get("last_payment_error", {}).get("message", "Unknown error")
+    }).insert(ignore_permissions=True)
+    frappe.db.commit()
+
+
+def handle_charge_refunded(charge):
+    """Handle Stripe refunds — create a reverse Payment Entry."""
+    frappe.logger().info(f"Stripe refund received for charge {charge['id']}")
+    # Implement refund logic based on your business requirements
+```
+
+## Custom Payment Gateway Integration
+
+When you need to integrate a gateway not natively supported (e.g., a regional
+UPI provider or a local bank gateway), you build a custom gateway controller.
+
+### The Gateway Controller Pattern
+
+Every custom gateway needs:
+
+1. **A Settings DocType** — stores API credentials.
+2. **A controller class** — implements `validate_transaction_currency()` and `get_payment_url()`.
+3. **A callback endpoint** — receives payment confirmation and calls `on_payment_authorized`.
+
+### Example 3: Custom UPI Payment Integration for POS
+
+The Settings DocType doubles as the controller: `get_payment_url()` calls the
+provider to mint a payment link, and `on_payment_authorized()` is the hook the
+callback fires to advance the reference document:
+
+```python title="scoopjoy/scoopjoy/doctype/upi_gateway_settings/upi_gateway_settings.py"
+import frappe
+from frappe.model.document import Document
+from frappe.utils import get_url
+import requests
+import json
+
+class UPIGatewaySettings(Document):
+    """Settings DocType for a custom UPI payment gateway."""
+
+    supported_currencies = ["INR"]
+
+    def validate_transaction_currency(self, currency):
+        if currency not in self.supported_currencies:
+            frappe.throw(
+                f"UPI Gateway does not support {currency}. "
+                f"Supported: {', '.join(self.supported_currencies)}"
+            )
+
+    def get_payment_url(self, **kwargs):
+        """Generate a UPI payment link for the customer."""
+        amount = kwargs.get("amount")
+        reference_doctype = kwargs.get("reference_doctype")
+        reference_docname = kwargs.get("reference_docname")
+        description = kwargs.get("description", "Payment")
+
+        # Call the UPI provider API to create a payment link
+        response = requests.post(
+            f"{self.api_url}/v1/payment-links",
+            headers={
+                "Authorization": f"Bearer {self.get_password('api_secret')}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "amount": int(amount * 100),  # Convert to paise
+                "currency": "INR",
+                "description": description,
+                "callback_url": get_url(
+                    "/api/method/scoopjoy.api.upi_callback.handle_callback"
+                ),
+                "metadata": {
+                    "reference_doctype": reference_doctype,
+                    "reference_docname": reference_docname
+                }
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        return data.get("payment_link_url")
+
+    def on_payment_authorized(self, status, reference_docname=None):
+        """Called when payment is confirmed — typically from the webhook."""
+        if status == "Completed" and reference_docname:
+            ref_doc = frappe.get_doc(
+                self.reference_doctype, reference_docname
+            )
+            ref_doc.run_method("on_payment_authorized", status)
+```
+
+The Settings DocType JSON definition (simplified). It's a Single (`is_single: 1`)
+because there's only one set of gateway credentials, with credentials stored as
+`Password` fields so they're encrypted at rest:
+
+```json title="scoopjoy/scoopjoy/doctype/upi_gateway_settings/upi_gateway_settings.json"
+{
+    "doctype": "DocType",
+    "name": "UPI Gateway Settings",
+    "module": "ScoopJoy",
+    "is_single": 1,
+    "fields": [
+        {
+            "fieldname": "api_url",
+            "fieldtype": "Data",
+            "label": "API URL",
+            "reqd": 1
+        },
+        {
+            "fieldname": "api_key",
+            "fieldtype": "Data",
+            "label": "API Key",
+            "reqd": 1
+        },
+        {
+            "fieldname": "api_secret",
+            "fieldtype": "Password",
+            "label": "API Secret",
+            "reqd": 1
+        },
+        {
+            "fieldname": "webhook_secret",
+            "fieldtype": "Password",
+            "label": "Webhook Secret"
+        }
+    ]
+}
+```
+
+Register the gateway on install so ERPNext recognizes it:
+
+```python title="scoopjoy/scoopjoy/install.py"
+import frappe
+
+def after_install():
+    """Register the UPI Gateway with the Payments app."""
+    if not frappe.db.exists("Payment Gateway", "UPI Gateway"):
+        frappe.get_doc({
+            "doctype": "Payment Gateway",
+            "gateway": "UPI Gateway",
+            "gateway_settings": "UPI Gateway Settings",
+            "gateway_controller": "UPI Gateway Settings"
+        }).insert(ignore_permissions=True)
+
+    frappe.db.commit()
+```
+
+The callback endpoint verifies the signature, logs an Integration Request, then
+calls `run_method("on_payment_authorized", ...)` on the reference document
+rather than poking accounting directly:
+
+```python title="scoopjoy/scoopjoy/api/upi_callback.py"
+import frappe
+import hmac
+import hashlib
+import json
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def handle_callback():
+    """Handle UPI payment callback."""
+    payload = frappe.request.data
+    signature = frappe.get_request_header("X-UPI-Signature")
+
+    settings = frappe.get_single("UPI Gateway Settings")
+    secret = settings.get_password("webhook_secret")
+
+    expected = hmac.new(
+        secret.encode("utf-8"), payload, hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature or "", expected):
+        frappe.throw("Invalid callback signature", frappe.AuthenticationError)
+
+    data = json.loads(payload)
+
+    if data.get("status") == "success":
+        reference_doctype = data["metadata"]["reference_doctype"]
+        reference_docname = data["metadata"]["reference_docname"]
+
+        # Update Integration Request
+        frappe.get_doc({
+            "doctype": "Integration Request",
+            "integration_type": "Remote",
+            "integration_request_service": "UPI Gateway",
+            "status": "Completed",
+            "data": json.dumps(data),
+            "reference_doctype": reference_doctype,
+            "reference_docname": reference_docname
+        }).insert(ignore_permissions=True)
+
+        # Trigger the payment authorized hook on the reference document
+        ref_doc = frappe.get_doc(reference_doctype, reference_docname)
+        ref_doc.run_method("on_payment_authorized", "Completed")
+
+        frappe.db.commit()
+
+    return {"status": "ok"}
+```
+
+## POS Payment Modes
+
+ERPNext POS supports multiple payment modes. Each POS Payment Method maps to a
+Mode of Payment, which in turn maps to an account in your Chart of Accounts —
+exactly how a ScoopJoy outlet splits its takings across Cash, Card, and UPI.
+
+```python title="scoopjoy/scoopjoy/setup/pos.py"
+import frappe
+
+def setup_pos_payment_modes(company="ScoopJoy Foods Pvt Ltd"):
+    """Set up POS payment modes: Cash, Card, and UPI."""
+    modes = [
+        {
+            "mode_of_payment": "Cash",
+            "account": "Cash - FIC",
+            "default": 1
+        },
+        {
+            "mode_of_payment": "Credit Card",
+            "account": "Card Payments - FIC",
+            "default": 0
+        },
+        {
+            "mode_of_payment": "UPI",
+            "account": "UPI Collections - FIC",
+            "default": 0
+        }
+    ]
+
+    # Ensure Mode of Payment records exist
+    for mode in modes:
+        if not frappe.db.exists("Mode of Payment", mode["mode_of_payment"]):
+            frappe.get_doc({
+                "doctype": "Mode of Payment",
+                "mode_of_payment": mode["mode_of_payment"],
+                "type": "General",
+                "accounts": [{
+                    "company": company,
+                    "default_account": mode["account"]
+                }]
+            }).insert(ignore_permissions=True)
+
+    frappe.db.commit()
+    return modes
+```
+
+### Example 4: Programmatic Payment Entry After External Payment Confirmation
+
+When an external system (mobile app, kiosk, third-party POS) confirms payment,
+create a Payment Entry programmatically. The helper looks up the right account
+from the Mode of Payment for the invoice's company, then books the receipt:
+
+```python title="scoopjoy/scoopjoy/api/payments.py" {25-31}
+import frappe
+from frappe.utils import nowdate
+
+@frappe.whitelist()
+def create_payment_entry_from_external(
+    invoice_name,
+    amount,
+    mode_of_payment="Cash",
+    reference_no=None,
+    reference_date=None
+):
+    """
+    Create a Payment Entry after an external system confirms payment.
+
+    Args:
+        invoice_name: Sales Invoice name (e.g., ACC-SINV-2026-00042)
+        amount: Payment amount
+        mode_of_payment: Cash, Credit Card, UPI, etc.
+        reference_no: External transaction reference
+        reference_date: Transaction date from external system
+    """
+    si = frappe.get_doc("Sales Invoice", invoice_name)
+    amount = float(amount)
+
+    # Get the payment account from Mode of Payment
+    mop = frappe.get_doc("Mode of Payment", mode_of_payment)
+    payment_account = None
+    for account in mop.accounts:
+        if account.company == si.company:
+            payment_account = account.default_account
+            break
+
+    if not payment_account:
+        frappe.throw(
+            f"No account configured for {mode_of_payment} in {si.company}"
+        )
+
+    pe = frappe.get_doc({
+        "doctype": "Payment Entry",
+        "payment_type": "Receive",
+        "posting_date": reference_date or nowdate(),
+        "company": si.company,
+        "mode_of_payment": mode_of_payment,
+        "party_type": "Customer",
+        "party": si.customer,
+        "paid_amount": amount,
+        "received_amount": amount,
+        "paid_to": payment_account,
+        "paid_from": frappe.get_cached_value(
+            "Company", si.company, "default_receivable_account"
+        ),
+        "reference_no": reference_no or si.name,
+        "reference_date": reference_date or nowdate(),
+        "references": [{
+            "reference_doctype": "Sales Invoice",
+            "reference_name": si.name,
+            "allocated_amount": amount
+        }],
+        "remarks": f"External payment via {mode_of_payment}"
+    })
+    pe.insert(ignore_permissions=True)
+    pe.submit()
+
+    frappe.db.commit()
+    return {
+        "payment_entry": pe.name,
+        "status": "submitted",
+        "amount": amount
+    }
+```
+
+Call it from your Node.js backend after a kiosk confirms a UPI payment — the
+whitelisted method's return value comes back under `response.data.message`:
+
+```javascript title="kiosk/erpnext-payments.js"
+const axios = require("axios");
+
+async function createPaymentEntry(invoiceName, paymentDetails) {
+  const response = await axios.post(
+    "https://icecream.example.com/api/method/scoopjoy.api.payments.create_payment_entry_from_external",
+    {
+      invoice_name: invoiceName,
+      amount: paymentDetails.amount,
+      mode_of_payment: paymentDetails.mode, // "UPI", "Credit Card", etc.
+      reference_no: paymentDetails.transactionId,
+      reference_date: paymentDetails.date,
+    },
+    {
+      headers: {
+        Authorization: "token api_key:api_secret",
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  console.log("Payment Entry created:", response.data.message.payment_entry);
+  return response.data.message;
+}
+
+// Example usage after a kiosk UPI payment
+createPaymentEntry("ACC-SINV-2026-00042", {
+  amount: 350.0,
+  mode: "UPI",
+  transactionId: "UPI-TXN-20260320-7891",
+  date: "2026-03-20",
+});
+```
+
+:::tip[Pro tip]
+Always call `on_payment_authorized` on your reference DocType (like Sales
+Invoice) rather than creating Payment Entries directly in webhook handlers. This
+keeps the payment flow consistent whether the payment comes from the portal, a
+webhook, or a manual entry. The Payments app orchestrates this through the
+`Integration Request` lifecycle.
+:::

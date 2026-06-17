@@ -1,0 +1,874 @@
+---
+title: Accounting & Finance
+description: Double-entry bookkeeping in ERPNext — chart of accounts, GST, invoices, payments, and multi-company consolidation for the ScoopJoy franchise.
+sidebar:
+  order: 10
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps } from "@astrojs/starlight/components";
+
+Accounting in ERPNext is built on real double-entry bookkeeping. Every
+transaction — whether a Sales Invoice, Payment Entry, or Stock Entry — produces
+General Ledger entries that keep your books balanced automatically. In this
+chapter we set up a full Chart of Accounts for an Indian franchise ice cream
+business, configure GST, create invoices and payments programmatically, and
+explore multi-company consolidated reporting.
+
+If you're coming from a Node.js stack, think of the GL as an append-only ledger
+the framework writes for you: you never hand-craft balancing rows the way you'd
+build double-entry logic by hand in an Express service. You post a business
+document; ERPNext derives the balanced GL entries.
+
+## Chart of Accounts: structure & root types
+
+ERPNext organises accounts in a **tree hierarchy**. Every account belongs to one
+of five root types:
+
+| Root Type | Purpose | Examples |
+|-----------|---------|----------|
+| **Asset** | What the business owns | Bank, Cash, Inventory, Equipment |
+| **Liability** | What the business owes | Creditors, GST Payable, Loans |
+| **Equity** | Owner's stake | Capital, Retained Earnings |
+| **Income** | Revenue streams | Sales, Service Income, Interest |
+| **Expense** | Costs incurred | COGS, Rent, Salaries, Marketing |
+
+Within the tree, nodes are either **Groups** (containers) or **Ledgers** (leaf
+accounts where transactions post). You can only post transactions to Ledger
+accounts.
+
+Each account also carries an `account_type` that tells ERPNext how to treat it:
+
+| Account Type | Used For |
+|---|---|
+| `Receivable` | Customer outstanding (Debtors) |
+| `Payable` | Supplier outstanding (Creditors) |
+| `Bank` | Bank accounts for reconciliation |
+| `Cash` | Cash-in-hand accounts |
+| `Stock` | Inventory valuation accounts |
+| `Cost of Goods Sold` | COGS posting from stock transactions |
+| `Tax` | GST, TDS, and other tax ledgers |
+| `Depreciation` | Fixed asset depreciation |
+
+## Setting up the Chart of Accounts for ScoopJoy
+
+When you create a Company in ERPNext with country set to India, the system
+bootstraps a standard Indian COA from a JSON template stored at
+`erpnext/accounts/doctype/account/chart_of_accounts/verified/in_standard.json`.
+You then customise it.
+
+Here is the target structure for **ScoopJoy Ice Creams Pvt Ltd**:
+
+```text
+Application of Funds (Assets) [Asset]
+  Current Assets
+    Accounts Receivable
+      Debtors - SJ
+    Bank Accounts
+      HDFC Current Account - SJ
+      Razorpay Settlement Account - SJ
+    Cash In Hand
+      Cash - SJ
+      POS Cash - SJ
+    Stock Assets
+      Stock In Hand - SJ
+    Loans and Advances
+      TDS Receivable - SJ
+  Fixed Assets
+    Furniture and Fixtures - SJ
+    Kitchen Equipment - SJ
+    Refrigeration Equipment - SJ
+    Accumulated Depreciation - SJ
+
+Source of Funds (Liabilities) [Liability]
+  Current Liabilities
+    Accounts Payable
+      Creditors - SJ
+    Duties and Taxes
+      Output Tax CGST - SJ
+      Output Tax SGST - SJ
+      Output Tax IGST - SJ
+      Input Tax CGST - SJ
+      Input Tax SGST - SJ
+      Input Tax IGST - SJ
+      TDS Payable - SJ
+    Provisions
+      Provision for Expenses - SJ
+
+Equity [Equity]
+  Capital Account
+    Share Capital - SJ
+  Retained Earnings - SJ
+
+Income [Income]
+  Direct Income
+    Sales - SJ
+    Franchise Royalty Income - SJ
+  Indirect Income
+    Interest Income - SJ
+
+Expenses [Expense]
+  Direct Expenses
+    Cost of Goods Sold - SJ
+    Stock Adjustment - SJ
+  Indirect Expenses
+    Rent - SJ
+    Salaries - SJ
+    Electricity - SJ
+    Marketing - SJ
+    Delivery Charges - SJ
+    Depreciation - SJ
+    Miscellaneous Expenses - SJ
+```
+
+### Creating an account programmatically
+
+Accounts are just DocTypes, so you create them with the ORM like any other
+record:
+
+```python title="Create a ledger account under Indirect Expenses"
+import frappe
+
+account = frappe.get_doc({
+    "doctype": "Account",
+    "account_name": "Packaging Expenses",
+    "parent_account": "Indirect Expenses - SJ",
+    "root_type": "Expense",
+    "account_type": "",
+    "is_group": 0,
+    "company": "ScoopJoy Ice Creams Pvt Ltd"
+})
+account.insert()
+frappe.db.commit()
+```
+
+The same thing over the auto-generated REST API:
+
+```bash
+curl -X POST https://erp.scoopjoy.com/api/resource/Account \
+  -H "Authorization: token api_key:api_secret" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "account_name": "Packaging Expenses",
+    "parent_account": "Indirect Expenses - SJ",
+    "root_type": "Expense",
+    "is_group": 0,
+    "company": "ScoopJoy Ice Creams Pvt Ltd"
+  }'
+```
+
+:::tip[Pro tip]
+Use the built-in **Chart of Accounts Importer** (Accounts > Chart of Accounts
+Importer) to bulk-upload a customised COA from a spreadsheet — handy when
+migrating from Tally or another system.
+:::
+
+## Company setup
+
+Before any accounting works, you need a Company and a Fiscal Year.
+
+```python title="Create the company"
+company = frappe.get_doc({
+    "doctype": "Company",
+    "company_name": "ScoopJoy Ice Creams Pvt Ltd",
+    "abbr": "SJ",
+    "country": "India",
+    "default_currency": "INR",
+    "chart_of_accounts": "Standard",
+    "enable_perpetual_inventory": 1,       # Stock posts to GL automatically
+    "default_receivable_account": "Debtors - SJ",
+    "default_payable_account": "Creditors - SJ",
+    "default_income_account": "Sales - SJ",
+    "default_expense_account": "Cost of Goods Sold - SJ",
+    "default_cash_account": "Cash - SJ",
+    "cost_center": "Main - SJ"
+})
+company.insert()
+```
+
+```python title="Create the fiscal year"
+fy = frappe.get_doc({
+    "doctype": "Fiscal Year",
+    "year": "2025-2026",
+    "year_start_date": "2025-04-01",
+    "year_end_date": "2026-03-31",
+    "companies": [
+        {"company": "ScoopJoy Ice Creams Pvt Ltd"}
+    ]
+})
+fy.insert()
+```
+
+India's fiscal year runs April to March. ERPNext enforces this across all
+accounting reports.
+
+## Journal Entry: manual double-entry bookkeeping
+
+A Journal Entry is used when no specialised document (Sales Invoice, Payment
+Entry) fits. Common uses: adjustments, write-offs, provisions, opening balances.
+
+Say the founders invest INR 50,00,000 into the business. We debit the bank and
+credit share capital:
+
+```python title="Record initial capital investment"
+je = frappe.get_doc({
+    "doctype": "Journal Entry",
+    "posting_date": "2025-04-01",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "accounts": [
+        {
+            "account": "HDFC Current Account - SJ",
+            "debit_in_account_currency": 5000000,
+            "credit_in_account_currency": 0
+        },
+        {
+            "account": "Share Capital - SJ",
+            "debit_in_account_currency": 0,
+            "credit_in_account_currency": 5000000
+        }
+    ],
+    "user_remark": "Initial capital investment by founders"
+})
+je.insert()
+je.submit()
+```
+
+The GL entries produced:
+
+| Account | Debit (INR) | Credit (INR) |
+|---|---|---|
+| HDFC Current Account - SJ | 50,00,000 | |
+| Share Capital - SJ | | 50,00,000 |
+
+:::caution[Journal Entries skip validations]
+Journal Entries bypass many validations that specialised documents enforce
+(like tax calculations and stock updates). Use them only when no better document
+type exists.
+:::
+
+## Sales Invoice and Payment Entry flow
+
+This is the most common accounting flow for retail ice cream sales. The document
+posts revenue, tax, and (because Perpetual Inventory is on) the COGS side too —
+then a Payment Entry settles the receivable.
+
+<Mermaid title="Sales Invoice → Payment posting flow" height={420} code={`
+flowchart LR
+  SI["Sales Invoice<br/>(submit)"] --> GL["GL Entries"]
+  GL --> D["Dr Debtors"]
+  GL --> S["Cr Sales"]
+  GL --> T["Cr Output GST"]
+  GL --> C["Dr COGS · Cr Stock In Hand"]
+  SI --> PE["Payment Entry<br/>(settle receivable)"]
+  PE --> PG["GL Entries"]
+  PG --> B["Dr Bank / Cash"]
+  PG --> DC["Cr Debtors"]
+`} />
+
+<Steps>
+
+1. **Create a Sales Invoice.** Via the UI: Accounts > Sales Invoice > New.
+   Programmatically (a POS sale):
+
+   ```python title="POS Sales Invoice"
+   si = frappe.get_doc({
+       "doctype": "Sales Invoice",
+       "customer": "Walk-in Customer",
+       "posting_date": "2025-07-15",
+       "posting_time": "14:30:00",
+       "company": "ScoopJoy Ice Creams Pvt Ltd",
+       "currency": "INR",
+       "selling_price_list": "Standard Selling",
+       "debit_to": "Debtors - SJ",
+       "is_pos": 1,
+       "pos_profile": "ScoopJoy Outlet 1 POS",
+       "cost_center": "Outlet 1 - SJ",
+       "taxes_and_charges": "In-State GST - SJ",
+       "items": [
+           {
+               "item_code": "SCOOP-VAN-REG",
+               "item_name": "Vanilla Ice Cream - Regular",
+               "qty": 2,
+               "rate": 120,
+               "warehouse": "Outlet 1 - SJ",
+               "cost_center": "Outlet 1 - SJ"
+           },
+           {
+               "item_code": "SCOOP-CHOC-LRG",
+               "item_name": "Chocolate Ice Cream - Large",
+               "qty": 1,
+               "rate": 180,
+               "warehouse": "Outlet 1 - SJ",
+               "cost_center": "Outlet 1 - SJ"
+           }
+       ],
+       "payments": [
+           {
+               "mode_of_payment": "Cash",
+               "amount": 495.60   # after GST
+           }
+       ]
+   })
+   si.insert()
+   si.submit()
+   frappe.db.commit()
+
+   print(f"Invoice: {si.name}, Grand Total: {si.grand_total}")
+   ```
+
+   The submitted Sales Invoice generates these GL entries:
+
+   | Account | Debit (INR) | Credit (INR) |
+   |---|---|---|
+   | Debtors - SJ | 495.60 | |
+   | Sales - SJ | | 420.00 |
+   | Output Tax CGST - SJ | | 37.80 |
+   | Output Tax SGST - SJ | | 37.80 |
+   | Cost of Goods Sold - SJ | 210.00 | |
+   | Stock In Hand - SJ | | 210.00 |
+
+   (The COGS entries appear because Perpetual Inventory is enabled.)
+
+2. **Create a Payment Entry** for non-POS invoices where payment comes later:
+
+   ```python title="Payment Entry from a Sales Invoice"
+   from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+
+   pe = get_payment_entry("Sales Invoice", si.name)
+   pe.mode_of_payment = "Bank Transfer"
+   pe.paid_to = "HDFC Current Account - SJ"
+   pe.reference_no = "UTR-20250715-001"
+   pe.reference_date = "2025-07-15"
+   pe.insert()
+   pe.submit()
+   ```
+
+</Steps>
+
+:::tip[Pro tip]
+`get_payment_entry` is the recommended way to create Payment Entries — it
+pre-fills amounts, accounts, and references from the source document
+automatically.
+:::
+
+## Purchase Invoice and Payment Entry flow
+
+The buying side mirrors selling. A Purchase Invoice for raw materials credits
+the supplier (Creditors) and a Payment Entry settles it.
+
+```python title="Purchase Invoice for raw materials"
+pi = frappe.get_doc({
+    "doctype": "Purchase Invoice",
+    "supplier": "Fresh Dairy Suppliers",
+    "posting_date": "2025-07-10",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "credit_to": "Creditors - SJ",
+    "taxes_and_charges": "In-State GST Purchase - SJ",
+    "items": [
+        {
+            "item_code": "RM-MILK-FULL",
+            "item_name": "Full Cream Milk",
+            "qty": 500,
+            "rate": 55,
+            "uom": "Litre",
+            "warehouse": "Central Kitchen - SJ",
+            "expense_account": "Cost of Goods Sold - SJ"
+        },
+        {
+            "item_code": "RM-SUGAR",
+            "item_name": "Sugar",
+            "qty": 50,
+            "rate": 42,
+            "uom": "Kg",
+            "warehouse": "Central Kitchen - SJ",
+            "expense_account": "Cost of Goods Sold - SJ"
+        }
+    ]
+})
+pi.insert()
+pi.submit()
+```
+
+```python title="Pay the supplier"
+from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+
+pe = get_payment_entry("Purchase Invoice", pi.name)
+pe.mode_of_payment = "Bank Transfer"
+pe.paid_from = "HDFC Current Account - SJ"
+pe.reference_no = "NEFT-20250712-042"
+pe.reference_date = "2025-07-12"
+pe.insert()
+pe.submit()
+```
+
+## Multi-company accounting
+
+For a franchise model, set up a parent company with child companies for each
+outlet:
+
+```text
+ScoopJoy Ice Creams Pvt Ltd  (Parent)
+  ├── ScoopJoy Outlet 1 - Indiranagar
+  ├── ScoopJoy Outlet 2 - Koramangala
+  └── ScoopJoy Outlet 3 - MG Road
+```
+
+```python title="Create a child company"
+outlet = frappe.get_doc({
+    "doctype": "Company",
+    "company_name": "ScoopJoy Outlet 1 - Indiranagar",
+    "abbr": "SJ1",
+    "country": "India",
+    "default_currency": "INR",
+    "parent_company": "ScoopJoy Ice Creams Pvt Ltd",
+    "chart_of_accounts": "Standard",
+    "enable_perpetual_inventory": 1
+})
+outlet.insert()
+```
+
+Each child company gets its own Chart of Accounts, Cost Centers, and independent
+books while rolling up into consolidated reports.
+
+## Inter-company transactions
+
+Inter-company transactions automatically mirror a posting from one company into
+its counterpart. To set them up:
+
+1. Mark accounts as **Inter Company Account** in the Chart of Accounts of both
+   companies.
+2. Create internal customers/suppliers linking the two companies.
+
+Suppose Outlet 1 pays a 5% royalty to the parent company on monthly sales of
+INR 8,00,000 — that's INR 40,000:
+
+```python title="Inter-company royalty Journal Entry (Outlet 1)"
+je = frappe.get_doc({
+    "doctype": "Journal Entry",
+    "voucher_type": "Inter Company Journal Entry",
+    "posting_date": "2025-07-31",
+    "company": "ScoopJoy Outlet 1 - Indiranagar",
+    "accounts": [
+        {
+            "account": "Franchise Royalty Expense - SJ1",
+            "debit_in_account_currency": 40000,
+            "cost_center": "Outlet 1 - SJ1"
+        },
+        {
+            "account": "Inter Company Payable - SJ1",
+            "party_type": "Supplier",
+            "party": "ScoopJoy Ice Creams Pvt Ltd (Internal)",
+            "credit_in_account_currency": 40000
+        }
+    ],
+    "inter_company_journal_entry_reference": ""
+})
+je.insert()
+je.submit()
+```
+
+When submitted, ERPNext automatically creates a mirror entry in the parent
+company:
+
+| Parent Company GL | Debit | Credit |
+|---|---|---|
+| Inter Company Receivable - SJ | 40,000 | |
+| Franchise Royalty Income - SJ | | 40,000 |
+
+:::tip[Pro tip]
+Enable **Auto Create Inter Company Journal Entry** in Accounts Settings to have
+mirror entries created automatically on submission.
+:::
+
+## Bank reconciliation
+
+ERPNext provides Bank Reconciliation under **Accounts > Bank Reconciliation**.
+The workflow:
+
+<Steps>
+
+1. Import a bank statement (CSV/OFX) or connect via Plaid integration.
+2. ERPNext creates **Bank Transaction** records for each statement line.
+3. Match each Bank Transaction against Payment Entries, Journal Entries, or
+   Expense Claims.
+4. Reconcile matched entries.
+
+</Steps>
+
+In v16, accounting reports are faster thanks to Frappe Caffeine caching, and
+better periodic inventory automation reduces month-end reconciliation work. The
+community **Mint** app (open-source) adds fuzzy matching, bulk reconciliation,
+and undo history on top of ERPNext's built-in flow.
+
+```python title="Reconcile a bank transaction programmatically"
+bt = frappe.get_doc("Bank Transaction", "BT-2025-00142")
+bt.append("payment_entries", {
+    "payment_document": "Payment Entry",
+    "payment_entry": "PE-2025-00089",
+    "allocated_amount": 15000
+})
+bt.save()
+```
+
+## Tax configuration: GST for India
+
+India compliance in ERPNext is handled via the **India Compliance** app
+(`india_compliance`), which auto-configures GST accounts, HSN codes, and tax
+templates.
+
+ERPNext creates separate accounts for sales (output) and purchase (input) GST:
+
+| Account | Type | Used In |
+|---|---|---|
+| Output Tax CGST | Tax | Sales Invoices (intra-state) |
+| Output Tax SGST | Tax | Sales Invoices (intra-state) |
+| Output Tax IGST | Tax | Sales Invoices (inter-state) |
+| Input Tax CGST | Tax | Purchase Invoices (intra-state) |
+| Input Tax SGST | Tax | Purchase Invoices (intra-state) |
+| Input Tax IGST | Tax | Purchase Invoices (inter-state) |
+
+### Tax templates
+
+You need two Sales Tax Templates and two Purchase Tax Templates. Intra-state
+sales split GST into CGST + SGST:
+
+```python title="In-state sales template (CGST + SGST)"
+tax_template = frappe.get_doc({
+    "doctype": "Sales Taxes and Charges Template",
+    "title": "In-State GST - SJ",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "tax_category": "In-State",
+    "taxes": [
+        {
+            "charge_type": "On Net Total",
+            "account_head": "Output Tax CGST - SJ",
+            "description": "CGST @ 9%",
+            "rate": 9
+        },
+        {
+            "charge_type": "On Net Total",
+            "account_head": "Output Tax SGST - SJ",
+            "description": "SGST @ 9%",
+            "rate": 9
+        }
+    ]
+})
+tax_template.insert()
+```
+
+Inter-state sales use a single IGST line:
+
+```python title="Out-of-state sales template (IGST)"
+tax_template_igst = frappe.get_doc({
+    "doctype": "Sales Taxes and Charges Template",
+    "title": "Out-of-State GST - SJ",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "tax_category": "Out-State",
+    "taxes": [
+        {
+            "charge_type": "On Net Total",
+            "account_head": "Output Tax IGST - SJ",
+            "description": "IGST @ 18%",
+            "rate": 18
+        }
+    ]
+})
+tax_template_igst.insert()
+```
+
+### GST-compliant invoice example
+
+Attach the template and the per-item HSN code; ERPNext computes the tax:
+
+```python title="GST-compliant Sales Invoice"
+si = frappe.get_doc({
+    "doctype": "Sales Invoice",
+    "customer": "Café Bliss",
+    "posting_date": "2025-07-15",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "currency": "INR",
+    "debit_to": "Debtors - SJ",
+    # Tax category auto-detects from addresses
+    "taxes_and_charges": "In-State GST - SJ",
+    "items": [
+        {
+            "item_code": "SCOOP-MIX-5L",
+            "item_name": "Vanilla Ice Cream Mix - 5L Tub",
+            "qty": 20,
+            "rate": 450,
+            "warehouse": "Central Kitchen - SJ",
+            "gst_hsn_code": "21050000",    # HSN code for ice cream
+            "cost_center": "Main - SJ"
+        }
+    ]
+})
+si.insert()
+si.submit()
+# Grand Total: 9000 + 810 (CGST) + 810 (SGST) = 10620
+```
+
+### TDS (Tax Deducted at Source)
+
+ERPNext v16 has a refactored TDS module with simplified workflows. Tag a
+supplier with a withholding category:
+
+```python title="Enable TDS on a supplier"
+supplier = frappe.get_doc("Supplier", "Marketing Agency XYZ")
+supplier.tax_withholding_category = "TDS - 194C - Contractors"
+supplier.save()
+```
+
+When you create a Purchase Invoice for this supplier, ERPNext automatically
+calculates the TDS amount based on the withholding category's thresholds and
+rates.
+
+### Item tax templates
+
+For items with non-standard GST rates (e.g., 5% on basic food items vs. 18% on
+premium products):
+
+```python title="5% GST Item Tax Template"
+item_tax = frappe.get_doc({
+    "doctype": "Item Tax Template",
+    "title": "GST 5% - SJ",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "taxes": [
+        {
+            "tax_type": "Output Tax CGST - SJ",
+            "tax_rate": 2.5
+        },
+        {
+            "tax_type": "Output Tax SGST - SJ",
+            "tax_rate": 2.5
+        },
+        {
+            "tax_type": "Output Tax IGST - SJ",
+            "tax_rate": 5
+        }
+    ]
+})
+item_tax.insert()
+```
+
+Assign this template to items in the Item master under the Taxes tab.
+
+:::tip[Pro tip]
+The India Compliance app handles GST determination automatically based on
+company and customer addresses. Set the `GST State` and `GSTIN` fields on all
+Address records for automatic in-state vs. out-of-state detection.
+:::
+
+## Cost Centers: per-outlet profitability
+
+Cost Centers let you track profitability by outlet, department, or project —
+independent of the Chart of Accounts hierarchy.
+
+```text
+ScoopJoy Ice Creams Pvt Ltd (root)
+  ├── Main - SJ                    (Head Office)
+  ├── Central Kitchen - SJ         (Production)
+  ├── Outlet 1 - SJ                (Indiranagar)
+  ├── Outlet 2 - SJ                (Koramangala)
+  ├── Outlet 3 - SJ                (MG Road)
+  └── Online Orders - SJ          (Swiggy/Zomato)
+```
+
+```python title="Create a Cost Center"
+cc = frappe.get_doc({
+    "doctype": "Cost Center",
+    "cost_center_name": "Outlet 1",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "parent_cost_center": "ScoopJoy Ice Creams Pvt Ltd - SJ",
+    "is_group": 0
+})
+cc.insert()
+```
+
+Every transaction (invoice, journal entry, expense claim) can tag a cost center.
+Then use **Accounts > Profitability Analysis** to see P&L per cost center.
+
+```python title="Fetch P&L for one cost center via the report API"
+from frappe.utils import getdate
+
+result = frappe.call(
+    "erpnext.accounts.report.profit_and_loss_statement.profit_and_loss_statement.execute",
+    filters={
+        "company": "ScoopJoy Ice Creams Pvt Ltd",
+        "filter_based_on": "Fiscal Year",
+        "fiscal_year": "2025-2026",
+        "cost_center": "Outlet 1 - SJ",
+        "periodicity": "Monthly"
+    }
+)
+columns, data = result
+```
+
+## Budget management
+
+Budgets control spending per cost center and account.
+
+```python title="Set up an annual budget"
+budget = frappe.get_doc({
+    "doctype": "Budget",
+    "budget_against": "Cost Center",
+    "cost_center": "Outlet 1 - SJ",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "fiscal_year": "2025-2026",
+    "action_if_annual_budget_exceeded": "Stop",
+    "action_if_accumulated_monthly_budget_exceeded": "Warn",
+    "accounts": [
+        {
+            "account": "Marketing - SJ",
+            "budget_amount": 120000    # 1.2 lakh per year
+        },
+        {
+            "account": "Rent - SJ",
+            "budget_amount": 600000    # 6 lakh per year
+        },
+        {
+            "account": "Electricity - SJ",
+            "budget_amount": 180000
+        }
+    ]
+})
+budget.insert()
+budget.submit()
+```
+
+When anyone tries to post an expense to Marketing - SJ for Outlet 1 that would
+exceed the budget, ERPNext will **block the transaction** (Stop) or **show a
+warning** (Warn) based on your configuration.
+
+:::note[v16 improvement]
+Budgeting controls are now enforced at transaction time with real-time budget
+consumption tracking. Automated alerts notify stakeholders when expenses
+approach or exceed limits.
+:::
+
+## Financial reports
+
+ERPNext includes all standard financial reports out of the box:
+
+| Report | Path | Purpose |
+|---|---|---|
+| **Profit & Loss** | Accounts > P&L Statement | Revenue minus expenses for a period |
+| **Balance Sheet** | Accounts > Balance Sheet | Assets, liabilities, equity snapshot |
+| **Trial Balance** | Accounts > Trial Balance | Debit/credit balances of all accounts |
+| **Cash Flow** | Accounts > Cash Flow | Cash inflows/outflows by activity |
+| **General Ledger** | Accounts > General Ledger | All GL entries with filters |
+| **Accounts Receivable** | Accounts > Accounts Receivable | Customer-wise outstanding |
+| **Accounts Payable** | Accounts > Accounts Payable | Supplier-wise outstanding |
+| **Budget Variance** | Accounts > Budget Variance | Actual vs. budgeted amounts |
+
+:::note[v16 improvement]
+Customizable Financial Statement Templates let you design tailored layouts for
+P&L, Balance Sheet, and Cash Flow without developer involvement.
+:::
+
+You can also pull GL data directly with the ORM:
+
+```python title="General Ledger for one account"
+gl_entries = frappe.get_all("GL Entry",
+    filters={
+        "company": "ScoopJoy Ice Creams Pvt Ltd",
+        "account": "Sales - SJ",
+        "posting_date": ["between", ["2025-07-01", "2025-07-31"]]
+    },
+    fields=["posting_date", "voucher_type", "voucher_no", "debit", "credit"],
+    order_by="posting_date asc"
+)
+```
+
+## Consolidated financial statements
+
+For multi-company setups, ERPNext generates consolidated reports across the
+parent and all child companies. Navigate to any financial report and select
+**Filter by Company Group** to see the consolidated view. ERPNext handles:
+
+- Currency conversion for child companies in different currencies.
+- Elimination of inter-company transactions.
+- Roll-up of all child company balances.
+
+:::note[v16 improvement]
+The Consolidated Trial Balance provides a unified view across all child
+companies with automated currency conversion.
+:::
+
+```python title="Consolidated Trial Balance"
+result = frappe.call(
+    "erpnext.accounts.report.consolidated_financial_statement.consolidated_financial_statement.execute",
+    filters={
+        "company": "ScoopJoy Ice Creams Pvt Ltd",
+        "filter_based_on": "Fiscal Year",
+        "fiscal_year": "2025-2026",
+        "periodicity": "Yearly"
+    }
+)
+```
+
+## Period Closing Voucher & year-end
+
+At the end of each accounting period (month, quarter, or year), use the
+**Period Closing Voucher** to transfer net profit/loss to a closing account.
+
+```python title="Year-end Period Closing Voucher"
+pcv = frappe.get_doc({
+    "doctype": "Period Closing Voucher",
+    "posting_date": "2026-03-31",
+    "transaction_date": "2026-03-31",
+    "fiscal_year": "2025-2026",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "closing_account_head": "Retained Earnings - SJ",
+    "remarks": "Closing FY 2025-2026"
+})
+pcv.insert()
+pcv.submit()
+```
+
+This zeroes out all Income and Expense accounts and posts the net balance to
+Retained Earnings, preparing the books for the new fiscal year.
+
+The year-end checklist:
+
+<Steps>
+
+1. Reconcile all bank accounts.
+2. Verify stock valuation matches GL (Stock Balance vs. Stock In Hand account).
+3. Process all pending depreciation entries.
+4. Review and clear suspense accounts.
+5. Submit the Period Closing Voucher.
+6. Create the next Fiscal Year.
+7. Verify opening balances carry forward correctly.
+
+</Steps>
+
+## Payment gateway integration
+
+ERPNext supports payment gateways (Razorpay, Stripe, PayPal) for online
+payments. Configuration is covered in detail in
+[Chapter 22](/erpnext/22-payment-gateways/), but the accounting flow is:
+
+<Steps>
+
+1. The customer receives a Payment Request via email/SMS.
+2. The customer pays via the gateway.
+3. ERPNext auto-creates a Payment Entry on successful payment.
+4. The amount posts to your Razorpay Settlement Account.
+5. When the settlement hits your bank, reconcile via Bank Reconciliation.
+
+</Steps>
+
+## Summary of v16 accounting improvements
+
+| Feature | Description |
+|---|---|
+| **Customizable Financial Statements** | Design custom P&L, BS, and CF layouts without code |
+| **Consolidated Trial Balance** | Unified multi-company view with auto currency conversion |
+| **Purchase Expense Booking** | Segregated COGS vs. service expenses, stock accounting by item group |
+| **Enhanced Budgeting** | Real-time enforcement at transaction time, automated alerts |
+| **Refactored TDS** | Simplified Indian TDS compliance workflow |
+| **Refactored Asset Module** | Cleaner depreciation and compliance |
+| **Landed Cost for Stock Entries** | Apply freight/duties to manufacturing and subcontracting entries |
+| **Periodic Inventory Automation** | Automated journal entries for periodic inventory adjustments |
+| **Improved POS** | Faster billing, better offline stability, smoother scanning |
+| **Performance (Frappe Caffeine)** | Up to 2× faster report generation via caching architecture |

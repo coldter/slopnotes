@@ -1,0 +1,493 @@
+---
+title: Document State Machine
+description: Drive a franchise-onboarding DocType through an explicit, validated state machine with transition logging, per-state side effects, and a pipeline report.
+sidebar:
+  order: 2
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a Franchise Onboarding DocType with a non-trivial state
+machine — Application → Document Verification → Site Inspection → Training →
+Soft Launch → Go Live → Active — plus rejection, withdrawal, and re-application
+paths. Each transition must be validated, logged, and able to fire side effects.
+
+**Solution:** Keep the allowed transitions in a plain `TRANSITIONS` adjacency
+dict, reject anything else in `validate`, and decouple per-state side effects into
+their own `_on_enter_*` methods dispatched from `on_update`. A child-table state
+log gives you a full audit trail.
+
+<Mermaid title="Franchise onboarding state machine" height={520} code={`
+stateDiagram-v2
+  [*] --> Application
+  Application --> DocumentVerification: approve
+  Application --> Rejected: reject
+  Application --> Withdrawn: withdraw
+  DocumentVerification --> SiteInspection: approve
+  DocumentVerification --> Application: send back
+  DocumentVerification --> Rejected: reject
+  SiteInspection --> Training: approve
+  SiteInspection --> DocumentVerification: send back
+  SiteInspection --> Rejected: reject
+  Training --> SoftLaunch: approve
+  Training --> SiteInspection: send back
+  Training --> Rejected: reject
+  SoftLaunch --> GoLive: approve
+  SoftLaunch --> Training: send back
+  SoftLaunch --> Rejected: reject
+  GoLive --> Active: approve
+  GoLive --> SoftLaunch: send back
+  GoLive --> Rejected: reject
+  Rejected --> Application: re-apply
+  Withdrawn --> Application: re-apply
+  Active --> [*]
+`} />
+
+## Step 1: DocType definition (JSON)
+
+The onboarding DocType holds applicant details, a read-only `status` Select that
+carries every state, and a collapsible child table for the state history. The
+`status` field is `read_only` so it can only move through code, not by hand-editing
+the form.
+
+```json title="scoopjoy/scoopjoy/doctype/franchise_onboarding/franchise_onboarding.json"
+{
+  "name": "Franchise Onboarding",
+  "module": "ScoopJoy",
+  "custom": 0,
+  "autoname": "SJ-ONB-.YYYY.-.#####",
+  "is_submittable": 0,
+  "track_changes": 1,
+  "fields": [
+    { "fieldname": "applicant_name", "fieldtype": "Data", "label": "Applicant Name", "reqd": 1 },
+    { "fieldname": "email", "fieldtype": "Data", "label": "Email", "options": "Email", "reqd": 1 },
+    { "fieldname": "phone", "fieldtype": "Data", "label": "Phone", "options": "Phone", "reqd": 1 },
+    { "fieldname": "territory", "fieldtype": "Link", "label": "Territory", "options": "Territory", "reqd": 1 },
+    { "fieldname": "proposed_location", "fieldtype": "Small Text", "label": "Proposed Location" },
+    { "fieldname": "investment_capacity", "fieldtype": "Currency", "label": "Investment Capacity" },
+    { "fieldname": "section_status", "fieldtype": "Section Break", "label": "Status" },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "\nApplication\nDocument Verification\nSite Inspection\nTraining\nSoft Launch\nGo Live\nActive\nRejected\nWithdrawn",
+      "default": "Application",
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "rejection_reason",
+      "fieldtype": "Small Text",
+      "label": "Rejection Reason",
+      "depends_on": "eval:doc.status === 'Rejected'"
+    },
+    { "fieldname": "section_state_history", "fieldtype": "Section Break", "label": "State History", "collapsible": 1 },
+    {
+      "fieldname": "state_history",
+      "fieldtype": "Table",
+      "label": "State History",
+      "options": "Franchise Onboarding State Log",
+      "read_only": 1
+    },
+    { "fieldname": "section_assignments", "fieldtype": "Section Break", "label": "Linked Records" },
+    {
+      "fieldname": "linked_franchise",
+      "fieldtype": "Link",
+      "label": "Franchise",
+      "options": "Customer",
+      "read_only": 1
+    }
+  ],
+  "permissions": [
+    { "role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1 },
+    { "role": "Franchise Manager", "read": 1, "write": 1, "create": 1 }
+  ]
+}
+```
+
+## Step 2: State log child table
+
+A tiny child DocType (`istable: 1`) records every transition: from-state,
+to-state, who changed it, when, and an optional comment. All fields are read-only —
+rows are appended by the controller, never typed in.
+
+```json title="scoopjoy/scoopjoy/doctype/franchise_onboarding_state_log/franchise_onboarding_state_log.json"
+{
+  "name": "Franchise Onboarding State Log",
+  "module": "ScoopJoy",
+  "istable": 1,
+  "fields": [
+    { "fieldname": "from_state", "fieldtype": "Data", "label": "From State", "read_only": 1 },
+    { "fieldname": "to_state", "fieldtype": "Data", "label": "To State", "read_only": 1 },
+    { "fieldname": "changed_by", "fieldtype": "Link", "label": "Changed By", "options": "User", "read_only": 1 },
+    { "fieldname": "changed_on", "fieldtype": "Datetime", "label": "Changed On", "read_only": 1 },
+    { "fieldname": "comment", "fieldtype": "Small Text", "label": "Comment", "read_only": 1 }
+  ]
+}
+```
+
+## Step 3: Controller with state machine logic
+
+This is the centerpiece. `TRANSITIONS` is the adjacency list — each state maps to
+the states it is allowed to move to (terminal `Active` maps to an empty list, and
+`Rejected`/`Withdrawn` map back to `Application` for the re-apply path).
+`STATE_ACTIONS` maps a destination state to the method that runs when the document
+enters it.
+
+`validate` rejects any move that isn't in the adjacency list. `on_update` compares
+the saved status against the previous one (via `get_doc_before_save()`), logs the
+change, fires the entry action, and emails the applicant.
+
+```python title="scoopjoy/scoopjoy/doctype/franchise_onboarding/franchise_onboarding.py" {9-19,40-51}
+import frappe
+from frappe.model.document import Document
+from frappe.utils import now_datetime
+
+
+# State machine: maps current_state -> list of valid next states
+TRANSITIONS = {
+    "Application":            ["Document Verification", "Rejected", "Withdrawn"],
+    "Document Verification":  ["Site Inspection", "Rejected", "Application"],
+    "Site Inspection":        ["Training", "Rejected", "Document Verification"],
+    "Training":               ["Soft Launch", "Rejected", "Site Inspection"],
+    "Soft Launch":            ["Go Live", "Rejected", "Training"],
+    "Go Live":                ["Active", "Rejected", "Soft Launch"],
+    "Active":                 [],
+    "Rejected":               ["Application"],  # re-apply path
+    "Withdrawn":              ["Application"],   # re-apply path
+}
+
+# Actions to fire when entering a state
+STATE_ACTIONS = {
+    "Document Verification": "_on_enter_doc_verification",
+    "Site Inspection":       "_on_enter_site_inspection",
+    "Training":              "_on_enter_training",
+    "Soft Launch":           "_on_enter_soft_launch",
+    "Go Live":               "_on_enter_go_live",
+    "Active":                "_on_enter_active",
+    "Rejected":              "_on_enter_rejected",
+}
+
+
+class FranchiseOnboarding(Document):
+    def validate(self):
+        if self.is_new():
+            self.status = "Application"
+            return
+
+        old_doc = self.get_doc_before_save()
+        if not old_doc or old_doc.status == self.status:
+            return
+
+        self._validate_transition(old_doc.status, self.status)
+
+    def on_update(self):
+        old_doc = self.get_doc_before_save()
+        if not old_doc:
+            return
+
+        old_status = old_doc.status
+        new_status = self.status
+
+        if old_status != new_status:
+            self._log_state_change(old_status, new_status)
+            self._fire_state_action(new_status)
+            self._send_status_email(old_status, new_status)
+
+    def _validate_transition(self, from_state, to_state):
+        valid_next = TRANSITIONS.get(from_state, [])
+        if to_state not in valid_next:
+            frappe.throw(
+                f"Invalid transition: <strong>{from_state}</strong> -> "
+                f"<strong>{to_state}</strong>. "
+                f"Allowed: {', '.join(valid_next) or 'None (terminal state)'}",
+                title="Invalid State Transition",
+            )
+
+    def _log_state_change(self, from_state, to_state):
+        self.append("state_history", {
+            "from_state": from_state,
+            "to_state": to_state,
+            "changed_by": frappe.session.user,
+            "changed_on": now_datetime(),
+            "comment": f"Transitioned by {frappe.session.user}",
+        })
+        # Save the child table row without triggering validate again
+        self.flags.ignore_validate = True
+        self.save(ignore_permissions=True)
+
+    def _fire_state_action(self, new_state):
+        method_name = STATE_ACTIONS.get(new_state)
+        if method_name and hasattr(self, method_name):
+            getattr(self, method_name)()
+
+    def _send_status_email(self, old_status, new_status):
+        frappe.sendmail(
+            recipients=[self.email],
+            subject=f"ScoopJoy Franchise Application Update - {self.name}",
+            template="franchise_onboarding_status",
+            args={
+                "applicant_name": self.applicant_name,
+                "old_status": old_status,
+                "new_status": new_status,
+                "doc_name": self.name,
+            },
+        )
+```
+
+Each `_on_enter_*` method holds the side effect for one state — creating ToDos,
+publishing a realtime event, or promoting the applicant to a `Customer` record on
+`Active`. Adding or changing a state's behavior means touching one method, not the
+core flow.
+
+```python title="scoopjoy/scoopjoy/doctype/franchise_onboarding/franchise_onboarding.py"
+    # --- State Entry Actions ---
+
+    def _on_enter_doc_verification(self):
+        """Create a ToDo for the franchise team to verify documents."""
+        frappe.get_doc({
+            "doctype": "ToDo",
+            "allocated_to": self._get_franchise_manager(),
+            "reference_type": "Franchise Onboarding",
+            "reference_name": self.name,
+            "description": f"Verify documents for franchise applicant {self.applicant_name}",
+            "priority": "High",
+        }).insert(ignore_permissions=True)
+
+    def _on_enter_site_inspection(self):
+        """Create a site inspection task."""
+        frappe.get_doc({
+            "doctype": "ToDo",
+            "allocated_to": self._get_franchise_manager(),
+            "reference_type": "Franchise Onboarding",
+            "reference_name": self.name,
+            "description": (
+                f"Schedule and complete site inspection at "
+                f"{self.proposed_location} for {self.applicant_name}"
+            ),
+            "priority": "High",
+        }).insert(ignore_permissions=True)
+
+    def _on_enter_training(self):
+        """Create training checklist tasks."""
+        training_modules = [
+            "Product Knowledge & Ice Cream Handling",
+            "POS System Training",
+            "Brand Standards & Visual Merchandising",
+            "Inventory Management",
+            "Health & Safety Compliance",
+        ]
+        for module in training_modules:
+            frappe.get_doc({
+                "doctype": "ToDo",
+                "allocated_to": self.email,
+                "reference_type": "Franchise Onboarding",
+                "reference_name": self.name,
+                "description": f"Complete training module: {module}",
+                "priority": "Medium",
+            }).insert(ignore_permissions=True)
+
+    def _on_enter_soft_launch(self):
+        """Notify operations team about upcoming soft launch."""
+        frappe.publish_realtime(
+            "franchise_soft_launch",
+            {"franchise": self.name, "location": self.proposed_location},
+            after_commit=True,
+        )
+
+    def _on_enter_go_live(self):
+        """Schedule go-live checklist."""
+        frappe.get_doc({
+            "doctype": "ToDo",
+            "allocated_to": self._get_franchise_manager(),
+            "reference_type": "Franchise Onboarding",
+            "reference_name": self.name,
+            "description": f"Final go-live checklist for {self.applicant_name}",
+            "priority": "Urgent",
+        }).insert(ignore_permissions=True)
+
+    def _on_enter_active(self):
+        """Create Customer record for the franchise and link it."""
+        customer = frappe.get_doc({
+            "doctype": "Customer",
+            "customer_name": f"ScoopJoy - {self.applicant_name}",
+            "customer_type": "Company",
+            "customer_group": "Franchise",
+            "territory": self.territory,
+        }).insert(ignore_permissions=True)
+
+        self.linked_franchise = customer.name
+        self.flags.ignore_validate = True
+        self.save(ignore_permissions=True)
+
+    def _on_enter_rejected(self):
+        """Close all open ToDos for this application."""
+        open_todos = frappe.get_all(
+            "ToDo",
+            filters={
+                "reference_type": "Franchise Onboarding",
+                "reference_name": self.name,
+                "status": "Open",
+            },
+            pluck="name",
+        )
+        for todo_name in open_todos:
+            todo = frappe.get_doc("ToDo", todo_name)
+            todo.status = "Cancelled"
+            todo.save(ignore_permissions=True)
+
+    def _get_franchise_manager(self):
+        """Get the first user with Franchise Manager role."""
+        users = frappe.get_all(
+            "Has Role",
+            filters={"role": "Franchise Manager", "parenttype": "User"},
+            pluck="parent",
+            limit=1,
+        )
+        return users[0] if users else frappe.session.user
+```
+
+## Step 4: API to advance state programmatically
+
+A whitelisted method lets external code or scripts move the document forward. It
+checks `write` permission, sets the new status, optionally logs a custom comment,
+then saves — which runs the same `validate`/`on_update` machinery, so illegal jumps
+are still rejected here.
+
+```python title="scoopjoy/scoopjoy/doctype/franchise_onboarding/franchise_onboarding.py"
+# (add to the same file, below the class)
+
+@frappe.whitelist()
+def advance_state(docname, new_state, comment=None):
+    """API to advance onboarding state.
+
+    Usage:
+        frappe.call('scoopjoy.scoopjoy.doctype.franchise_onboarding.franchise_onboarding.advance_state',
+                     docname='SJ-ONB-2025-00001', new_state='Document Verification')
+    """
+    doc = frappe.get_doc("Franchise Onboarding", docname)
+    old_state = doc.status
+
+    # Validate the caller has permission
+    doc.check_permission("write")
+
+    doc.status = new_state
+    if comment:
+        doc.append("state_history", {
+            "from_state": old_state,
+            "to_state": new_state,
+            "changed_by": frappe.session.user,
+            "changed_on": now_datetime(),
+            "comment": comment,
+        })
+
+    doc.save()
+    frappe.db.commit()
+
+    return {"status": "success", "from": old_state, "to": new_state}
+```
+
+## Step 5: Pipeline dashboard (script report)
+
+A script report counts applications per stage and the average days each has sat
+there, returning a bar chart for the dashboard.
+
+```python title="scoopjoy/scoopjoy/report/franchise_onboarding_pipeline/franchise_onboarding_pipeline.py"
+import frappe
+
+
+def execute(filters=None):
+    columns = [
+        {"fieldname": "status", "label": "Stage", "fieldtype": "Data", "width": 200},
+        {"fieldname": "count", "label": "Count", "fieldtype": "Int", "width": 100},
+        {"fieldname": "avg_days_in_stage", "label": "Avg Days in Stage", "fieldtype": "Float", "width": 150},
+    ]
+
+    pipeline_stages = [
+        "Application",
+        "Document Verification",
+        "Site Inspection",
+        "Training",
+        "Soft Launch",
+        "Go Live",
+        "Active",
+    ]
+
+    data = []
+    for stage in pipeline_stages:
+        count = frappe.db.count("Franchise Onboarding", {"status": stage})
+
+        # Calculate average days in current stage
+        avg_days = frappe.db.sql(
+            """
+            SELECT AVG(DATEDIFF(NOW(), modified)) as avg_days
+            FROM `tabFranchise Onboarding`
+            WHERE status = %s
+            """,
+            stage,
+            as_dict=True,
+        )
+
+        data.append({
+            "status": stage,
+            "count": count,
+            "avg_days_in_stage": round(avg_days[0].avg_days or 0, 1),
+        })
+
+    # Add chart data
+    chart = {
+        "data": {
+            "labels": [d["status"] for d in data],
+            "datasets": [{"name": "Applications", "values": [d["count"] for d in data]}],
+        },
+        "type": "bar",
+        "colors": ["#5e64ff"],
+    }
+
+    return columns, data, None, chart
+```
+
+The report's JavaScript formatter renders each stage as a coloured indicator pill,
+so the pipeline reads at a glance.
+
+```javascript title="scoopjoy/scoopjoy/report/franchise_onboarding_pipeline/franchise_onboarding_pipeline.js"
+frappe.query_reports["Franchise Onboarding Pipeline"] = {
+    filters: [],
+    formatter: function (value, row, column, data, default_formatter) {
+        value = default_formatter(value, row, column, data);
+        if (column.fieldname === "status") {
+            const color_map = {
+                Application: "blue",
+                "Document Verification": "orange",
+                "Site Inspection": "yellow",
+                Training: "purple",
+                "Soft Launch": "cyan",
+                "Go Live": "green",
+                Active: "darkgreen",
+            };
+            const color = color_map[data.status] || "grey";
+            value = `<span class="indicator-pill ${color}">${value}</span>`;
+        }
+        return value;
+    },
+};
+```
+
+:::note[Why this works]
+The `TRANSITIONS` dictionary acts as an explicit adjacency list for the state
+machine. The `validate` hook catches illegal transitions before they reach the
+database. State entry actions are decoupled into individual `_on_enter_*` methods,
+making it easy to add or modify behavior for each state without touching the core
+flow.
+:::
+
+:::caution[Common mistake]
+Calling `self.save()` inside `on_update` without setting
+`self.flags.ignore_validate = True` creates infinite recursion. The
+`_log_state_change` method shows the correct pattern — set the flag before saving
+to prevent re-triggering validation.
+:::

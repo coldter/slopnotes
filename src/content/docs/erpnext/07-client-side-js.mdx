@@ -1,0 +1,836 @@
+---
+title: Client-Side Framework (JS)
+description: Scripting Frappe's Desk SPA with form scripts, list scripts, dialogs, RPC calls, and Socket.IO real-time events.
+sidebar:
+  order: 7
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+:::caution[v16 changed the Desk route]
+Frappe v16 moved the Desk URL route from `/app/*` to `/desk/*`. URLs that used
+`/app/sales-order` are now `/desk/sales-order`. The old `/app` routes may redirect
+but should not be relied upon. Examples here use `/app` for v15 compatibility —
+substitute `/desk` on v16 deployments.
+:::
+
+Frappe's client-side framework is a full single-page application (SPA) called
+**Desk**. It is built on jQuery and custom UI components under the `frappe.ui`
+namespace. If you are coming from a React/Vue background, the paradigm is
+event-driven and imperative rather than declarative — closer to jQuery's style, but
+with a structured form/list event system layered on top.
+
+## Frappe's client-side architecture
+
+The Desk loads as a single page. Navigation between DocTypes, views, and pages
+happens through client-side routing (`frappe.router`) — no full page reloads. The
+namespaces you'll reach for most:
+
+| Namespace | Purpose |
+|-----------|---------|
+| `frappe.ui.form` | Form (document) view scripting |
+| `frappe.ui.Dialog` | Modal dialogs |
+| `frappe.ui.page` | Custom standalone pages |
+| `frappe.call` / `frappe.xcall` | Server RPC calls |
+| `frappe.realtime` | Socket.IO real-time events |
+| `frappe.router` | Client-side page navigation |
+| `frappe.model` | Client-side document model |
+
+## Form scripts: frappe.ui.form.on()
+
+Form scripts are the backbone of client-side customization. They respond to
+form-level events (the document's lifecycle) and field-level changes. In Express
+you might wire up DOM event listeners by hand; in Frappe you register handlers
+against a named event map and the framework dispatches them for you.
+
+**Form-level events:**
+
+| Event | When It Fires |
+|-------|---------------|
+| `setup` | Once when the form class is initialized (not per document) |
+| `onload` | When the form is loaded (first time or refresh) |
+| `refresh` | Every time the form is rendered (after load, save, amend) |
+| `validate` | Before save — set `frappe.validated = false` to cancel |
+| `before_save` | Just before the save RPC call |
+| `after_save` | After a successful save |
+| `before_submit` | Before the submit action |
+| `on_submit` | After successful submission |
+| `before_cancel` | Before the cancel action |
+| `after_cancel` | After successful cancellation |
+| `timeline_refresh` | When the timeline section is re-rendered |
+| `before_workflow_action` | Before a workflow action is executed |
+
+**Field-level events** fire when a specific field's value changes — the event name
+matches the fieldname. Here every kind of handler is wired up for a ScoopJoy
+franchise outlet form:
+
+```javascript title="scoopjoy/public/js/franchise_outlet.js"
+frappe.ui.form.on("Franchise Outlet", {
+    // --- Form-level events ---
+
+    setup(frm) {
+        // Runs once when the form class initializes.
+        // Good for setting query filters on Link fields.
+        frm.set_query("territory", () => {
+            return {
+                filters: { "is_group": 0 }
+            };
+        });
+    },
+
+    onload(frm) {
+        // Runs when the form loads.
+        if (frm.is_new()) {
+            frm.set_value("status", "Draft");
+        }
+    },
+
+    refresh(frm) {
+        // Runs every time the form renders.
+        // Add custom buttons, toggle visibility, etc.
+
+        // Hide the "Amend" button for non-admins
+        if (!frappe.user.has_role("Franchise Auditor")) {
+            frm.toggle_display("amended_from", false);
+        }
+
+        // Add a custom button (only on saved, active docs)
+        if (!frm.is_new() && frm.doc.status === "Active") {
+            frm.add_custom_button(__("Generate Monthly Report"), () => {
+                generate_monthly_report(frm);
+            }, __("Actions"));
+
+            frm.add_custom_button(__("View Royalty Summary"), () => {
+                frappe.set_route("query-report", "Franchise Royalty Summary", {
+                    "franchise_outlet": frm.doc.name,
+                });
+            }, __("View"));
+        }
+
+        // Color-code the status indicator
+        if (frm.doc.status === "Active") {
+            frm.dashboard.set_headline_alert(
+                `<div class="indicator green">Active Franchise</div>`
+            );
+        }
+    },
+
+    validate(frm) {
+        // Runs before save — validate client-side.
+        if (frm.doc.royalty_percentage < 0 || frm.doc.royalty_percentage > 50) {
+            frappe.msgprint(__("Royalty percentage must be between 0 and 50"));
+            frappe.validated = false;  // Prevent the save
+        }
+    },
+
+    // --- Field-level events ---
+
+    territory(frm) {
+        // Fires when the "territory" field changes
+        if (frm.doc.territory) {
+            frappe.call({
+                method: "scoopjoy.api.get_territory_manager",
+                args: { territory: frm.doc.territory },
+                callback(r) {
+                    if (r.message) {
+                        frm.set_value("custom_territory_manager", r.message.manager);
+                        frm.set_value("custom_region", r.message.region);
+                    }
+                },
+            });
+        }
+    },
+
+    franchise_type(frm) {
+        // Toggle fields based on franchise type
+        const is_premium = frm.doc.franchise_type === "Premium";
+        frm.toggle_display("premium_features_section", is_premium);
+        frm.toggle_reqd("custom_premium_deposit", is_premium);
+
+        // Set a field property directly
+        frm.set_df_property("seating_capacity", "read_only", !is_premium);
+    },
+
+    opening_date(frm) {
+        // Auto-calculate agreement end date (5 years from opening)
+        if (frm.doc.opening_date) {
+            frm.set_value(
+                "custom_agreement_end_date",
+                frappe.datetime.add_months(frm.doc.opening_date, 60)
+            );
+        }
+    },
+});
+
+
+// Helper function for the custom button
+function generate_monthly_report(frm) {
+    frappe.xcall(
+        "scoopjoy.api.generate_monthly_report",
+        { outlet: frm.doc.name }
+    ).then((report_url) => {
+        frappe.msgprint({
+            title: __("Report Generated"),
+            message: __("Monthly report is ready. <a href='{0}'>Download</a>", [report_url]),
+            indicator: "green",
+        });
+    });
+}
+```
+
+:::note
+`setup` fires once per form class, not per document — so it's the right place for
+static `frm.set_query(...)` filters. `refresh` fires on every render, so guard
+button-adding code with `frm.is_new()` or status checks to avoid duplicate buttons.
+:::
+
+## Managing visibility and field properties
+
+These helpers cover most of what you'll want to do imperatively: show/hide fields,
+toggle whether they're mandatory, and rewrite their definition (`df`) on the fly.
+
+```javascript
+// Toggle display (show / hide a field)
+frm.toggle_display("fieldname", true);  // show
+frm.toggle_display("fieldname", false); // hide
+frm.toggle_display(["field1", "field2"], condition); // multiple fields
+
+// Toggle required
+frm.toggle_reqd("fieldname", true);  // make mandatory
+frm.toggle_reqd("fieldname", false); // make optional
+
+// Set field properties dynamically
+frm.set_df_property("fieldname", "read_only", 1);
+frm.set_df_property("fieldname", "hidden", 1);
+frm.set_df_property("fieldname", "label", "New Label");
+frm.set_df_property("fieldname", "options", "Option1\nOption2\nOption3");
+frm.set_df_property("fieldname", "description", "Help text shown below the field");
+
+// Set a value programmatically
+frm.set_value("fieldname", "new_value");
+
+// Or mutate the doc directly — but this does NOT trigger UI updates
+// or fire change events, so prefer set_value when other handlers depend on it
+frm.doc.fieldname = "value";
+```
+
+:::caution[Common mistake]
+Assigning `frm.doc.fieldname = "value"` directly skips the field's change event and
+the UI refresh. If another handler reacts to that field, use `frm.set_value(...)`
+so the change propagates.
+:::
+
+## Child table operations
+
+Parent forms often need to manipulate their child tables — clearing rows, bulk-adding,
+or reacting to per-row changes. The `refresh` handler below adds a button that pulls
+default menu items from the server and rebuilds the `franchise_menu_items` table:
+
+```javascript title="scoopjoy/public/js/franchise_outlet.js"
+frappe.ui.form.on("Franchise Outlet", {
+    refresh(frm) {
+        frm.add_custom_button(__("Populate Default Menu"), () => {
+            frappe.xcall(
+                "scoopjoy.api.get_default_menu_items"
+            ).then((items) => {
+                // Clear existing rows
+                frm.clear_table("franchise_menu_items");
+
+                // Add each item as a new row
+                items.forEach((item) => {
+                    let row = frm.add_child("franchise_menu_items", {
+                        item_code: item.item_code,
+                        item_name: item.item_name,
+                        standard_price: item.price,
+                        is_mandatory: item.is_mandatory,
+                    });
+                });
+
+                // Refresh the child table UI
+                frm.refresh_field("franchise_menu_items");
+                frm.dirty();  // Mark the form as modified
+            });
+        });
+    },
+});
+```
+
+Events on child-table **rows** are registered against the child DocType name. The
+handler receives `(frm, cdt, cdn)` — `cdt` is the child DocType name and `cdn` is the
+row's document name. Look the row up via `locals[cdt][cdn]` and write back with
+`frappe.model.set_value(...)` so the grid re-renders:
+
+```javascript title="scoopjoy/public/js/franchise_outlet.js" {28-32}
+// "franchise_menu_items" is the child-table fieldname in the parent
+// "Franchise Menu Item" is the child-table DocType name
+frappe.ui.form.on("Franchise Menu Item", {
+
+    item_code(frm, cdt, cdn) {
+        // cdt = child DocType name, cdn = child document name (row id)
+        let row = locals[cdt][cdn];
+
+        if (row.item_code) {
+            frappe.call({
+                method: "frappe.client.get_value",
+                args: {
+                    doctype: "Item",
+                    filters: { name: row.item_code },
+                    fieldname: ["item_name", "standard_rate"],
+                },
+                callback(r) {
+                    if (r.message) {
+                        frappe.model.set_value(cdt, cdn, "item_name", r.message.item_name);
+                        frappe.model.set_value(cdt, cdn, "standard_price", r.message.standard_rate);
+                    }
+                },
+            });
+        }
+    },
+
+    standard_price(frm, cdt, cdn) {
+        // Recalculate the parent total when a child price changes
+        calculate_total_menu_value(frm);
+    },
+
+    franchise_menu_items_remove(frm) {
+        // Fires when a row is deleted
+        calculate_total_menu_value(frm);
+    },
+});
+
+function calculate_total_menu_value(frm) {
+    let total = 0;
+    (frm.doc.franchise_menu_items || []).forEach((row) => {
+        total += row.standard_price || 0;
+    });
+    frm.set_value("custom_total_menu_value", total);
+}
+```
+
+The special `<fieldname>_remove` event (here `franchise_menu_items_remove`) fires when
+a row is deleted — handy for recomputing parent totals.
+
+## List scripts: frappe.listview_settings
+
+List scripts customize the list view of a DocType — adding colored indicators, custom
+column formatters, and toolbar buttons.
+
+```javascript title="scoopjoy/public/js/sales_invoice_list.js"
+frappe.listview_settings["Sales Invoice"] = {
+    // Add a colored indicator based on franchise royalty status
+    get_indicator(doc) {
+        if (doc.custom_franchise_outlet && doc.custom_royalty_processed) {
+            return [__("Royalty Processed"), "green", "custom_royalty_processed,=,1"];
+        }
+        if (doc.custom_franchise_outlet && !doc.custom_royalty_processed) {
+            return [__("Royalty Pending"), "orange", "custom_royalty_processed,=,0"];
+        }
+        // Return null to fall back to the default indicator
+        return null;
+    },
+
+    // Custom formatters for columns
+    formatters: {
+        custom_franchise_outlet(value) {
+            if (value) {
+                return `<span class="indicator-pill green">${value}</span>`;
+            }
+            return value;
+        },
+    },
+
+    // Add a button to the list view
+    onload(listview) {
+        listview.page.add_inner_button(__("Bulk Process Royalties"), () => {
+            const selected = listview.get_checked_items();
+            if (!selected.length) {
+                frappe.msgprint(__("Please select invoices first"));
+                return;
+            }
+            frappe.xcall(
+                "scoopjoy.api.bulk_process_royalties",
+                { invoices: selected.map((d) => d.name) }
+            ).then(() => {
+                frappe.msgprint(__("Royalties processed successfully"));
+                listview.refresh();
+            });
+        });
+    },
+};
+```
+
+## frappe.call() and frappe.xcall(): server RPC
+
+This is how the client talks to whitelisted Python methods — the Frappe equivalent of
+`fetch("/api/...")` in a Node front end. `frappe.call()` is the traditional
+callback-based form; `frappe.xcall()` is the modern Promise-based alternative
+(available since v15) that returns just `r.message`, so it works cleanly with
+`async`/`await`.
+
+<Tabs syncKey="stack">
+  <TabItem label="Node.js">
+
+  ```javascript
+  // Calling your own Express backend
+  async function loadDashboard() {
+    const res = await fetch(
+      "/api/outlets/OUTLET-001/dashboard?period=monthly"
+    );
+    if (!res.ok) return frappe.msgprint("Failed to load dashboard data");
+    renderDashboard(await res.json());
+  }
+  ```
+
+  </TabItem>
+  <TabItem label="Frappe (Python)">
+
+  ```javascript
+  // Modern Promise-based style (preferred in v16+)
+  async function load_dashboard() {
+      try {
+          const data = await frappe.xcall(
+              "scoopjoy.api.get_outlet_dashboard_data",
+              { outlet: "OUTLET-001", period: "monthly" }
+          );
+          render_dashboard(data);
+      } catch (e) {
+          frappe.msgprint(__("Failed to load dashboard data"));
+      }
+  }
+  ```
+
+  </TabItem>
+</Tabs>
+
+The traditional callback form gives you `freeze` (a loading spinner), an explicit
+`callback`, and a separate `error` handler:
+
+```javascript
+frappe.call({
+    method: "scoopjoy.api.get_outlet_dashboard_data",
+    args: {
+        outlet: "OUTLET-001",
+        period: "monthly",
+    },
+    freeze: true,                    // Show a loading spinner
+    freeze_message: __("Loading dashboard..."),
+    callback(r) {
+        if (r.message) {
+            render_dashboard(r.message);
+        }
+    },
+    error(r) {
+        frappe.msgprint(__("Failed to load dashboard data"));
+    },
+});
+```
+
+Both call the same whitelisted Python method. The `@frappe.whitelist()` decorator is
+what exposes it over RPC; the explicit `frappe.has_permission(...)` check enforces
+access (see [Permissions, Roles & Security](/erpnext/09-permissions-security/)):
+
+```python title="scoopjoy/api.py"
+import frappe
+
+@frappe.whitelist()
+def get_outlet_dashboard_data(outlet: str, period: str = "monthly"):
+    """Return dashboard data for a franchise outlet."""
+    frappe.has_permission("Franchise Outlet", doc=outlet, throw=True)
+
+    return {
+        "total_sales": get_total_sales(outlet, period),
+        "royalty_due": get_royalty_due(outlet, period),
+        "top_items": get_top_selling_items(outlet, period),
+        "daily_trend": get_daily_sales_trend(outlet, period),
+    }
+```
+
+## Dialogs: msgprint, confirm, prompt, and Dialog
+
+Frappe ships a ladder of dialog helpers, from a one-line message up to a full custom
+modal. Reach for the simplest one that fits.
+
+`frappe.msgprint(...)` shows a message, optionally with a server-backed action button:
+
+```javascript
+frappe.msgprint({
+    title: __("Royalty Alert"),
+    message: __("Royalty payment for Q4 is overdue by 15 days."),
+    indicator: "red",
+    primary_action: {
+        label: __("Send Reminder"),
+        server_action: "scoopjoy.api.send_royalty_reminder",
+        args: { outlet: cur_frm.doc.name },
+    },
+});
+```
+
+`frappe.confirm(...)` is a yes/no prompt — the second callback (the "No" branch) is
+optional:
+
+```javascript
+frappe.confirm(
+    __("Are you sure you want to deactivate this franchise outlet?"),
+    () => {
+        // Yes
+        frappe.xcall(
+            "scoopjoy.api.deactivate_outlet",
+            { outlet: cur_frm.doc.name }
+        ).then(() => cur_frm.reload_doc());
+    },
+    () => {
+        // No (optional)
+        frappe.show_alert(__("Deactivation cancelled"));
+    }
+);
+```
+
+`frappe.prompt(...)` collects one or more fields without you building a dialog by
+hand — pass an array of field definitions and a callback that receives the `values`:
+
+```javascript
+frappe.prompt(
+    [
+        {
+            label: __("Reason for Deactivation"),
+            fieldname: "reason",
+            fieldtype: "Small Text",
+            reqd: 1,
+        },
+        {
+            label: __("Effective Date"),
+            fieldname: "effective_date",
+            fieldtype: "Date",
+            default: frappe.datetime.now_date(),
+        },
+    ],
+    (values) => {
+        frappe.xcall(
+            "scoopjoy.api.deactivate_outlet",
+            {
+                outlet: cur_frm.doc.name,
+                reason: values.reason,
+                effective_date: values.effective_date,
+            }
+        );
+    },
+    __("Deactivate Outlet"),
+    __("Confirm Deactivation")
+);
+```
+
+For anything stateful — like a multi-step wizard — instantiate `frappe.ui.Dialog`
+directly. Here a single dialog drives a three-step franchise onboarding flow by
+toggling section visibility and rewriting its own primary action label:
+
+```javascript
+function show_onboarding_wizard() {
+    let current_step = 0;
+
+    const dialog = new frappe.ui.Dialog({
+        title: __("Franchise Onboarding Wizard"),
+        size: "large",
+        fields: [
+            // Step 1: Basic Info
+            { fieldtype: "Section Break", label: __("Step 1: Outlet Information"), fieldname: "step_1" },
+            { fieldtype: "Data", label: __("Outlet Name"), fieldname: "outlet_name", reqd: 1 },
+            { fieldtype: "Link", label: __("Territory"), fieldname: "territory", options: "Territory", reqd: 1 },
+            { fieldtype: "Select", label: __("Franchise Type"), fieldname: "franchise_type",
+              options: "Standard\nPremium\nExpress", default: "Standard" },
+            { fieldtype: "Data", label: __("Contact Email"), fieldname: "email", reqd: 1 },
+
+            // Step 2: Financial Details
+            { fieldtype: "Section Break", label: __("Step 2: Financial Details"),
+              fieldname: "step_2", hidden: 1 },
+            { fieldtype: "Currency", label: __("Initial Investment"), fieldname: "investment" },
+            { fieldtype: "Percent", label: __("Royalty Percentage"), fieldname: "royalty_pct", default: 5 },
+            { fieldtype: "Date", label: __("Agreement Start Date"), fieldname: "start_date",
+              default: frappe.datetime.now_date() },
+
+            // Step 3: Confirmation
+            { fieldtype: "Section Break", label: __("Step 3: Review & Confirm"),
+              fieldname: "step_3", hidden: 1 },
+            { fieldtype: "HTML", fieldname: "review_html" },
+        ],
+        primary_action_label: __("Next"),
+        primary_action(values) {
+            if (current_step === 0) {
+                // Move to step 2
+                dialog.set_df_property("step_1", "hidden", 1);
+                dialog.set_df_property("step_2", "hidden", 0);
+                dialog.set_primary_action_label(__("Next"));
+                current_step = 1;
+            } else if (current_step === 1) {
+                // Move to step 3 — show the review
+                dialog.set_df_property("step_2", "hidden", 1);
+                dialog.set_df_property("step_3", "hidden", 0);
+
+                const v = dialog.get_values();
+                dialog.fields_dict.review_html.$wrapper.html(`
+                    <div class="review-summary">
+                        <h5>Review Your Details</h5>
+                        <p><strong>Outlet:</strong> ${v.outlet_name}</p>
+                        <p><strong>Territory:</strong> ${v.territory}</p>
+                        <p><strong>Type:</strong> ${v.franchise_type}</p>
+                        <p><strong>Royalty:</strong> ${v.royalty_pct}%</p>
+                        <p><strong>Start Date:</strong> ${v.start_date}</p>
+                    </div>
+                `);
+                dialog.set_primary_action_label(__("Create Franchise"));
+                current_step = 2;
+            } else {
+                // Final step — create the franchise
+                frappe.xcall(
+                    "scoopjoy.api.create_franchise_outlet",
+                    dialog.get_values()
+                ).then((outlet_name) => {
+                    dialog.hide();
+                    frappe.set_route("Form", "Franchise Outlet", outlet_name);
+                    frappe.show_alert({
+                        message: __("Franchise outlet {0} created!", [outlet_name]),
+                        indicator: "green",
+                    });
+                });
+            }
+        },
+        secondary_action_label: __("Back"),
+        secondary_action() {
+            if (current_step === 1) {
+                dialog.set_df_property("step_2", "hidden", 1);
+                dialog.set_df_property("step_1", "hidden", 0);
+                dialog.set_primary_action_label(__("Next"));
+                current_step = 0;
+            } else if (current_step === 2) {
+                dialog.set_df_property("step_3", "hidden", 1);
+                dialog.set_df_property("step_2", "hidden", 0);
+                dialog.set_primary_action_label(__("Next"));
+                current_step = 1;
+            }
+        },
+    });
+
+    dialog.show();
+}
+```
+
+## frappe.realtime: Socket.IO events
+
+Frappe includes built-in real-time communication via Socket.IO, backed by Redis
+pub/sub. The client subscribes to named events with `frappe.realtime.on(...)`; the
+server pushes to those events from Python.
+
+On the client, register a handler per event and unsubscribe with
+`frappe.realtime.off(...)` when you no longer need it:
+
+```javascript title="scoopjoy/public/js/realtime_alerts.js"
+// Listen for new POS sales at any outlet
+frappe.realtime.on("new_pos_sale", (data) => {
+    frappe.show_alert({
+        message: `New sale at ${data.outlet_name}: ${data.grand_total}`,
+        indicator: "green",
+    }, 5);  // Show for 5 seconds
+
+    // Update a live dashboard counter if it's visible
+    if (cur_page && cur_page.page_name === "franchise-dashboard") {
+        update_live_sales_counter(data);
+    }
+});
+
+// Listen for an outlet going offline
+frappe.realtime.on("outlet_offline", (data) => {
+    frappe.show_alert({
+        message: `Warning: ${data.outlet_name} POS has gone offline`,
+        indicator: "red",
+    }, 10);
+});
+
+// Unsubscribe when no longer needed
+frappe.realtime.off("new_pos_sale");
+```
+
+On the server, publish with `frappe.publish_realtime(...)`. Scope each push with
+`user=`, `room=`, or broadcast to a role; pass `after_commit=True` so events fire only
+once the DB transaction has actually committed:
+
+```python title="scoopjoy/scoopjoy/events.py"
+import frappe
+
+def notify_hq_new_sale(doc, method):
+    """Notify the HQ dashboard when a POS Invoice is created at any outlet."""
+    frappe.publish_realtime(
+        event="new_pos_sale",
+        message={
+            "outlet": doc.custom_franchise_outlet,
+            "outlet_name": frappe.db.get_value(
+                "Franchise Outlet", doc.custom_franchise_outlet, "outlet_name"
+            ),
+            "grand_total": doc.grand_total,
+            "invoice": doc.name,
+            "items_count": len(doc.items),
+        },
+        # Target options:
+        #   user="specific@user.com"  -- send to one user
+        #   room="specific-room"       -- send to a room
+        #   after_commit=True          -- only send after DB commit succeeds
+        user="Administrator",
+        after_commit=True,
+    )
+
+    # Broadcast to every user with the Franchise Manager role
+    franchise_managers = frappe.get_all(
+        "Has Role",
+        filters={"role": "Franchise Manager", "parenttype": "User"},
+        pluck="parent",
+    )
+    for manager in franchise_managers:
+        frappe.publish_realtime(
+            event="new_pos_sale",
+            message={
+                "outlet": doc.custom_franchise_outlet,
+                "grand_total": doc.grand_total,
+            },
+            user=manager,
+            after_commit=True,
+        )
+```
+
+:::tip[Pro tip]
+Always pass `after_commit=True` when publishing from a document event. Otherwise a
+listener can react to a "new sale" that a later validation error rolls back, leaving
+your dashboard showing a sale that never persisted.
+:::
+
+## Client-side routing and navigation
+
+`frappe.set_route(...)` drives the SPA's navigation — the same router that powers
+clicking around the Desk. The first argument is the view type (`Form`, `List`,
+`query-report`, or a custom page name), followed by view-specific arguments:
+
+```javascript
+// Navigate to a specific form
+frappe.set_route("Form", "Franchise Outlet", "OUTLET-001");
+
+// Navigate to a list view with filters
+frappe.set_route("List", "Sales Invoice", {
+    custom_franchise_outlet: "OUTLET-001",
+    posting_date: [">=", "2025-01-01"],
+});
+
+// Navigate to a report
+frappe.set_route("query-report", "Franchise Royalty Summary");
+
+// Navigate to a custom page
+frappe.set_route("franchise-dashboard");
+
+// Route hooks — intercept navigation
+frappe.route_hooks.after_load = (frm) => {
+    // Runs after any form loads
+    if (frm.doctype === "Franchise Outlet") {
+        console.log("Loaded franchise outlet:", frm.doc.name);
+    }
+};
+```
+
+## Custom Desk pages
+
+For standalone dashboards or tools that don't map to a single DocType, create a custom
+Desk page. A page is a small bundle of three files — a Python module for data, a JS
+file that builds the page, and an HTML template for rendering.
+
+The Python side exposes a whitelisted data method:
+
+```python title="scoopjoy/scoopjoy/page/franchise_dashboard/franchise_dashboard.py"
+import frappe
+
+@frappe.whitelist()
+def get_dashboard_data():
+    return {
+        "active_outlets": frappe.db.count("Franchise Outlet", {"status": "Active"}),
+        "total_royalty_this_month": get_monthly_royalty(),
+        "top_outlets": get_top_outlets(),
+    }
+```
+
+The JS file wires the page into the Desk via `frappe.pages[...].on_page_load`, adds
+toolbar actions, fetches data with `frappe.xcall(...)`, and even subscribes to
+real-time updates:
+
+```javascript title="scoopjoy/scoopjoy/page/franchise_dashboard/franchise_dashboard.js"
+frappe.pages["franchise-dashboard"].on_page_load = function(wrapper) {
+    const page = frappe.ui.make_app_page({
+        parent: wrapper,
+        title: __("Franchise Dashboard"),
+        single_column: true,
+    });
+
+    // Add toolbar buttons
+    page.set_primary_action(__("Refresh"), () => load_dashboard(page), "refresh");
+    page.add_menu_item(__("Export Report"), () => export_report());
+
+    load_dashboard(page);
+
+    // Auto-refresh every 30 seconds
+    setInterval(() => load_dashboard(page), 30000);
+
+    // Real-time updates
+    frappe.realtime.on("new_pos_sale", () => load_dashboard(page));
+};
+
+async function load_dashboard(page) {
+    const data = await frappe.xcall(
+        "scoopjoy.scoopjoy.page.franchise_dashboard.franchise_dashboard.get_dashboard_data"
+    );
+
+    page.body.html(frappe.render_template("franchise_dashboard", data));
+}
+```
+
+The HTML template is plain Jinja — `frappe.render_template(...)` feeds it the data
+object. Note the `frappe.format(...)` helper and the `{% for %}` loop, exactly as you
+would write a server-side template:
+
+```html title="scoopjoy/scoopjoy/page/franchise_dashboard/franchise_dashboard.html"
+<div class="franchise-dashboard">
+    <div class="row">
+        <div class="col-md-4">
+            <div class="stat-card">
+                <h3>{{ active_outlets }}</h3>
+                <p>Active Outlets</p>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="stat-card">
+                <h3>{{ frappe.format(total_royalty_this_month, {fieldtype: "Currency"}) }}</h3>
+                <p>Royalty This Month</p>
+            </div>
+        </div>
+    </div>
+    <div class="row mt-4">
+        <div class="col-12">
+            <h4>Top Performing Outlets</h4>
+            <table class="table table-bordered">
+                <thead>
+                    <tr>
+                        <th>Outlet</th>
+                        <th>Sales</th>
+                        <th>Royalty</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for outlet in top_outlets %}
+                    <tr>
+                        <td>{{ outlet.outlet_name }}</td>
+                        <td>{{ frappe.format(outlet.total_sales, {fieldtype: "Currency"}) }}</td>
+                        <td>{{ frappe.format(outlet.royalty_amount, {fieldtype: "Currency"}) }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+```
+
+With the client-side framework in hand, the next chapter steps back to the server
+boundary — the [REST API, RPC & real-time](/erpnext/08-rest-api-realtime/) surface
+your Desk scripts are calling into.

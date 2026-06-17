@@ -1,0 +1,616 @@
+---
+title: Server Scripts & Jobs
+description: Run server-side Frappe code three ways — controllers, sandboxed Server Scripts, and hooks — plus background jobs and scheduled tasks.
+sidebar:
+  order: 18
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+Frappe gives you several ways to run server-side code, and the right one depends
+on who's writing it and where it ships. If you're coming from Node.js, this is the
+spread between an Express route handler (your own code), an admin-editable rule in
+a dashboard (a sandboxed script), and a cron job (the scheduler). The choice comes
+down to whether you're building for one specific site or for a distributable app.
+
+### Three types of server-side customization
+
+| Approach | Where it lives | Best for |
+|---|---|---|
+| Controller methods | `.py` files in your app | Distributable apps, complex logic |
+| Server Script DocType | Database (created via Desk) | Quick site-specific customizations |
+| Document Event Hooks | `hooks.py` in your app | Reacting to other apps' DocTypes |
+
+## Controller methods
+
+We covered controller methods in [Chapter 17](/erpnext/17-custom-doctypes-forms/).
+These are Python methods defined in the DocType's `.py` controller file, and they
+fire automatically as a document moves through its lifecycle — think of them as the
+middleware chain you'd wire up around a save in an ORM, but built in.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_outlet/sj_outlet.py"
+class SJOutlet(Document):
+    def validate(self):
+        # Runs before save, for both insert and update
+        pass
+
+    def before_save(self):
+        # Runs after validate, before writing to DB
+        pass
+
+    def on_update(self):
+        # Runs after the document is saved
+        pass
+
+    def on_submit(self):
+        # Runs when a submittable document is submitted
+        pass
+
+    def on_cancel(self):
+        # Runs when a submitted document is cancelled
+        pass
+
+    def on_trash(self):
+        # Runs before the document is deleted
+        pass
+
+    def before_insert(self):
+        # Runs before a new document is inserted
+        pass
+
+    def after_insert(self):
+        # Runs after a new document is inserted
+        pass
+
+    def autoname(self):
+        # Programmatic naming - set self.name
+        pass
+```
+
+The full event lifecycle for a save and for a submit:
+
+<Mermaid title="Save vs submit lifecycle" height={260} code={`
+flowchart LR
+  subgraph Save
+    bv1["before_validate"] --> v1["validate"] --> bs["before_save"] --> w1["DB write"] --> ou["on_update"] --> oc1["on_change"] --> as["after_save"]
+  end
+  subgraph Submit
+    bv2["before_validate"] --> v2["validate"] --> bsub["before_submit"] --> w2["DB write"] --> os["on_submit"] --> oc2["on_change"]
+  end
+`} />
+
+## Server Script DocType
+
+Server Scripts are created through the Desk UI at **Home > Server Script**. They run
+in a restricted Python sandbox — no `import` statements, limited `frappe` API
+access. That sandbox is what makes them safe for non-developers to write, at the
+cost of being less powerful than controller code. There are four types.
+
+### 1. DocType Event Server Script
+
+Auto-calculate a franchise royalty when a Sales Invoice is submitted. Navigate to
+**Server Script > New** and set Script Type to `DocType Event`, Reference DocType
+to `Sales Invoice`, and DocType Event to `Before Submit`.
+
+```python title="Server Script: Calculate Franchise Royalty (Before Submit on Sales Invoice)"
+if doc.franchise_outlet:
+    outlet = frappe.get_doc("SJ Outlet", doc.franchise_outlet)
+    royalty = doc.net_total * (outlet.royalty_percentage / 100)
+    marketing_fee = doc.net_total * (outlet.marketing_fee_percentage / 100)
+
+    doc.franchise_royalty = royalty
+    doc.franchise_marketing_fee = marketing_fee
+    doc.total_franchise_deductions = royalty + marketing_fee
+
+    frappe.msgprint(
+        f"Franchise deductions calculated: Royalty {frappe.format_value(royalty, 'Currency')} "
+        f"+ Marketing Fee {frappe.format_value(marketing_fee, 'Currency')}",
+        alert=True,
+        indicator="blue"
+    )
+```
+
+:::tip[Pro tip]
+Server Scripts have access to `doc` (the current document), `frappe` (a limited
+API), and a few utility functions. They cannot import modules, touch the file
+system, or run shell commands. For anything complex, use controller methods in
+your custom app.
+:::
+
+### 2. API Server Script
+
+Creates a custom whitelisted API endpoint — the sandboxed equivalent of a
+`@frappe.whitelist()` function. Set Script Type to `API` and API Method to
+`scoopjoy.api.get_franchise_metrics`.
+
+```python title="Server Script: Franchise Performance Metrics (API: scoopjoy.api.get_franchise_metrics)"
+outlet = frappe.form_dict.get("outlet")
+period = frappe.form_dict.get("period", "Monthly")
+
+if not outlet:
+    frappe.throw("Franchise Outlet is required")
+
+# Get sales data
+filters = {
+    "franchise_outlet": outlet,
+    "docstatus": 1,
+}
+
+if period == "Monthly":
+    filters["posting_date"] = [">=", frappe.utils.add_months(frappe.utils.today(), -1)]
+elif period == "Quarterly":
+    filters["posting_date"] = [">=", frappe.utils.add_months(frappe.utils.today(), -3)]
+
+total_sales = frappe.db.get_value(
+    "Sales Invoice",
+    filters=filters,
+    fieldname="sum(grand_total)"
+) or 0
+
+invoice_count = frappe.db.count("Sales Invoice", filters=filters)
+
+avg_invoice = total_sales / invoice_count if invoice_count else 0
+
+frappe.response["message"] = {
+    "outlet": outlet,
+    "period": period,
+    "total_sales": total_sales,
+    "invoice_count": invoice_count,
+    "average_invoice_value": avg_invoice,
+}
+```
+
+Call it from the client just like any other whitelisted method:
+
+```javascript
+frappe.call({
+    method: 'scoopjoy.api.get_franchise_metrics',
+    args: {
+        outlet: 'FO-Mumbai-001',
+        period: 'Monthly'
+    },
+    callback: function(r) {
+        console.log(r.message);
+    }
+});
+```
+
+### 3. Permission Query Server Script
+
+Restricts which records a user can see by appending a SQL condition to every list
+query. Set Script Type to `Permission Query` and Reference DocType to `SJ Outlet`.
+
+```python title="Server Script: Permission Query (SJ Outlet)"
+# Only show outlets in the user's territory
+conditions = ""
+user_territory = frappe.db.get_value("Employee", {"user_id": frappe.session.user}, "territory")
+if user_territory:
+    conditions = f"`tabSJ Outlet`.city = {frappe.db.escape(user_territory)}"
+```
+
+### 4. Scheduled Server Script
+
+Runs on a schedule — the Desk-managed cousin of `scheduler_events` in `hooks.py`.
+Set Script Type to `Scheduler Event` and Event Frequency to `Daily`.
+
+```python title="Server Script: Daily Franchise Compliance Check (Scheduler Event, Daily)"
+outlets = frappe.get_all(
+    "SJ Outlet",
+    filters={"status": "Active"},
+    fields=["name", "outlet_name", "owner_name"]
+)
+
+for outlet in outlets:
+    # Check for agreements expiring in 30 days
+    expiring = frappe.db.exists(
+        "Franchise Agreement",
+        {
+            "franchise_outlet": outlet.name,
+            "docstatus": 1,
+            "expiry_date": ["between", [
+                frappe.utils.today(),
+                frappe.utils.add_days(frappe.utils.today(), 30)
+            ]]
+        }
+    )
+
+    if expiring:
+        frappe.get_doc({
+            "doctype": "Notification Log",
+            "subject": f"Agreement expiring soon for {outlet.outlet_name}",
+            "for_user": "administrator",
+            "type": "Alert",
+        }).insert(ignore_permissions=True)
+```
+
+## Document event hooks in hooks.py
+
+When your custom app needs to react to events on DocTypes from *other* apps (like
+ERPNext's Sales Invoice), use `doc_events` in `hooks.py`. This is the distributable
+equivalent of a DocType Event Server Script — same trigger, but it ships with your
+app instead of living in one site's database.
+
+```python title="scoopjoy/scoopjoy/hooks.py"
+doc_events = {
+    "Sales Invoice": {
+        "on_submit": "scoopjoy.events.sales_invoice.on_submit",
+        "on_cancel": "scoopjoy.events.sales_invoice.on_cancel",
+    },
+    "Sales Order": {
+        "validate": "scoopjoy.events.sales_order.validate",
+    },
+    # Wildcard: runs for ALL DocTypes
+    # "*": {
+    #     "on_update": "scoopjoy.events.common.track_changes",
+    # },
+}
+```
+
+The handlers receive the document and the method name that fired them, so you can
+keep submit and cancel symmetric (apply on submit, reverse on cancel):
+
+```python title="scoopjoy/scoopjoy/events/sales_invoice.py"
+import frappe
+
+
+def on_submit(doc, method):
+    """Update franchise dashboard when a Sales Invoice is submitted."""
+    if not doc.franchise_outlet:
+        return
+
+    update_franchise_sales_summary(doc)
+    create_royalty_entry(doc)
+
+
+def on_cancel(doc, method):
+    """Reverse franchise dashboard updates when invoice is cancelled."""
+    if not doc.franchise_outlet:
+        return
+
+    reverse_franchise_sales_summary(doc)
+    cancel_royalty_entry(doc)
+
+
+def update_franchise_sales_summary(doc):
+    """Aggregate sales data for the franchise outlet."""
+    outlet = doc.franchise_outlet
+    posting_month = frappe.utils.getdate(doc.posting_date).strftime("%Y-%m")
+
+    # Upsert the monthly summary
+    existing = frappe.db.exists(
+        "Franchise Sales Summary",
+        {"franchise_outlet": outlet, "month": posting_month},
+    )
+
+    if existing:
+        summary = frappe.get_doc("Franchise Sales Summary", existing)
+        summary.total_sales += doc.net_total
+        summary.invoice_count += 1
+        summary.save(ignore_permissions=True)
+    else:
+        frappe.get_doc({
+            "doctype": "Franchise Sales Summary",
+            "franchise_outlet": outlet,
+            "month": posting_month,
+            "total_sales": doc.net_total,
+            "invoice_count": 1,
+        }).insert(ignore_permissions=True)
+
+
+def create_royalty_entry(doc):
+    """Create a royalty journal entry for the franchise."""
+    outlet = frappe.get_doc("SJ Outlet", doc.franchise_outlet)
+    royalty_amount = doc.net_total * (outlet.royalty_percentage / 100)
+
+    if royalty_amount <= 0:
+        return
+
+    frappe.get_doc({
+        "doctype": "Franchise Royalty Entry",
+        "franchise_outlet": doc.franchise_outlet,
+        "sales_invoice": doc.name,
+        "posting_date": doc.posting_date,
+        "sales_amount": doc.net_total,
+        "royalty_percentage": outlet.royalty_percentage,
+        "royalty_amount": royalty_amount,
+    }).insert(ignore_permissions=True)
+
+
+def reverse_franchise_sales_summary(doc):
+    """Reverse the sales summary when invoice is cancelled."""
+    posting_month = frappe.utils.getdate(doc.posting_date).strftime("%Y-%m")
+    existing = frappe.db.exists(
+        "Franchise Sales Summary",
+        {"franchise_outlet": doc.franchise_outlet, "month": posting_month},
+    )
+    if existing:
+        summary = frappe.get_doc("Franchise Sales Summary", existing)
+        summary.total_sales -= doc.net_total
+        summary.invoice_count -= 1
+        summary.save(ignore_permissions=True)
+
+
+def cancel_royalty_entry(doc):
+    """Cancel the royalty entry when invoice is cancelled."""
+    royalty_entries = frappe.get_all(
+        "Franchise Royalty Entry",
+        filters={"sales_invoice": doc.name},
+        pluck="name",
+    )
+    for entry_name in royalty_entries:
+        frappe.delete_doc("Franchise Royalty Entry", entry_name, ignore_permissions=True)
+```
+
+:::note
+The `doc_events` hook is additive. If ERPNext already has an `on_submit` for Sales
+Invoice, your hook runs *in addition to* it — not instead of it. The order depends
+on app installation order, with the base app running first.
+:::
+
+## Background jobs with frappe.enqueue()
+
+Long-running operations should never block the web request — the Node.js instinct
+to offload to a job queue applies directly here. Use `frappe.enqueue()` to push
+work to a background worker:
+
+```python title="scoopjoy/scoopjoy/api.py"
+import frappe
+
+
+@frappe.whitelist()
+def generate_monthly_compliance_reports(month=None):
+    """Enqueue bulk report generation as a background job."""
+    if not month:
+        month = frappe.utils.add_months(frappe.utils.today(), -1)
+        month = frappe.utils.getdate(month).strftime("%Y-%m")
+
+    frappe.enqueue(
+        method="scoopjoy.tasks.compliance.generate_reports_for_month",
+        queue="long",
+        timeout=1800,           # 30 minutes max
+        job_id=f"compliance-report-{month}",  # Deduplication key
+        enqueue_after_commit=True,
+        month=month,
+    )
+    frappe.msgprint(f"Report generation queued for {month}. Check background jobs for status.")
+```
+
+The enqueued worker function streams progress back to the browser with
+`frappe.publish_progress` and a final `frappe.publish_realtime` event:
+
+```python title="scoopjoy/scoopjoy/tasks/compliance.py" {12-16,23-27}
+import frappe
+from frappe.utils import getdate
+
+
+def generate_reports_for_month(month):
+    """Generate compliance reports for all active outlets for a given month."""
+    outlets = frappe.get_all(
+        "SJ Outlet",
+        filters={"status": "Active"},
+        fields=["name", "outlet_name", "franchise_code"],
+    )
+
+    total = len(outlets)
+    for i, outlet in enumerate(outlets):
+        frappe.publish_progress(
+            percent=(i / total) * 100,
+            title="Generating Compliance Reports",
+            description=f"Processing {outlet.outlet_name}...",
+        )
+
+        generate_single_report(outlet, month)
+
+    frappe.publish_realtime(
+        event="compliance_reports_complete",
+        message={"month": month, "count": total},
+        user=frappe.session.user,
+    )
+
+
+def generate_single_report(outlet, month):
+    """Generate a compliance report for a single outlet."""
+    # Fetch sales data for the month
+    start_date = getdate(f"{month}-01")
+    end_date = frappe.utils.get_last_day(start_date)
+
+    sales_total = frappe.db.get_value(
+        "Sales Invoice",
+        filters={
+            "franchise_outlet": outlet.name,
+            "posting_date": ["between", [start_date, end_date]],
+            "docstatus": 1,
+        },
+        fieldname="sum(net_total)",
+    ) or 0
+
+    # Create compliance report document
+    report = frappe.get_doc({
+        "doctype": "Franchise Compliance Report",
+        "franchise_outlet": outlet.name,
+        "report_month": month,
+        "total_sales": sales_total,
+        "report_date": frappe.utils.today(),
+    })
+    report.insert(ignore_permissions=True)
+    frappe.db.commit()  # Commit after each report to avoid long transactions
+```
+
+Key `frappe.enqueue()` parameters:
+
+| Parameter | Description |
+|---|---|
+| `method` | Dotted path to the function |
+| `queue` | `"short"` (default 300s), `"default"` (default 300s), or `"long"` (default 1500s) |
+| `timeout` | Override the queue's default timeout (seconds) |
+| `job_id` | Unique ID for deduplication; if a job with this ID is queued/running, the new one is skipped |
+| `enqueue_after_commit` | If `True`, only enqueues after the current DB transaction commits successfully |
+| `is_async` | Set to `False` to run synchronously (useful for testing) |
+| `at_front` | If `True`, adds the job to the front of the queue |
+
+<Mermaid title="Enqueue → worker → realtime" height={300} code={`
+flowchart LR
+  W["Web request<br/>frappe.enqueue()"] --> Q["Redis Queue<br/>short · default · long"]
+  Q --> R["RQ Worker"]
+  R -->|"publish_progress"| B["Browser<br/>progress bar"]
+  R -->|"publish_realtime"| B
+`} />
+
+:::caution
+The queue has a hard limit of 500 jobs (`MAX_QUEUED_JOBS`). If you enqueue
+thousands of jobs in a loop, you'll hit failures. Instead, enqueue a single
+"orchestrator" job that processes items sequentially inside the worker.
+:::
+
+## Scheduled jobs via hooks.py
+
+For recurring tasks, define `scheduler_events` in `hooks.py`. Each key is a
+frequency; the values are dotted paths to functions. The `all` bucket ticks roughly
+every 5 minutes, `daily_long` runs heavy daily jobs on the long worker, and `cron`
+takes raw cron expressions like `0 */6 * * *` (every 6 hours) or `0 9 * * 1-5`
+(weekdays at 9 AM).
+
+```python title="scoopjoy/scoopjoy/hooks.py"
+scheduler_events = {
+    # Runs every time the scheduler ticks (roughly every 5 minutes)
+    "all": [
+        "scoopjoy.tasks.realtime.sync_outlet_status",
+    ],
+
+    # Runs once daily (after midnight)
+    "daily": [
+        "scoopjoy.tasks.compliance.check_expiring_agreements",
+    ],
+
+    # Runs once daily on the long worker (for heavy jobs)
+    "daily_long": [
+        "scoopjoy.tasks.analytics.rebuild_franchise_dashboards",
+    ],
+
+    # Runs once hourly
+    "hourly": [
+        "scoopjoy.tasks.sync.sync_outlet_stock_levels",
+    ],
+
+    # Runs once weekly
+    "weekly": [
+        "scoopjoy.tasks.reports.send_weekly_franchise_digest",
+    ],
+
+    # Runs once monthly
+    "monthly": [
+        "scoopjoy.tasks.billing.generate_royalty_invoices",
+    ],
+
+    # Custom cron schedule
+    "cron": {
+        # Every 6 hours
+        "0 */6 * * *": [
+            "scoopjoy.tasks.sync.sync_central_inventory",
+        ],
+        # Every weekday at 9 AM
+        "0 9 * * 1-5": [
+            "scoopjoy.tasks.notifications.send_daily_briefing",
+        ],
+    },
+}
+```
+
+A nightly stock-level sync shows the shape of a real scheduled task: iterate active
+outlets, wrap each in a `try`/`except` with `frappe.log_error` so one bad outlet
+doesn't sink the whole run, and `commit` at the end.
+
+```python title="scoopjoy/scoopjoy/tasks/sync.py" {12-18}
+import frappe
+
+
+def sync_outlet_stock_levels():
+    """Sync stock levels from all franchise outlet warehouses to the central dashboard."""
+    outlets = frappe.get_all(
+        "SJ Outlet",
+        filters={"status": "Active", "warehouse": ["is", "set"]},
+        fields=["name", "outlet_name", "warehouse"],
+    )
+
+    for outlet in outlets:
+        try:
+            sync_single_outlet_stock(outlet)
+        except Exception:
+            frappe.log_error(
+                title=f"Stock Sync Failed: {outlet.outlet_name}",
+                message=frappe.get_traceback(),
+            )
+
+    frappe.db.commit()
+
+
+def sync_single_outlet_stock(outlet):
+    """Sync stock for a single outlet warehouse."""
+    stock_data = frappe.db.sql(
+        """
+        SELECT
+            item_code,
+            actual_qty,
+            reserved_qty,
+            (actual_qty - reserved_qty) AS available_qty
+        FROM `tabBin`
+        WHERE warehouse = %s AND actual_qty > 0
+        ORDER BY item_code
+        """,
+        outlet.warehouse,
+        as_dict=True,
+    )
+
+    # Upsert stock snapshot
+    snapshot_name = f"{outlet.name}-{frappe.utils.today()}"
+    if frappe.db.exists("Franchise Stock Snapshot", snapshot_name):
+        snapshot = frappe.get_doc("Franchise Stock Snapshot", snapshot_name)
+        snapshot.stock_items = []
+    else:
+        snapshot = frappe.get_doc({
+            "doctype": "Franchise Stock Snapshot",
+            "name": snapshot_name,
+            "franchise_outlet": outlet.name,
+            "snapshot_date": frappe.utils.today(),
+        })
+
+    for item in stock_data:
+        snapshot.append("stock_items", {
+            "item_code": item.item_code,
+            "actual_qty": item.actual_qty,
+            "reserved_qty": item.reserved_qty,
+            "available_qty": item.available_qty,
+        })
+
+    snapshot.save(ignore_permissions=True)
+```
+
+## Monitoring background jobs
+
+Frappe uses Redis Queue (RQ) for background job execution. You can watch jobs from
+the Desk UI by navigating to **Home > Background Jobs** to see queued, started,
+finished, and failed jobs, or from the command line:
+
+```bash
+# View all workers and their status
+bench worker --queue short &
+bench worker --queue default &
+bench worker --queue long &
+
+# Check scheduler status
+bench --site mysite.localhost scheduler status
+
+# Manually trigger scheduler (for testing)
+bench --site mysite.localhost scheduler trigger
+
+# Enable/disable scheduler
+bench --site mysite.localhost scheduler enable
+bench --site mysite.localhost scheduler disable
+```
+
+:::tip[Pro tip]
+In development, the scheduler runs automatically with `bench start`. In production,
+Supervisor manages the worker and scheduler processes. If a scheduled job isn't
+running, first confirm the scheduler is enabled with
+`bench --site mysite.localhost scheduler status`.
+:::

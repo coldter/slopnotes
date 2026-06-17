@@ -1,0 +1,258 @@
+---
+title: Advanced Naming Patterns
+description: Generate structured document names like SO-MUM-2026-0001 with thread-safe sequences, bulk pre-generation, and safe cascading renames.
+sidebar:
+  order: 5
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Generate complex document names like `SO-MUM-2026-0001`
+(type-city-year-sequence), with thread-safe sequences that hold up under
+concurrent inserts.
+
+**Solution:** Use the `autoname` controller method together with `frappe.db.sql`
+and `SELECT ... FOR UPDATE` for thread-safe sequence generation. Simpler cases
+need no Python at all — a format-string `naming_rule` handles them.
+
+### Pattern A: Format-String Autoname (Simple)
+
+For basic patterns, set the naming rule and `autoname` format string directly in
+the DocType JSON — no Python required.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_sales_order/sj_sales_order.json"
+{
+  "naming_rule": "Expression",
+  "autoname": "SJ-SO-.{franchise_city_code}.-.YYYY.-.#####"
+}
+```
+
+This generates names like `SJ-SO-MUM-2026-00001` when `franchise_city_code` is set
+to `MUM` on the document. The `.{fieldname}.` segments interpolate a field value,
+`.YYYY.` the current year, and `.#####.` an auto-incrementing sequence.
+
+### Pattern B: Controller-Based Custom Naming (Complex)
+
+When the name depends on derived data or a custom sequence, implement `autoname`
+in the controller. Here the city code comes from the linked franchise outlet, and
+the sequence is pulled from a dedicated counter table.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_sales_order/sj_sales_order.py" {7-13}
+import frappe
+from frappe import _
+from frappe.model.document import Document
+from frappe.utils import nowdate, cint
+
+
+class SJSalesOrder(Document):
+    def autoname(self):
+        """Generate: SO-{CITY}-{YYYY}-{SEQUENCE}
+        Example: SO-MUM-2026-0001
+        Thread-safe via SELECT FOR UPDATE on a counter table.
+        """
+        city_code = self.get_city_code()
+        year = nowdate()[:4]
+        prefix = f"SO-{city_code}-{year}"
+        sequence = get_next_sequence(prefix)
+        self.name = f"{prefix}-{sequence:04d}"
+
+    def get_city_code(self):
+        """Derive 3-letter city code from the linked franchise outlet."""
+        if not self.franchise_outlet:
+            frappe.throw(_("Franchise Outlet is required for naming."))
+
+        city_code = frappe.db.get_value(
+            "SJ Franchise Outlet", self.franchise_outlet, "city_code"
+        )
+        if not city_code:
+            frappe.throw(
+                _("City Code not set on Franchise Outlet {0}").format(self.franchise_outlet)
+            )
+        return city_code.upper()[:3]
+
+
+def get_next_sequence(prefix):
+    """Thread-safe sequence generation using a counter table with row-level locking.
+
+    Uses SELECT ... FOR UPDATE to prevent race conditions when
+    multiple workers insert documents simultaneously.
+    """
+    # Ensure we are inside a transaction
+    result = frappe.db.sql(
+        """
+        SELECT current_value
+        FROM `tabSJ Naming Counter`
+        WHERE prefix = %s
+        FOR UPDATE
+        """,
+        (prefix,),
+        as_dict=True,
+    )
+
+    if result:
+        next_val = cint(result[0].current_value) + 1
+        frappe.db.sql(
+            """
+            UPDATE `tabSJ Naming Counter`
+            SET current_value = %s
+            WHERE prefix = %s
+            """,
+            (next_val, prefix),
+        )
+    else:
+        next_val = 1
+        frappe.db.sql(
+            """
+            INSERT INTO `tabSJ Naming Counter` (name, prefix, current_value, creation, modified, owner, modified_by)
+            VALUES (%s, %s, %s, NOW(), NOW(), %s, %s)
+            """,
+            (prefix, prefix, next_val, frappe.session.user, frappe.session.user),
+        )
+
+    return next_val
+```
+
+The `SELECT ... FOR UPDATE` takes a row-level lock on the counter row for this
+prefix; any concurrent insert with the same prefix blocks until this transaction
+commits, so two documents can never claim the same sequence number.
+
+#### The Counter Table DocType
+
+The sequence state lives in a tiny DocType keyed by `prefix`, with `By fieldname`
+naming so each prefix maps to exactly one row.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_naming_counter/sj_naming_counter.json"
+{
+  "name": "SJ Naming Counter",
+  "module": "ScoopJoy",
+  "naming_rule": "By fieldname",
+  "autoname": "field:prefix",
+  "fields": [
+    {
+      "fieldname": "prefix",
+      "fieldtype": "Data",
+      "label": "Prefix",
+      "reqd": 1,
+      "unique": 1
+    },
+    {
+      "fieldname": "current_value",
+      "fieldtype": "Int",
+      "label": "Current Value",
+      "default": "0"
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1
+    }
+  ]
+}
+```
+
+### Pattern C: Bulk Name Pre-Generation for Imports
+
+For bulk imports you want a whole block of names reserved at once, not one lock
+per row. Grab the current counter value, bump it by the batch size in a single
+update, and hand back the range.
+
+```python title="scoopjoy/scoopjoy/utils/naming.py"
+import frappe
+from frappe.utils import nowdate, cint
+
+
+def pre_generate_names(city_code, count):
+    """Pre-generate a batch of names for bulk import.
+    Returns a list of names and updates the counter atomically.
+
+    Usage:
+        names = pre_generate_names("MUM", 500)
+        # names = ["SO-MUM-2026-0101", "SO-MUM-2026-0102", ...]
+    """
+    year = nowdate()[:4]
+    prefix = f"SO-{city_code}-{year}"
+
+    result = frappe.db.sql(
+        """
+        SELECT current_value
+        FROM `tabSJ Naming Counter`
+        WHERE prefix = %s
+        FOR UPDATE
+        """,
+        (prefix,),
+        as_dict=True,
+    )
+
+    if result:
+        start = cint(result[0].current_value) + 1
+    else:
+        start = 1
+        frappe.db.sql(
+            """
+            INSERT INTO `tabSJ Naming Counter` (name, prefix, current_value, creation, modified, owner, modified_by)
+            VALUES (%s, %s, 0, NOW(), NOW(), 'Administrator', 'Administrator')
+            """,
+            (prefix, prefix),
+        )
+
+    end = start + count
+    frappe.db.sql(
+        """
+        UPDATE `tabSJ Naming Counter`
+        SET current_value = %s
+        WHERE prefix = %s
+        """,
+        (end - 1, prefix),
+    )
+
+    names = [f"{prefix}-{seq:04d}" for seq in range(start, end)]
+    frappe.db.commit()
+    return names
+```
+
+### Pattern D: Renaming with Cascade Updates
+
+When a document name must change after creation, never hand-edit it — let
+`frappe.rename_doc` cascade the change across every reference in the database.
+
+```python title="scoopjoy/scoopjoy/utils/naming.py"
+@frappe.whitelist()
+def rename_outlet_and_cascade(old_name, new_name):
+    """Rename a franchise outlet and update all linked documents.
+
+    frappe.rename_doc handles:
+    - Renaming the document itself
+    - Updating all Link fields pointing to this DocType across ALL DocTypes
+    - Updating Dynamic Link references
+    - Updating child table references
+    """
+    # rename_doc handles all cascade updates automatically
+    frappe.rename_doc("SJ Franchise Outlet", old_name, new_name, merge=False)
+
+    # Clear any caches that store the old name
+    frappe.cache.hdel("sj_outlet_cache", old_name)
+
+    frappe.msgprint(
+        f"Renamed '{old_name}' to '{new_name}'. All references updated.",
+        indicator="green",
+        alert=True,
+    )
+    return new_name
+```
+
+:::note[Why this works]
+The `autoname` controller method has the highest priority after Document Naming
+Rules and runs before `db_insert`. Using `SELECT ... FOR UPDATE` creates a
+row-level lock in MySQL/MariaDB, ensuring that even under concurrent inserts, no
+two documents get the same sequence number.
+:::
+
+:::caution[Common mistake]
+Using Python-level counters (e.g., `frappe.db.count` + 1) for naming. This creates
+race conditions under concurrent requests. Always use database-level locking
+(`FOR UPDATE`) or Frappe's built-in `make_autoname` with `#####` sequences.
+:::

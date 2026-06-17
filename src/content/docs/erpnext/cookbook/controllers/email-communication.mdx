@@ -1,0 +1,375 @@
+---
+title: Email & Communication Patterns
+description: Send Jinja-templated emails with PDF attachments, bulk-send without blocking, link emails to documents, and track delivery in Frappe.
+sidebar:
+  order: 8
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Send rich emails from the ScoopJoy franchise app — Jinja-templated
+emails, PDF attachments, bulk sending to every franchise manager, and emails that
+show up in a document's timeline.
+
+**Solution:** Lean on `frappe.sendmail`. It takes a Jinja `template`, an `args`
+context, binary `attachments`, and `reference_doctype`/`reference_name` to bind the
+mail to a document. Queue with `now=False` and wrap bulk sends in a background job
+so you never block an HTTP request.
+
+## Pattern 1: Jinja-templated email with PDF attachment
+
+The email body is an ordinary HTML file under `templates/emails/`. Jinja
+placeholders like `{{ franchise_name }}` are filled from the `args` dict you pass
+to `frappe.sendmail`.
+
+```html title="apps/scoopjoy/scoopjoy/templates/emails/franchise_weekly_digest.html"
+<h2>Weekly Sales Digest: {{ franchise_name }}</h2>
+<p>Territory: {{ territory }} | Period: {{ week_start }} to {{ week_end }}</p>
+
+<table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+  <tr style="background-color: #E91E63; color: white;">
+    <th>Metric</th>
+    <th>Value</th>
+  </tr>
+  <tr>
+    <td>Total Transactions</td>
+    <td>{{ invoice_count }}</td>
+  </tr>
+  <tr>
+    <td>Total Revenue</td>
+    <td>{{ total_revenue_formatted }}</td>
+  </tr>
+  <tr>
+    <td>Average Ticket Size</td>
+    <td>{{ avg_ticket_size_formatted }}</td>
+  </tr>
+</table>
+
+<p style="margin-top: 20px; color: #666;">
+  This is an automated weekly digest from ScoopJoy ERP.
+  Log in to <a href="{{ frappe.utils.get_url() }}">your dashboard</a> for more details.
+</p>
+```
+
+To attach the invoice as a PDF, render a print format with `frappe.get_print`, run
+it through `get_pdf`, and hand the bytes to `attachments`. The `reference_doctype`
+and `reference_name` arguments bind the mail to the Sales Invoice so it appears in
+the document timeline.
+
+```python title="apps/scoopjoy/scoopjoy/email_utils.py" {16-22,33-38}
+import frappe
+from frappe import _
+from frappe.utils import get_url
+from frappe.utils.pdf import get_pdf
+
+
+def send_franchise_invoice_email(invoice_name):
+    """
+    Send a Sales Invoice email with the invoice PDF attached.
+    Uses a Jinja template for the email body and attaches the
+    print format as a PDF.
+    """
+    invoice = frappe.get_doc("Sales Invoice", invoice_name)
+
+    # Generate PDF from the default print format
+    pdf_content = get_pdf(
+        frappe.get_print(
+            doctype="Sales Invoice",
+            name=invoice_name,
+            print_format="ScoopJoy Invoice",
+        )
+    )
+
+    frappe.sendmail(
+        recipients=[invoice.contact_email or frappe.db.get_value("Customer", invoice.customer, "email_id")],
+        subject=_("ScoopJoy Invoice {0}").format(invoice_name),
+        template="franchise_invoice_email",
+        args={
+            "customer_name": invoice.customer_name,
+            "invoice_name": invoice_name,
+            "grand_total": frappe.format_value(invoice.grand_total, {"fieldtype": "Currency"}),
+            "due_date": frappe.format_value(invoice.due_date, {"fieldtype": "Date"}),
+            "invoice_url": get_url(f"/app/sales-invoice/{invoice_name}"),
+            "company": invoice.company,
+        },
+        attachments=[
+            {
+                "fname": f"{invoice_name}.pdf",
+                "fcontent": pdf_content,
+            }
+        ],
+        reference_doctype="Sales Invoice",
+        reference_name=invoice_name,
+    )
+```
+
+The matching body template renders the `args` context — note how `{{ invoice_url }}`
+and `{{ grand_total }}` map straight to the keys passed above.
+
+```html title="apps/scoopjoy/scoopjoy/templates/emails/franchise_invoice_email.html"
+<p>Dear {{ customer_name }},</p>
+
+<p>Please find attached your invoice <strong>{{ invoice_name }}</strong> from {{ company }}.</p>
+
+<table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
+  <tr>
+    <td><strong>Invoice</strong></td>
+    <td><a href="{{ invoice_url }}">{{ invoice_name }}</a></td>
+  </tr>
+  <tr>
+    <td><strong>Amount Due</strong></td>
+    <td>{{ grand_total }}</td>
+  </tr>
+  <tr>
+    <td><strong>Due Date</strong></td>
+    <td>{{ due_date }}</td>
+  </tr>
+</table>
+
+<p>Please ensure timely payment to avoid any disruption in services.</p>
+
+<p>Thank you,<br>ScoopJoy Finance Team</p>
+```
+
+## Pattern 2: Bulk email without blocking
+
+Sending to every franchise manager in the request would time out. Enqueue a
+background job, send in batches of 50, and commit after each batch.
+
+```python title="apps/scoopjoy/scoopjoy/bulk_email.py" {32-35,40}
+import frappe
+from frappe import _
+
+
+def send_promotion_to_all_franchisees(promotion_name):
+    """
+    Send a promotional email to all franchise managers.
+    Uses frappe.enqueue to avoid blocking and sends through the email queue.
+    """
+    frappe.enqueue(
+        "scoopjoy.bulk_email._send_promotion_bulk",
+        queue="short",
+        timeout=600,
+        job_id=f"scoopjoy_promo_email::{promotion_name}",
+        deduplicate=True,
+        promotion_name=promotion_name,
+    )
+
+
+def _send_promotion_bulk(promotion_name):
+    """Background job: send promotional emails in batches."""
+    promotion = frappe.get_doc("ScoopJoy Promotion", promotion_name)
+
+    franchise_managers = frappe.get_all(
+        "Franchise Agreement",
+        filters={"docstatus": 1, "agreement_status": "Active"},
+        fields=["franchise_manager_email", "franchise_name", "territory"],
+    )
+
+    batch_size = 50
+    for i in range(0, len(franchise_managers), batch_size):
+        batch = franchise_managers[i : i + batch_size]
+
+        for manager in batch:
+            try:
+                frappe.sendmail(
+                    recipients=[manager.franchise_manager_email],
+                    subject=promotion.email_subject,
+                    template="franchise_promotion",
+                    args={
+                        "franchise_name": manager.franchise_name,
+                        "territory": manager.territory,
+                        "promotion_title": promotion.title,
+                        "promotion_details": promotion.details,
+                        "valid_from": frappe.format_value(promotion.valid_from, {"fieldtype": "Date"}),
+                        "valid_to": frappe.format_value(promotion.valid_to, {"fieldtype": "Date"}),
+                    },
+                    reference_doctype="ScoopJoy Promotion",
+                    reference_name=promotion_name,
+                    now=False,  # Queue, don't send immediately
+                )
+            except Exception:
+                frappe.log_error(
+                    title=_("Promo Email Error: {0}").format(manager.franchise_manager_email),
+                )
+
+        frappe.db.commit()
+
+    frappe.db.set_value("ScoopJoy Promotion", promotion_name, "email_sent", 1)
+    frappe.db.commit()
+```
+
+The `now=False` flag drops each message into the `Email Queue` rather than sending
+synchronously, and a per-manager `try/except` means one bad address can't abort the
+whole batch.
+
+## Pattern 3: Communication DocType — linking emails to documents
+
+A `Communication` record makes an email show up in a document's timeline. You can
+create one directly, or let `frappe.sendmail` create it automatically with
+`communication=True`.
+
+```python title="apps/scoopjoy/scoopjoy/communication.py" {30}
+import frappe
+from frappe import _
+from frappe.utils import now_datetime
+
+
+def log_franchise_communication(agreement_name, subject, content, comm_type="Communication"):
+    """
+    Create a Communication record linked to a Franchise Agreement.
+    This appears in the document's timeline/activity feed.
+    """
+    comm = frappe.get_doc({
+        "doctype": "Communication",
+        "communication_type": comm_type,
+        "communication_medium": "Email",
+        "subject": subject,
+        "content": content,
+        "sender": frappe.session.user,
+        "reference_doctype": "Franchise Agreement",
+        "reference_name": agreement_name,
+        "communication_date": now_datetime(),
+        "sent_or_received": "Sent",
+    })
+    comm.insert(ignore_permissions=True)
+    return comm.name
+
+
+def send_and_log_franchise_notice(agreement_name, subject, message):
+    """
+    Send an email AND create a Communication record linked to the agreement.
+    The recipient sees it in their inbox; the franchise agreement shows it in its timeline.
+    """
+    agreement = frappe.get_doc("Franchise Agreement", agreement_name)
+
+    frappe.sendmail(
+        recipients=[agreement.franchise_manager_email],
+        subject=subject,
+        message=message,
+        reference_doctype="Franchise Agreement",
+        reference_name=agreement_name,
+        communication=True,  # Automatically creates a Communication record
+    )
+
+    return {"status": "sent", "recipient": agreement.franchise_manager_email}
+
+
+def get_franchise_email_history(agreement_name, limit=20):
+    """Retrieve email history for a franchise agreement from the Communication timeline."""
+    communications = frappe.get_all(
+        "Communication",
+        filters={
+            "reference_doctype": "Franchise Agreement",
+            "reference_name": agreement_name,
+            "communication_medium": "Email",
+        },
+        fields=["name", "subject", "sender", "recipients", "communication_date", "sent_or_received"],
+        order_by="communication_date desc",
+        limit=limit,
+    )
+    return communications
+```
+
+## Pattern 4: Email delivery tracking
+
+Every queued email leaves a row in `Email Queue`. Join it back to `Communication`
+to see what was delivered, what bounced, and what is still pending for a franchise.
+
+```python title="apps/scoopjoy/scoopjoy/email_tracking.py"
+import frappe
+from frappe import _
+
+
+def check_email_delivery_status(communication_name):
+    """
+    Check if an email from the Email Queue was delivered, bounced, or is still pending.
+    """
+    queue_entry = frappe.db.get_value(
+        "Email Queue",
+        {"communication": communication_name},
+        ["name", "status", "error", "creation"],
+        as_dict=True,
+    )
+
+    if not queue_entry:
+        return {"status": "not_found", "message": "No email queue entry for this communication."}
+
+    return {
+        "queue_id": queue_entry.name,
+        "status": queue_entry.status,
+        "error": queue_entry.error,
+        "sent_at": str(queue_entry.creation),
+    }
+
+
+def get_franchise_email_stats(agreement_name, days=30):
+    """Get email delivery stats for a franchise over the last N days."""
+    from frappe.utils import add_days, today
+
+    start_date = add_days(today(), -days)
+
+    stats = frappe.db.sql(
+        """
+        SELECT
+            eq.status,
+            COUNT(*) as count
+        FROM `tabEmail Queue` eq
+        JOIN `tabCommunication` c ON eq.communication = c.name
+        WHERE c.reference_doctype = 'Franchise Agreement'
+          AND c.reference_name = %(agreement)s
+          AND eq.creation >= %(start_date)s
+        GROUP BY eq.status
+        """,
+        {"agreement": agreement_name, "start_date": start_date},
+        as_dict=True,
+    )
+
+    return {row.status: row.count for row in stats}
+```
+
+## Pattern 5: Outlet offline alert template
+
+A Jinja `{% for %}` loop renders one table row per offline outlet — the same
+template referenced by the heartbeat scheduler task. The `{{ loop.index }}` helper
+numbers the rows.
+
+```html title="apps/scoopjoy/scoopjoy/templates/emails/outlet_offline_alert.html"
+<h2 style="color: #D32F2F;">Outlet Offline Alert</h2>
+<p>{{ count }} outlet(s) have not sent a heartbeat in the last 30 minutes as of {{ check_time }}.</p>
+
+<table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+  <tr style="background-color: #D32F2F; color: white;">
+    <th>#</th>
+    <th>Outlet Name</th>
+  </tr>
+  {% for outlet in offline_outlets %}
+  <tr>
+    <td>{{ loop.index }}</td>
+    <td>{{ outlet }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<p style="margin-top: 16px;">
+  Please investigate and contact the franchise managers if needed.
+</p>
+<p style="color: #999;">Automated alert from ScoopJoy Operations ERP</p>
+```
+
+:::note[Why this works]
+Setting `reference_doctype` and `reference_name` on `frappe.sendmail` links the
+email to the document, making it appear in the timeline. Using `now=False` queues
+emails via `Email Queue` instead of sending synchronously, preventing HTTP request
+timeouts when sending bulk emails. The `get_pdf` + `frappe.get_print` pattern
+generates a PDF from any Frappe print format and attaches it as binary content.
+:::
+
+:::caution[Common mistake]
+Passing `now=True` in bulk email operations. This sends each email synchronously
+during the request, which can easily time out when sending to 100+ recipients.
+Always use `now=False` (the default) to queue emails, or enqueue the entire
+operation as a background job.
+:::

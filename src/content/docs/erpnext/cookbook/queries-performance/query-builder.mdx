@@ -1,0 +1,708 @@
+---
+title: frappe.qb Query Builder Masterclass
+description: Ten production-ready frappe.qb patterns — joins, subqueries, window functions, CASE, UNION, and date functions — each with its raw-SQL equivalent.
+sidebar:
+  order: 1
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** You need to build complex queries against ScoopJoy's data without
+hand-rolling raw SQL strings. Frappe v16's Query Builder (pypika-based) covers
+everything from simple selects to window functions, but the docs only scratch the
+surface.
+
+**Solution:** Ten production-ready query patterns, each shown as `frappe.qb` code
+alongside its equivalent raw SQL. Every pattern lives in the same
+`scoopjoy/scoopjoy/api/queries.py` module, so you can drop them straight into the
+app.
+
+### Pattern A: Simple Select with Filters
+
+The workhorse: pick fields, filter, sort, and limit. `frappe.qb.DocType()` returns a
+table object you build the query against.
+
+```python title="scoopjoy/scoopjoy/api/queries.py"
+import frappe
+
+def get_active_outlets():
+    """Fetch active franchise outlets with specific fields."""
+    Outlet = frappe.qb.DocType("Franchise Outlet")
+
+    outlets = (
+        frappe.qb.from_(Outlet)
+        .select(
+            Outlet.name,
+            Outlet.outlet_name,
+            Outlet.city,
+            Outlet.franchise_owner,
+            Outlet.monthly_target,
+        )
+        .where(Outlet.is_active == 1)
+        .where(Outlet.city.isin(["Mumbai", "Delhi", "Bangalore"]))
+        .orderby(Outlet.outlet_name)
+        .limit(50)
+    ).run(as_dict=True)
+
+    return outlets
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT name, outlet_name, city, franchise_owner, monthly_target
+FROM `tabFranchise Outlet`
+WHERE is_active = 1
+  AND city IN ('Mumbai', 'Delhi', 'Bangalore')
+ORDER BY outlet_name
+LIMIT 50
+```
+
+:::note[Why this works]
+`frappe.qb.DocType()` returns a pypika `Table` object referencing the
+`tab`-prefixed MariaDB table. Chained `.where()` calls produce `AND` conditions.
+The `.run(as_dict=True)` executes via the site's database connection and returns a
+list of dicts.
+:::
+
+:::caution[Common mistake]
+Forgetting `as_dict=True` — without it you get a list of tuples, which breaks code
+that accesses `row.field_name`.
+:::
+
+### Pattern B: JOIN Between DocTypes (Sales Invoice + Customer)
+
+Join Sales Invoice to Customer and aggregate per customer with `Sum`.
+
+```python title="scoopjoy/scoopjoy/api/queries.py"
+import frappe
+from frappe.query_builder.functions import Sum
+
+def get_customer_invoice_totals(from_date, to_date):
+    """Join Sales Invoice with Customer for franchise sales summary."""
+    SI = frappe.qb.DocType("Sales Invoice")
+    Cust = frappe.qb.DocType("Customer")
+
+    data = (
+        frappe.qb.from_(SI)
+        .join(Cust).on(SI.customer == Cust.name)
+        .select(
+            Cust.name.as_("customer_id"),
+            Cust.customer_name,
+            Cust.territory,
+            Sum(SI.grand_total).as_("total_sales"),
+            Sum(SI.outstanding_amount).as_("total_outstanding"),
+        )
+        .where(SI.docstatus == 1)
+        .where(SI.posting_date.between(from_date, to_date))
+        .groupby(Cust.name)
+        .orderby(Sum(SI.grand_total), order=frappe.qb.desc)
+    ).run(as_dict=True)
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT
+    c.name AS customer_id,
+    c.customer_name,
+    c.territory,
+    SUM(si.grand_total) AS total_sales,
+    SUM(si.outstanding_amount) AS total_outstanding
+FROM `tabSales Invoice` si
+JOIN `tabCustomer` c ON si.customer = c.name
+WHERE si.docstatus = 1
+  AND si.posting_date BETWEEN '2025-01-01' AND '2025-03-31'
+GROUP BY c.name
+ORDER BY SUM(si.grand_total) DESC
+```
+
+:::note[Performance note]
+The `docstatus` column is indexed by default on all submittable DocTypes. Adding an
+index on `posting_date` for Sales Invoice is recommended for date-range queries on
+large tables (see [Database Indexing](/erpnext/cookbook/queries-performance/database-indexing/)).
+:::
+
+### Pattern C: LEFT JOIN with Null Handling
+
+Find outlets that may have **zero** invoices. The trick is where the date filter
+goes.
+
+```python title="scoopjoy/scoopjoy/api/queries.py" {11-15}
+import frappe
+from frappe.query_builder.functions import IfNull, Count
+
+def get_outlets_with_invoice_counts(from_date, to_date):
+    """Find outlets that may have ZERO invoices (LEFT JOIN)."""
+    Outlet = frappe.qb.DocType("Franchise Outlet")
+    SI = frappe.qb.DocType("Sales Invoice")
+
+    data = (
+        frappe.qb.from_(Outlet)
+        .left_join(SI).on(
+            (SI.franchise_outlet == Outlet.name)
+            & (SI.docstatus == 1)
+            & (SI.posting_date.between(from_date, to_date))
+        )
+        .select(
+            Outlet.name.as_("outlet"),
+            Outlet.outlet_name,
+            Outlet.city,
+            Count(SI.name).as_("invoice_count"),
+            IfNull(frappe.qb.terms.ValueWrapper(0), SI.grand_total).as_("has_sales"),
+        )
+        .groupby(Outlet.name)
+        .orderby(Count(SI.name))
+    ).run(as_dict=True)
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT
+    o.name AS outlet,
+    o.outlet_name,
+    o.city,
+    COUNT(si.name) AS invoice_count,
+    IFNULL(si.grand_total, 0) AS has_sales
+FROM `tabFranchise Outlet` o
+LEFT JOIN `tabSales Invoice` si
+    ON si.franchise_outlet = o.name
+    AND si.docstatus = 1
+    AND si.posting_date BETWEEN '2025-01-01' AND '2025-03-31'
+GROUP BY o.name
+ORDER BY COUNT(si.name)
+```
+
+:::note[Why this works]
+Placing the date filter in the `ON` clause (not `WHERE`) is critical for LEFT JOINs.
+If you put it in `WHERE`, outlets with zero invoices get filtered out — defeating
+the purpose of the LEFT JOIN.
+:::
+
+:::caution[Common mistake]
+Writing `.left_join(SI).on(SI.franchise_outlet == Outlet.name)` then
+`.where(SI.posting_date.between(...))` — this converts your LEFT JOIN into an INNER
+JOIN in practice.
+:::
+
+### Pattern D: Subquery in WHERE Clause
+
+Filter outlets by a correlated scalar subquery — total sales above a threshold.
+
+```python title="scoopjoy/scoopjoy/api/queries.py"
+import frappe
+from frappe.query_builder.functions import Sum
+
+def get_high_performing_outlets(threshold=500000):
+    """Find outlets whose total sales exceed a threshold (subquery)."""
+    Outlet = frappe.qb.DocType("Franchise Outlet")
+    SI = frappe.qb.DocType("Sales Invoice")
+
+    # Build the subquery: total sales per outlet
+    sales_subquery = (
+        frappe.qb.from_(SI)
+        .select(Sum(SI.grand_total))
+        .where(SI.franchise_outlet == Outlet.name)
+        .where(SI.docstatus == 1)
+    )
+
+    data = (
+        frappe.qb.from_(Outlet)
+        .select(
+            Outlet.name,
+            Outlet.outlet_name,
+            Outlet.city,
+            Outlet.franchise_owner,
+        )
+        .where(Outlet.is_active == 1)
+        .where(sales_subquery > threshold)
+    ).run(as_dict=True)
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT name, outlet_name, city, franchise_owner
+FROM `tabFranchise Outlet` o
+WHERE is_active = 1
+  AND (
+    SELECT SUM(grand_total)
+    FROM `tabSales Invoice`
+    WHERE franchise_outlet = o.name AND docstatus = 1
+  ) > 500000
+```
+
+:::note[Performance note]
+Correlated subqueries execute once per row in the outer query. For large tables
+(10K+ outlets), rewrite as a JOIN with `GROUP BY` + `HAVING` (Pattern E). Use this
+pattern only when the outer table is small or when the subquery is used as a scalar
+value.
+:::
+
+### Pattern E: GROUP BY with HAVING
+
+Aggregate across a join, then filter the groups with `.having()` — outlets that
+clear both an order-count and a revenue floor.
+
+```python title="scoopjoy/scoopjoy/api/queries.py"
+import frappe
+from frappe.query_builder.functions import Sum, Count, Avg
+from pypika.terms import Criterion
+
+def get_franchise_performance_summary(min_orders=10, min_revenue=100000):
+    """Outlets with minimum order count AND minimum revenue."""
+    SI = frappe.qb.DocType("Sales Invoice")
+    SII = frappe.qb.DocType("Sales Invoice Item")
+
+    data = (
+        frappe.qb.from_(SI)
+        .join(SII).on(SII.parent == SI.name)
+        .select(
+            SI.franchise_outlet.as_("outlet"),
+            Count(SI.name).as_("order_count"),
+            Sum(SI.grand_total).as_("total_revenue"),
+            Avg(SI.grand_total).as_("avg_order_value"),
+            Sum(SII.qty).as_("total_items_sold"),
+        )
+        .where(SI.docstatus == 1)
+        .groupby(SI.franchise_outlet)
+        .having(Count(SI.name) >= min_orders)
+        .having(Sum(SI.grand_total) >= min_revenue)
+        .orderby(Sum(SI.grand_total), order=frappe.qb.desc)
+    ).run(as_dict=True)
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT
+    si.franchise_outlet AS outlet,
+    COUNT(si.name) AS order_count,
+    SUM(si.grand_total) AS total_revenue,
+    AVG(si.grand_total) AS avg_order_value,
+    SUM(sii.qty) AS total_items_sold
+FROM `tabSales Invoice` si
+JOIN `tabSales Invoice Item` sii ON sii.parent = si.name
+WHERE si.docstatus = 1
+GROUP BY si.franchise_outlet
+HAVING COUNT(si.name) >= 10
+  AND SUM(si.grand_total) >= 100000
+ORDER BY SUM(si.grand_total) DESC
+```
+
+### Pattern F: CASE WHEN for Computed Columns
+
+Classify outlets into Gold/Silver/Bronze tiers inline using pypika's `Case()`.
+
+```python title="scoopjoy/scoopjoy/api/queries.py"
+import frappe
+from frappe.query_builder.functions import Sum
+from pypika.terms import Case
+
+def get_outlet_performance_tiers():
+    """Classify outlets into Gold/Silver/Bronze based on monthly sales."""
+    SI = frappe.qb.DocType("Sales Invoice")
+
+    tier_case = (
+        Case()
+        .when(Sum(SI.grand_total) >= 1000000, "Gold")
+        .when(Sum(SI.grand_total) >= 500000, "Silver")
+        .when(Sum(SI.grand_total) >= 100000, "Bronze")
+        .else_("Starter")
+    )
+
+    status_case = (
+        Case()
+        .when(Sum(SI.grand_total) >= 500000, "Above Target")
+        .else_("Below Target")
+    )
+
+    data = (
+        frappe.qb.from_(SI)
+        .select(
+            SI.franchise_outlet.as_("outlet"),
+            Sum(SI.grand_total).as_("total_sales"),
+            tier_case.as_("performance_tier"),
+            status_case.as_("target_status"),
+        )
+        .where(SI.docstatus == 1)
+        .where(SI.posting_date.between("2025-01-01", "2025-03-31"))
+        .groupby(SI.franchise_outlet)
+        .orderby(Sum(SI.grand_total), order=frappe.qb.desc)
+    ).run(as_dict=True)
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT
+    franchise_outlet AS outlet,
+    SUM(grand_total) AS total_sales,
+    CASE
+        WHEN SUM(grand_total) >= 1000000 THEN 'Gold'
+        WHEN SUM(grand_total) >= 500000 THEN 'Silver'
+        WHEN SUM(grand_total) >= 100000 THEN 'Bronze'
+        ELSE 'Starter'
+    END AS performance_tier,
+    CASE
+        WHEN SUM(grand_total) >= 500000 THEN 'Above Target'
+        ELSE 'Below Target'
+    END AS target_status
+FROM `tabSales Invoice`
+WHERE docstatus = 1
+  AND posting_date BETWEEN '2025-01-01' AND '2025-03-31'
+GROUP BY franchise_outlet
+ORDER BY SUM(grand_total) DESC
+```
+
+:::note[Why this works]
+pypika's `Case()` generates standard SQL CASE expressions. You chain
+`.when(condition, value)` and end with `.else_(default)`. It can wrap aggregates
+because the CASE operates on the grouped result.
+:::
+
+### Pattern G: Window Functions (ROW_NUMBER, RANK)
+
+Top N selling items per outlet. `frappe.qb` doesn't ship window functions, so extend
+pypika's `AnalyticFunction`.
+
+```python title="scoopjoy/scoopjoy/api/queries.py" {6-15}
+import frappe
+from frappe.query_builder.functions import Sum
+from pypika.terms import AnalyticFunction
+from pypika import Order
+
+# Custom window function classes (frappe.qb doesn't ship these natively)
+class RowNumber(AnalyticFunction):
+    def __init__(self):
+        super().__init__("ROW_NUMBER")
+
+class Rank(AnalyticFunction):
+    def __init__(self):
+        super().__init__("RANK")
+
+class DenseRank(AnalyticFunction):
+    def __init__(self):
+        super().__init__("DENSE_RANK")
+
+
+def get_top_items_per_outlet(top_n=3):
+    """Top N selling items per outlet using ROW_NUMBER window function."""
+    SII = frappe.qb.DocType("Sales Invoice Item")
+    SI = frappe.qb.DocType("Sales Invoice")
+
+    # Build inner query with window function
+    row_num = (
+        RowNumber()
+        .over(SI.franchise_outlet)
+        .orderby(Sum(SII.amount), order=Order.desc)
+    )
+
+    inner = (
+        frappe.qb.from_(SII)
+        .join(SI).on(SII.parent == SI.name)
+        .select(
+            SI.franchise_outlet.as_("outlet"),
+            SII.item_code,
+            SII.item_name,
+            Sum(SII.qty).as_("total_qty"),
+            Sum(SII.amount).as_("total_amount"),
+            row_num.as_("rank_in_outlet"),
+        )
+        .where(SI.docstatus == 1)
+        .groupby(SI.franchise_outlet, SII.item_code)
+    )
+
+    # For the outer filter, use raw SQL since pypika subquery-from is verbose
+    data = frappe.db.sql("""
+        SELECT outlet, item_code, item_name, total_qty, total_amount, rank_in_outlet
+        FROM ({inner_sql}) ranked
+        WHERE rank_in_outlet <= %(top_n)s
+        ORDER BY outlet, rank_in_outlet
+    """.format(inner_sql=inner.get_sql()), {"top_n": top_n}, as_dict=True)
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT outlet, item_code, item_name, total_qty, total_amount, rank_in_outlet
+FROM (
+    SELECT
+        si.franchise_outlet AS outlet,
+        sii.item_code,
+        sii.item_name,
+        SUM(sii.qty) AS total_qty,
+        SUM(sii.amount) AS total_amount,
+        ROW_NUMBER() OVER (
+            PARTITION BY si.franchise_outlet
+            ORDER BY SUM(sii.amount) DESC
+        ) AS rank_in_outlet
+    FROM `tabSales Invoice Item` sii
+    JOIN `tabSales Invoice` si ON sii.parent = si.name
+    WHERE si.docstatus = 1
+    GROUP BY si.franchise_outlet, sii.item_code
+) ranked
+WHERE rank_in_outlet <= 3
+ORDER BY outlet, rank_in_outlet
+```
+
+:::note[Why this works]
+Frappe's query builder wraps pypika, which supports `AnalyticFunction` for window
+functions. Since `ROW_NUMBER`, `RANK`, and `DENSE_RANK` aren't built into
+`frappe.query_builder.functions`, we extend `pypika.terms.AnalyticFunction`. The
+`.over()` method sets `PARTITION BY` and `.orderby()` sets `ORDER BY` within the
+window.
+:::
+
+:::caution[Common mistake]
+Trying to filter by `rank_in_outlet` in the same query level where it's defined.
+Window function results cannot be used in `WHERE` — you must wrap in a subquery
+first.
+:::
+
+### Pattern H: UNION of Multiple Queries
+
+Combine dine-in and delivery revenue into one report. In pypika, the `+` operator
+produces a `UNION ALL`.
+
+```python title="scoopjoy/scoopjoy/api/queries.py" {30}
+import frappe
+from frappe.query_builder.functions import Sum
+from pypika import Union
+
+def get_combined_revenue_report():
+    """Combine dine-in and delivery revenue into one report."""
+    SI = frappe.qb.DocType("Sales Invoice")
+
+    dine_in = (
+        frappe.qb.from_(SI)
+        .select(
+            SI.franchise_outlet.as_("outlet"),
+            frappe.qb.terms.ValueWrapper("Dine-In").as_("channel"),
+            Sum(SI.grand_total).as_("revenue"),
+        )
+        .where(SI.docstatus == 1)
+        .where(SI.order_type == "Dine-In")
+        .groupby(SI.franchise_outlet)
+    )
+
+    delivery = (
+        frappe.qb.from_(SI)
+        .select(
+            SI.franchise_outlet.as_("outlet"),
+            frappe.qb.terms.ValueWrapper("Delivery").as_("channel"),
+            Sum(SI.grand_total).as_("revenue"),
+        )
+        .where(SI.docstatus == 1)
+        .where(SI.order_type == "Delivery")
+        .groupby(SI.franchise_outlet)
+    )
+
+    # pypika Union
+    union_query = dine_in + delivery  # UNION ALL
+
+    # Execute via raw SQL since pypika union returns a special object
+    data = frappe.db.sql(
+        union_query.get_sql(),
+        as_dict=True
+    )
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT franchise_outlet AS outlet, 'Dine-In' AS channel, SUM(grand_total) AS revenue
+FROM `tabSales Invoice`
+WHERE docstatus = 1 AND order_type = 'Dine-In'
+GROUP BY franchise_outlet
+
+UNION ALL
+
+SELECT franchise_outlet AS outlet, 'Delivery' AS channel, SUM(grand_total) AS revenue
+FROM `tabSales Invoice`
+WHERE docstatus = 1 AND order_type = 'Delivery'
+GROUP BY franchise_outlet
+```
+
+:::note[Performance note]
+`UNION ALL` (the `+` operator in pypika) is faster than `UNION` (which deduplicates).
+Use `UNION ALL` when you know results don't overlap or when duplicates are
+acceptable.
+:::
+
+### Pattern I: EXISTS Subquery for Filtering
+
+Find outlets with at least one open, high-priority complaint. `EXISTS` short-circuits
+on the first match.
+
+```python title="scoopjoy/scoopjoy/api/queries.py"
+import frappe
+from pypika.terms import ExistsCriterion
+
+def get_outlets_with_complaints():
+    """Find outlets that have at least one unresolved complaint."""
+    Outlet = frappe.qb.DocType("Franchise Outlet")
+    Complaint = frappe.qb.DocType("Customer Complaint")
+
+    exists_subquery = (
+        frappe.qb.from_(Complaint)
+        .select(frappe.qb.terms.ValueWrapper(1))
+        .where(Complaint.franchise_outlet == Outlet.name)
+        .where(Complaint.status == "Open")
+        .where(Complaint.priority.isin(["High", "Critical"]))
+    )
+
+    data = (
+        frappe.qb.from_(Outlet)
+        .select(
+            Outlet.name,
+            Outlet.outlet_name,
+            Outlet.city,
+            Outlet.franchise_owner,
+        )
+        .where(Outlet.is_active == 1)
+        .where(ExistsCriterion(exists_subquery))
+        .orderby(Outlet.outlet_name)
+    ).run(as_dict=True)
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+SELECT name, outlet_name, city, franchise_owner
+FROM `tabFranchise Outlet` o
+WHERE is_active = 1
+  AND EXISTS (
+    SELECT 1
+    FROM `tabCustomer Complaint` c
+    WHERE c.franchise_outlet = o.name
+      AND c.status = 'Open'
+      AND c.priority IN ('High', 'Critical')
+  )
+ORDER BY outlet_name
+```
+
+:::note[Why this works]
+`EXISTS` stops scanning as soon as it finds one matching row, making it faster than
+`IN` with a subquery when the subquery table is large. pypika provides
+`ExistsCriterion` for this pattern.
+:::
+
+### Pattern J: Date Range and Date Functions
+
+Use `CustomFunction` to reach MariaDB date functions that frappe doesn't wrap, then
+build a monthly breakdown and an "inactive for N days" report.
+
+```python title="scoopjoy/scoopjoy/api/queries.py" {5-9}
+import frappe
+from frappe.query_builder.functions import Sum, Count
+from frappe.query_builder import CustomFunction
+
+# Register MariaDB date functions
+Month = CustomFunction("MONTH", ["date"])
+Year = CustomFunction("YEAR", ["date"])
+DateDiff = CustomFunction("DATEDIFF", ["date1", "date2"])
+CurDate = CustomFunction("CURDATE", [])
+
+def get_monthly_sales_breakdown(year=2025):
+    """Monthly sales breakdown with days-since-last-order calculation."""
+    SI = frappe.qb.DocType("Sales Invoice")
+
+    data = (
+        frappe.qb.from_(SI)
+        .select(
+            SI.franchise_outlet.as_("outlet"),
+            Year(SI.posting_date).as_("year"),
+            Month(SI.posting_date).as_("month"),
+            Count(SI.name).as_("order_count"),
+            Sum(SI.grand_total).as_("monthly_revenue"),
+        )
+        .where(SI.docstatus == 1)
+        .where(Year(SI.posting_date) == year)
+        .groupby(
+            SI.franchise_outlet,
+            Year(SI.posting_date),
+            Month(SI.posting_date),
+        )
+        .orderby(SI.franchise_outlet)
+        .orderby(Month(SI.posting_date))
+    ).run(as_dict=True)
+
+    return data
+
+
+def get_outlets_inactive_for_days(days=30):
+    """Outlets with no sales in the last N days."""
+    SI = frappe.qb.DocType("Sales Invoice")
+    Outlet = frappe.qb.DocType("Franchise Outlet")
+
+    last_sale = (
+        frappe.qb.from_(SI)
+        .select(frappe.qb.functions.Max(SI.posting_date))
+        .where(SI.franchise_outlet == Outlet.name)
+        .where(SI.docstatus == 1)
+    )
+
+    data = (
+        frappe.qb.from_(Outlet)
+        .select(
+            Outlet.name,
+            Outlet.outlet_name,
+            Outlet.city,
+        )
+        .where(Outlet.is_active == 1)
+        .where(DateDiff(CurDate(), last_sale) > days)
+    ).run(as_dict=True)
+
+    return data
+```
+
+Equivalent raw SQL:
+
+```sql
+-- Monthly breakdown
+SELECT
+    franchise_outlet AS outlet,
+    YEAR(posting_date) AS year,
+    MONTH(posting_date) AS month,
+    COUNT(name) AS order_count,
+    SUM(grand_total) AS monthly_revenue
+FROM `tabSales Invoice`
+WHERE docstatus = 1 AND YEAR(posting_date) = 2025
+GROUP BY franchise_outlet, YEAR(posting_date), MONTH(posting_date)
+ORDER BY franchise_outlet, MONTH(posting_date);
+
+-- Inactive outlets
+SELECT o.name, o.outlet_name, o.city
+FROM `tabFranchise Outlet` o
+WHERE o.is_active = 1
+  AND DATEDIFF(CURDATE(), (
+    SELECT MAX(posting_date)
+    FROM `tabSales Invoice`
+    WHERE franchise_outlet = o.name AND docstatus = 1
+  )) > 30;
+```
+
+:::caution[Common mistake]
+Using `frappe.query_builder.functions.Date` when you mean `CURDATE()`. The
+`CustomFunction` approach works for any SQL function not already wrapped by frappe.
+:::

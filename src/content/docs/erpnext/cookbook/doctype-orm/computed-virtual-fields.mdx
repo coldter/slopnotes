@@ -1,0 +1,404 @@
+---
+title: Computed & Virtual Fields
+description: Show fetched, computed, and conditionally-visible values on Frappe forms — without storing every one of them in the database.
+sidebar:
+  order: 8
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** A ScoopJoy Sales Order form needs to show the outlet's city, owner,
+and rent; a Franchise Outlet card needs live counts of notes, complaints, and a
+performance grade; and an agreement needs running totals from its child tables —
+all without bloating the database with values you can recompute or copy.
+
+**Solution:** Use the right tool for each case. `fetch_from` denormalizes a copy
+from a linked document (stored), `is_virtual` fields are computed by a Python
+`@property` (not stored), child-table aggregates are written into real parent
+fields during `validate()`, and `depends_on` controls conditional visibility and
+validation in the browser.
+
+## Pattern A: `fetch_from` — auto-copy from a linked document
+
+`fetch_from` copies a field from the document a `Link` points at, every time the
+parent is saved. Here a `SJ Sales Order` pulls the outlet's city, owner, and rent
+off the linked `SJ Franchise Outlet`.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_sales_order/sj_sales_order.json" {12,20,28}
+{
+  "fields": [
+    {
+      "fieldname": "franchise_outlet",
+      "fieldtype": "Link",
+      "label": "Franchise Outlet",
+      "options": "SJ Franchise Outlet",
+      "reqd": 1
+    },
+    {
+      "fieldname": "outlet_city",
+      "fieldtype": "Data",
+      "label": "Outlet City",
+      "fetch_from": "franchise_outlet.city",
+      "read_only": 1
+    },
+    {
+      "fieldname": "outlet_owner_name",
+      "fieldtype": "Data",
+      "label": "Outlet Owner",
+      "fetch_from": "franchise_outlet.owner_name",
+      "read_only": 1,
+      "fetch_if_empty": 1
+    },
+    {
+      "fieldname": "outlet_monthly_rent",
+      "fieldtype": "Currency",
+      "label": "Monthly Rent",
+      "fetch_from": "franchise_outlet.monthly_rent",
+      "read_only": 1
+    }
+  ]
+}
+```
+
+:::note
+`fetch_from` copies the value on save, and it **is** stored in the database. Reach
+for it when you need the value for filters, reports, or a historical snapshot — the
+copy on the Sales Order stays frozen even if the outlet's rent changes later. Add
+`fetch_if_empty: 1` to only populate when the target field is blank, so manual
+edits stick.
+:::
+
+## Pattern B: virtual fields (computed, not stored)
+
+Fields marked `is_virtual: 1` hold no column in the database. They are computed on
+demand by a Python `@property` whose name matches the `fieldname`.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_franchise_outlet/sj_franchise_outlet.json" {5,12,19,26}
+{
+  "fields": [
+    {
+      "fieldname": "total_notes_count",
+      "fieldtype": "Int",
+      "label": "Total Notes",
+      "read_only": 1,
+      "is_virtual": 1
+    },
+    {
+      "fieldname": "unresolved_complaints",
+      "fieldtype": "Int",
+      "label": "Unresolved Complaints",
+      "read_only": 1,
+      "is_virtual": 1
+    },
+    {
+      "fieldname": "days_since_last_visit",
+      "fieldtype": "Int",
+      "label": "Days Since Last Visit",
+      "read_only": 1,
+      "is_virtual": 1
+    },
+    {
+      "fieldname": "performance_grade",
+      "fieldtype": "Data",
+      "label": "Performance Grade",
+      "read_only": 1,
+      "is_virtual": 1
+    }
+  ]
+}
+```
+
+Each virtual field gets a matching `@property` on the controller. These run a
+fresh query (or a date diff) every time the document is loaded or serialized into
+an API response.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_franchise_outlet/sj_franchise_outlet.py" {17,26,38,49}
+import frappe
+from frappe import _
+from frappe.model.document import Document
+from frappe.utils import date_diff, nowdate, flt
+
+
+class SJFranchiseOutlet(Document):
+    def validate(self):
+        self.validate_city_code()
+
+    def validate_city_code(self):
+        if self.city_code:
+            self.city_code = self.city_code.upper().strip()[:3]
+
+    # --- Virtual field computations ---
+
+    @property
+    def total_notes_count(self):
+        return frappe.db.count(
+            "SJ Note",
+            filters={
+                "reference_doctype": "SJ Franchise Outlet",
+                "reference_name": self.name,
+            },
+        )
+
+    @property
+    def unresolved_complaints(self):
+        return frappe.db.count(
+            "SJ Note",
+            filters={
+                "reference_doctype": "SJ Franchise Outlet",
+                "reference_name": self.name,
+                "note_type": "Complaint",
+                "resolved": 0,
+            },
+        )
+
+    @property
+    def days_since_last_visit(self):
+        last_visit = frappe.db.get_value(
+            "SJ Outlet Visit",
+            filters={"outlet": self.name, "docstatus": 1},
+            fieldname="visit_date",
+            order_by="visit_date desc",
+        )
+        if last_visit:
+            return date_diff(nowdate(), last_visit)
+        return -1  # No visits recorded
+
+    @property
+    def performance_grade(self):
+        revenue = flt(self.monthly_revenue)
+        if revenue >= 500000:
+            return "A - Excellent"
+        elif revenue >= 300000:
+            return "B - Good"
+        elif revenue >= 150000:
+            return "C - Average"
+        elif revenue > 0:
+            return "D - Below Average"
+        return "N/A"
+```
+
+:::note[Why this works]
+In Frappe v16, fields with `is_virtual: 1` are computed by Python `@property`
+methods on the controller. They appear on the form and in API responses but never
+touch the database. The property name must match the `fieldname` exactly.
+:::
+
+## Pattern C: aggregated child-table summaries
+
+Sometimes you *do* want the rollup stored — for sorting, reporting, or printing.
+Compute it from the child tables during `validate()` and write it into real
+(non-virtual) parent fields. Here `SJ Franchise Agreement` summarizes its `clauses`
+and `subconditions` tables.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_franchise_agreement/sj_franchise_agreement.py" {7-10}
+class SJFranchiseAgreement(Document):
+    # ... (existing methods from Recipe 1.2) ...
+
+    def validate(self):
+        self.assign_clause_ids()
+        self.validate_subcondition_references()
+        self.compute_total_penalty()
+        self.compute_clause_summary()
+
+    def compute_clause_summary(self):
+        """Aggregate child table data into parent fields."""
+        self.total_clauses = len(self.clauses)
+        self.mandatory_clauses = sum(1 for c in self.clauses if c.is_mandatory)
+        self.total_subconditions = len(self.subconditions)
+        self.total_penalty = sum(flt(c.penalty_amount) for c in self.clauses if c.is_mandatory)
+```
+
+These are ordinary `read_only` fields in the JSON — grouped under a section and
+column break so the summary reads as a tidy block on the form.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_franchise_agreement/sj_franchise_agreement.json"
+{
+  "fields": [
+    {
+      "fieldname": "section_summary",
+      "fieldtype": "Section Break",
+      "label": "Agreement Summary"
+    },
+    {
+      "fieldname": "total_clauses",
+      "fieldtype": "Int",
+      "label": "Total Clauses",
+      "read_only": 1
+    },
+    {
+      "fieldname": "mandatory_clauses",
+      "fieldtype": "Int",
+      "label": "Mandatory Clauses",
+      "read_only": 1
+    },
+    {
+      "fieldname": "column_break_summary",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "total_subconditions",
+      "fieldtype": "Int",
+      "label": "Total Sub-conditions",
+      "read_only": 1
+    },
+    {
+      "fieldname": "total_penalty",
+      "fieldtype": "Currency",
+      "label": "Total Penalty Exposure",
+      "read_only": 1
+    }
+  ]
+}
+```
+
+The difference from Pattern B: these values are persisted, so a list view or report
+can filter and sort on `total_penalty` without instantiating every controller.
+
+## Pattern D: `depends_on` for conditional visibility and validation
+
+`depends_on` shows or hides a field based on an `eval:` expression that runs in the
+browser. Its siblings `mandatory_depends_on` and `read_only_depends_on` make a
+field required or read-only under the same kind of condition. Below, suspension
+fields appear only when status is `Suspended`, cold-storage details unlock when the
+`has_cold_storage` checkbox is ticked, and the financials section is gated by role.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_franchise_outlet/sj_franchise_outlet.json" {12-13,40,52}
+{
+  "fields": [
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "\nActive\nSuspended\nClosed",
+      "default": "Active"
+    },
+    {
+      "fieldname": "suspension_reason",
+      "fieldtype": "Small Text",
+      "label": "Suspension Reason",
+      "depends_on": "eval:doc.status === 'Suspended'",
+      "mandatory_depends_on": "eval:doc.status === 'Suspended'"
+    },
+    {
+      "fieldname": "suspension_date",
+      "fieldtype": "Date",
+      "label": "Suspended Since",
+      "depends_on": "eval:doc.status === 'Suspended'",
+      "mandatory_depends_on": "eval:doc.status === 'Suspended'"
+    },
+    {
+      "fieldname": "closure_date",
+      "fieldtype": "Date",
+      "label": "Closure Date",
+      "depends_on": "eval:doc.status === 'Closed'",
+      "mandatory_depends_on": "eval:doc.status === 'Closed'"
+    },
+    {
+      "fieldname": "closure_settlement_amount",
+      "fieldtype": "Currency",
+      "label": "Settlement Amount",
+      "depends_on": "eval:doc.status === 'Closed'"
+    },
+    {
+      "fieldname": "has_cold_storage",
+      "fieldtype": "Check",
+      "label": "Has Cold Storage"
+    },
+    {
+      "fieldname": "cold_storage_capacity_liters",
+      "fieldtype": "Int",
+      "label": "Cold Storage Capacity (Liters)",
+      "depends_on": "eval:doc.has_cold_storage",
+      "mandatory_depends_on": "eval:doc.has_cold_storage"
+    },
+    {
+      "fieldname": "cold_storage_temperature",
+      "fieldtype": "Float",
+      "label": "Storage Temperature (C)",
+      "depends_on": "eval:doc.has_cold_storage",
+      "description": "Should be between -18 and -22 for ice cream"
+    },
+    {
+      "fieldname": "section_financials",
+      "fieldtype": "Section Break",
+      "label": "Financial Details",
+      "depends_on": "eval:frappe.user_roles.includes('Franchise Manager') || frappe.user_roles.includes('System Manager')",
+      "collapsible": 1
+    },
+    {
+      "fieldname": "monthly_revenue",
+      "fieldtype": "Currency",
+      "label": "Monthly Revenue",
+      "read_only_depends_on": "eval:!frappe.user_roles.includes('Franchise Manager')"
+    },
+    {
+      "fieldname": "monthly_rent",
+      "fieldtype": "Currency",
+      "label": "Monthly Rent"
+    }
+  ]
+}
+```
+
+Because `depends_on` only runs in the browser, the server must enforce the same
+rules. Mirror every conditional-mandatory check in the controller's `validate()`.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_franchise_outlet/sj_franchise_outlet.py"
+    def validate(self):
+        self.validate_city_code()
+        self.validate_cold_storage()
+        self.validate_closure()
+
+    def validate_cold_storage(self):
+        """Server-side validation matching depends_on client-side logic."""
+        if self.has_cold_storage:
+            if not self.cold_storage_capacity_liters:
+                frappe.throw(_("Cold Storage Capacity is required when Has Cold Storage is checked."))
+            if self.cold_storage_temperature and (
+                self.cold_storage_temperature > -18 or self.cold_storage_temperature < -30
+            ):
+                frappe.throw(
+                    _("Storage temperature must be between -30 and -18 C. Got: {0}").format(
+                        self.cold_storage_temperature
+                    )
+                )
+
+    def validate_closure(self):
+        """Server-side validation for closure fields."""
+        if self.status == "Closed" and not self.closure_date:
+            frappe.throw(_("Closure Date is required when status is Closed."))
+        if self.status == "Suspended" and not self.suspension_reason:
+            frappe.throw(_("Suspension Reason is required when status is Suspended."))
+```
+
+:::note[Why this works]
+`depends_on` uses `eval:` expressions that run in the browser to show or hide
+fields dynamically. `mandatory_depends_on` and `read_only_depends_on` control
+validation and editability the same way. Server-side validation in `validate()`
+must mirror these rules, since client-side checks can be bypassed.
+:::
+
+:::caution[Common mistake]
+Relying only on `depends_on` for validation. It is a client-side UX feature — the
+server does **not** enforce it. Always duplicate conditional-mandatory checks in
+your Python controller's `validate()` method.
+:::
+
+## Quick reference: v16 ORM method cheat sheet
+
+| Task | Method | Notes |
+|---|---|---|
+| Get single doc | `frappe.get_doc("DocType", name)` | Full ORM object with controller |
+| Get value(s) | `frappe.db.get_value("DT", name, "field")` | Single field, no ORM overhead |
+| Get list | `frappe.get_all("DT", filters, fields)` | Permission-checked, returns dicts |
+| Get list (no perms) | `frappe.get_list("DT", ...)` | Same as `get_all` with `ignore_permissions` |
+| Count | `frappe.db.count("DT", filters)` | `SELECT COUNT(*)` |
+| Exists check | `frappe.db.exists("DT", name)` | Returns name or `None` |
+| Set single value | `frappe.db.set_value("DT", name, "field", val)` | Skips controller, fires `on_change` |
+| Bulk insert | `frappe.db.bulk_insert("DT", fields, values)` | Skips ALL hooks and naming |
+| Query builder | `frappe.qb.from_(DocType).select(...).where(...)` | Pypika-based, parameterized |
+| Raw SQL | `frappe.db.sql(query, values, as_dict=True)` | Always use `%s` placeholders |
+| Run=0 (v16) | `frappe.get_list("DT", run=0)` | Returns a QueryBuilder object, not a string |
+| Aggregation (v16) | `fields=[{"SUM": "amount", "as": "total"}]` | Dict syntax for aggregate functions |

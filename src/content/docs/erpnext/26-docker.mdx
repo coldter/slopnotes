@@ -1,0 +1,682 @@
+---
+title: Docker Dev & Deployment
+description: Use the official frappe_docker images and compose files to run ScoopJoy from local development through production containers.
+sidebar:
+  order: 26
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, FileTree, Aside } from "@astrojs/starlight/components";
+
+Docker has become the standard way to develop and deploy Frappe/ERPNext
+applications. The official `frappe_docker` repository provides production-grade
+container images and compose configurations for every stage of the application
+lifecycle — from local development through production deployment. If you've used
+`docker compose` to wire up a Node.js API, a Postgres container, and a Redis
+container, the mental model here is identical: a handful of services on a shared
+bridge network, talking to each other by service name.
+
+## The `frappe_docker` repository
+
+The official repository at `github.com/frappe/frappe_docker` is the canonical
+source for all Docker-related Frappe infrastructure. Clone it as your starting
+point:
+
+```bash
+git clone https://github.com/frappe/frappe_docker.git
+cd frappe_docker
+```
+
+The repository structure:
+
+<FileTree>
+- frappe_docker/
+  - compose.yaml production compose (template)
+  - overrides/
+    - compose.erpnext.yaml ERPNext-specific service overrides
+  - images/
+    - custom/
+      - Containerfile multi-stage build for custom apps
+    - layered/
+      - Containerfile layered build (faster rebuilds)
+  - devcontainer-example/ VS Code devcontainer config
+  - development/
+    - vscode-example/ VS Code debugging config
+    - …
+  - docs/ official documentation
+  - example.env environment variable template
+  - pwd.yml quick demo / Play with Docker
+</FileTree>
+
+## Development container setup
+
+The development environment uses a compose file that mounts your local source
+code into the container, enabling live editing and hot reload. First, copy the
+devcontainer configuration into place:
+
+```bash
+# Clone frappe_docker
+git clone https://github.com/frappe/frappe_docker.git
+cd frappe_docker
+
+# Copy devcontainer configuration
+cp -r devcontainer-example .devcontainer
+cp -r development/vscode-example development/.vscode
+```
+
+### Docker Compose for local development
+
+Here is a complete development compose file. The `frappe` service runs
+`sleep infinity` — it stays up as an idle workspace you exec into, rather than
+running a server on boot. The volume mount on line 9 is the important one: your
+`scoopjoy` app source is bind-mounted so edits in your local IDE appear instantly
+inside the container.
+
+```yaml title="development/docker-compose.yml" {9}
+services:
+  frappe:
+    image: frappe/bench:latest
+    command: sleep infinity
+    environment:
+      - SHELL=/bin/bash
+    volumes:
+      - frappe-bench:/home/frappe/frappe-bench
+      - ../apps/scoopjoy:/home/frappe/frappe-bench/apps/scoopjoy  # live editing
+    ports:
+      - "8000-8005:8000-8005"  # Frappe web + socketio
+      - "9000-9005:9000-9005"  # Additional debug ports
+    depends_on:
+      - mariadb
+      - redis-cache
+      - redis-queue
+
+  mariadb:
+    image: mariadb:11.4
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    ports:
+      - "3307:3306"
+
+  redis-cache:
+    image: redis:7-alpine
+    ports:
+      - "13000:6379"
+
+  redis-queue:
+    image: redis:7-alpine
+    ports:
+      - "11000:6379"
+
+volumes:
+  frappe-bench:
+  mariadb-data:
+```
+
+After starting the containers with `docker compose up -d`, initialize the bench
+inside the `frappe` container:
+
+<Steps>
+
+1. Enter the container:
+
+   ```bash
+   docker compose exec frappe bash
+   ```
+
+2. Initialize bench with Frappe v16 and move into it:
+
+   ```bash
+   bench init --frappe-branch version-16 frappe-bench
+   cd frappe-bench
+   ```
+
+3. Create a new site:
+
+   ```bash
+   bench new-site development.localhost --mariadb-root-password admin --admin-password admin
+   ```
+
+4. Install ERPNext:
+
+   ```bash
+   bench get-app --branch version-16 erpnext
+   bench --site development.localhost install-app erpnext
+   ```
+
+5. Enable developer mode (required for hot reload) and clear the cache:
+
+   ```bash
+   bench --site development.localhost set-config developer_mode 1
+   bench --site development.localhost clear-cache
+   ```
+
+6. Start the development server:
+
+   ```bash
+   bench start
+   ```
+
+</Steps>
+
+### VS Code DevContainer integration
+
+The `.devcontainer/devcontainer.json` file automates the entire setup. When you
+open the project in VS Code, it detects the configuration and offers to reopen in
+the container:
+
+```jsonc title=".devcontainer/devcontainer.json"
+{
+  "name": "Frappe Bench",
+  "dockerComposeFile": [
+    "../development/docker-compose.yml"
+  ],
+  "service": "frappe",
+  "workspaceFolder": "/home/frappe/frappe-bench",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.pythonPath": "/home/frappe/frappe-bench/env/bin/python",
+        "[python]": {
+            "editor.defaultFormatter": "charliermarsh.ruff",
+            "editor.formatOnSave": true
+        }
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  },
+  "forwardPorts": [8000, 9000],
+  "postCreateCommand": "echo 'DevContainer ready. Run bench start to begin.'",
+  "remoteUser": "frappe"
+}
+```
+
+### Hot reload in Docker
+
+Hot reload works automatically when `developer_mode` is enabled:
+
+- **Python changes**: Gunicorn detects file changes and restarts workers
+  automatically when running `bench start`.
+- **JavaScript changes**: The Node.js watcher rebuilds assets on change.
+- **Jinja template changes**: Reflected immediately on page refresh.
+
+```bash
+# Enable developer mode (required for hot reload)
+bench --site development.localhost set-config developer_mode 1
+
+# Start bench -- watches for file changes automatically
+bench start
+```
+
+<Aside type="tip" title="Pro tip">
+Mount your custom app directory as a volume (as shown in the compose file above)
+so edits in your local IDE are immediately visible inside the container. This
+avoids the need to rebuild or copy files.
+</Aside>
+
+## Production container setup
+
+### Multi-stage Dockerfile: ERPNext + custom apps
+
+Production images are built using the multi-stage `Containerfile` in
+`images/custom/`. You define your apps in an `apps.json` file:
+
+```json title="apps.json"
+[
+  {
+    "url": "https://github.com/frappe/erpnext",
+    "branch": "version-16"
+  },
+  {
+    "url": "https://github.com/your-org/scoopjoy",
+    "branch": "main"
+  }
+]
+```
+
+Build the custom image. `apps.json` is base64-encoded and passed as a build arg
+so it survives Docker's layer caching cleanly:
+
+```bash
+# Encode apps.json to base64
+export APPS_JSON_BASE64=$(base64 -w 0 apps.json)
+
+# Build the custom production image
+docker build \
+  --build-arg=FRAPPE_PATH=https://github.com/frappe/frappe \
+  --build-arg=FRAPPE_BRANCH=version-16 \
+  --build-arg=PYTHON_VERSION=3.12.7 \
+  --build-arg=NODE_VERSION=20.18.0 \
+  --build-arg=APPS_JSON_BASE64=$APPS_JSON_BASE64 \
+  --tag=scoopjoy-erp:v16-latest \
+  --file=images/custom/Containerfile .
+```
+
+The multi-stage Containerfile performs three stages:
+
+1. **Stage 1 (args):** Declares all build arguments.
+2. **Stage 2 (assets):** Installs apps from `apps.json`, runs `bench build` for
+   production assets.
+3. **Stage 3 (production):** Copies built assets and installed apps into a minimal
+   runtime image.
+
+For a complete custom Containerfile that adds system dependencies — for example
+when a custom app needs `libcairo2` for SVG rendering:
+
+```dockerfile title="Containerfile.scoopjoy"
+ARG FRAPPE_VERSION=v16.10.10
+
+FROM frappe/erpnext:${FRAPPE_VERSION} AS base
+
+# Add any system-level dependencies your custom app needs
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
+USER frappe
+
+# This example extends an existing ERPNext image with a custom app.
+# For production, prefer the apps.json build approach above.
+FROM base AS final
+
+# Copy custom app (if pre-built)
+COPY --chown=frappe:frappe . /home/frappe/frappe-bench/apps/scoopjoy
+
+RUN cd /home/frappe/frappe-bench \
+    && bench pip install -e apps/scoopjoy \
+    && bench build --app scoopjoy --production
+```
+
+### Container topology
+
+A production deployment is a fleet of containers built from the same custom image,
+each running a different command, all fronted by an Nginx container and backed by
+shared MariaDB, Redis, and volumes. A one-shot `configurator` container writes the
+global config before the long-running services start.
+
+<Mermaid title="Production container topology" height={520} code={`
+flowchart TB
+  Internet["Internet"] -->|":8080"| FE["frontend<br/>Nginx (frappe/erpnext:v16-nginx)"]
+  FE -->|"backend:8000"| BE["backend<br/>Gunicorn (scoopjoy-erp image)"]
+  FE -->|"websocket:9000"| WS["websocket<br/>Node.js Socket.IO"]
+  BE --> MD["mariadb:3306"]
+  BE --> RC["redis-cache:6379"]
+  BE --> RQ["redis-queue:6379"]
+  WS --> RQ
+  subgraph Workers["Background workers (same image)"]
+    QS["queue-short"]
+    QD["queue-default"]
+    QL["queue-long"]
+    SCH["scheduler"]
+  end
+  Workers --> MD
+  Workers --> RQ
+  CFG["configurator<br/>(one-shot: writes global config)"] -.->|"runs first"| BE
+  subgraph Vols["Shared volumes"]
+    SV["sites"]
+    LG["logs"]
+  end
+  BE --- SV
+  FE --- SV
+`} />
+
+### Production `docker-compose.yml`
+
+This is a complete production compose file for deploying ERPNext with the ScoopJoy
+app. The two YAML anchors at the top (`&customizable_image` and
+`&depends_on_configurator`) are reused across every app service so the image,
+pull policy, and startup dependency are defined once.
+
+```yaml title="docker-compose.production.yml" {1-7}
+x-customizable-image: &customizable_image
+  image: scoopjoy-erp:v16-latest
+  pull_policy: never
+
+x-depends-on-configurator: &depends_on_configurator
+  depends_on:
+    configurator:
+      condition: service_completed_successfully
+
+services:
+  # --- Reverse Proxy ---
+  frontend:
+    image: frappe/erpnext:v16-nginx
+    restart: unless-stopped
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: $$host
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    depends_on:
+      - backend
+      - websocket
+
+  # --- Application Server ---
+  backend:
+    <<: *customizable_image
+    restart: unless-stopped
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    <<: *depends_on_configurator
+    environment:
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
+      WORKER_TIMEOUT: 120
+
+  # --- WebSocket Server ---
+  websocket:
+    <<: *customizable_image
+    restart: unless-stopped
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    <<: *depends_on_configurator
+    environment:
+      REDIS_CACHE: redis://redis-cache:6379
+      REDIS_QUEUE: redis://redis-queue:6379
+
+  # --- Background Workers ---
+  queue-short:
+    <<: *customizable_image
+    restart: unless-stopped
+    command: bench worker --queue short
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    <<: *depends_on_configurator
+
+  queue-default:
+    <<: *customizable_image
+    restart: unless-stopped
+    command: bench worker --queue default
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    <<: *depends_on_configurator
+
+  queue-long:
+    <<: *customizable_image
+    restart: unless-stopped
+    command: bench worker --queue long
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    <<: *depends_on_configurator
+
+  # --- Scheduler ---
+  scheduler:
+    <<: *customizable_image
+    restart: unless-stopped
+    command: bench schedule
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    <<: *depends_on_configurator
+
+  # --- Redis ---
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-cache-data:/data
+
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+
+  # --- Database ---
+  mariadb:
+    image: mariadb:11.4
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+      - --innodb-buffer-pool-size=2G
+      - --innodb-log-file-size=512M
+      - --innodb-flush-log-at-trx-commit=1
+      - --max-connections=200
+      - --slow-query-log=1
+      - --long-query-time=2
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Initial Configuration (one-shot) ---
+  configurator:
+    <<: *customizable_image
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps/frappe/frappe/utils/scheduler.py > /dev/null 2>&1 &&
+        bench set-config -g db_host mariadb &&
+        bench set-config -g db_port 3306 &&
+        bench set-config -g redis_cache redis://redis-cache:6379 &&
+        bench set-config -g redis_queue redis://redis-queue:6379 &&
+        bench set-config -g redis_socketio redis://redis-queue:6379 &&
+        bench set-config -g socketio_port 9000
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+
+volumes:
+  sites:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SITES_DIR:-./data/sites}
+  logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${LOGS_DIR:-./data/logs}
+  mariadb-data:
+  redis-cache-data:
+  redis-queue-data:
+```
+
+The corresponding `.env` file keeps secrets and tunables out of the compose file:
+
+```bash title=".env"
+# Production environment configuration
+
+# Image
+CUSTOM_IMAGE=scoopjoy-erp
+CUSTOM_TAG=v16-latest
+
+# Networking
+HTTP_PORT=8080
+FRAPPE_SITE_NAME_HEADER=$$host
+
+# Database
+DB_ROOT_PASSWORD=your-secure-db-root-password-here
+
+# Gunicorn
+GUNICORN_WORKERS=4
+
+# Volume paths (bind mounts for easy backup)
+SITES_DIR=./data/sites
+LOGS_DIR=./data/logs
+```
+
+### Persistent volumes
+
+The compose file uses bind-mount volumes for `sites` and `logs`, making backups
+straightforward — they map to plain directories on the host you can `tar` or
+`rsync`.
+
+| Volume | Purpose | Backup Priority |
+|--------|---------|-----------------|
+| `sites` | Site configs, database names, uploaded files | Critical |
+| `logs` | Application and worker logs | Important |
+| `mariadb-data` | Database storage | Critical |
+| `redis-cache-data` | Cache (can be regenerated) | Low |
+| `redis-queue-data` | Job queue state | Medium |
+
+## Building custom images with additional apps
+
+The standard workflow for building an image with multiple custom apps — here
+ERPNext, HRMS, the ScoopJoy app, and a separate POS app:
+
+```bash
+# 1. Create apps.json with all your apps
+cat > apps.json <<'EOF'
+[
+  {
+    "url": "https://github.com/frappe/erpnext",
+    "branch": "version-16"
+  },
+  {
+    "url": "https://github.com/frappe/hrms",
+    "branch": "version-16"
+  },
+  {
+    "url": "https://github.com/your-org/scoopjoy",
+    "branch": "main"
+  },
+  {
+    "url": "https://github.com/your-org/scoopjoy_pos",
+    "branch": "main"
+  }
+]
+EOF
+
+# 2. Base64 encode it
+export APPS_JSON_BASE64=$(base64 -w 0 apps.json)
+
+# 3. Build
+docker build \
+  --build-arg=FRAPPE_PATH=https://github.com/frappe/frappe \
+  --build-arg=FRAPPE_BRANCH=version-16 \
+  --build-arg=PYTHON_VERSION=3.12.7 \
+  --build-arg=NODE_VERSION=20.18.0 \
+  --build-arg=APPS_JSON_BASE64=$APPS_JSON_BASE64 \
+  --tag=registry.example.com/scoopjoy-erp:v16-$(date +%Y%m%d) \
+  --file=images/custom/Containerfile .
+
+# 4. Push to your private registry
+docker push registry.example.com/scoopjoy-erp:v16-$(date +%Y%m%d)
+```
+
+<Aside type="tip" title="Pro tip">
+Use a CI/CD pipeline (GitHub Actions, GitLab CI) to build and push images
+automatically on every merge to `main`. This ensures every deployment uses a
+tested, versioned image. See [Chapter 34](/erpnext/34-cicd/) for the full pipeline.
+</Aside>
+
+## Docker networking: service discovery
+
+Docker Compose creates a default bridge network for all services. Containers
+communicate using service names as hostnames — exactly like Compose networking in
+any Node.js stack:
+
+- `backend` reaches MariaDB at `mariadb:3306`
+- `websocket` reaches Redis at `redis-cache:6379` and `redis-queue:6379`
+- `frontend` (Nginx) proxies to `backend:8000` and `websocket:9000`
+
+For multi-bench or multi-tenant setups with separate compose stacks, use an
+external network so stacks can share services:
+
+```yaml title="docker-compose.production.yml"
+# Create a shared network
+networks:
+  frappe-network:
+    external: true
+    name: frappe-shared
+
+# Reference it in your services
+services:
+  backend:
+    networks:
+      - frappe-network
+```
+
+## Docker commands cheat sheet
+
+```bash
+# --- Daily Operations ---
+docker compose up -d                    # Start all services
+docker compose down                     # Stop all services
+docker compose logs -f backend          # Follow backend logs
+docker compose logs -f --tail=100       # Last 100 lines, all services
+docker compose ps                       # Service status
+
+# --- Bench Operations Inside Container ---
+docker compose exec backend bench --site scoopjoy.example.com migrate
+docker compose exec backend bench --site scoopjoy.example.com backup
+docker compose exec backend bench --site scoopjoy.example.com console
+docker compose exec backend bench --site scoopjoy.example.com set-admin-password newpassword
+docker compose exec backend bench --site scoopjoy.example.com clear-cache
+docker compose exec backend bench --site scoopjoy.example.com scheduler resume
+
+# --- Site Management ---
+# Create a new site
+docker compose exec backend bench new-site outlet1.scoopjoy.example.com \
+  --mariadb-root-password "$DB_ROOT_PASSWORD" \
+  --admin-password admin123 \
+  --install-app erpnext \
+  --install-app scoopjoy
+
+# --- Image Management ---
+docker compose pull                     # Pull latest images
+docker compose build                    # Rebuild custom images
+docker compose up -d --force-recreate   # Restart with new images
+
+# --- Debugging ---
+docker compose exec backend bash        # Shell access
+docker compose exec mariadb mariadb -u root -p  # DB shell
+docker compose exec redis-cache redis-cli       # Redis CLI
+docker stats                            # Resource usage
+
+# --- Cleanup ---
+docker system prune -f                  # Remove unused containers/images
+docker volume ls                        # List volumes
+```
+
+Once your image is built and your compose stack is running, the next step is
+hardening a single-server deployment with Nginx, SSL, and Supervisor — covered in
+[Chapter 27](/erpnext/27-production-deployment/) — or scaling the same image out
+across a cluster in [Chapter 28](/erpnext/28-kubernetes/).

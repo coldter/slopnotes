@@ -1,0 +1,670 @@
+---
+title: Permissions & Security
+description: Frappe's layered access control — RBAC, field-level permission levels, user permissions, custom permission hooks, sharing, and security hardening.
+sidebar:
+  order: 9
+---
+
+Security in Frappe is multi-layered: Role-Based Access Control (RBAC) at the
+DocType level, field-level permissions for sensitive data, User Permissions for
+row-level filtering, and programmatic checks for complex business rules. For a
+franchise system like ScoopJoy, getting permissions right means a franchise
+manager sees only their outlet's data while headquarters sees everything.
+
+## Role-Based Access Control (RBAC)
+
+Roles are the foundation of Frappe's permission system. A Role defines what
+actions a user can perform on a DocType. If you're coming from Express, think of
+a Role as a middleware-enforced capability set — except Frappe enforces it for
+you at the ORM and API layers, not in hand-written guards.
+
+You can create roles programmatically, typically in an `after_install` hook:
+
+```python title="franchise_management/setup/roles.py"
+import frappe
+
+def create_franchise_roles():
+    roles = [
+        {"role_name": "Franchise Manager", "desk_access": 1, "is_custom": 1},
+        {"role_name": "Franchise Staff", "desk_access": 1, "is_custom": 1},
+        {"role_name": "Franchise Auditor", "desk_access": 1, "is_custom": 1},
+        {"role_name": "Franchise Portal User", "desk_access": 0, "is_custom": 1},
+    ]
+    for role in roles:
+        if not frappe.db.exists("Role", role["role_name"]):
+            frappe.get_doc({"doctype": "Role", **role}).insert(ignore_permissions=True)
+```
+
+Or declaratively via fixtures, which is preferred because roles ship with the app
+and migrate cleanly between sites:
+
+```json title="franchise_management/fixtures/role.json"
+[
+    {"doctype": "Role", "role_name": "Franchise Manager", "desk_access": 1, "is_custom": 1},
+    {"doctype": "Role", "role_name": "Franchise Staff", "desk_access": 1, "is_custom": 1},
+    {"doctype": "Role", "role_name": "Franchise Auditor", "desk_access": 1, "is_custom": 1}
+]
+```
+
+## DocType Permissions
+
+Each DocType has a permission matrix defining what each Role can do. These are set
+in the DocType definition (JSON file) or via the **Role Permission Manager** in
+the UI.
+
+| Permission | Description |
+|------------|-------------|
+| `read` | Can view documents |
+| `write` | Can edit documents |
+| `create` | Can create new documents |
+| `delete` | Can delete documents |
+| `submit` | Can submit (for Submittable DocTypes) |
+| `cancel` | Can cancel submitted documents |
+| `amend` | Can amend cancelled documents |
+| `print` | Can print documents |
+| `email` | Can email documents |
+| `report` | Can view reports based on this DocType |
+| `import` | Can import data via Data Import |
+| `export` | Can export data |
+| `share` | Can share documents with other users |
+
+The matrix is typically configured via the UI, but here's the underlying
+structure as it lives in the DocType JSON:
+
+```json title="franchise_management/doctype/franchise_outlet/franchise_outlet.json"
+{
+    "permissions": [
+        {
+            "role": "System Manager",
+            "read": 1, "write": 1, "create": 1, "delete": 1,
+            "submit": 0, "cancel": 0, "amend": 0,
+            "print": 1, "email": 1, "report": 1,
+            "import": 1, "export": 1, "share": 1,
+            "permlevel": 0
+        },
+        {
+            "role": "Franchise Manager",
+            "read": 1, "write": 1, "create": 0, "delete": 0,
+            "print": 1, "email": 1, "report": 1,
+            "export": 1,
+            "permlevel": 0
+        },
+        {
+            "role": "Franchise Staff",
+            "read": 1, "write": 0, "create": 0, "delete": 0,
+            "print": 1,
+            "permlevel": 0
+        },
+        {
+            "role": "Franchise Auditor",
+            "read": 1, "write": 0, "create": 0, "delete": 0,
+            "report": 1, "export": 1,
+            "permlevel": 0
+        }
+    ]
+}
+```
+
+## Permission Level: Field-Level Security
+
+Permission Levels (0-9) let you control which Roles can read/write specific
+fields. This is how you hide sensitive financial data from lower-privilege roles —
+for ScoopJoy, that means keeping cost prices and royalty figures away from
+outlet-floor staff.
+
+First, set the `permlevel` on sensitive fields in the DocType. Level 0 is the
+default and visible to anyone with read access; higher levels are progressively
+more restricted:
+
+```json title="franchise_management/doctype/franchise_outlet/franchise_outlet.json"
+{
+    "fieldname": "custom_cost_price",
+    "fieldtype": "Currency",
+    "label": "Cost Price",
+    "permlevel": 1
+}
+```
+
+```json
+{
+    "fieldname": "custom_profit_margin",
+    "fieldtype": "Percent",
+    "label": "Profit Margin",
+    "permlevel": 1
+}
+```
+
+```json
+{
+    "fieldname": "custom_royalty_amount",
+    "fieldtype": "Currency",
+    "label": "Royalty Amount",
+    "permlevel": 2
+}
+```
+
+Then assign level-specific permissions per Role. Each role gets one permission row
+per level it should reach:
+
+```python
+# Level 0 = visible to all roles with read access (default)
+# Level 1 = cost data -- visible to Franchise Manager and above
+# Level 2 = royalty data -- visible to Franchise Auditor and System Manager only
+
+{
+    "permissions": [
+        # System Manager: full access to all levels
+        {"role": "System Manager", "permlevel": 0, "read": 1, "write": 1},
+        {"role": "System Manager", "permlevel": 1, "read": 1, "write": 1},
+        {"role": "System Manager", "permlevel": 2, "read": 1, "write": 1},
+
+        # Franchise Manager: can see costs but not modify, cannot see royalty internals
+        {"role": "Franchise Manager", "permlevel": 0, "read": 1, "write": 1},
+        {"role": "Franchise Manager", "permlevel": 1, "read": 1, "write": 0},
+
+        # Franchise Staff: only sees level 0 fields
+        {"role": "Franchise Staff", "permlevel": 0, "read": 1, "write": 0},
+
+        # Franchise Auditor: read-only on all levels
+        {"role": "Franchise Auditor", "permlevel": 0, "read": 1, "write": 0},
+        {"role": "Franchise Auditor", "permlevel": 1, "read": 1, "write": 0},
+        {"role": "Franchise Auditor", "permlevel": 2, "read": 1, "write": 0},
+    ]
+}
+```
+
+With this setup:
+
+- **Franchise Staff** sees the outlet form, but cost price and royalty fields are
+  completely hidden.
+- **Franchise Manager** can see cost prices (read-only) but cannot see royalty
+  calculation details.
+- **Franchise Auditor** can see everything but cannot modify anything.
+
+## User Permissions: Row-Level Data Filtering
+
+User Permissions restrict which documents a user can access based on Link field
+values. This is how you ensure a franchise manager only sees their own outlet's
+data — the row-level equivalent of a `WHERE outlet = ?` clause applied
+automatically to every query.
+
+How it works: if a User Permission exists linking `User A` to
+`Franchise Outlet = OUTLET-001`, then User A can only see:
+
+- Franchise Outlet `OUTLET-001` (and no other outlets).
+- Sales Invoices where `custom_franchise_outlet = OUTLET-001`.
+- Any other DocType with a Link to Franchise Outlet, filtered to `OUTLET-001`.
+
+```python title="franchise_management/setup/user_permissions.py"
+import frappe
+
+def assign_outlet_to_manager(outlet_name, user_email):
+    """Restrict a user to only see data for their assigned outlet."""
+    # Remove existing Franchise Outlet permissions for this user
+    frappe.db.delete("User Permission", {
+        "user": user_email,
+        "allow": "Franchise Outlet",
+    })
+
+    # Create new permission
+    frappe.get_doc({
+        "doctype": "User Permission",
+        "user": user_email,
+        "allow": "Franchise Outlet",
+        "for_value": outlet_name,
+        "apply_to_all_doctypes": 1,  # Apply across all DocTypes
+    }).insert(ignore_permissions=True)
+
+    # Also restrict by Territory if needed
+    territory = frappe.db.get_value("Franchise Outlet", outlet_name, "territory")
+    if territory:
+        frappe.get_doc({
+            "doctype": "User Permission",
+            "user": user_email,
+            "allow": "Territory",
+            "for_value": territory,
+        }).insert(ignore_permissions=True)
+
+
+def assign_multi_outlet_manager(user_email, outlet_names):
+    """Assign a regional manager to multiple outlets."""
+    frappe.db.delete("User Permission", {
+        "user": user_email,
+        "allow": "Franchise Outlet",
+    })
+
+    for outlet_name in outlet_names:
+        frappe.get_doc({
+            "doctype": "User Permission",
+            "user": user_email,
+            "allow": "Franchise Outlet",
+            "for_value": outlet_name,
+            "apply_to_all_doctypes": 1,
+        }).insert(ignore_permissions=True)
+```
+
+:::caution[User Permissions restrict, they don't grant]
+User Permissions work by **restriction**, not by **grant**. If no User Permission
+exists for a DocType, the user can see all records. The moment you add one User
+Permission, the user is restricted to only matching records. This inverted model
+trips people up — adding a permission actually *narrows* access.
+:::
+
+## Role Permissions for Pages and Reports
+
+Control which Roles can access custom Pages and Script Reports.
+
+```python title="franchise_management/setup/page_permissions.py"
+import frappe
+
+def set_page_permissions():
+    # Allow only Franchise Manager to access the dashboard page
+    frappe.get_doc({
+        "doctype": "Role Permission for Page and Report",
+        "page": "franchise-dashboard",
+        "set_role_for": "Page",
+        "roles": [
+            {"role": "Franchise Manager"},
+            {"role": "Franchise Auditor"},
+            {"role": "System Manager"},
+        ],
+    }).insert(ignore_permissions=True)
+
+def set_report_permissions():
+    frappe.get_doc({
+        "doctype": "Role Permission for Page and Report",
+        "report": "Franchise Royalty Summary",
+        "set_role_for": "Report",
+        "roles": [
+            {"role": "Franchise Manager"},
+            {"role": "Franchise Auditor"},
+            {"role": "System Manager"},
+        ],
+    }).insert(ignore_permissions=True)
+```
+
+## The `has_permission()` Hook: Custom Permission Logic
+
+For complex permission rules that cannot be expressed through the UI-based system,
+implement `has_permission` in your controller. This is your escape hatch for rules
+that depend on document data, the current user, or runtime state.
+
+:::caution[v16 breaking change: return `True` explicitly]
+In v16, `has_permission` controller methods and hook functions **must explicitly
+return `True`** to grant access. Returning `None`, `1`, or any other truthy value
+no longer grants access — only `return True` works. This is a breaking change from
+v15, where any truthy return granted access.
+:::
+
+```python title="franchise_management/doctype/franchise_outlet/franchise_outlet.py" {6,15,18,28}
+import frappe
+from frappe.model.document import Document
+
+class FranchiseOutlet(Document):
+    def has_permission(self, permtype="read", user=None):
+        """Custom permission logic for Franchise Outlet.
+
+        IMPORTANT (v16): This method MUST return True explicitly to grant access.
+        Returning None or a non-False value is no longer sufficient.
+        """
+        user = user or frappe.session.user
+
+        # System Manager and Administrator always have access
+        if user == "Administrator" or "System Manager" in frappe.get_roles(user):
+            return True
+
+        # Franchise Auditors can read any outlet
+        if permtype == "read" and "Franchise Auditor" in frappe.get_roles(user):
+            return True
+
+        # Franchise Managers can only access their assigned outlets
+        if "Franchise Manager" in frappe.get_roles(user):
+            if self.custom_manager_user == user:
+                return True
+
+            # Check if user is a regional manager for this territory
+            is_regional = frappe.db.exists("User Permission", {
+                "user": user,
+                "allow": "Territory",
+                "for_value": self.territory,
+            })
+            if is_regional:
+                return True
+
+        # Franchise Staff: only their own outlet
+        if "Franchise Staff" in frappe.get_roles(user):
+            staff_outlet = frappe.db.get_value(
+                "User Permission",
+                {"user": user, "allow": "Franchise Outlet"},
+                "for_value",
+            )
+            if staff_outlet == self.name:
+                return True
+
+        return False
+```
+
+You can also call `frappe.has_permission()` directly inside whitelisted API
+methods. This checks both the DocType permission matrix *and* the `has_permission`
+hook:
+
+```python title="franchise_management/api.py"
+@frappe.whitelist()
+def get_outlet_financials(outlet: str):
+    """Check permissions before returning sensitive financial data."""
+    # This checks both DocType permissions AND the has_permission hook
+    if not frappe.has_permission("Franchise Outlet", doc=outlet, ptype="read"):
+        frappe.throw("You do not have permission to view this outlet", frappe.PermissionError)
+
+    # Additional check: only users with Franchise Auditor role can see financials
+    if "Franchise Auditor" not in frappe.get_roles():
+        frappe.throw("Only Franchise Auditors can view financial data", frappe.PermissionError)
+
+    return get_financial_data(outlet)
+```
+
+## Document Sharing
+
+Sharing grants access to a *specific* document to a user who would not normally
+have access — a controlled exception to the rules above.
+
+```python title="franchise_management/setup/sharing.py"
+import frappe
+
+def share_report_with_franchise_owner(report_name, owner_email):
+    """Share a specific report document with a franchise owner."""
+    frappe.share.add(
+        doctype="Franchise Report",
+        name=report_name,
+        user=owner_email,
+        read=1,
+        write=0,
+        submit=0,
+        share=0,
+        notify=1,  # Send email notification
+    )
+```
+
+```python
+# Remove a share
+frappe.share.remove(
+    doctype="Franchise Report",
+    name=report_name,
+    user=owner_email,
+)
+
+# Check existing shares
+shares = frappe.share.get_shared(
+    doctype="Franchise Report",
+    name=report_name,
+)
+```
+
+:::caution[Keep your install patched]
+A vulnerability was discovered (patched in v15.98.0 and v14.100.0) where users
+could share documents granting permissions they themselves did not have. Always
+ensure your Frappe installation is up to date.
+:::
+
+## Guest Access and Website Permissions
+
+For public-facing pages — a franchise locator or menu browser — expose only the
+fields that are safe for anyone to read:
+
+```python title="franchise_management/api.py"
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+def get_public_outlet_info(outlet: str):
+    """Public API for franchise portal -- no login required."""
+    outlet_doc = frappe.get_doc("Franchise Outlet", outlet)
+
+    # Only return public fields -- never expose internal data to guests
+    return {
+        "outlet_name": outlet_doc.outlet_name,
+        "city": outlet_doc.city,
+        "state": outlet_doc.state,
+        "opening_hours": outlet_doc.custom_opening_hours,
+        "contact_phone": outlet_doc.custom_public_phone,
+    }
+```
+
+For website DocTypes shown on the portal, set `has_web_view = 1` and gate
+publication with `is_website_published`:
+
+```python title="franchise_management/doctype/franchise_outlet/franchise_outlet.py"
+class FranchiseOutlet(Document):
+    def is_website_published(self):
+        """Control whether this outlet appears on the public website."""
+        return self.status == "Active" and self.custom_show_on_website
+```
+
+## System Manager vs Administrator
+
+These two are easy to confuse but behave very differently. **System Manager** is a
+*role*; **Administrator** is a single *user account* that bypasses everything.
+
+| | System Manager (Role) | Administrator (User) |
+|---|---|---|
+| **What** | A role assigned to users | A specific user account |
+| **Scope** | Full desk access, can manage users/roles | Bypasses ALL permission checks |
+| **Restrictions** | Subject to DocType permissions (just has them all) | No restrictions whatsoever |
+| **User Permissions** | Applied (can be restricted) | Never applied |
+| **`has_permission`** | Checked (but usually returns True) | Skipped entirely |
+| **Use case** | Day-to-day admin tasks | Emergency access, initial setup |
+
+:::tip[Pro tip]
+Never use the Administrator account for daily operations. Create named users with
+the System Manager role instead. This keeps audit trails traceable to real people.
+:::
+
+## Practical Example: Complete Franchise Permission Setup
+
+Tying it all together, here is a single `after_install` entry point that creates
+the roles, sets DocType permissions, and seeds a sample user permission for
+ScoopJoy:
+
+```python title="franchise_management/setup/permissions.py"
+import frappe
+
+def setup_franchise_permissions():
+    """Complete permission setup for the franchise management app.
+
+    Call from after_install hook.
+    """
+
+    # 1. Create Roles
+    roles = {
+        "Franchise Manager": {"desk_access": 1},
+        "Franchise Staff": {"desk_access": 1},
+        "Franchise Auditor": {"desk_access": 1},
+    }
+    for role_name, props in roles.items():
+        if not frappe.db.exists("Role", role_name):
+            doc = frappe.get_doc({"doctype": "Role", "role_name": role_name, **props})
+            doc.insert(ignore_permissions=True)
+
+    # 2. Set DocType permissions for Franchise Outlet
+    set_doctype_permissions("Franchise Outlet", [
+        {"role": "Franchise Manager", "read": 1, "write": 1, "create": 0,
+         "delete": 0, "print": 1, "email": 1, "report": 1, "export": 1},
+        {"role": "Franchise Staff", "read": 1, "write": 0, "create": 0,
+         "delete": 0, "print": 1},
+        {"role": "Franchise Auditor", "read": 1, "write": 0, "create": 0,
+         "delete": 0, "report": 1, "export": 1},
+    ])
+
+    # 3. Set DocType permissions for Franchise Royalty
+    set_doctype_permissions("Franchise Royalty", [
+        {"role": "Franchise Manager", "read": 1, "write": 0, "report": 1},
+        {"role": "Franchise Auditor", "read": 1, "write": 0, "report": 1, "export": 1},
+        # Staff cannot see royalty records at all
+    ])
+
+    # 4. Create a sample user permission setup
+    # (This would typically be done via UI or triggered by business events)
+    sample_setup_user_permission(
+        user="john@lakeside.com",
+        outlet="OUTLET-001",
+        territory="Midwest",
+    )
+
+
+def set_doctype_permissions(doctype, permission_list):
+    """Helper to set permissions on a DocType."""
+    frappe.get_meta(doctype)
+    # Remove existing custom permissions
+    for perm in permission_list:
+        existing = frappe.db.exists("Custom DocPerm", {
+            "parent": doctype,
+            "role": perm["role"],
+            "permlevel": perm.get("permlevel", 0),
+        })
+        if existing:
+            frappe.delete_doc("Custom DocPerm", existing, ignore_permissions=True)
+
+        frappe.get_doc({
+            "doctype": "Custom DocPerm",
+            "parent": doctype,
+            "parenttype": "DocType",
+            "parentfield": "permissions",
+            "role": perm["role"],
+            "permlevel": perm.get("permlevel", 0),
+            **{k: v for k, v in perm.items() if k not in ("role", "permlevel")},
+        }).insert(ignore_permissions=True)
+
+
+def sample_setup_user_permission(user, outlet, territory):
+    """Set up user permissions for a franchise manager."""
+    for allow, value in [("Franchise Outlet", outlet), ("Territory", territory)]:
+        if not frappe.db.exists("User Permission", {
+            "user": user, "allow": allow, "for_value": value,
+        }):
+            frappe.get_doc({
+                "doctype": "User Permission",
+                "user": user,
+                "allow": allow,
+                "for_value": value,
+                "apply_to_all_doctypes": 1,
+            }).insert(ignore_permissions=True)
+```
+
+## Security Best Practices
+
+### CSRF Protection
+
+Frappe includes built-in CSRF protection. Every non-GET request must include a
+CSRF token — in Express you'd reach for `csurf`; here it's automatic in Desk and
+required for external callers.
+
+```javascript
+// In Desk, frappe.csrf_token is auto-available.
+// For external calls, get it from the cookie or login response.
+
+fetch("/api/method/some_method", {
+    method: "POST",
+    headers: {
+        "Content-Type": "application/json",
+        "X-Frappe-CSRF-Token": frappe.csrf_token,
+    },
+    body: JSON.stringify({ key: "value" }),
+});
+```
+
+:::caution[Keep Frappe patched]
+A CSRF bypass vulnerability was discovered in Frappe v15 where password changes
+could be performed via GET requests. Always keep Frappe updated to the latest
+patch version.
+:::
+
+### SQL Injection Prevention
+
+Frappe's ORM (`frappe.get_all`, `frappe.get_list`, `frappe.db.get_value`) is safe
+by default. Vulnerabilities arise only when you drop to raw SQL.
+
+```python
+# DANGEROUS -- SQL injection via string concatenation
+def get_outlet_sales_UNSAFE(outlet_name):
+    return frappe.db.sql(
+        f"SELECT * FROM `tabSales Invoice` WHERE custom_franchise_outlet = '{outlet_name}'"
+    )
+
+# SAFE -- parameterized queries
+def get_outlet_sales(outlet_name):
+    return frappe.db.sql(
+        "SELECT * FROM `tabSales Invoice` WHERE custom_franchise_outlet = %s",
+        (outlet_name,),
+        as_dict=True,
+    )
+
+# SAFEST -- use the ORM
+def get_outlet_sales_orm(outlet_name):
+    return frappe.get_all(
+        "Sales Invoice",
+        filters={"custom_franchise_outlet": outlet_name},
+        fields=["name", "grand_total", "posting_date"],
+    )
+```
+
+:::danger[Never concatenate user input into SQL]
+CVE-2025-30212 and CVE-2025-56380 exposed SQL injection vulnerabilities in Frappe
+where user input was concatenated into SQL queries. Always use parameterized
+queries (`%s` placeholders) or the ORM. Never build SQL strings with f-strings or
+`.format()`.
+:::
+
+### XSS Prevention
+
+Frappe escapes output by default in Jinja templates. Be cautious when you bypass
+that to emit raw HTML.
+
+```python
+# DANGEROUS -- passing user input as raw HTML
+frappe.msgprint(f"Welcome, {user_input}")
+
+# SAFE -- use frappe.bold() or explicit escaping
+frappe.msgprint(f"Welcome, {frappe.bold(frappe.utils.escape_html(user_input))}")
+
+# In Jinja templates:
+#   {{ variable }}        is auto-escaped
+#   {{ variable | safe }} bypasses escaping -- NEVER use with user input
+```
+
+### Whitelisted Method Security
+
+A whitelisted method is a public endpoint. Treat it like one: validate types,
+check permissions, restrict roles, and never trust the client's field list.
+
+```python title="franchise_management/api.py"
+@frappe.whitelist()
+def update_outlet_settings(outlet: str, settings: dict):
+    """Secure whitelisted method with proper checks."""
+    # 1. Type annotations enforce parameter types (v16+)
+
+    # 2. Always check permissions
+    frappe.has_permission("Franchise Outlet", doc=outlet, ptype="write", throw=True)
+
+    # 3. Restrict to specific roles if needed
+    frappe.only_for(["Franchise Manager", "System Manager"])
+
+    # 4. Validate input -- don't trust the client
+    allowed_fields = {"opening_hours", "contact_phone", "seating_capacity"}
+    for key in settings:
+        if key not in allowed_fields:
+            frappe.throw(f"Cannot update field: {key}")
+
+    # 5. Use set_value for controlled updates (not doc.update with an arbitrary dict)
+    for field, value in settings.items():
+        frappe.db.set_value("Franchise Outlet", outlet, field, value)
+```
+
+### Summary of Security Layers
+
+| Layer | Mechanism | Scope |
+|-------|-----------|-------|
+| **Authentication** | Login + session/token/OAuth | Who is accessing |
+| **Role Permissions** | DocType permission matrix | What they can do (CRUD) |
+| **Permission Levels** | Field-level `permlevel` (0-9) | Which fields they see |
+| **User Permissions** | Link-field-based row filtering | Which records they see |
+| **`has_permission()`** | Custom Python logic | Complex business rules |
+| **Sharing** | Document-level grants | Exceptions to the above |
+| **CSRF Tokens** | `X-Frappe-CSRF-Token` header | Prevents cross-site attacks |
+| **Input Validation** | Type annotations, parameterized SQL | Prevents injection attacks |

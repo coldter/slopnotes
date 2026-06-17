@@ -1,0 +1,557 @@
+---
+title: Custom Desk Page
+description: Build a full-bleed Frappe Desk page with summary cards, a revenue chart, quick actions, and a live activity feed.
+sidebar:
+  order: 6
+---
+
+import { LinkCard, FileTree } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a full custom page — a Franchise Command Center — that shows
+ScoopJoy outlet performance metrics, a revenue trend, quick actions, and an
+activity feed, all on one Desk screen rather than scattered across separate
+reports and list views.
+
+**Solution:** Frappe custom pages are not DocTypes. A page lives in its own folder
+and is made of four parallel files: a `.json` for metadata, a `.html` template, a
+`.css` stylesheet, and a `.js` controller. A single whitelisted Python method feeds
+the whole thing with one round trip.
+
+<FileTree>
+- scoopjoy/scoopjoy/
+  - api/
+    - **command_center.py** the single data endpoint
+  - scoopjoy/page/franchise_command_center/
+    - **franchise_command_center.json** page metadata
+    - **franchise_command_center.html** template
+    - **franchise_command_center.css** styles
+    - **franchise_command_center.js** controller class
+  - hooks.py register the page bundle
+</FileTree>
+
+## Step 1: The data endpoint
+
+One whitelisted method gathers everything the page needs — outlet summary, daily
+revenue, recent activity, and alerts — and returns it as a single dict. The page
+then makes exactly one network call. Each query is a plain `frappe.db.sql` against
+the `tabFranchise Outlet`, `tabSales Invoice`, and `tabComment` tables.
+
+```python title="scoopjoy/scoopjoy/api/command_center.py"
+import frappe
+from frappe.utils import nowdate, add_days, flt
+
+
+@frappe.whitelist()
+def get_command_center_data():
+    today = nowdate()
+    week_ago = add_days(today, -7)
+
+    # Outlet summary
+    outlet_summary = frappe.db.sql("""
+        SELECT
+            franchise_type,
+            COUNT(*) as count,
+            SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) as active,
+            SUM(CASE WHEN status = 'Suspended' THEN 1 ELSE 0 END) as suspended,
+            COALESCE(AVG(avg_customer_rating), 0) as avg_rating
+        FROM `tabFranchise Outlet`
+        WHERE status != 'Closed'
+        GROUP BY franchise_type
+        ORDER BY franchise_type
+    """, as_dict=True)
+
+    # Revenue by day (last 7 days)
+    daily_revenue = frappe.db.sql("""
+        SELECT posting_date, SUM(grand_total) as revenue, COUNT(*) as orders
+        FROM `tabSales Invoice`
+        WHERE posting_date BETWEEN %s AND %s AND docstatus = 1
+        GROUP BY posting_date
+        ORDER BY posting_date
+    """, (week_ago, today), as_dict=True)
+
+    # Recent activity (last 20 events)
+    recent_activity = frappe.db.sql("""
+        SELECT
+            c.creation, c.comment_type, c.content, c.comment_by,
+            c.reference_doctype, c.reference_name
+        FROM `tabComment` c
+        WHERE c.reference_doctype = 'Franchise Outlet'
+            AND c.comment_type IN ('Info', 'Edit', 'Workflow')
+        ORDER BY c.creation DESC
+        LIMIT 20
+    """, as_dict=True)
+
+    # Alerts: outlets needing attention
+    alerts = frappe.db.sql("""
+        SELECT name, franchise_name, franchise_type, city,
+            last_inspection_date, avg_customer_rating
+        FROM `tabFranchise Outlet`
+        WHERE status = 'Active'
+            AND (
+                last_inspection_date < %s
+                OR avg_customer_rating < 3.0
+                OR last_inspection_date IS NULL
+            )
+        ORDER BY avg_customer_rating ASC
+        LIMIT 10
+    """, add_days(today, -30), as_dict=True)
+
+    return {
+        "outlet_summary":  outlet_summary,
+        "daily_revenue":   daily_revenue,
+        "recent_activity": recent_activity,
+        "alerts":          alerts,
+    }
+```
+
+## Step 2: Page metadata
+
+The `.json` file registers the page object: its `name` (the slug used in routes and
+`frappe.pages[...]`), `title`, icon, owning module, and the roles allowed to open
+it. Setting `standard` to `Yes` makes it part of the app rather than a site-local
+record.
+
+```json title="scoopjoy/scoopjoy/scoopjoy/page/franchise_command_center/franchise_command_center.json"
+{
+    "creation": "2025-01-20 10:00:00",
+    "doctype": "Page",
+    "icon": "dashboard",
+    "module": "ScoopJoy",
+    "name": "franchise-command-center",
+    "page_name": "franchise-command-center",
+    "roles": [
+        { "role": "System Manager" },
+        { "role": "ScoopJoy Admin" }
+    ],
+    "standard": "Yes",
+    "system_page": 0,
+    "title": "Franchise Command Center"
+}
+```
+
+## Step 3: The HTML template
+
+This is the static skeleton: empty containers with `id`s that the controller fills
+in. Note the quick-action buttons wire their `onclick` to `scoopjoy.cc.*` methods —
+the controller exposes itself on that global namespace in Step 5.
+
+```html title="scoopjoy/scoopjoy/scoopjoy/page/franchise_command_center/franchise_command_center.html"
+<div class="command-center">
+    <!-- Summary Cards -->
+    <div class="row summary-row mb-4" id="summary-cards"></div>
+
+    <!-- Main Content -->
+    <div class="row mb-4">
+        <div class="col-md-8">
+            <div class="cc-card">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h6 class="mb-0">Revenue Trend (Last 7 Days)</h6>
+                    <span class="text-muted text-sm" id="last-updated"></span>
+                </div>
+                <div id="revenue-chart"></div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="cc-card">
+                <h6>Quick Actions</h6>
+                <div class="d-grid gap-2" id="quick-actions">
+                    <button class="btn btn-primary btn-sm btn-block" onclick="scoopjoy.cc.new_outlet()">
+                        New Franchise Outlet
+                    </button>
+                    <button class="btn btn-default btn-sm btn-block" onclick="scoopjoy.cc.view_report()">
+                        Sales Summary Report
+                    </button>
+                    <button class="btn btn-default btn-sm btn-block" onclick="scoopjoy.cc.bulk_inspection()">
+                        Schedule Bulk Inspections
+                    </button>
+                    <button class="btn btn-default btn-sm btn-block" onclick="scoopjoy.cc.export_data()">
+                        Export Outlet Data
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <!-- Alerts -->
+        <div class="col-md-6">
+            <div class="cc-card">
+                <h6>Attention Required</h6>
+                <div id="alerts-list"></div>
+            </div>
+        </div>
+        <!-- Recent Activity -->
+        <div class="col-md-6">
+            <div class="cc-card">
+                <h6>Recent Activity</h6>
+                <div id="activity-feed" style="max-height: 350px; overflow-y: auto;"></div>
+            </div>
+        </div>
+    </div>
+</div>
+```
+
+## Step 4: Styles
+
+The stylesheet leans on Frappe's CSS custom properties (`var(--card-bg)`,
+`var(--border-color)`) so the page respects light and dark themes automatically.
+
+```css title="scoopjoy/scoopjoy/scoopjoy/page/franchise_command_center/franchise_command_center.css"
+.command-center {
+    padding: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.cc-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 20px;
+    height: 100%;
+}
+
+.summary-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.summary-card .summary-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+}
+
+.summary-card .summary-value {
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.summary-card .summary-label {
+    font-size: 12px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    letter-spacing: 0.3px;
+}
+
+.alert-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--light-border-color);
+}
+
+.alert-row:last-child { border-bottom: none; }
+
+.alert-badge {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.alert-badge.rating { background: #fff3e0; color: #e65100; }
+.alert-badge.inspection { background: #fce4ec; color: #c62828; }
+
+.activity-item {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--light-border-color);
+    font-size: 13px;
+}
+
+.activity-item:last-child { border-bottom: none; }
+
+.activity-item .activity-time {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+```
+
+## Step 5: The controller
+
+The `.js` file is where the page comes alive. Frappe calls `on_page_load` once to
+build the chrome and instantiate the controller class, and `on_page_show` each time
+the page is revisited. `frappe.ui.make_app_page` gives the standard title bar and
+action buttons; `frappe.render_template('franchise_command_center')` injects the
+HTML template from Step 3.
+
+```javascript title="scoopjoy/scoopjoy/scoopjoy/page/franchise_command_center/franchise_command_center.js" {1,11,16}
+frappe.pages['franchise-command-center'].on_page_load = function(wrapper) {
+    const page = frappe.ui.make_app_page({
+        parent: wrapper,
+        title: 'Franchise Command Center',
+        single_column: true,
+    });
+
+    $(frappe.render_template('franchise_command_center')).appendTo(page.body);
+
+    page.cc = new FranchiseCommandCenter(page);
+};
+
+frappe.pages['franchise-command-center'].on_page_show = function(wrapper) {
+    wrapper.page.cc?.load_data();
+};
+
+
+class FranchiseCommandCenter {
+    constructor(page) {
+        this.page = page;
+        this.$wrapper = $(page.body);
+        this.revenue_chart = null;
+        this.auto_refresh_timer = null;
+
+        // Expose quick action methods globally for the HTML onclick handlers
+        frappe.provide('scoopjoy.cc');
+        scoopjoy.cc = this;
+
+        this.page.set_secondary_action('Refresh', () => this.load_data(), 'refresh');
+        this.load_data();
+        this.start_auto_refresh();
+    }
+
+    async load_data() {
+        try {
+            const data = await frappe.xcall(
+                'scoopjoy.scoopjoy.api.command_center.get_command_center_data'
+            );
+            this.render_summary(data.outlet_summary);
+            this.render_revenue_chart(data.daily_revenue);
+            this.render_alerts(data.alerts);
+            this.render_activity(data.recent_activity);
+
+            this.$wrapper.find('#last-updated').text(
+                `Updated ${frappe.datetime.prettyDate(frappe.datetime.now_datetime())}`
+            );
+        } catch (e) {
+            frappe.show_alert({ message: 'Error loading data', indicator: 'red' });
+            console.error(e);
+        }
+    }
+
+    render_summary(outlet_summary) {
+        const totals = outlet_summary.reduce((acc, row) => ({
+            count:     acc.count + row.count,
+            active:    acc.active + row.active,
+            suspended: acc.suspended + row.suspended,
+        }), { count: 0, active: 0, suspended: 0 });
+
+        const avg_rating = outlet_summary.length
+            ? (outlet_summary.reduce((s, r) => s + r.avg_rating * r.count, 0) / totals.count).toFixed(1)
+            : 'N/A';
+
+        const cards = [
+            { icon: 'building',     bg: '#e3f2fd', color: '#1565c0',
+              value: totals.count,     label: 'Total Outlets' },
+            { icon: 'check-circle', bg: '#e8f5e9', color: '#2e7d32',
+              value: totals.active,    label: 'Active' },
+            { icon: 'alert-circle', bg: '#fff3e0', color: '#e65100',
+              value: totals.suspended, label: 'Suspended' },
+            { icon: 'star',         bg: '#f3e5f5', color: '#7b1fa2',
+              value: avg_rating,       label: 'Avg Rating' },
+        ];
+
+        const html = cards.map(c => `
+            <div class="col-md-3 col-sm-6 mb-3">
+                <div class="summary-card">
+                    <div class="summary-icon" style="background:${c.bg};color:${c.color}">
+                        ${frappe.utils.icon(c.icon, 'md')}
+                    </div>
+                    <div>
+                        <div class="summary-value">${c.value}</div>
+                        <div class="summary-label">${c.label}</div>
+                    </div>
+                </div>
+            </div>
+        `).join('');
+
+        this.$wrapper.find('#summary-cards').html(html);
+    }
+
+    render_revenue_chart(daily_revenue) {
+        const labels = daily_revenue.map(r =>
+            frappe.datetime.str_to_user(r.posting_date).split('-').slice(0, 2).join('/')
+        );
+        const values = daily_revenue.map(r => r.revenue);
+
+        if (this.revenue_chart) {
+            this.revenue_chart.update({ labels, datasets: [{ values }] });
+        } else {
+            this.revenue_chart = new frappe.Chart('#revenue-chart', {
+                data: {
+                    labels,
+                    datasets: [{ name: 'Revenue', values, chartType: 'line' }],
+                },
+                type: 'axis-mixed',
+                height: 250,
+                colors: ['#7cd6fd'],
+                lineOptions: { regionFill: 1 },
+                tooltipOptions: {
+                    formatTooltipY: d => format_currency(d, 'INR'),
+                },
+            });
+        }
+    }
+
+    render_alerts(alerts) {
+        if (!alerts.length) {
+            this.$wrapper.find('#alerts-list').html(
+                '<p class="text-muted">All outlets are in good shape.</p>'
+            );
+            return;
+        }
+
+        const html = alerts.map(a => {
+            const reasons = [];
+            if (!a.last_inspection_date ||
+                frappe.datetime.get_diff(frappe.datetime.nowdate(), a.last_inspection_date) > 30) {
+                reasons.push('<span class="alert-badge inspection">Inspection Overdue</span>');
+            }
+            if (a.avg_customer_rating && a.avg_customer_rating < 3.0) {
+                reasons.push(`<span class="alert-badge rating">Rating: ${a.avg_customer_rating}</span>`);
+            }
+
+            return `
+                <div class="alert-row">
+                    <div>
+                        <a href="/desk/franchise-outlet/${a.name}" class="fw-bold">${a.franchise_name}</a>
+                        <div class="text-muted text-sm">${a.city} | ${a.franchise_type}</div>
+                    </div>
+                    <div class="d-flex gap-1">${reasons.join('')}</div>
+                </div>
+            `;
+        }).join('');
+
+        this.$wrapper.find('#alerts-list').html(html);
+    }
+
+    render_activity(activity) {
+        if (!activity.length) {
+            this.$wrapper.find('#activity-feed').html(
+                '<p class="text-muted">No recent activity.</p>'
+            );
+            return;
+        }
+
+        const html = activity.map(a => `
+            <div class="activity-item">
+                <div class="d-flex justify-content-between">
+                    <span>
+                        <a href="/desk/${frappe.router.slug(a.reference_doctype)}/${a.reference_name}">
+                            ${a.reference_name}
+                        </a>
+                    </span>
+                    <span class="activity-time">${frappe.datetime.prettyDate(a.creation)}</span>
+                </div>
+                <div class="text-muted">${frappe.utils.escape_html(a.content || a.comment_type)}</div>
+                <small class="text-muted">by ${a.comment_by}</small>
+            </div>
+        `).join('');
+
+        this.$wrapper.find('#activity-feed').html(html);
+    }
+
+    // --- Quick Actions (called from the HTML onclick handlers) ---
+
+    new_outlet() {
+        scoopjoy.start_onboarding();  // from the multi-step wizard recipe
+    }
+
+    view_report() {
+        frappe.set_route('query-report', 'Franchise Sales Summary');
+    }
+
+    async bulk_inspection() {
+        const d = await frappe.prompt([
+            { fieldname: 'date', fieldtype: 'Date', label: 'Inspection Date', reqd: 1,
+              default: frappe.datetime.add_days(frappe.datetime.nowdate(), 7) },
+            { fieldname: 'inspector', fieldtype: 'Link', label: 'Inspector',
+              options: 'Employee', reqd: 1 },
+        ], null, __('Schedule Bulk Inspections'));
+
+        frappe.dom.freeze('Scheduling...');
+        try {
+            const result = await frappe.xcall(
+                'scoopjoy.api.franchise.bulk_schedule_inspections',
+                { date: d.date, inspector: d.inspector }
+            );
+            frappe.dom.unfreeze();
+            frappe.msgprint({
+                title: 'Done',
+                indicator: 'green',
+                message: __('Scheduled {0} inspections.', [result.count]),
+            });
+        } catch (e) {
+            frappe.dom.unfreeze();
+            frappe.msgprint({ title: 'Error', indicator: 'red', message: e.message });
+        }
+    }
+
+    export_data() {
+        window.open(
+            `/api/method/frappe.client.get_list?doctype=Franchise+Outlet&fields=["name","franchise_name","franchise_type","city","status","current_month_revenue"]&limit_page_length=0&as_csv=1`,
+            '_blank'
+        );
+    }
+
+    start_auto_refresh() {
+        this.auto_refresh_timer = setInterval(() => this.load_data(), 10 * 60 * 1000);
+    }
+
+    destroy() {
+        if (this.auto_refresh_timer) {
+            clearInterval(this.auto_refresh_timer);
+        }
+    }
+}
+```
+
+A few details worth calling out:
+
+- `frappe.provide('scoopjoy.cc')` then `scoopjoy.cc = this` is how the inline
+  `onclick="scoopjoy.cc.new_outlet()"` handlers in the template reach the class
+  instance — there is no global controller object otherwise.
+- `frappe.xcall(...)` returns a promise directly, so `async`/`await` reads
+  naturally; the single call to `get_command_center_data` hydrates the whole page.
+- `start_auto_refresh` re-fetches every 10 minutes, and `destroy` clears that timer
+  so it does not leak when the page is torn down.
+
+## Step 6: Register the page bundle
+
+Finally, register the page's JS bundle in `hooks.py` so Frappe loads it and the page
+shows up in search and can be pinned to a workspace.
+
+```python title="scoopjoy/hooks.py"
+# Register the page so it appears in search and can be added to workspaces
+page_js = {
+    "franchise-command-center": "public/js/franchise_command_center.js"
+}
+```
+
+:::note[Why this works]
+Custom pages in Frappe follow a strict file structure: `page_name.json` (metadata),
+`page_name.js` (controller), `page_name.html` (template), and `page_name.css`
+(styles), all in one folder. The `frappe.render_template('template_name')` call
+loads the HTML file from that same directory. `frappe.ui.make_app_page` provides the
+standard Frappe page chrome — breadcrumbs, title bar, action buttons — and
+`frappe.xcall` returns promises directly, making `async`/`await` natural.
+:::
+
+:::caution[Common mistake]
+Placing HTML with `<script>` tags directly in the page directory. Frappe auto-loads
+every `.html` file in the page folder — if any contain inline JS with single quotes,
+it breaks the template parser. Put complex templates in a `templates/` subdirectory
+instead, or keep all logic in the `.js` file.
+:::

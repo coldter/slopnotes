@@ -1,0 +1,687 @@
+---
+title: Production Deployment
+description: Deploy ERPNext to bare metal or a VM with native bench, Nginx, SSL, and Supervisor — the production stack that runs ScoopJoy's outlets.
+sidebar:
+  order: 27
+---
+
+import { Steps, Aside } from "@astrojs/starlight/components";
+
+This chapter covers native bench-based production deployment on bare metal or
+virtual machines. While [Docker](/erpnext/26-docker/) is increasingly popular,
+many organizations prefer direct installations for maximum control and simpler
+debugging — and it's the clearest way to see every moving part of a Frappe
+deployment. We'll stand up ScoopJoy's franchise ERP on a fresh Ubuntu server,
+serving the HQ site plus per-outlet subdomains.
+
+If you've deployed a Node.js app behind Nginx with PM2 or systemd, the shape is
+familiar: a reverse proxy terminates SSL and serves static assets, an app server
+(here Gunicorn instead of `node`) handles dynamic requests, and a process
+manager (Supervisor instead of PM2) keeps everything alive. Frappe just has more
+moving parts: a WSGI web server, a Node.js Socket.IO server, a scheduler, and
+three pools of background workers.
+
+## Native bench production setup on Ubuntu 24.04
+
+### Prerequisites
+
+Install the system packages Frappe depends on — the database, cache, proxy,
+process manager, and PDF tooling:
+
+```bash
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install system dependencies
+sudo apt install -y \
+  git \
+  python3-dev \
+  python3-pip \
+  python3-venv \
+  python3-setuptools \
+  redis-server \
+  mariadb-server \
+  mariadb-client \
+  libmariadb-dev \
+  nginx \
+  supervisor \
+  curl \
+  wget \
+  xvfb \
+  libfontconfig \
+  wkhtmltopdf \
+  libcairo2
+
+# Install Node.js 20 LTS (system-wide for Supervisor compatibility)
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+
+# Install Yarn
+sudo npm install -g yarn
+
+# Secure MariaDB
+sudo mysql_secure_installation
+```
+
+<Aside type="caution" title="Install Node.js system-wide">
+For production, install Node.js system-wide using the NodeSource repository
+rather than `nvm`. Supervisor and systemd cannot resolve `nvm`-managed Node
+paths, causing Socket.IO failures.
+</Aside>
+
+### MariaDB configuration
+
+Frappe requires `utf8mb4` and InnoDB. Tune the buffer pool to your RAM and enable
+slow-query logging so you can find problem queries later:
+
+```ini title="/etc/mysql/mariadb.conf.d/99-frappe.cnf"
+[mysqld]
+character-set-server  = utf8mb4
+collation-server      = utf8mb4_unicode_ci
+default-storage-engine = InnoDB
+innodb-file-per-table = 1
+
+# Performance
+innodb_buffer_pool_size  = 4G
+innodb_log_file_size     = 512M
+innodb_flush_log_at_trx_commit = 1
+max_connections          = 200
+
+# Logging
+slow_query_log           = 1
+slow_query_log_file      = /var/log/mysql/slow.log
+long_query_time          = 2
+
+[mysql]
+default-character-set = utf8mb4
+```
+
+```bash
+sudo systemctl restart mariadb
+```
+
+### Create the frappe user and initialize bench
+
+Production benches run as a dedicated unprivileged user. Create it, install the
+`bench` CLI, then initialize the bench and create the ScoopJoy HQ site:
+
+<Steps>
+
+1. Create a dedicated `frappe` user and switch to it:
+
+   ```bash
+   sudo useradd -m -s /bin/bash frappe
+   sudo usermod -aG sudo frappe
+   sudo su - frappe
+   ```
+
+2. Install the `bench` CLI and initialize a v16 bench:
+
+   ```bash
+   pip3 install frappe-bench
+   bench init --frappe-branch version-16 frappe-bench
+   cd frappe-bench
+   ```
+
+3. Fetch ERPNext and the ScoopJoy custom app:
+
+   ```bash
+   bench get-app --branch version-16 erpnext
+   bench get-app --branch main https://github.com/your-org/scoopjoy
+   ```
+
+4. Create the production site and install the apps on it:
+
+   ```bash
+   bench new-site scoopjoy.com \
+     --mariadb-root-password YOUR_DB_ROOT_PASSWORD \
+     --admin-password YOUR_ADMIN_PASSWORD
+
+   bench --site scoopjoy.com install-app erpnext
+   bench --site scoopjoy.com install-app scoopjoy
+   ```
+
+5. Set it as the default site:
+
+   ```bash
+   bench use scoopjoy.com
+   ```
+
+</Steps>
+
+### Running `bench setup production`
+
+One command wires up everything that turns a dev bench into a production
+deployment:
+
+```bash
+sudo bench setup production frappe
+```
+
+This command:
+
+1. Generates the Nginx configuration and symlinks it to `/etc/nginx/conf.d/`.
+2. Generates the Supervisor configuration and symlinks it to `/etc/supervisor/conf.d/`.
+3. Adds a crontab entry for `bench schedule` (if not using Supervisor for scheduling).
+4. Sets appropriate file permissions.
+5. Restarts Nginx and Supervisor.
+
+For manual control, run the steps individually:
+
+```bash
+# Generate configs
+bench setup supervisor
+bench setup nginx
+
+# Symlink configs
+sudo ln -s ~/frappe-bench/config/supervisor.conf \
+  /etc/supervisor/conf.d/frappe-bench.conf
+sudo ln -s ~/frappe-bench/config/nginx.conf \
+  /etc/nginx/conf.d/frappe-bench.conf
+
+# Remove default nginx site that conflicts with port 80
+sudo rm -f /etc/nginx/sites-enabled/default
+
+# Reload services
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl restart all
+sudo systemctl reload nginx
+```
+
+## Nginx configuration
+
+`bench setup nginx` generates a complete config for you. Here is a
+production-ready version with SSL, a WebSocket proxy for Socket.IO, rate
+limiting on login and API endpoints, and security headers — serving both the
+ScoopJoy HQ site and a franchise outlet subdomain:
+
+```nginx title="/etc/nginx/conf.d/frappe-bench.conf"
+# Rate limiting zones
+limit_req_zone $binary_remote_addr zone=login:10m rate=5r/s;
+limit_req_zone $binary_remote_addr zone=api:10m rate=20r/s;
+
+# Upstream definitions
+upstream frappe-bench-frappe {
+    server 127.0.0.1:8000 fail_timeout=0;
+}
+
+upstream frappe-bench-socketio {
+    server 127.0.0.1:9000 fail_timeout=0;
+}
+
+# --- HTTP -> HTTPS Redirect ---
+server {
+    listen 80;
+    server_name scoopjoy.com outlet1.scoopjoy.com;
+
+    # Let's Encrypt challenge
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# --- Primary Site: scoopjoy.com ---
+server {
+    listen 443 ssl;  # Note: 'listen 443 ssl http2' syntax is deprecated since Nginx 1.25.1
+    http2 on;
+    server_name scoopjoy.com;
+
+    # SSL Configuration
+    ssl_certificate     /etc/letsencrypt/live/scoopjoy.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/scoopjoy.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Upload limit
+    client_max_body_size 50m;
+
+    # Proxy headers
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Use-X-Accel-Redirect True;
+
+    # Timeouts
+    proxy_read_timeout 120;
+    proxy_connect_timeout 120;
+    proxy_send_timeout 120;
+
+    # Static files with caching
+    location /assets {
+        alias /home/frappe/frappe-bench/sites/assets;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    location /files {
+        alias /home/frappe/frappe-bench/sites/scoopjoy.com/public/files;
+        expires 1M;
+        add_header Cache-Control "public";
+        access_log off;
+    }
+
+    # Socket.IO for real-time updates
+    location /socket.io {
+        proxy_pass http://frappe-bench-socketio;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Rate-limited endpoints
+    location /api/method/login {
+        limit_req zone=login burst=10 nodelay;
+        proxy_pass http://frappe-bench-frappe;
+    }
+
+    location /api/ {
+        limit_req zone=api burst=40 nodelay;
+        proxy_pass http://frappe-bench-frappe;
+    }
+
+    # All other requests to Gunicorn
+    location / {
+        proxy_pass http://frappe-bench-frappe;
+    }
+}
+
+# --- Franchise Outlet Site ---
+server {
+    listen 443 ssl;  # Note: 'listen 443 ssl http2' syntax is deprecated since Nginx 1.25.1
+    http2 on;
+    server_name outlet1.scoopjoy.com;
+
+    ssl_certificate     /etc/letsencrypt/live/outlet1.scoopjoy.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/outlet1.scoopjoy.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+
+    client_max_body_size 50m;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_read_timeout 120;
+
+    location /assets {
+        alias /home/frappe/frappe-bench/sites/assets;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    location /files {
+        alias /home/frappe/frappe-bench/sites/outlet1.scoopjoy.com/public/files;
+        expires 1M;
+        access_log off;
+    }
+
+    location /socket.io {
+        proxy_pass http://frappe-bench-socketio;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+
+    location / {
+        proxy_pass http://frappe-bench-frappe;
+    }
+}
+```
+
+### SSL with Let's Encrypt
+
+```bash
+# Method 1: Using bench (preferred for single sites)
+sudo -H bench setup lets-encrypt scoopjoy.com
+
+# Method 2: Using certbot directly (for multi-site)
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d scoopjoy.com
+sudo certbot --nginx -d outlet1.scoopjoy.com
+
+# Method 3: Wildcard certificate for all franchise subdomains
+sudo bench setup wildcard-ssl scoopjoy.com
+
+# Verify auto-renewal
+sudo certbot renew --dry-run
+```
+
+The bench Let's Encrypt command automatically adds a crontab entry for monthly
+certificate renewal.
+
+### Multi-site Nginx configuration
+
+For DNS-based multi-tenancy, each outlet gets its own subdomain. Enable DNS
+multitenancy, create one site per outlet, then regenerate the Nginx config so it
+includes every site:
+
+```bash
+# Enable DNS multitenancy
+bench config dns_multitenant on
+
+# Create sites with domain names
+bench new-site outlet1.scoopjoy.com \
+  --mariadb-root-password YOUR_DB_ROOT_PASSWORD \
+  --admin-password OUTLET1_PASSWORD
+bench --site outlet1.scoopjoy.com install-app erpnext
+bench --site outlet1.scoopjoy.com install-app scoopjoy
+
+bench new-site outlet2.scoopjoy.com \
+  --mariadb-root-password YOUR_DB_ROOT_PASSWORD \
+  --admin-password OUTLET2_PASSWORD
+bench --site outlet2.scoopjoy.com install-app erpnext
+bench --site outlet2.scoopjoy.com install-app scoopjoy
+
+# Regenerate nginx config to include all sites
+bench setup nginx
+sudo systemctl reload nginx
+```
+
+## Supervisor configuration
+
+`bench setup supervisor` generates a config that manages every Frappe process:
+the Gunicorn web server, the Node.js Socket.IO server, the scheduler, and the
+three background-worker pools. Here is a production-tuned version:
+
+```ini title="/etc/supervisor/conf.d/frappe-bench.conf"
+; --- Gunicorn (Web Server) ---
+[program:frappe-bench-frappe-web]
+command=/home/frappe/frappe-bench/env/bin/gunicorn \
+  --bind 0.0.0.0:8000 \
+  --workers 5 \
+  --timeout 120 \
+  --graceful-timeout 30 \
+  --worker-tmp-dir /dev/shm \
+  --preload \
+  frappe.app:application
+directory=/home/frappe/frappe-bench/sites
+user=frappe
+autostart=true
+autorestart=true
+startretries=3
+stopwaitsecs=40
+stdout_logfile=/home/frappe/frappe-bench/logs/web.log
+stderr_logfile=/home/frappe/frappe-bench/logs/web.error.log
+priority=1
+
+; --- Node.js Socket.IO Server ---
+[program:frappe-bench-node-socketio]
+command=node /home/frappe/frappe-bench/apps/frappe/socketio.js
+directory=/home/frappe/frappe-bench
+user=frappe
+autostart=true
+autorestart=true
+startretries=3
+stopwaitsecs=20
+stdout_logfile=/home/frappe/frappe-bench/logs/socketio.log
+stderr_logfile=/home/frappe/frappe-bench/logs/socketio.error.log
+priority=2
+
+; --- Scheduler ---
+[program:frappe-bench-frappe-schedule]
+command=/home/frappe/frappe-bench/env/bin/bench schedule
+directory=/home/frappe/frappe-bench
+user=frappe
+autostart=true
+autorestart=true
+startretries=3
+stopwaitsecs=20
+stdout_logfile=/home/frappe/frappe-bench/logs/schedule.log
+stderr_logfile=/home/frappe/frappe-bench/logs/schedule.error.log
+priority=3
+
+; --- Background Workers ---
+[program:frappe-bench-frappe-worker-short]
+command=/home/frappe/frappe-bench/env/bin/bench worker --queue short
+directory=/home/frappe/frappe-bench
+user=frappe
+autostart=true
+autorestart=true
+startretries=3
+stopwaitsecs=360
+numprocs=2
+process_name=%(program_name)s-%(process_num)02d
+stdout_logfile=/home/frappe/frappe-bench/logs/worker-short.log
+stderr_logfile=/home/frappe/frappe-bench/logs/worker-short.error.log
+priority=4
+
+[program:frappe-bench-frappe-worker-default]
+command=/home/frappe/frappe-bench/env/bin/bench worker --queue default
+directory=/home/frappe/frappe-bench
+user=frappe
+autostart=true
+autorestart=true
+startretries=3
+stopwaitsecs=1500
+numprocs=3
+process_name=%(program_name)s-%(process_num)02d
+stdout_logfile=/home/frappe/frappe-bench/logs/worker-default.log
+stderr_logfile=/home/frappe/frappe-bench/logs/worker-default.error.log
+priority=4
+
+[program:frappe-bench-frappe-worker-long]
+command=/home/frappe/frappe-bench/env/bin/bench worker --queue long
+directory=/home/frappe/frappe-bench
+user=frappe
+autostart=true
+autorestart=true
+startretries=3
+stopwaitsecs=1500
+numprocs=2
+process_name=%(program_name)s-%(process_num)02d
+stdout_logfile=/home/frappe/frappe-bench/logs/worker-long.log
+stderr_logfile=/home/frappe/frappe-bench/logs/worker-long.error.log
+priority=4
+
+; --- Process Groups ---
+[group:frappe-bench-web]
+programs=frappe-bench-frappe-web,frappe-bench-node-socketio
+
+[group:frappe-bench-workers]
+programs=frappe-bench-frappe-schedule,frappe-bench-frappe-worker-short,frappe-bench-frappe-worker-default,frappe-bench-frappe-worker-long
+```
+
+Worker counts for a medium load (30–50 users, roughly ScoopJoy's HQ + outlet
+staff):
+
+| Process | Count | Rationale |
+|---------|-------|-----------|
+| Gunicorn workers | 5 | `(2 x CPU cores) + 1` for a 2-core server |
+| Short queue workers | 2 | Quick tasks: notifications, cache updates |
+| Default queue workers | 3 | Standard operations: email, reports |
+| Long queue workers | 2 | Heavy jobs: data import, bulk operations |
+
+## Production settings
+
+A handful of config flags separate a dev bench from a production one — multitenancy,
+disabling developer mode, and enabling the scheduler:
+
+```bash
+# Essential production configurations
+bench config dns_multitenant on
+bench config serve_default_site on
+
+# Disable developer mode
+bench --site scoopjoy.com set-config developer_mode 0
+
+# Enable scheduler
+bench --site scoopjoy.com scheduler enable
+
+# Set maintenance mode when needed
+bench --site scoopjoy.com set-maintenance-mode on
+```
+
+## Gunicorn tuning
+
+The formula for Gunicorn worker count is `(2 x num_cpu_cores) + 1`:
+
+| Server CPUs | Workers | Max Concurrent Requests |
+|-------------|---------|------------------------|
+| 1 | 3 | ~3 |
+| 2 | 5 | ~5 |
+| 4 | 9 | ~9 |
+| 8 | 17 | ~17 |
+
+Set the worker count and HTTP timeout via bench config, then regenerate
+Supervisor so the new value takes effect:
+
+```bash
+bench config gunicorn_workers 9
+bench config http_timeout 120
+bench setup supervisor
+sudo supervisorctl reread
+sudo supervisorctl update
+```
+
+You can also tune the dev server's port in the `Procfile`:
+
+```text title="Procfile"
+web: bench serve --port 8000
+```
+
+## Domain and DNS setup
+
+For ScoopJoy's multi-site deployment, point HQ and each outlet subdomain at your
+server IP. A wildcard record lets you spin up new outlets without touching DNS:
+
+```text title="DNS A Records (server IP: 203.0.113.10)"
+scoopjoy.com          A    203.0.113.10
+outlet1.scoopjoy.com  A    203.0.113.10
+outlet2.scoopjoy.com  A    203.0.113.10
+*.scoopjoy.com        A    203.0.113.10   # Wildcard for future outlets
+```
+
+## Firewall configuration
+
+Lock the server down to SSH, HTTP, and HTTPS with UFW:
+
+```bash
+# Configure UFW
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+# Allow SSH
+sudo ufw allow 22/tcp
+
+# Allow HTTP and HTTPS
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+
+# Enable firewall
+sudo ufw enable
+
+# Verify
+sudo ufw status verbose
+```
+
+<Aside type="caution">
+Ensure SSH access (port 22) is allowed before enabling UFW, or you risk being
+locked out of your server.
+</Aside>
+
+## Complete production setup from scratch
+
+Putting it all together — the full sequence to stand up ScoopJoy's production ERP
+on a fresh Ubuntu 24.04 server, runnable as root:
+
+```bash title="production-setup.sh"
+#!/bin/bash
+# production-setup.sh -- Complete ERPNext v16 production setup
+# Run as root on a fresh Ubuntu 24.04 LTS server
+
+set -e
+
+FRAPPE_USER="frappe"
+SITE_NAME="scoopjoy.com"
+DB_ROOT_PASSWORD="your-secure-db-password"
+ADMIN_PASSWORD="your-admin-password"
+
+# 1. System updates and dependencies
+apt update && apt upgrade -y
+apt install -y \
+  git python3-dev python3-pip python3-venv python3-setuptools \
+  redis-server mariadb-server mariadb-client libmariadb-dev \
+  nginx supervisor curl wget \
+  xvfb libfontconfig wkhtmltopdf libcairo2
+
+# 2. Install Node.js 20 LTS
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+npm install -g yarn
+
+# 3. Configure MariaDB
+cat > /etc/mysql/mariadb.conf.d/99-frappe.cnf <<'MARIADBEOF'
+[mysqld]
+character-set-server  = utf8mb4
+collation-server      = utf8mb4_unicode_ci
+default-storage-engine = InnoDB
+innodb-file-per-table = 1
+innodb_buffer_pool_size = 4G
+innodb_log_file_size    = 512M
+max_connections         = 200
+MARIADBEOF
+systemctl restart mariadb
+
+# 4. Create frappe user
+useradd -m -s /bin/bash $FRAPPE_USER
+usermod -aG sudo $FRAPPE_USER
+echo "$FRAPPE_USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/frappe
+
+# 5. Initialize bench as frappe user
+su - $FRAPPE_USER <<USEREOF
+pip3 install frappe-bench
+bench init --frappe-branch version-16 frappe-bench
+cd frappe-bench
+bench get-app --branch version-16 erpnext
+bench get-app --branch main https://github.com/your-org/scoopjoy
+bench new-site $SITE_NAME \
+  --mariadb-root-password $DB_ROOT_PASSWORD \
+  --admin-password $ADMIN_PASSWORD
+bench --site $SITE_NAME install-app erpnext
+bench --site $SITE_NAME install-app scoopjoy
+bench use $SITE_NAME
+bench config dns_multitenant on
+USEREOF
+
+# 6. Setup production
+cd /home/$FRAPPE_USER/frappe-bench
+sudo bench setup production $FRAPPE_USER
+
+# 7. Firewall
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw --force enable
+
+# 8. SSL (run after DNS propagation)
+# sudo -H bench setup lets-encrypt $SITE_NAME
+
+echo "Production setup complete. Access at http://$SITE_NAME"
+```

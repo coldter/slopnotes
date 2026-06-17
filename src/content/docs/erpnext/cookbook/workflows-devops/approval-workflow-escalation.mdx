@@ -1,0 +1,555 @@
+---
+title: Multi-Level Approval Workflow with Escalation
+description: Build a tiered Purchase Order approval workflow in Frappe with amount-based routing and auto-escalation when approvers go quiet.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a Purchase Order approval workflow for ScoopJoy:
+Draft → L1 Review (Manager, under 50K) → L2 Review (Director, 50K–5L) →
+L3 Review (CFO, over 5L) → Approved → Ordered, with auto-escalation if a PO
+sits unactioned for 24 hours.
+
+**Solution:** Drive the lifecycle with a Frappe **Workflow** — a state machine
+backed by the `workflow_state` field. Amount-based `condition` expressions route
+each PO to the right approval tier, an hourly scheduled job escalates stale
+documents, and a `before_workflow_action` client hook gates risky transitions
+behind a confirmation.
+
+<Mermaid title="ScoopJoy PO approval lifecycle" height={520} code={`
+stateDiagram-v2
+  [*] --> Draft
+  Draft --> L1Review: Submit for Review (< 50K)
+  Draft --> L2Review: Submit for Director Review (50K-5L)
+  Draft --> L3Review: Submit for CFO Review (> 5L)
+  L1Review --> Approved: Approve (< 50K)
+  L1Review --> L2Review: Escalate to Director (>= 50K)
+  L1Review --> Rejected: Reject
+  L2Review --> Approved: Approve (< 5L)
+  L2Review --> L3Review: Escalate to CFO (>= 5L)
+  L2Review --> Rejected: Reject
+  L3Review --> Approved: Approve
+  L3Review --> Rejected: Reject
+  Rejected --> Draft: Revise and Resubmit
+  Approved --> Ordered: Mark as Ordered
+  Ordered --> [*]
+`} />
+
+## Step 1: Workflow fixture JSON
+
+The Workflow ships as a fixture so it deploys with the app. Each `states` entry
+maps a state to a `doc_status` (`0` = draft, `1` = submitted) and an editing role;
+each `transitions` entry names an action, its target state, the role allowed to
+fire it, and a `condition` — a Python expression evaluated with `doc` in scope
+that routes by `doc.grand_total`.
+
+```json title="scoopjoy/scoopjoy/fixtures/purchase_order_workflow.json" {39-46}
+[
+  {
+    "doctype": "Workflow",
+    "name": "ScoopJoy PO Approval",
+    "document_type": "Purchase Order",
+    "is_active": 1,
+    "send_email_alert": 1,
+    "workflow_state_field": "workflow_state",
+    "states": [
+      { "state": "Draft", "doc_status": 0, "allow_edit": "Purchase User", "is_optional_state": 0 },
+      { "state": "L1 Review", "doc_status": 0, "allow_edit": "Purchase Manager", "is_optional_state": 0 },
+      { "state": "L2 Review", "doc_status": 0, "allow_edit": "Director", "is_optional_state": 0 },
+      { "state": "L3 Review", "doc_status": 0, "allow_edit": "CFO", "is_optional_state": 0 },
+      { "state": "Approved", "doc_status": 1, "allow_edit": "Purchase Manager", "is_optional_state": 0 },
+      { "state": "Rejected", "doc_status": 0, "allow_edit": "Purchase User", "is_optional_state": 1 },
+      { "state": "Ordered", "doc_status": 1, "allow_edit": "Purchase Manager", "is_optional_state": 0 }
+    ],
+    "transitions": [
+      {
+        "state": "Draft",
+        "action": "Submit for Review",
+        "next_state": "L1 Review",
+        "allowed": "Purchase User",
+        "allow_self_approval": 1,
+        "condition": "doc.grand_total < 500000"
+      },
+      {
+        "state": "Draft",
+        "action": "Submit for Director Review",
+        "next_state": "L2 Review",
+        "allowed": "Purchase User",
+        "allow_self_approval": 1,
+        "condition": "doc.grand_total >= 50000 and doc.grand_total < 500000"
+      },
+      {
+        "state": "Draft",
+        "action": "Submit for CFO Review",
+        "next_state": "L3 Review",
+        "allowed": "Purchase User",
+        "allow_self_approval": 1,
+        "condition": "doc.grand_total >= 500000"
+      },
+      {
+        "state": "L1 Review",
+        "action": "Approve",
+        "next_state": "Approved",
+        "allowed": "Purchase Manager",
+        "allow_self_approval": 0,
+        "condition": "doc.grand_total < 50000"
+      },
+      {
+        "state": "L1 Review",
+        "action": "Escalate to Director",
+        "next_state": "L2 Review",
+        "allowed": "Purchase Manager",
+        "allow_self_approval": 0,
+        "condition": "doc.grand_total >= 50000"
+      },
+      {
+        "state": "L1 Review",
+        "action": "Reject",
+        "next_state": "Rejected",
+        "allowed": "Purchase Manager",
+        "allow_self_approval": 0
+      },
+      {
+        "state": "L2 Review",
+        "action": "Approve",
+        "next_state": "Approved",
+        "allowed": "Director",
+        "allow_self_approval": 0,
+        "condition": "doc.grand_total < 500000"
+      },
+      {
+        "state": "L2 Review",
+        "action": "Escalate to CFO",
+        "next_state": "L3 Review",
+        "allowed": "Director",
+        "allow_self_approval": 0,
+        "condition": "doc.grand_total >= 500000"
+      },
+      {
+        "state": "L2 Review",
+        "action": "Reject",
+        "next_state": "Rejected",
+        "allowed": "Director",
+        "allow_self_approval": 0
+      },
+      {
+        "state": "L3 Review",
+        "action": "Approve",
+        "next_state": "Approved",
+        "allowed": "CFO",
+        "allow_self_approval": 0
+      },
+      {
+        "state": "L3 Review",
+        "action": "Reject",
+        "next_state": "Rejected",
+        "allowed": "CFO",
+        "allow_self_approval": 0
+      },
+      {
+        "state": "Rejected",
+        "action": "Revise and Resubmit",
+        "next_state": "Draft",
+        "allowed": "Purchase User",
+        "allow_self_approval": 1
+      },
+      {
+        "state": "Approved",
+        "action": "Mark as Ordered",
+        "next_state": "Ordered",
+        "allowed": "Purchase Manager",
+        "allow_self_approval": 1
+      }
+    ]
+  }
+]
+```
+
+## Step 2: Register the fixture in hooks.py
+
+The Workflow definition references `Workflow State` and `Workflow Action Master`
+records, so all three DocTypes must be exported as fixtures for the workflow to
+survive a fresh install.
+
+```python title="scoopjoy/hooks.py"
+fixtures = [
+    {
+        "doctype": "Workflow",
+        "filters": [["name", "=", "ScoopJoy PO Approval"]],
+    },
+    {
+        "doctype": "Workflow State",
+        "filters": [
+            ["name", "in", [
+                "Draft", "L1 Review", "L2 Review", "L3 Review",
+                "Approved", "Rejected", "Ordered"
+            ]]
+        ],
+    },
+    {
+        "doctype": "Workflow Action Master",
+        "filters": [
+            ["name", "in", [
+                "Submit for Review", "Submit for Director Review",
+                "Submit for CFO Review", "Approve", "Reject",
+                "Escalate to Director", "Escalate to CFO",
+                "Revise and Resubmit", "Mark as Ordered"
+            ]]
+        ],
+    },
+]
+```
+
+## Step 3: Escalation scheduled job
+
+This is the auto-escalation engine. It scans for documents stuck in each review
+state past the 24-hour cutoff, advances them one tier, drops an audit comment, and
+emails the next approver role. The `escalation_map` defines where each stale state
+goes next and whom to notify; `L3 Review` re-notifies the CEO rather than advancing.
+
+```python title="scoopjoy/scoopjoy/tasks.py" {24-26,38-53}
+import frappe
+from frappe.utils import add_hours, now_datetime, get_datetime
+
+
+def escalate_pending_approvals():
+    """Auto-escalate POs not acted on within 24 hours.
+    Runs hourly via scheduler_events in hooks.py.
+    """
+    escalation_map = {
+        "L1 Review": {
+            "next_state": "L2 Review",
+            "notify_role": "Director",
+            "label": "Director",
+        },
+        "L2 Review": {
+            "next_state": "L3 Review",
+            "notify_role": "CFO",
+            "label": "CFO",
+        },
+        "L3 Review": {
+            "next_state": "L3 Review",  # stays — just re-notifies
+            "notify_role": "CEO",
+            "label": "CEO (final escalation)",
+        },
+    }
+
+    cutoff = add_hours(now_datetime(), -24)
+
+    for state, config in escalation_map.items():
+        stale_pos = frappe.get_all(
+            "Purchase Order",
+            filters={
+                "workflow_state": state,
+                "modified": ("<=", cutoff),
+                "docstatus": 0,
+            },
+            fields=["name", "grand_total", "modified", "owner"],
+        )
+
+        for po in stale_pos:
+            try:
+                doc = frappe.get_doc("Purchase Order", po.name)
+
+                # Skip if already at L3 and already escalated once
+                if state == "L3 Review":
+                    if frappe.db.exists("Comment", {
+                        "reference_doctype": "Purchase Order",
+                        "reference_name": po.name,
+                        "content": ("like", "%CFO escalation%"),
+                    }):
+                        continue
+
+                # Advance workflow state
+                if config["next_state"] != state:
+                    doc.workflow_state = config["next_state"]
+                    doc.add_comment(
+                        "Workflow",
+                        f"Auto-escalated from {state} to {config['next_state']} "
+                        f"(no action for 24+ hours)",
+                    )
+                    doc.flags.ignore_permissions = True
+                    doc.save()
+
+                # Send escalation notification
+                _send_escalation_email(doc, state, config)
+
+                frappe.logger("scoopjoy.escalation").info(
+                    f"Escalated PO {po.name} from {state} -> {config['next_state']}"
+                )
+
+            except Exception:
+                frappe.log_error(
+                    title=f"PO Escalation Failed: {po.name}",
+                    reference_doctype="Purchase Order",
+                    reference_name=po.name,
+                )
+
+    frappe.db.commit()
+
+
+def _send_escalation_email(doc, from_state, config):
+    """Send escalation email to the next approver role."""
+    recipients = _get_users_with_role(config["notify_role"])
+    if not recipients:
+        return
+
+    frappe.sendmail(
+        recipients=recipients,
+        subject=f"[ESCALATION] Purchase Order {doc.name} requires {config['label']} approval",
+        template="po_escalation",
+        args={
+            "po_name": doc.name,
+            "supplier": doc.supplier_name,
+            "grand_total": frappe.format_value(doc.grand_total, {"fieldtype": "Currency"}),
+            "from_state": from_state,
+            "to_state": config["next_state"],
+            "hours_pending": _hours_since(doc.modified),
+            "doc_url": frappe.utils.get_url_to_form("Purchase Order", doc.name),
+        },
+        now=True,
+    )
+
+
+def _get_users_with_role(role):
+    """Get active users with the given role."""
+    return frappe.get_all(
+        "Has Role",
+        filters={"role": role, "parenttype": "User"},
+        pluck="parent",
+    )
+
+
+def _hours_since(dt):
+    delta = now_datetime() - get_datetime(dt)
+    return round(delta.total_seconds() / 3600, 1)
+```
+
+:::tip[Pro tip]
+Setting `doc.flags.ignore_permissions = True` before `doc.save()` lets the
+scheduler advance the state even though no logged-in user has the approving role —
+the job runs as Administrator and the comment trail records that it was an
+automated escalation, not a human approval.
+:::
+
+## Step 4: Escalation email template
+
+A standalone Jinja template keeps the markup out of Python. The `{{ ... }}`
+placeholders are filled from the `args` dict passed to `frappe.sendmail` above.
+
+```html title="scoopjoy/scoopjoy/templates/emails/po_escalation.html"
+<h3 style="color: #d32f2f;">Purchase Order Escalation</h3>
+
+<table style="border-collapse: collapse; width: 100%; font-family: Arial, sans-serif;">
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd; background: #f5f5f5; font-weight: bold;">PO Number</td>
+    <td style="padding: 8px; border: 1px solid #ddd;">{{ po_name }}</td>
+  </tr>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd; background: #f5f5f5; font-weight: bold;">Supplier</td>
+    <td style="padding: 8px; border: 1px solid #ddd;">{{ supplier }}</td>
+  </tr>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd; background: #f5f5f5; font-weight: bold;">Amount</td>
+    <td style="padding: 8px; border: 1px solid #ddd;">{{ grand_total }}</td>
+  </tr>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd; background: #f5f5f5; font-weight: bold;">Pending Since</td>
+    <td style="padding: 8px; border: 1px solid #ddd; color: #d32f2f;">{{ hours_pending }} hours</td>
+  </tr>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd; background: #f5f5f5; font-weight: bold;">Escalated From</td>
+    <td style="padding: 8px; border: 1px solid #ddd;">{{ from_state }} &rarr; {{ to_state }}</td>
+  </tr>
+</table>
+
+<p style="margin-top: 16px;">
+  <a href="{{ doc_url }}" style="display: inline-block; padding: 10px 24px; background: #1976d2; color: white; text-decoration: none; border-radius: 4px;">
+    Review Purchase Order
+  </a>
+</p>
+```
+
+## Step 5: Hook the scheduler
+
+Register the escalation job to run hourly. Frappe's scheduler picks it up
+automatically once the app is installed.
+
+```python title="scoopjoy/hooks.py"
+scheduler_events = {
+    "hourly": [
+        "scoopjoy.scoopjoy.tasks.escalate_pending_approvals",
+    ],
+}
+```
+
+## Step 6: Notification on each transition
+
+To email the right people the moment a PO changes state, override the
+`Purchase Order` controller and react in `before_save` whenever `workflow_state`
+has changed. `has_value_changed` and `get_doc_before_save` give you the old and new
+states so you can route the notification by `role_map`.
+
+```python title="scoopjoy/scoopjoy/overrides/purchase_order.py" {6-9}
+import frappe
+from erpnext.buying.doctype.purchase_order.purchase_order import PurchaseOrder
+
+
+class ScoopJoyPurchaseOrder(PurchaseOrder):
+    def before_save(self):
+        super().before_save()
+        if self.has_value_changed("workflow_state"):
+            self._notify_workflow_transition()
+
+    def _notify_workflow_transition(self):
+        """Send email when workflow state changes."""
+        old_state = self.get_doc_before_save()
+        old_workflow = old_state.workflow_state if old_state else "Draft"
+        new_state = self.workflow_state
+
+        # Determine recipients based on new state
+        role_map = {
+            "L1 Review": "Purchase Manager",
+            "L2 Review": "Director",
+            "L3 Review": "CFO",
+            "Approved": "Purchase User",
+            "Rejected": "Purchase User",
+        }
+
+        role = role_map.get(new_state)
+        if not role:
+            return
+
+        recipients = frappe.get_all(
+            "Has Role",
+            filters={"role": role, "parenttype": "User"},
+            pluck="parent",
+        )
+
+        # Also notify the document owner for rejections/approvals
+        if new_state in ("Approved", "Rejected") and self.owner not in recipients:
+            recipients.append(self.owner)
+
+        frappe.sendmail(
+            recipients=recipients,
+            subject=f"PO {self.name}: {old_workflow} -> {new_state}",
+            template="po_workflow_transition",
+            args={
+                "po_name": self.name,
+                "supplier": self.supplier_name,
+                "grand_total": frappe.format_value(self.grand_total, {"fieldtype": "Currency"}),
+                "old_state": old_workflow,
+                "new_state": new_state,
+                "changed_by": frappe.session.user,
+                "doc_url": frappe.utils.get_url_to_form("Purchase Order", self.name),
+            },
+            now=True,
+        )
+```
+
+Register the override so Frappe loads your subclass instead of the stock one.
+
+```python title="scoopjoy/hooks.py"
+override_doctype_class = {
+    "Purchase Order": "scoopjoy.scoopjoy.overrides.purchase_order.ScoopJoyPurchaseOrder",
+}
+```
+
+## Step 7: Client-side workflow hooks
+
+Two form events shape the desk experience. `before_workflow_action` runs *before*
+the transition and can gate it: returning a `Promise` that only resolves once the
+user supplies a rejection reason or confirms a large approval. `after_workflow_action`
+runs once the state has changed — here it toasts the result and stamps approval
+metadata.
+
+```javascript title="scoopjoy/scoopjoy/public/js/purchase_order.js" {3-22}
+frappe.ui.form.on("Purchase Order", {
+    before_workflow_action: function (frm) {
+        const action = frm.selected_workflow_action;
+
+        // Require rejection reason
+        if (action === "Reject") {
+            return new Promise((resolve, reject) => {
+                frappe.prompt(
+                    {
+                        fieldtype: "Small Text",
+                        fieldname: "rejection_reason",
+                        label: "Rejection Reason",
+                        reqd: 1,
+                    },
+                    (values) => {
+                        frm.set_value("custom_rejection_reason", values.rejection_reason);
+                        frm.comment_area &&
+                            frm.comment_area.set_value(values.rejection_reason);
+                        resolve();
+                    },
+                    "Reason for Rejection",
+                    "Reject"
+                );
+                // If dialog is closed without submitting, cancel the action
+                frappe.cur_dialog &&
+                    frappe.cur_dialog.$wrapper.on("hidden.bs.modal", () => {
+                        reject();
+                    });
+            });
+        }
+
+        // Confirm large approvals
+        if (action === "Approve" && frm.doc.grand_total >= 500000) {
+            return new Promise((resolve, reject) => {
+                frappe.confirm(
+                    `Approving PO worth <strong>${format_currency(
+                        frm.doc.grand_total
+                    )}</strong>. Are you sure?`,
+                    () => resolve(),
+                    () => reject()
+                );
+            });
+        }
+    },
+
+    after_workflow_action: function (frm) {
+        const new_state = frm.doc.workflow_state;
+
+        // Show toast notification
+        frappe.show_alert(
+            {
+                message: `PO moved to <strong>${new_state}</strong>`,
+                indicator: new_state === "Rejected" ? "red" : "green",
+            },
+            5
+        );
+
+        // Log state change timestamp in custom fields
+        if (new_state === "Approved") {
+            frm.set_value("custom_approved_on", frappe.datetime.now_datetime());
+            frm.set_value("custom_approved_by", frappe.session.user);
+            frm.save();
+        }
+
+        // Refresh the form to pick up any server-side changes
+        frm.reload_doc();
+    },
+});
+```
+
+:::note[Why this works]
+Frappe workflows use a state machine backed by the `workflow_state` field.
+Transitions fire server-side validation via conditions (Python expressions
+evaluated with `doc` in scope), and the `Workflow Action` DocType creates
+inbox-style action items for each pending approver. The `before_workflow_action`
+client event returns a Promise, so async operations (dialogs, API calls) gate the
+transition.
+:::
+
+:::caution[Common mistake]
+Forgetting to return a `Promise` from `before_workflow_action`. Without it, the
+workflow proceeds immediately — your dialog or confirm appears but the action has
+already completed. Always `return new Promise(...)`.
+:::

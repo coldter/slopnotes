@@ -1,0 +1,781 @@
+---
+title: Building a Mobile App REST API Layer
+description: Expose a versioned, auth-protected REST API for a franchise mobile app using Frappe whitelisted methods, a response envelope, and per-user rate limiting.
+sidebar:
+  order: 1
+---
+
+import { LinkCard, FileTree, Steps } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a complete REST API for a ScoopJoy franchise mobile app
+(React Native / Flutter) with proper auth, versioning, and error handling.
+
+**Solution:** Create an API module inside your custom app with a standardized
+response envelope, token-based auth, rate limiting, and versioned endpoints.
+Frappe's `@frappe.whitelist()` decorator exposes any Python function at
+`/api/method/<dotted.path>`, so the "API layer" is really just a set of
+well-organized, decorated functions — no separate router or controller layer
+like you'd wire up in Express.
+
+## Step 1: App structure
+
+Group the API by version (`v1/`) so you can add a `v2/` later without breaking
+mobile clients, and keep cross-cutting helpers (response envelope, rate limiter)
+in a shared `utils/` package.
+
+<FileTree>
+- ice_cream_shop/
+  - ice_cream_shop/
+    - api/
+      - __init__.py
+      - v1/
+        - __init__.py
+        - **auth.py** login + token issue
+        - dashboard.py outlet KPIs
+        - menu.py items + pricing
+        - orders.py place + status
+        - uploads.py receipt photos
+    - utils/
+      - __init__.py
+      - api_response.py standardized envelope
+      - rate_limiter.py per-user limits
+</FileTree>
+
+## Step 2: Standardized response envelope
+
+Every endpoint returns the same `{status, data, message, errors}` shape, so the
+mobile client can write one generic response handler. The `handle_api_errors`
+decorator maps Frappe's exception types to HTTP status codes — the equivalent of
+a global Express error-handling middleware.
+
+```python title="ice_cream_shop/utils/api_response.py" {91-110}
+import frappe
+from frappe import _
+import functools
+import time
+import traceback
+
+
+def api_response(status="success", data=None, message=None, errors=None, http_status=200):
+    """Standardized JSON response envelope for all API endpoints."""
+    frappe.local.response["http_status_code"] = http_status
+    return {
+        "status": status,
+        "data": data,
+        "message": message,
+        "errors": errors,
+        "timestamp": time.time(),
+    }
+
+
+def success(data=None, message=None):
+    return api_response(status="success", data=data, message=message, http_status=200)
+
+
+def created(data=None, message=None):
+    return api_response(status="success", data=data, message=message, http_status=201)
+
+
+def bad_request(message=None, errors=None):
+    return api_response(status="error", message=message, errors=errors, http_status=400)
+
+
+def unauthorized(message="Authentication required"):
+    return api_response(status="error", message=message, http_status=401)
+
+
+def forbidden(message="Insufficient permissions"):
+    return api_response(status="error", message=message, http_status=403)
+
+
+def not_found(message="Resource not found"):
+    return api_response(status="error", message=message, http_status=404)
+
+
+def rate_limited(message="Too many requests. Try again later."):
+    return api_response(status="error", message=message, http_status=429)
+
+
+def server_error(message="Internal server error"):
+    return api_response(status="error", message=message, http_status=500)
+
+
+def handle_api_errors(func):
+    """Decorator that catches exceptions and returns standardized error responses."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except frappe.AuthenticationError:
+            return unauthorized()
+        except frappe.PermissionError:
+            return forbidden()
+        except frappe.DoesNotExistError as e:
+            return not_found(str(e))
+        except frappe.ValidationError as e:
+            return bad_request(str(e))
+        except Exception:
+            frappe.log_error(title=f"API Error in {func.__name__}")
+            if frappe.conf.developer_mode:
+                return server_error(traceback.format_exc())
+            return server_error()
+    return wrapper
+```
+
+## Step 3: Per-user rate limiter
+
+`RateLimiter` buckets requests into fixed time windows keyed in Redis via
+`frappe.cache`. The `rate_limit` decorator wraps an endpoint, sets the standard
+`X-RateLimit-*` response headers, and short-circuits with a `429` when a user
+exceeds their quota.
+
+```python title="ice_cream_shop/utils/rate_limiter.py" {32-34,42-47}
+import frappe
+import time
+import functools
+
+
+class RateLimiter:
+    """Per-user rate limiting using frappe.cache (Redis)."""
+
+    def __init__(self, max_requests=60, window_seconds=60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+
+    def _get_cache_key(self, user=None):
+        user = user or frappe.session.user
+        return f"rate_limit:{user}:{int(time.time() // self.window_seconds)}"
+
+    def check(self, user=None):
+        """Returns (allowed: bool, remaining: int, reset_at: float)."""
+        key = self._get_cache_key(user)
+        current = frappe.cache.get_value(key) or 0
+
+        window_start = int(time.time() // self.window_seconds) * self.window_seconds
+        reset_at = window_start + self.window_seconds
+        remaining = max(0, self.max_requests - current - 1)
+
+        if current >= self.max_requests:
+            return False, 0, reset_at
+
+        frappe.cache.set_value(key, current + 1, expires_in_sec=self.window_seconds)
+        return True, remaining, reset_at
+
+
+def rate_limit(max_requests=60, window_seconds=60):
+    """Decorator for per-user rate limiting on API endpoints."""
+    limiter = RateLimiter(max_requests, window_seconds)
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            from ice_cream_shop.utils.api_response import rate_limited
+
+            allowed, remaining, reset_at = limiter.check()
+
+            # Always set rate-limit headers
+            frappe.local.response.headers = frappe.local.response.get("headers", {})
+            frappe.local.response.headers["X-RateLimit-Limit"] = str(max_requests)
+            frappe.local.response.headers["X-RateLimit-Remaining"] = str(remaining)
+            frappe.local.response.headers["X-RateLimit-Reset"] = str(int(reset_at))
+
+            if not allowed:
+                return rate_limited(f"Rate limit exceeded. Resets at {int(reset_at)}.")
+
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+```
+
+## Step 4: Auth endpoint (login + token)
+
+The decorators stack: `@frappe.whitelist(allow_guest=True, methods=["POST"])`
+makes `login` reachable without a session, `@handle_api_errors` normalizes
+failures, and `@rate_limit` throttles brute-force attempts. On success it
+returns the user's API key/secret as a ready-to-use `token api_key:api_secret`
+string the mobile client stores and replays.
+
+```python title="ice_cream_shop/api/v1/auth.py" {1-3,15-17}
+import frappe
+from frappe import _
+from ice_cream_shop.utils.api_response import (
+    success, bad_request, unauthorized, handle_api_errors
+)
+from ice_cream_shop.utils.rate_limiter import rate_limit
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@handle_api_errors
+@rate_limit(max_requests=10, window_seconds=300)  # 10 login attempts per 5 min
+def login(usr=None, pwd=None):
+    """
+    Authenticate user, return API key + secret.
+
+    POST /api/method/ice_cream_shop.api.v1.auth.login
+    Body: {"usr": "outlet@scoopjoy.com", "pwd": "password123"}
+    """
+    if not usr or not pwd:
+        return bad_request("Both 'usr' and 'pwd' are required.")
+
+    try:
+        frappe.local.login_manager.authenticate(usr, pwd)
+        frappe.local.login_manager.post_login()
+    except frappe.AuthenticationError:
+        return unauthorized("Invalid email or password.")
+
+    user = frappe.session.user
+    user_doc = frappe.get_doc("User", user)
+
+    # Generate API keys if not present
+    api_key = user_doc.api_key
+    if not api_key:
+        from frappe.core.doctype.user.user import generate_keys
+        keys = generate_keys(user)
+        api_key = frappe.db.get_value("User", user, "api_key")
+        api_secret = keys["api_secret"]
+    else:
+        api_secret = frappe.utils.password.get_decrypted_password(
+            "User", user, "api_secret"
+        )
+
+    # Get user roles for the mobile app
+    roles = frappe.get_roles(user)
+
+    return success(
+        data={
+            "user": user,
+            "full_name": frappe.db.get_value("User", user, "full_name"),
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "token": f"token {api_key}:{api_secret}",
+            "roles": roles,
+        },
+        message="Login successful."
+    )
+
+
+@frappe.whitelist(methods=["POST"])
+@handle_api_errors
+def logout():
+    """
+    Invalidate session.
+
+    POST /api/method/ice_cream_shop.api.v1.auth.logout
+    Header: Authorization: token <api_key>:<api_secret>
+    """
+    frappe.local.login_manager.logout()
+    return success(message="Logged out successfully.")
+```
+
+## Step 5: Dashboard endpoint
+
+The home screen of the franchise app needs today's sales, a weekly trend, top
+sellers, and low-stock alerts — all scoped to the outlet linked to the logged-in
+user. This combines `frappe.db.get_list` aggregates with raw `frappe.db.sql` for
+the joins.
+
+```python title="ice_cream_shop/api/v1/dashboard.py" {12-16}
+import frappe
+from frappe import _
+from frappe.utils import nowdate, add_days, flt, getdate
+from ice_cream_shop.utils.api_response import success, handle_api_errors
+from ice_cream_shop.utils.rate_limiter import rate_limit
+
+
+@frappe.whitelist(methods=["GET"])
+@handle_api_errors
+@rate_limit(max_requests=120, window_seconds=60)
+def get_dashboard():
+    """
+    Return franchise outlet dashboard KPIs.
+
+    GET /api/method/ice_cream_shop.api.v1.dashboard.get_dashboard
+    Header: Authorization: token <api_key>:<api_secret>
+    """
+    user = frappe.session.user
+    # Find the outlet linked to this user
+    outlet = frappe.db.get_value(
+        "ScoopJoy Outlet", {"owner_email": user}, "name"
+    )
+
+    if not outlet:
+        # Fall back: return HQ-level stats for admin users
+        outlet = None
+
+    today = nowdate()
+    week_ago = add_days(today, -7)
+
+    filters = {"posting_date": ["between", [today, today]], "docstatus": 1}
+    if outlet:
+        filters["custom_outlet"] = outlet
+
+    # Today's sales
+    today_sales = frappe.db.get_list(
+        "Sales Invoice",
+        filters=filters,
+        fields=["SUM(grand_total) as total", "COUNT(name) as count"],
+        as_list=False,
+    )
+
+    # Weekly trend
+    weekly_filters = {"posting_date": ["between", [week_ago, today]], "docstatus": 1}
+    if outlet:
+        weekly_filters["custom_outlet"] = outlet
+
+    weekly_sales = frappe.db.get_list(
+        "Sales Invoice",
+        filters=weekly_filters,
+        fields=["posting_date", "SUM(grand_total) as total"],
+        group_by="posting_date",
+        order_by="posting_date asc",
+        as_list=False,
+    )
+
+    # Top selling items today
+    top_items = frappe.db.sql("""
+        SELECT sii.item_name, SUM(sii.qty) as qty, SUM(sii.amount) as revenue
+        FROM `tabSales Invoice Item` sii
+        JOIN `tabSales Invoice` si ON si.name = sii.parent
+        WHERE si.posting_date = %s AND si.docstatus = 1
+        {outlet_filter}
+        GROUP BY sii.item_code
+        ORDER BY qty DESC
+        LIMIT 5
+    """.format(
+        outlet_filter=f"AND si.custom_outlet = '{outlet}'" if outlet else ""
+    ), (today,), as_dict=True)
+
+    # Low stock alerts (items below reorder level)
+    low_stock = []
+    if outlet:
+        low_stock = frappe.db.sql("""
+            SELECT b.item_code, b.item_name, b.actual_qty, b.reserved_qty
+            FROM `tabBin` b
+            JOIN `tabItem` i ON i.name = b.item_code
+            WHERE b.warehouse = (
+                SELECT default_warehouse FROM `tabScoopJoy Outlet` WHERE name = %s
+            )
+            AND b.actual_qty < i.custom_reorder_level
+            AND b.actual_qty > 0
+        """, (outlet,), as_dict=True)
+
+    return success(data={
+        "outlet": outlet,
+        "today": {
+            "total_sales": flt(today_sales[0]["total"]) if today_sales else 0,
+            "order_count": today_sales[0]["count"] if today_sales else 0,
+        },
+        "weekly_trend": [
+            {"date": str(row["posting_date"]), "total": flt(row["total"])}
+            for row in weekly_sales
+        ],
+        "top_items": top_items,
+        "low_stock_alerts": low_stock,
+    })
+```
+
+## Step 6: Menu endpoint
+
+Returns active menu items, layers in outlet-specific pricing from the outlet's
+price list, checks live stock at the outlet warehouse, and groups everything by
+category — exactly the structure a menu screen needs.
+
+```python title="ice_cream_shop/api/v1/menu.py" {26-34}
+import frappe
+from frappe import _
+from ice_cream_shop.utils.api_response import success, bad_request, handle_api_errors
+from ice_cream_shop.utils.rate_limiter import rate_limit
+
+
+@frappe.whitelist(methods=["GET"])
+@handle_api_errors
+@rate_limit(max_requests=120, window_seconds=60)
+def get_menu(outlet=None, category=None):
+    """
+    Return active menu items with pricing and availability.
+
+    GET /api/method/ice_cream_shop.api.v1.menu.get_menu?outlet=SJ-MUM-001
+    Header: Authorization: token <api_key>:<api_secret>
+    """
+    filters = {"disabled": 0, "custom_is_menu_item": 1}
+    if category:
+        filters["item_group"] = category
+
+    items = frappe.get_list(
+        "Item",
+        filters=filters,
+        fields=[
+            "name as item_code", "item_name", "item_group as category",
+            "description", "custom_is_veg", "custom_allergens",
+            "image", "standard_rate as base_price",
+        ],
+        order_by="item_group, item_name",
+        limit_page_length=0,
+    )
+
+    # Fetch outlet-specific pricing if outlet is given
+    if outlet:
+        price_list = frappe.db.get_value(
+            "ScoopJoy Outlet", outlet, "custom_selling_price_list"
+        ) or "Standard Selling"
+
+        for item in items:
+            outlet_price = frappe.db.get_value(
+                "Item Price",
+                {"item_code": item["item_code"], "price_list": price_list, "selling": 1},
+                "price_list_rate"
+            )
+            item["price"] = outlet_price or item["base_price"]
+
+            # Stock availability at the outlet warehouse
+            warehouse = frappe.db.get_value(
+                "ScoopJoy Outlet", outlet, "default_warehouse"
+            )
+            if warehouse:
+                actual_qty = frappe.db.get_value(
+                    "Bin",
+                    {"item_code": item["item_code"], "warehouse": warehouse},
+                    "actual_qty"
+                ) or 0
+                item["in_stock"] = actual_qty > 0
+                item["qty_available"] = actual_qty
+            else:
+                item["in_stock"] = True
+                item["qty_available"] = None
+    else:
+        for item in items:
+            item["price"] = item["base_price"]
+            item["in_stock"] = True
+
+    # Group by category
+    categories = {}
+    for item in items:
+        cat = item["category"]
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(item)
+
+    return success(data={
+        "categories": [
+            {"name": cat, "items": cat_items}
+            for cat, cat_items in categories.items()
+        ],
+        "total_items": len(items),
+    })
+```
+
+## Step 7: Place order + get order status
+
+Placing an order builds and submits a POS `Sales Invoice`, validating stock per
+line before appending it. Note the `isinstance(items, str)` guard — mobile
+clients often POST the `items` array as a JSON string, so we parse it defensively
+(see the common mistake below).
+
+```python title="ice_cream_shop/api/v1/orders.py" {27-30}
+import frappe
+from frappe import _
+from frappe.utils import nowdate, nowtime, flt
+from ice_cream_shop.utils.api_response import (
+    success, created, bad_request, not_found, handle_api_errors
+)
+from ice_cream_shop.utils.rate_limiter import rate_limit
+
+
+@frappe.whitelist(methods=["POST"])
+@handle_api_errors
+@rate_limit(max_requests=30, window_seconds=60)
+def place_order(outlet=None, items=None, customer=None, payment_mode="Cash"):
+    """
+    Place a new order (creates a Sales Invoice).
+
+    POST /api/method/ice_cream_shop.api.v1.orders.place_order
+    Header: Authorization: token <api_key>:<api_secret>
+    """
+    if not outlet:
+        return bad_request("'outlet' is required.")
+    if not items or not isinstance(items, list):
+        return bad_request("'items' must be a non-empty list.")
+
+    # Parse items if received as JSON string (common from mobile clients)
+    if isinstance(items, str):
+        import json
+        items = json.loads(items)
+
+    # Resolve outlet details
+    outlet_doc = frappe.get_doc("ScoopJoy Outlet", outlet)
+    warehouse = outlet_doc.default_warehouse
+    price_list = outlet_doc.custom_selling_price_list or "Standard Selling"
+    customer = customer or outlet_doc.custom_default_customer or "Walk-in Customer"
+
+    # Build Sales Invoice
+    si = frappe.new_doc("Sales Invoice")
+    si.customer = customer
+    si.posting_date = nowdate()
+    si.posting_time = nowtime()
+    si.selling_price_list = price_list
+    si.set_warehouse = warehouse
+    si.custom_outlet = outlet
+    si.custom_order_source = "Mobile App"
+    si.is_pos = 1
+    si.update_stock = 1
+
+    for line in items:
+        item_code = line.get("item_code")
+        qty = flt(line.get("qty", 1))
+
+        if not item_code:
+            return bad_request("Each item must have 'item_code'.")
+        if qty <= 0:
+            return bad_request(f"Invalid qty {qty} for {item_code}.")
+
+        # Check stock
+        actual_qty = frappe.db.get_value(
+            "Bin", {"item_code": item_code, "warehouse": warehouse}, "actual_qty"
+        ) or 0
+        if actual_qty < qty:
+            return bad_request(
+                f"Insufficient stock for {item_code}: available={actual_qty}, requested={qty}"
+            )
+
+        si.append("items", {
+            "item_code": item_code,
+            "qty": qty,
+            "warehouse": warehouse,
+        })
+
+    # Add payment entry for POS
+    si.append("payments", {
+        "mode_of_payment": payment_mode,
+        "amount": 0,  # Will be calculated on insert
+    })
+
+    si.flags.ignore_permissions = False
+    si.insert()
+    si.calculate_taxes_and_totals()
+
+    # Update payment amount to match total
+    si.payments[0].amount = si.grand_total
+    si.paid_amount = si.grand_total
+    si.save()
+    si.submit()
+
+    return created(
+        data={
+            "order_id": si.name,
+            "grand_total": si.grand_total,
+            "currency": si.currency,
+            "items": [
+                {
+                    "item_code": row.item_code,
+                    "item_name": row.item_name,
+                    "qty": row.qty,
+                    "rate": row.rate,
+                    "amount": row.amount,
+                }
+                for row in si.items
+            ],
+            "status": "Submitted",
+        },
+        message=f"Order {si.name} placed successfully."
+    )
+
+
+@frappe.whitelist(methods=["GET"])
+@handle_api_errors
+@rate_limit(max_requests=120, window_seconds=60)
+def get_order_status(order_id=None):
+    """
+    Get status of an order.
+
+    GET /api/method/ice_cream_shop.api.v1.orders.get_order_status?order_id=ACC-SINV-2025-00042
+    Header: Authorization: token <api_key>:<api_secret>
+    """
+    if not order_id:
+        return bad_request("'order_id' is required.")
+
+    if not frappe.db.exists("Sales Invoice", order_id):
+        return not_found(f"Order {order_id} not found.")
+
+    si = frappe.get_doc("Sales Invoice", order_id)
+    frappe.has_permission("Sales Invoice", doc=si, throw=True)
+
+    return success(data={
+        "order_id": si.name,
+        "status": si.status,
+        "docstatus": si.docstatus,
+        "grand_total": si.grand_total,
+        "outstanding_amount": si.outstanding_amount,
+        "is_paid": si.outstanding_amount == 0,
+        "posting_date": str(si.posting_date),
+        "customer": si.customer,
+        "outlet": si.custom_outlet,
+        "items": [
+            {
+                "item_code": row.item_code,
+                "item_name": row.item_name,
+                "qty": row.qty,
+                "rate": row.rate,
+                "amount": row.amount,
+            }
+            for row in si.items
+        ],
+    })
+```
+
+## Step 8: Upload receipt photo
+
+A `multipart/form-data` endpoint that validates the file extension and size,
+then persists it as a private `File` doc attached to the invoice. Read uploaded
+files from `frappe.request.files`, not the JSON body.
+
+```python title="ice_cream_shop/api/v1/uploads.py" {19-28}
+import frappe
+from frappe import _
+from ice_cream_shop.utils.api_response import success, bad_request, handle_api_errors
+from ice_cream_shop.utils.rate_limiter import rate_limit
+
+
+@frappe.whitelist(methods=["POST"])
+@handle_api_errors
+@rate_limit(max_requests=20, window_seconds=60)
+def upload_receipt_photo(order_id=None):
+    """
+    Upload a receipt/payment screenshot and attach to the Sales Invoice.
+
+    POST /api/method/ice_cream_shop.api.v1.uploads.upload_receipt_photo
+    Header: Authorization: token <api_key>:<api_secret>
+    Content-Type: multipart/form-data
+    Body: file=<binary>, order_id=ACC-SINV-2025-00042
+    """
+    if not order_id:
+        return bad_request("'order_id' is required.")
+
+    if not frappe.db.exists("Sales Invoice", order_id):
+        return bad_request(f"Order {order_id} not found.")
+
+    files = frappe.request.files
+    if not files or "file" not in files:
+        return bad_request("No file uploaded. Send file as multipart form data with key 'file'.")
+
+    uploaded_file = files["file"]
+
+    # Validate file type
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".pdf", ".heic"}
+    import os
+    ext = os.path.splitext(uploaded_file.filename)[1].lower()
+    if ext not in allowed_extensions:
+        return bad_request(f"File type '{ext}' not allowed. Use: {', '.join(allowed_extensions)}")
+
+    # Validate file size (max 5MB)
+    uploaded_file.seek(0, 2)
+    size = uploaded_file.tell()
+    uploaded_file.seek(0)
+    if size > 5 * 1024 * 1024:
+        return bad_request("File size exceeds 5MB limit.")
+
+    # Save file using Frappe's file manager
+    file_doc = frappe.get_doc({
+        "doctype": "File",
+        "file_name": f"receipt_{order_id}_{uploaded_file.filename}",
+        "attached_to_doctype": "Sales Invoice",
+        "attached_to_name": order_id,
+        "content": uploaded_file.read(),
+        "is_private": 1,
+    })
+    file_doc.save(ignore_permissions=False)
+
+    # Add a comment on the invoice
+    frappe.get_doc("Sales Invoice", order_id).add_comment(
+        "Attachment",
+        _("Receipt photo uploaded via mobile app: {0}").format(file_doc.file_url)
+    )
+
+    return success(
+        data={
+            "file_name": file_doc.file_name,
+            "file_url": file_doc.file_url,
+            "attached_to": order_id,
+        },
+        message="Receipt uploaded successfully."
+    )
+```
+
+## Step 9: curl examples for every endpoint
+
+The same calls a mobile client makes, ready to paste into a terminal. Note how
+every authenticated request carries the `Authorization: token <api_key>:<api_secret>`
+header — Frappe's built-in token auth, no custom middleware required.
+
+```bash
+# --- 1. Login (get token) ---
+curl -X POST 'https://erp.scoopjoy.com/api/method/ice_cream_shop.api.v1.auth.login' \
+  -H 'Content-Type: application/json' \
+  -d '{"usr": "outlet@scoopjoy.com", "pwd": "S3cure!Pass"}'
+
+# Response:
+# {
+#   "message": {
+#     "status": "success",
+#     "data": {
+#       "user": "outlet@scoopjoy.com",
+#       "full_name": "Mumbai Outlet Manager",
+#       "api_key": "abc1234xyz",
+#       "api_secret": "secret9876",
+#       "token": "token abc1234xyz:secret9876",
+#       "roles": ["Franchise User", "Sales User"]
+#     },
+#     "message": "Login successful.",
+#     "timestamp": 1711929600.0
+#   }
+# }
+
+# --- 2. Get Dashboard ---
+curl -X GET 'https://erp.scoopjoy.com/api/method/ice_cream_shop.api.v1.dashboard.get_dashboard' \
+  -H 'Authorization: token abc1234xyz:secret9876'
+
+# --- 3. Get Menu ---
+curl -X GET 'https://erp.scoopjoy.com/api/method/ice_cream_shop.api.v1.menu.get_menu?outlet=SJ-MUM-001&category=Ice%20Cream' \
+  -H 'Authorization: token abc1234xyz:secret9876'
+
+# --- 4. Place Order ---
+curl -X POST 'https://erp.scoopjoy.com/api/method/ice_cream_shop.api.v1.orders.place_order' \
+  -H 'Authorization: token abc1234xyz:secret9876' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "outlet": "SJ-MUM-001",
+    "customer": "Walk-in Customer",
+    "payment_mode": "UPI",
+    "items": [
+      {"item_code": "SCOOP-VAN-001", "qty": 2},
+      {"item_code": "CONE-WAF-001", "qty": 1}
+    ]
+  }'
+
+# --- 5. Get Order Status ---
+curl -X GET 'https://erp.scoopjoy.com/api/method/ice_cream_shop.api.v1.orders.get_order_status?order_id=ACC-SINV-2025-00042' \
+  -H 'Authorization: token abc1234xyz:secret9876'
+
+# --- 6. Upload Receipt Photo ---
+curl -X POST 'https://erp.scoopjoy.com/api/method/ice_cream_shop.api.v1.uploads.upload_receipt_photo' \
+  -H 'Authorization: token abc1234xyz:secret9876' \
+  -F 'order_id=ACC-SINV-2025-00042' \
+  -F 'file=@/path/to/receipt.jpg'
+```
+
+:::note[Why this works]
+Frappe's `@frappe.whitelist()` decorator exposes Python functions at
+`/api/method/<dotted.path.to.function>`, and the `methods` parameter restricts
+HTTP verbs. The `Authorization: token api_key:api_secret` header is Frappe's
+built-in token auth — no custom middleware needed. Every response uses the same
+`{status, data, message, errors}` envelope, so mobile clients can write one
+generic response handler.
+:::
+
+:::caution[Common mistake]
+Sending `items` as a JSON array in a POST body without setting
+`Content-Type: application/json`. Frappe will receive it as a string instead of
+a list. Always parse with `json.loads()` as a safety net (as in Step 7), or
+ensure the mobile client sends proper JSON headers.
+:::

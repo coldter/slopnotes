@@ -1,0 +1,232 @@
+---
+title: extend_doctype_class Patterns (v16)
+description: Extend a stock DocType like Sales Invoice from your own app — safely stacking validations and methods alongside other apps via the v16 extend hook.
+sidebar:
+  order: 6
+---
+
+import { LinkCard, Badge } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Extend Sales Invoice from your custom app to add franchise-specific
+validation and methods — without conflicting with other apps installed on the same
+bench.
+
+**Solution:** Use the v16 <Badge text="v16" /> `extend_doctype_class` hook. Unlike the
+older `override_doctype_class` (which let only one app win), `extend_doctype_class`
+merges your methods into the original DocType's method resolution order, so multiple
+apps can extend the same DocType at once. Each extension calls `super()` to chain with
+the original logic and every other app's extensions.
+
+## Step 1: Register the extension in hooks.py
+
+Map each DocType name to the dotted path of your extension class. The key insight is
+the verb: this *extends* rather than *overrides*, so other apps can map the same
+DocType safely.
+
+```python title="apps/scoopjoy/scoopjoy/hooks.py" {2}
+# v16+: extend (not override) — multiple apps can safely extend the same DocType
+extend_doctype_class = {
+    "Sales Invoice": "scoopjoy.overrides.sales_invoice.ScoopJoySalesInvoice",
+    "POS Invoice": "scoopjoy.overrides.pos_invoice.ScoopJoyPOSInvoice",
+    "Stock Entry": "scoopjoy.overrides.stock_entry.ScoopJoyStockEntry",
+}
+```
+
+## Step 2: Write the extension class
+
+The extension class is a plain class — it does not subclass the DocType. Frappe merges
+its methods into the original class chain. New methods are added directly; existing
+methods like `validate` and `on_submit` are overridden, and you call `super()` to chain
+back into the original Sales Invoice logic plus any other app's extensions.
+
+```python title="apps/scoopjoy/scoopjoy/overrides/sales_invoice.py" {15-18}
+import frappe
+from frappe import _
+from frappe.utils import flt
+
+
+class ScoopJoySalesInvoice:
+    """
+    Extends Sales Invoice with franchise-specific logic.
+
+    In v16, extend_doctype_class merges methods into the original class.
+    - New methods are added directly.
+    - Existing methods can be overridden; call super() to chain with the original.
+    - Multiple apps can extend the same DocType safely.
+    """
+
+    # ── Add new validation: franchise credit limit check ───────────
+    def validate(self):
+        # IMPORTANT: call super() to run the original Sales Invoice validation
+        # plus any validations added by other apps
+        super().validate()
+        self.validate_franchise_credit_limit()
+        self.set_franchise_cost_center()
+
+    def validate_franchise_credit_limit(self):
+        """Check if the franchise has exceeded its credit limit."""
+        if not self.custom_franchise_agreement:
+            return
+
+        credit_limit = frappe.db.get_value(
+            "Franchise Agreement",
+            self.custom_franchise_agreement,
+            "credit_limit",
+        )
+
+        if not credit_limit:
+            return
+
+        outstanding = frappe.db.sql(
+            """
+            SELECT COALESCE(SUM(outstanding_amount), 0) as total
+            FROM `tabSales Invoice`
+            WHERE custom_franchise_agreement = %(agreement)s
+              AND docstatus = 1
+              AND outstanding_amount > 0
+              AND name != %(name)s
+            """,
+            {"agreement": self.custom_franchise_agreement, "name": self.name},
+            as_dict=True,
+        )[0].total
+
+        new_total = flt(outstanding) + flt(self.grand_total)
+        if new_total > flt(credit_limit):
+            frappe.throw(
+                msg=_(
+                    "This invoice would bring franchise outstanding to {0}, "
+                    "exceeding the credit limit of {1}."
+                ).format(
+                    frappe.format_value(new_total, {"fieldtype": "Currency"}),
+                    frappe.format_value(credit_limit, {"fieldtype": "Currency"}),
+                ),
+                title=_("Credit Limit Exceeded"),
+                exc=frappe.ValidationError,
+            )
+
+    def set_franchise_cost_center(self):
+        """Auto-set cost center from franchise agreement if not already set."""
+        if not self.custom_franchise_agreement or self.cost_center:
+            return
+
+        cost_center = frappe.db.get_value(
+            "Franchise Agreement",
+            self.custom_franchise_agreement,
+            "franchise_cost_center",
+        )
+        if cost_center:
+            self.cost_center = cost_center
+            for item in self.items:
+                if not item.cost_center:
+                    item.cost_center = cost_center
+
+    # ── Add a new whitelisted method to Sales Invoice ──────────────
+    @frappe.whitelist()
+    def calculate_franchise_royalty(self):
+        """Calculate royalty owed on this invoice. Callable from client JS."""
+        if not self.custom_franchise_agreement:
+            frappe.throw(_("This invoice is not linked to a franchise agreement."))
+
+        royalty_pct = frappe.db.get_value(
+            "Franchise Agreement",
+            self.custom_franchise_agreement,
+            "royalty_percentage",
+        )
+
+        royalty_amount = flt(self.grand_total) * flt(royalty_pct) / 100
+        return {
+            "royalty_percentage": royalty_pct,
+            "royalty_amount": royalty_amount,
+            "invoice_total": self.grand_total,
+        }
+
+    # ── Override on_submit to add franchise-specific post-submit logic ─
+    def on_submit(self):
+        super().on_submit()
+        self.update_franchise_sales_tracker()
+
+    def update_franchise_sales_tracker(self):
+        """Update the franchise's running sales total for the current period."""
+        if not self.custom_franchise_agreement:
+            return
+
+        frappe.db.sql(
+            """
+            UPDATE `tabFranchise Agreement`
+            SET custom_current_month_sales = COALESCE(custom_current_month_sales, 0) + %(amount)s
+            WHERE name = %(agreement)s
+            """,
+            {"amount": flt(self.grand_total), "agreement": self.custom_franchise_agreement},
+        )
+```
+
+The new `validate` adds a credit-limit check and auto-fills the cost center, while
+`calculate_franchise_royalty` is a brand-new `@frappe.whitelist()` method bolted onto
+Sales Invoice — callable straight from client JS. The overridden `on_submit` calls
+`super().on_submit()` first, then bumps the franchise's running monthly sales total.
+
+## Step 3: A second app extending the same DocType
+
+This is what the old `override_doctype_class` could not do. A separate loyalty app
+maps Sales Invoice to its own extension class, and v16 merges both into the chain
+without either app stepping on the other.
+
+```python title="apps/scoopjoy_loyalty/scoopjoy_loyalty/hooks.py"
+extend_doctype_class = {
+    "Sales Invoice": "scoopjoy_loyalty.overrides.sales_invoice.LoyaltySalesInvoice",
+}
+```
+
+```python title="apps/scoopjoy_loyalty/scoopjoy_loyalty/overrides/sales_invoice.py" {12-14}
+import frappe
+from frappe import _
+from frappe.utils import flt
+
+
+class LoyaltySalesInvoice:
+    """
+    A second app extending Sales Invoice — no conflict with ScoopJoySalesInvoice.
+    Frappe v16 merges both extensions into the class chain.
+    """
+
+    def on_submit(self):
+        super().on_submit()
+        self.award_loyalty_points()
+
+    def award_loyalty_points(self):
+        """Award loyalty points based on invoice total."""
+        if not self.customer:
+            return
+
+        points_per_100 = frappe.db.get_single_value("Loyalty Settings", "points_per_100_rupees") or 1
+        points = int(flt(self.grand_total) / 100) * points_per_100
+
+        if points > 0:
+            frappe.get_doc({
+                "doctype": "Loyalty Point Entry",
+                "customer": self.customer,
+                "invoice": self.name,
+                "points": points,
+                "posting_date": self.posting_date,
+            }).insert(ignore_permissions=True)
+```
+
+When a Sales Invoice is submitted, both `ScoopJoySalesInvoice.on_submit` (sales
+tracker) and `LoyaltySalesInvoice.on_submit` (loyalty points) run, threaded together
+by their `super()` calls.
+
+:::note[Why this works]
+`extend_doctype_class` merges methods from the extension class into the original
+DocType's method resolution order. Both `ScoopJoySalesInvoice.on_submit` and
+`LoyaltySalesInvoice.on_submit` run via the `super()` chain. The old
+`override_doctype_class` hook only allowed one app to override a DocType — the last one
+in app installation order won.
+:::
+
+:::caution[Common mistake]
+Forgetting `super().validate()` or `super().on_submit()` in your extension. Without
+`super()`, the original DocType's logic and other apps' extensions are silently
+skipped. Always call `super()` first, then add your custom logic after.
+:::

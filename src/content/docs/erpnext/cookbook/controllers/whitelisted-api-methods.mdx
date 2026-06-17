@@ -1,0 +1,512 @@
+---
+title: Whitelisted API Methods
+description: Build a rate-limited, role-checked mobile API layer in Frappe using @frappe.whitelist() with a consistent JSON response envelope.
+sidebar:
+  order: 5
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a mini API layer for the ScoopJoy franchise mobile app —
+several endpoints with proper auth, rate limiting, and standardized responses.
+In Express you'd reach for a router plus middleware; in Frappe the unit is a
+whitelisted Python function exposed at `/api/method/...`.
+
+**Solution:** Put the endpoints in a module under your app's `api/` package.
+Decorate each with `@frappe.whitelist()` to expose it over HTTP and
+`@rate_limit()` to throttle it. Share a small set of helpers — a response
+envelope, a role check, and a franchise lookup — across every method.
+
+## The API module
+
+Everything lives in one module. The helpers at the top run before any real
+work in each endpoint, so authorization and the response shape stay consistent.
+
+### Shared helpers
+
+`api_response` wraps every return value in the same envelope, so the mobile
+client only ever parses one structure. `require_franchise_role()` is an explicit
+authorization gate on top of Frappe's session auth, and `get_user_franchise()`
+resolves the active agreement for the logged-in user.
+
+```python title="apps/scoopjoy/scoopjoy/api/mobile.py"
+import frappe
+from frappe import _
+from frappe.utils import now_datetime, today, flt, cint, getdate
+from frappe.rate_limiter import rate_limit
+
+
+# ── Helper: Standardized API response ──────────────────────────────
+def api_response(data=None, message="Success", status_code=200):
+    """Wrap every API response in a consistent envelope."""
+    frappe.response["http_status_code"] = status_code
+    return {
+        "status": "success" if status_code < 400 else "error",
+        "message": message,
+        "data": data,
+        "timestamp": str(now_datetime()),
+        "user": frappe.session.user,
+    }
+
+
+def require_franchise_role():
+    """Verify the current user has Franchise Manager role."""
+    roles = frappe.get_roles(frappe.session.user)
+    if "Franchise Manager" not in roles and "Administrator" not in roles:
+        frappe.throw(
+            msg=_("You do not have Franchise Manager permissions."),
+            exc=frappe.PermissionError,
+        )
+
+
+def get_user_franchise():
+    """Get the franchise agreement linked to the current user."""
+    agreement = frappe.db.get_value(
+        "Franchise Agreement",
+        {
+            "franchise_manager_email": frappe.session.user,
+            "docstatus": 1,
+            "agreement_status": "Active",
+        },
+        ["name", "franchise_name", "franchise_warehouse", "franchise_cost_center", "territory"],
+        as_dict=True,
+    )
+    if not agreement:
+        frappe.throw(
+            msg=_("No active franchise agreement found for your account."),
+            exc=frappe.DoesNotExistError,
+        )
+    return agreement
+```
+
+### A read endpoint: dashboard
+
+The dashboard is a GET-style read. Note the two decorators on lines 2–3: the
+first exposes the method, the second caps it at 30 calls per minute. The body
+calls the auth helpers first, then runs its queries scoped to the caller's
+franchise, and finally returns through `api_response`.
+
+```python title="apps/scoopjoy/scoopjoy/api/mobile.py" {2-3}
+# ── 1. Dashboard ───────────────────────────────────────────────────
+@frappe.whitelist()
+@rate_limit(limit=30, seconds=60)
+def get_dashboard() -> dict:
+    """Mobile app dashboard: today's sales, stock alerts, pending tasks."""
+    require_franchise_role()
+    franchise = get_user_franchise()
+
+    todays_sales = frappe.db.sql(
+        """
+        SELECT
+            COUNT(*) as transaction_count,
+            COALESCE(SUM(grand_total), 0) as total_revenue,
+            COALESCE(SUM(total_qty), 0) as items_sold
+        FROM `tabPOS Invoice`
+        WHERE posting_date = %(today)s
+          AND docstatus = 1
+          AND custom_franchise_agreement = %(agreement)s
+        """,
+        {"today": today(), "agreement": franchise.name},
+        as_dict=True,
+    )[0]
+
+    low_stock_items = frappe.db.sql(
+        """
+        SELECT
+            b.item_code,
+            b.actual_qty,
+            b.reserved_qty,
+            (b.actual_qty - b.reserved_qty) as available_qty
+        FROM `tabBin` b
+        WHERE b.warehouse = %(warehouse)s
+          AND b.actual_qty < 10
+        ORDER BY b.actual_qty ASC
+        LIMIT 10
+        """,
+        {"warehouse": franchise.franchise_warehouse},
+        as_dict=True,
+    )
+
+    pending_tasks = frappe.get_all(
+        "ToDo",
+        filters={
+            "allocated_to": frappe.session.user,
+            "status": "Open",
+        },
+        fields=["name", "description", "date", "priority"],
+        limit=5,
+        order_by="priority desc, date asc",
+    )
+
+    return api_response(data={
+        "franchise_name": franchise.franchise_name,
+        "territory": franchise.territory,
+        "today": str(today()),
+        "sales": {
+            "transaction_count": cint(todays_sales.transaction_count),
+            "total_revenue": flt(todays_sales.total_revenue),
+            "items_sold": flt(todays_sales.items_sold),
+        },
+        "low_stock_items": low_stock_items,
+        "pending_tasks": pending_tasks,
+    })
+```
+
+### A write endpoint: record a sale
+
+For mutations, pin the HTTP verb with `@frappe.whitelist(methods=["POST"])` so
+the method can't be triggered by a stray GET. Frappe deserializes JSON arrays
+into Python `list` arguments automatically, so `items` and `payments` arrive
+ready to iterate.
+
+```python title="apps/scoopjoy/scoopjoy/api/mobile.py" {2}
+# ── 2. Record Sale ────────────────────────────────────────────────
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=60, seconds=60)
+def record_sale(
+    items: list,
+    customer: str = "Walk-in Customer",
+    payments: list | None = None,
+) -> dict:
+    """Record a POS sale from the mobile app."""
+    require_franchise_role()
+    franchise = get_user_franchise()
+
+    if not items or len(items) == 0:
+        frappe.throw(
+            msg=_("At least one item is required to record a sale."),
+            exc=frappe.ValidationError,
+        )
+
+    pos_profile = frappe.db.get_value(
+        "POS Profile",
+        {"custom_franchise_agreement": franchise.name, "disabled": 0},
+    )
+    if not pos_profile:
+        frappe.throw(
+            msg=_("No active POS Profile found for your franchise."),
+            exc=frappe.DoesNotExistError,
+        )
+
+    invoice_items = []
+    for item in items:
+        invoice_items.append({
+            "item_code": item.get("item_code"),
+            "qty": flt(item.get("qty", 1)),
+            "rate": flt(item.get("rate")) if item.get("rate") else None,
+        })
+
+    invoice_payments = []
+    if payments:
+        for payment in payments:
+            invoice_payments.append({
+                "mode_of_payment": payment.get("mode"),
+                "amount": flt(payment.get("amount")),
+            })
+    else:
+        invoice_payments.append({
+            "mode_of_payment": "Cash",
+            "amount": 0,  # Will be auto-calculated
+        })
+
+    invoice = frappe.get_doc({
+        "doctype": "POS Invoice",
+        "customer": customer,
+        "company": frappe.db.get_value("Franchise Agreement", franchise.name, "company"),
+        "pos_profile": pos_profile,
+        "set_warehouse": franchise.franchise_warehouse,
+        "cost_center": franchise.franchise_cost_center,
+        "custom_franchise_agreement": franchise.name,
+        "posting_date": today(),
+        "items": invoice_items,
+        "payments": invoice_payments,
+    })
+    invoice.insert(ignore_permissions=True)
+    invoice.submit()
+
+    return api_response(
+        data={"invoice_name": invoice.name, "grand_total": invoice.grand_total},
+        message=_("Sale recorded successfully."),
+    )
+```
+
+### More endpoints: stock, attendance, notifications, photo upload
+
+The remaining four endpoints follow the same shape — decorate, authorize,
+scope to the franchise, return through `api_response`. A few details worth
+noting: `update_attendance` validates the status against a fixed set and checks
+the employee belongs to the caller's company; `upload_photo` reads the binary
+from `frappe.request.files` and restricts both the target DocType and the file
+extension.
+
+```python title="apps/scoopjoy/scoopjoy/api/mobile.py"
+# ── 3. Get Stock ──────────────────────────────────────────────────
+@frappe.whitelist()
+@rate_limit(limit=30, seconds=60)
+def get_stock(item_code: str | None = None) -> dict:
+    """Get current stock levels for the franchise warehouse."""
+    require_franchise_role()
+    franchise = get_user_franchise()
+
+    filters = {"warehouse": franchise.franchise_warehouse}
+    if item_code:
+        filters["item_code"] = item_code
+
+    stock_data = frappe.get_all(
+        "Bin",
+        filters=filters,
+        fields=[
+            "item_code",
+            "actual_qty",
+            "reserved_qty",
+            "projected_qty",
+            "valuation_rate",
+        ],
+        order_by="item_code asc",
+        limit=200,
+    )
+
+    for row in stock_data:
+        row["available_qty"] = flt(row["actual_qty"]) - flt(row["reserved_qty"])
+
+    return api_response(data={
+        "warehouse": franchise.franchise_warehouse,
+        "items": stock_data,
+        "count": len(stock_data),
+    })
+
+
+# ── 4. Update Attendance ──────────────────────────────────────────
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=20, seconds=60)
+def update_attendance(
+    employee: str,
+    status: str,
+    attendance_date: str | None = None,
+) -> dict:
+    """Mark attendance for a franchise employee."""
+    require_franchise_role()
+    franchise = get_user_franchise()
+
+    if status not in ("Present", "Absent", "Half Day", "Work From Home"):
+        frappe.throw(
+            msg=_("Invalid attendance status: {0}").format(status),
+            exc=frappe.ValidationError,
+        )
+
+    att_date = attendance_date or today()
+
+    # Verify employee belongs to this franchise
+    emp_company = frappe.db.get_value("Employee", employee, "company")
+    agreement_company = frappe.db.get_value("Franchise Agreement", franchise.name, "company")
+    if emp_company != agreement_company:
+        frappe.throw(
+            msg=_("Employee {0} does not belong to your franchise.").format(employee),
+            exc=frappe.PermissionError,
+        )
+
+    existing = frappe.db.exists(
+        "Attendance",
+        {"employee": employee, "attendance_date": att_date, "docstatus": ("!=", 2)},
+    )
+    if existing:
+        return api_response(
+            message=_("Attendance already marked for {0} on {1}.").format(employee, att_date),
+            data={"attendance": existing, "already_exists": True},
+        )
+
+    attendance = frappe.get_doc({
+        "doctype": "Attendance",
+        "employee": employee,
+        "attendance_date": att_date,
+        "status": status,
+        "company": agreement_company,
+    })
+    attendance.insert(ignore_permissions=True)
+    attendance.submit()
+
+    return api_response(
+        data={"attendance": attendance.name, "status": status},
+        message=_("Attendance marked successfully."),
+    )
+
+
+# ── 5. Get Notifications ──────────────────────────────────────────
+@frappe.whitelist()
+@rate_limit(limit=30, seconds=60)
+def get_notifications(
+    limit: int = 20,
+    read_status: str = "unread",
+) -> dict:
+    """Get notifications for the current franchise user."""
+    require_franchise_role()
+
+    filters = {"for_user": frappe.session.user}
+    if read_status == "unread":
+        filters["read"] = 0
+    elif read_status == "read":
+        filters["read"] = 1
+
+    notifications = frappe.get_all(
+        "Notification Log",
+        filters=filters,
+        fields=["name", "subject", "type", "read", "creation", "document_type", "document_name"],
+        order_by="creation desc",
+        limit=cint(limit),
+    )
+
+    unread_count = frappe.db.count(
+        "Notification Log",
+        {"for_user": frappe.session.user, "read": 0},
+    )
+
+    return api_response(data={
+        "notifications": notifications,
+        "unread_count": unread_count,
+    })
+
+
+# ── 6. Upload Photo ───────────────────────────────────────────────
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=10, seconds=60)
+def upload_photo(
+    doctype: str,
+    docname: str,
+    description: str = "",
+) -> dict:
+    """
+    Upload a photo attachment to a document.
+    The file itself comes via frappe.request.files.
+    """
+    require_franchise_role()
+    franchise = get_user_franchise()
+
+    allowed_doctypes = ["Franchise Agreement", "POS Invoice", "Stock Entry"]
+    if doctype not in allowed_doctypes:
+        frappe.throw(
+            msg=_("Photo upload not allowed for DocType: {0}").format(doctype),
+            exc=frappe.ValidationError,
+        )
+
+    if not frappe.db.exists(doctype, docname):
+        frappe.throw(
+            msg=_("{0} {1} does not exist.").format(doctype, docname),
+            exc=frappe.DoesNotExistError,
+        )
+
+    files = frappe.request.files
+    if "file" not in files:
+        frappe.throw(
+            msg=_("No file uploaded. Send file as multipart form field named 'file'."),
+            exc=frappe.ValidationError,
+        )
+
+    uploaded_file = files["file"]
+
+    allowed_extensions = (".jpg", ".jpeg", ".png", ".webp")
+    if not uploaded_file.filename.lower().endswith(allowed_extensions):
+        frappe.throw(
+            msg=_("Only image files are allowed: {0}").format(", ".join(allowed_extensions)),
+            exc=frappe.ValidationError,
+        )
+
+    file_doc = frappe.get_doc({
+        "doctype": "File",
+        "file_name": uploaded_file.filename,
+        "attached_to_doctype": doctype,
+        "attached_to_name": docname,
+        "content": uploaded_file.read(),
+        "is_private": 1,
+    })
+    file_doc.save(ignore_permissions=True)
+
+    return api_response(
+        data={
+            "file_name": file_doc.file_name,
+            "file_url": file_doc.file_url,
+        },
+        message=_("Photo uploaded successfully."),
+    )
+```
+
+## Testing from the bench console
+
+You can exercise any whitelisted method directly in the console by impersonating
+a user with `frappe.set_user`. Roll back at the end so test sales and attendance
+don't persist.
+
+```python
+# From terminal: bench --site scoopjoy.localhost console
+
+import frappe
+
+# Simulate a logged-in franchise manager
+frappe.set_user("manager@delhifranchise.com")
+
+# Test get_dashboard
+from scoopjoy.api.mobile import get_dashboard
+result = get_dashboard()
+print(result)
+
+# Test get_stock
+from scoopjoy.api.mobile import get_stock
+result = get_stock(item_code="Vanilla Scoop 100ml")
+print(result)
+
+# Test record_sale
+from scoopjoy.api.mobile import record_sale
+result = record_sale(
+    items=[{"item_code": "Vanilla Scoop 100ml", "qty": 2, "rate": 80}],
+    customer="Walk-in Customer",
+    payments=[{"mode": "UPI", "amount": 160}],
+)
+print(result)
+frappe.db.rollback()  # rollback in console to avoid persisting test data
+```
+
+## Calling from the mobile app (HTTP)
+
+Each method is reachable at `/api/method/<dotted.path>`. Authenticate with an
+API key/secret token header. GET methods take query params; POST methods take a
+JSON body; `upload_photo` takes a multipart form so it can carry the binary.
+
+```bash
+# Get dashboard
+curl -X GET "https://scoopjoy.example.com/api/method/scoopjoy.api.mobile.get_dashboard" \
+  -H "Authorization: token api_key:api_secret" \
+  -H "Content-Type: application/json"
+
+# Record a sale
+curl -X POST "https://scoopjoy.example.com/api/method/scoopjoy.api.mobile.record_sale" \
+  -H "Authorization: token api_key:api_secret" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [{"item_code": "Vanilla Scoop 100ml", "qty": 2, "rate": 80}],
+    "customer": "Walk-in Customer",
+    "payments": [{"mode": "UPI", "amount": 160}]
+  }'
+
+# Upload photo (multipart)
+curl -X POST "https://scoopjoy.example.com/api/method/scoopjoy.api.mobile.upload_photo" \
+  -H "Authorization: token api_key:api_secret" \
+  -F "doctype=POS Invoice" \
+  -F "docname=POS-INV-00042" \
+  -F "file=@/path/to/store_photo.jpg" \
+  -F "description=Store front photo"
+```
+
+:::note[Why this works]
+Each endpoint decorates with `@frappe.whitelist()` for HTTP access and
+`@rate_limit()` for per-IP throttling. The `api_response` helper enforces a
+consistent JSON envelope so mobile clients can rely on a single parsing
+structure. `require_franchise_role()` is called at the top of every method as an
+explicit authorization check beyond Frappe's built-in session auth.
+:::
+
+:::caution[Common mistake]
+Using `@frappe.whitelist(allow_guest=True)` on endpoints that access business
+data. This exposes your API to unauthenticated requests. Only use
+`allow_guest=True` for truly public endpoints like a store locator or menu page.
+:::

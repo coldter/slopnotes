@@ -1,0 +1,360 @@
+---
+title: Architecture Overview
+description: How the Frappe Framework and ERPNext fit together — the site-bench-app model, the request lifecycle, and the "everything is a DocType" philosophy.
+sidebar:
+  order: 1
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { FileTree } from "@astrojs/starlight/components";
+
+## What is the Frappe Framework?
+
+Frappe is a full-stack, metadata-driven web framework written in Python and
+JavaScript. Unlike traditional frameworks where you write models, views, routes,
+and controllers from scratch, Frappe generates most of that from declarative
+definitions called **DocTypes**. If you're coming from Node.js, think of Frappe as
+an opinionated, batteries-included framework — roughly NestJS + Prisma + AdminJS —
+except everything is driven by metadata rather than decorators.
+
+Frappe gives you:
+
+- An ORM with automatic database schema management
+- A REST and RPC API layer, auto-generated from DocTypes
+- A single-page admin interface called **Desk**
+- A website builder with Jinja2 templates
+- Background job processing via Redis Queue (RQ)
+- Role-based permissions, workflows, and print formats
+- Real-time updates via Socket.IO
+
+## How ERPNext sits on top of Frappe
+
+ERPNext is a **Frappe app** — one of many that can be installed on a Frappe site.
+It isn't a separate product; it's a collection of DocTypes, controllers, reports,
+and print formats that implement accounting, inventory, manufacturing, HR, CRM,
+and more.
+
+<Mermaid title="The Frappe stack" height={360} code={`
+flowchart TB
+  A["Your Custom App (e.g. scoopjoy)"] --> B["ERPNext<br/>Accounting · Stock · Manufacturing · HR · CRM"]
+  B --> C["Frappe Framework<br/>ORM · Desk UI · API · Permissions · Workflows"]
+  C --> D["Python · MariaDB · Redis · Node.js"]
+`} />
+
+This layering means:
+
+- Frappe can run **without** ERPNext (for building any business application).
+- ERPNext **cannot** run without Frappe (it depends on the framework).
+- Your custom apps sit on top and can extend or override both Frappe and ERPNext.
+
+## The site-bench-app model
+
+This is the single most important architectural concept to grasp. Frappe uses a
+three-level hierarchy:
+
+- **Bench** — a deployment directory containing the framework, apps, sites, and a
+  shared Python virtualenv. One bench = one set of app versions.
+- **App** — a Python/JavaScript package that follows Frappe conventions. Frappe
+  itself is an app; ERPNext is another; your custom code is yet another.
+- **Site** — a tenant with its own database, file storage, and configuration.
+  Multiple sites can run on one bench, each with a different combination of
+  installed apps.
+
+<FileTree>
+- frappe-bench/ the "Bench"
+  - apps/
+    - frappe/ the framework itself
+    - erpnext/ the ERPNext modules
+    - scoopjoy/ **your custom app**
+  - sites/
+    - icecream.localhost/ Site 1
+      - site_config.json
+      - private/
+      - public/
+    - franchise-hq.localhost/ Site 2
+      - site_config.json
+    - common_site_config.json shared config for all sites
+  - env/ Python virtualenv
+  - config/ Redis, Nginx, Supervisor configs
+  - Procfile process definitions for `bench start`
+  - patches.txt
+</FileTree>
+
+:::tip[Pro tip]
+One bench can host dozens of sites (multi-tenancy). Each site gets its own MariaDB
+database and file directory, but they all share the same app code. This is how
+Frappe Cloud hosts thousands of ERPNext instances.
+:::
+
+## Tech stack
+
+Frappe v16 runs on the following stack:
+
+| Component | Version | Role |
+|-----------|---------|------|
+| Python | 3.14+ | Server-side logic, ORM, controllers, API |
+| Node.js | 24 LTS | Asset bundling (esbuild), Socket.IO server |
+| MariaDB | 10.6+ | Primary relational database (Postgres 14+ also supported) |
+| Redis | 8+ | Caching, job queues, real-time pub/sub |
+| Nginx | latest | Reverse proxy, static files, SSL termination |
+| Gunicorn | latest | WSGI application server (production) |
+| Werkzeug | latest | WSGI toolkit (development server) |
+| Socket.IO | latest | Real-time bidirectional communication |
+| Supervisor | latest | Process management in production |
+| wkhtmltopdf | 0.12.6+ | Legacy PDF generation (v16 adds Chrome-based PDF) |
+
+:::caution[Python 3.14 required]
+Frappe v16 requires **Python 3.14+**. Python 3.12 or earlier will not work — a
+breaking change from v15, which supported Python 3.10+. Make sure your OS or pyenv
+provides Python 3.14 before starting.
+:::
+
+## Request lifecycle
+
+Understanding how a request flows through the stack is critical for debugging and
+performance tuning.
+
+<Mermaid title="Request flow" height={460} code={`
+flowchart TB
+  Browser["Browser request"] -->|"HTTP/HTTPS :80/:443"| Nginx["Nginx<br/>reverse proxy · static files"]
+  Nginx -->|"proxy_pass :8000"| App["Gunicorn (prod)<br/>or Werkzeug (dev)"]
+  App --> WSGI["Frappe WSGI app<br/>1 resolve site · 2 init context<br/>3 connect DB · 4 auth · 5 route"]
+  WSGI --> Handler["Request handler"]
+  Handler -->|"/api/method/*"| M["whitelisted Python fn"]
+  Handler -->|"/api/resource/*"| R["DocType REST API"]
+  Handler -->|"/app/*"| Desk["Desk SPA"]
+  Handler -->|"/*"| Web["Website (Jinja)"]
+  M --> Ctrl["App controller<br/>validation · triggers · logic"]
+  R --> Ctrl
+  Ctrl --> DB["MariaDB via frappe.db / frappe.qb"]
+`} />
+
+The handler dispatches on the URL pattern: `/api/method/*` hits a whitelisted
+Python function, `/api/resource/*` hits the auto-generated DocType REST API,
+`/app/*` serves the Desk SPA, and everything else renders a website page through
+Jinja. For real-time events (document updates, notifications), Frappe publishes to
+Redis and the Node.js Socket.IO server pushes updates to connected browsers.
+
+### What happens when you save a Sales Order
+
+1. The browser sends `POST /api/resource/Sales Order`.
+2. Frappe authenticates and identifies the site from the `Host` header.
+3. It loads the Sales Order DocType definition (cached in Redis).
+4. `before_validate()` runs — your custom hook.
+5. Mandatory fields, links, and formulas are validated.
+6. `validate()` runs — business logic.
+7. `before_save()` runs.
+8. Rows are written to `tabSales Order` and `tabSales Order Item` in MariaDB.
+9. `after_save()` / `on_update()` run.
+10. The transaction commits.
+11. A real-time event is published via Redis → Socket.IO.
+12. A JSON response returns to the browser.
+
+## Background workers (Redis Queue)
+
+Long-running tasks don't execute in the request-response cycle. Frappe uses Python
+RQ (Redis Queue) for asynchronous job processing.
+
+<Mermaid title="Background job flow" height={300} code={`
+flowchart LR
+  W["Web request<br/>(enqueue job)"] --> Q["Redis Queue<br/>default · short · long"]
+  Q --> R["RQ Worker<br/>background Python process"]
+`} />
+
+There are three default queues, each handled by a dedicated worker process:
+
+- **default** — standard background jobs (sending emails, generating reports).
+- **short** — quick tasks that should complete within seconds.
+- **long** — heavy tasks (data import, bulk operations, report generation).
+
+```python
+# Enqueuing a background job from your app controller
+import frappe
+
+frappe.enqueue(
+    "scoopjoy.tasks.sync_franchise_inventory",
+    queue="long",
+    timeout=600,
+    franchise_id="FRAN-001",
+)
+```
+
+The scheduler (managed by `bench enable-scheduler`) runs periodic tasks defined in
+your app's `hooks.py`:
+
+```python title="scoopjoy/hooks.py"
+scheduler_events = {
+    "daily": [
+        "scoopjoy.tasks.generate_daily_sales_report",
+    ],
+    "hourly": [
+        "scoopjoy.tasks.sync_ingredient_stock",
+    ],
+    "cron": {
+        "0 9 * * *": [
+            "scoopjoy.tasks.send_franchise_morning_briefing",
+        ],
+    },
+}
+```
+
+## The "everything is a DocType" philosophy
+
+This is the concept Node.js developers often find most foreign — and most powerful
+once it clicks. In Frappe, **every entity is a DocType**: a Customer, a Sales
+Invoice, a User, an Email Account, a Print Format, a Workflow, a Report — even
+DocType itself — is defined as a DocType. That makes the system self-referential
+and metadata-driven:
+
+<Mermaid title="What a DocType generates" height={420} code={`
+flowchart LR
+  D["DocType<br/>(meta-definition)"] --> T["Database table (tabDocType Name)"]
+  D --> A["REST API (/api/resource/...)"]
+  D --> F["Form view (layout + validation)"]
+  D --> L["List view (filters, sorting)"]
+  D --> P["Permission model (per role)"]
+  D --> S["Search indexing"]
+  D --> V["Activity log / version tracking"]
+`} />
+
+1. **Creating a DocType automatically creates** a database table, a REST API, a
+   form view, a list view, permission rules, search indexing, and change tracking.
+2. **No migration files.** When you modify a DocType, Frappe reads the JSON
+   definition and alters the table automatically on `bench migrate`.
+3. **Customization without code.** Admins can add Custom Fields, set Property
+   Setters, and create Client Scripts — all stored as DocTypes themselves.
+
+### DocType types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| Regular | Standard CRUD document with list + form views | Customer, Sales Order |
+| Child Table | Rows inside a parent document (1:N) | Sales Order Item |
+| Single | Singleton — only one record exists (settings) | Selling Settings |
+| Submittable | Has a Draft → Submitted → Cancelled lifecycle | Sales Invoice, Journal Entry |
+| Tree | Hierarchical parent-child structure | Account, Territory |
+| Virtual | No database table; data comes from an external source | Custom API-backed DocType |
+
+### Example: a Flavor DocType
+
+This single JSON file gives you a database table, REST API, admin form, list view,
+permissions, and search — with zero additional code.
+
+```json title="scoopjoy/scoopjoy/doctype/ice_cream_flavor/ice_cream_flavor.json"
+{
+  "name": "Ice Cream Flavor",
+  "module": "ScoopJoy",
+  "doctype": "DocType",
+  "is_tree": 0,
+  "is_submittable": 0,
+  "fields": [
+    { "fieldname": "flavor_name", "fieldtype": "Data", "label": "Flavor Name", "reqd": 1, "unique": 1 },
+    { "fieldname": "base_type", "fieldtype": "Select", "label": "Base Type", "options": "\nDairy\nSorbet\nVegan", "default": "Dairy" },
+    { "fieldname": "cost_per_scoop", "fieldtype": "Currency", "label": "Cost Per Scoop", "reqd": 1 },
+    { "fieldname": "is_seasonal", "fieldtype": "Check", "label": "Is Seasonal" },
+    { "fieldname": "available_from", "fieldtype": "Date", "label": "Available From", "depends_on": "eval:doc.is_seasonal" },
+    { "fieldname": "available_until", "fieldtype": "Date", "label": "Available Until", "depends_on": "eval:doc.is_seasonal" }
+  ],
+  "permissions": [
+    { "role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1 }
+  ],
+  "naming_rule": "By fieldname",
+  "autoname": "field:flavor_name",
+  "sort_field": "creation",
+  "sort_order": "DESC"
+}
+```
+
+:::caution[v16 changed the default sort]
+Frappe v16 changed the default sort field from `modified` to `creation` for all
+DocTypes and database queries (`frappe.get_all`, `frappe.get_list`). If you rely on
+modification-order sorting, explicitly pass `order_by="modified desc"`.
+:::
+
+## Key directories
+
+Knowing where things live saves hours when you're spelunking through framework or
+ERPNext source.
+
+<FileTree>
+- frappe-bench/
+  - apps/
+    - frappe/ framework core
+      - frappe/
+        - core/ core DocTypes (User, DocType, File…)
+        - email/ email send + receive
+        - client/ Desk SPA source (JS/CSS)
+        - public/ static assets served by Nginx
+        - templates/ Jinja2 website templates
+        - database/ DB abstraction (MariaDB + Postgres)
+        - handler.py request handler
+        - app.py WSGI application entry point
+        - hooks.py framework hooks definition
+    - erpnext/ the ERPNext app
+      - erpnext/
+        - accounts/ Chart of Accounts, GL Entry, invoices
+        - stock/ Warehouse, Stock Entry, inventory
+        - selling/ Quotation, Sales Order
+        - buying/ Purchase Order, Supplier
+        - manufacturing/ BOM, Work Order, Production Plan
+        - setup/ Company, naming series, defaults
+        - hooks.py ERPNext hooks into Frappe
+  - sites/
+    - common_site_config.json shared config (Redis URLs, etc.)
+    - icecream.localhost/
+      - site_config.json site-specific config (db name, etc.)
+      - private/ private files (attachments, backups)
+      - public/ public files (website images, etc.)
+  - config/
+    - redis_cache.conf
+    - redis_queue.conf
+    - supervisor.conf production process manager config
+    - nginx.conf generated Nginx config
+  - Procfile development server process definitions
+</FileTree>
+
+## How ERPNext v16 differs from older versions
+
+ERPNext v16 (released January 2026, built on Frappe v16) is a major leap:
+
+| Area | v15 and earlier | v16 |
+|------|-----------------|-----|
+| **Performance** | Standard caching | "Frappe Caffeine" — ~2× faster page loads and reports |
+| **UI/UX** | Fixed-width layout | Redesigned workspace, persistent sidebar, full-width adaptive layout |
+| **List views** | Fixed columns | Scrollable with unlimited columns, horizontal scroll |
+| **Child tables** | Fixed columns | Scrollable with sticky columns |
+| **PDF generation** | wkhtmltopdf only | Chrome-based rendering (modern CSS including flexbox) |
+| **Security** | Basic field-level permissions | Role-based field masking (sensitive fields show `xxxx`) |
+| **Python** | 3.10+ | 3.14+ (required) |
+| **Node.js** | 18+ | 24 LTS (required) |
+| **Database** | MariaDB/Postgres only | Adds native SQLite for lightweight deployments |
+| **Developer tools** | Manual linting | Automated linter, typed APIs, app dependency management |
+| **Accounting** | Basic statements | Customizable statement templates, separate COGS/service accounting |
+| **Manufacturing** | Standard MRP | Stock reservation, landed cost on stock entries, better traceability |
+
+:::tip[Pro tip]
+Existing Frappe apps automatically benefit from the Caffeine improvements without
+code changes — the optimizations are at the framework level (smarter caching,
+optimized queries, ~30% less CPU/RAM).
+:::
+
+## The full picture
+
+Putting every moving part together — the browser, the proxy, the two application
+servers, and the data tier:
+
+<Mermaid title="ERPNext production architecture" height={560} code={`
+flowchart TB
+  Browser["Browser"] -->|"HTTP/HTTPS · WebSocket"| Nginx["Nginx<br/>reverse proxy · static · SSL"]
+  Nginx -->|":8000"| Gunicorn["Gunicorn (WSGI) workers"]
+  Nginx -->|":9000"| Socket["Node.js Socket.IO server"]
+  Gunicorn --> Frappe["Frappe app<br/>auth · routing · ORM · controllers"]
+  Frappe --> Maria["MariaDB (data)"]
+  Frappe --> Cache["Redis (cache)"]
+  Frappe --> Queue["Redis (queue + pub/sub)"]
+  Socket --- Queue
+  Queue --> RQ["RQ Workers<br/>background jobs"]
+`} />
+
+With the architecture in hand, the next chapter sets up a working development
+environment so you can start poking at all of this live.

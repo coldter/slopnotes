@@ -1,0 +1,1140 @@
+---
+title: HR & Payroll
+description: Manage the ScoopJoy employee lifecycle in Frappe HRMS — attendance, shifts, leave, salary structures, and a multi-outlet payroll run.
+sidebar:
+  order: 15
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+ERPNext's HR module (via the companion Frappe HRMS app) manages the complete
+employee lifecycle — from onboarding to payroll to separation. For ScoopJoy, this
+means managing production workers, retail cashiers, delivery personnel, and
+administrative staff across multiple outlets.
+
+:::caution[HR & Payroll live in the HRMS app]
+Since ERPNext v14, all HR and Payroll functionality (except the Employee and
+Department DocTypes) has been moved to the separate **HRMS app**. You must install
+it first:
+
+```bash
+bench get-app hrms --branch version-16
+bench --site icecream.localhost install-app hrms
+```
+
+DocTypes like Salary Structure, Salary Slip, Payroll Entry, Leave Application,
+Attendance, Shift Type, etc. all belong to `hrms`. The
+`frappe.new_doc("Salary Structure")` pattern works (Frappe resolves by DocType
+name), but direct Python imports use `hrms.*` module paths, not `erpnext.*`.
+:::
+
+## Employee Master
+
+The Employee DocType stores all employee information. Creating one is the entry
+point for everything else in this chapter — attendance, leave, and payroll all hang
+off it.
+
+```python title="scoopjoy/scoopjoy/hr/employee.py"
+def create_employee(name, department, designation, outlet=None):
+    """Create a new employee for a ScoopJoy outlet."""
+    emp = frappe.new_doc("Employee")
+    emp.employee_name = name
+    emp.company = "ScoopJoy Ice Creams Pvt Ltd"
+    emp.status = "Active"
+    emp.gender = "Male"
+    emp.date_of_birth = "1995-06-15"
+    emp.date_of_joining = frappe.utils.today()
+    emp.department = department
+    emp.designation = designation
+
+    # Employment type
+    emp.employment_type = "Full-time"
+
+    # Branch (outlet)
+    if outlet:
+        emp.branch = outlet
+
+    # Attendance and Leave
+    emp.attendance_device_id = f"BIO-{emp.name}"
+    emp.holiday_list = "ScoopJoy 2026 Holiday List"
+    emp.default_shift = "General Shift"
+
+    # Bank details for salary
+    emp.mode_of_payment = "Bank"
+    emp.payroll_cost_center = f"{outlet} - SJ" if outlet else "Main - SJ"
+
+    emp.insert()
+    frappe.db.commit()
+    return emp.name
+```
+
+### Employment Types
+
+| Type | Use Case at ScoopJoy |
+|---|---|
+| Full-time | Permanent staff, managers |
+| Part-time | Weekend-only retail staff |
+| Contract | Seasonal workers during summer rush |
+| Intern | Training program participants |
+
+## Department and Designation Setup
+
+Departments form a tree (so you can roll up costs by branch and function), while
+Designations are flat job titles. ScoopJoy's franchise structure maps cleanly onto
+both.
+
+```python title="scoopjoy/scoopjoy/hr/org_setup.py"
+def setup_franchise_departments():
+    """Create departments for the franchise structure."""
+    departments = [
+        {"name": "Production", "parent": "All Departments"},
+        {"name": "Production - Mixing", "parent": "Production"},
+        {"name": "Production - Packaging", "parent": "Production"},
+        {"name": "Retail", "parent": "All Departments"},
+        {"name": "Retail - Outlet 1", "parent": "Retail"},
+        {"name": "Retail - Outlet 2", "parent": "Retail"},
+        {"name": "Retail - Outlet 3", "parent": "Retail"},
+        {"name": "Admin", "parent": "All Departments"},
+        {"name": "Finance", "parent": "Admin"},
+        {"name": "Logistics", "parent": "All Departments"},
+    ]
+
+    for dept_data in departments:
+        if not frappe.db.exists("Department",
+                {"department_name": dept_data["name"],
+                 "company": "ScoopJoy Ice Creams Pvt Ltd"}):
+            dept = frappe.new_doc("Department")
+            dept.department_name = dept_data["name"]
+            dept.parent_department = dept_data["parent"]
+            dept.company = "ScoopJoy Ice Creams Pvt Ltd"
+            dept.insert()
+
+    frappe.db.commit()
+
+
+def setup_designations():
+    """Create designations for various roles."""
+    designations = [
+        "Outlet Manager",
+        "Cashier",
+        "Production Supervisor",
+        "Production Worker",
+        "Delivery Executive",
+        "Quality Inspector",
+        "Store Keeper",
+        "HR Executive",
+        "Accountant",
+    ]
+
+    for desig_name in designations:
+        if not frappe.db.exists("Designation", desig_name):
+            desig = frappe.new_doc("Designation")
+            desig.designation = desig_name
+            desig.insert()
+
+    frappe.db.commit()
+```
+
+## Attendance
+
+### Shift Management
+
+Define shifts for different work patterns. Production runs early; retail runs late.
+With `enable_auto_attendance` set, the shift can mark attendance straight from
+check-in logs.
+
+```python title="scoopjoy/scoopjoy/hr/shifts.py"
+def setup_shifts():
+    """Configure shifts for ScoopJoy operations."""
+    shifts = [
+        {
+            "name": "Morning Shift",
+            "start_time": "06:00:00",
+            "end_time": "14:00:00",
+            "enable_auto_attendance": 1,
+            "late_entry_grace_period": 15,  # minutes
+            "early_exit_grace_period": 15
+        },
+        {
+            "name": "Evening Shift",
+            "start_time": "14:00:00",
+            "end_time": "22:00:00",
+            "enable_auto_attendance": 1,
+            "late_entry_grace_period": 15,
+            "early_exit_grace_period": 15
+        },
+        {
+            "name": "Retail Shift",
+            "start_time": "10:00:00",
+            "end_time": "20:00:00",
+            "enable_auto_attendance": 1,
+            "late_entry_grace_period": 10,
+            "early_exit_grace_period": 10
+        }
+    ]
+
+    for shift_data in shifts:
+        if not frappe.db.exists("Shift Type", shift_data["name"]):
+            shift = frappe.new_doc("Shift Type")
+            shift.name = shift_data["name"]
+            shift.start_time = shift_data["start_time"]
+            shift.end_time = shift_data["end_time"]
+            shift.enable_auto_attendance = shift_data["enable_auto_attendance"]
+            shift.late_entry_grace_period = shift_data.get("late_entry_grace_period", 0)
+            shift.early_exit_grace_period = shift_data.get("early_exit_grace_period", 0)
+            shift.insert()
+
+    frappe.db.commit()
+```
+
+### Shift Assignment
+
+Assign a shift to an employee over a date range. The Shift Assignment is
+submittable, so submit it to make it active.
+
+```python title="scoopjoy/scoopjoy/hr/shifts.py"
+def assign_shift(employee, shift_type, from_date, to_date=None):
+    """Assign a shift to an employee."""
+    sa = frappe.new_doc("Shift Assignment")
+    sa.employee = employee
+    sa.shift_type = shift_type
+    sa.start_date = from_date
+    sa.end_date = to_date
+    sa.company = "ScoopJoy Ice Creams Pvt Ltd"
+    sa.insert()
+    sa.submit()
+    return sa.name
+```
+
+### Auto-Attendance
+
+ERPNext can automatically mark attendance from biometric or check-in devices. Each
+swipe creates an Employee Checkin record; the shift's auto-attendance job then turns
+those raw logs into Attendance documents based on the shift rules.
+
+<Mermaid title="Auto-attendance flow" height={300} code={`
+flowchart LR
+  D["Biometric / check-in device"] --> C["Employee Checkin<br/>(IN / OUT logs)"]
+  C --> P["Shift Type<br/>Process Auto Attendance"]
+  P --> A["Attendance<br/>(Present · Late · Absent)"]
+`} />
+
+```python title="scoopjoy/scoopjoy/hr/checkin.py"
+# Employee Check-in records are created from device integration
+checkin = frappe.new_doc("Employee Checkin")
+checkin.employee = "HR-EMP-0005"
+checkin.time = "2026-03-20 06:05:00"  # Arrived 5 min late
+checkin.device_id = "BIO-001"
+checkin.log_type = "IN"
+checkin.insert()
+
+# Auto-attendance processes these check-ins
+# and marks attendance based on shift rules
+# Run via: Shift Type > Process Auto Attendance
+```
+
+In v16, attendance options respect user permissions more strictly, and employees can
+initiate attendance correction requests.
+
+### Manual Attendance
+
+When there's no device, mark attendance directly through the Attendance DocType.
+
+```python title="scoopjoy/scoopjoy/hr/checkin.py"
+# Bulk attendance via Attendance doctype
+attendance = frappe.new_doc("Attendance")
+attendance.employee = "HR-EMP-0005"
+attendance.attendance_date = "2026-03-20"
+attendance.status = "Present"
+attendance.shift = "Morning Shift"
+attendance.company = "ScoopJoy Ice Creams Pvt Ltd"
+attendance.insert()
+attendance.submit()
+```
+
+## Leave Management
+
+### Leave Types
+
+A Leave Type defines the rules: how many days, whether unused days carry forward, and
+whether it's paid. ScoopJoy uses the standard Indian mix plus Leave Without Pay.
+
+```python title="scoopjoy/scoopjoy/hr/leave_setup.py"
+def setup_leave_types():
+    """Configure leave types for ScoopJoy."""
+    leave_types = [
+        {
+            "name": "Casual Leave",
+            "max_leaves_allowed": 12,
+            "is_carry_forward": 0,
+            "is_earned_leave": 0,
+            "include_holiday": 0
+        },
+        {
+            "name": "Sick Leave",
+            "max_leaves_allowed": 10,
+            "is_carry_forward": 0,
+            "is_earned_leave": 0,
+            "include_holiday": 0
+        },
+        {
+            "name": "Earned Leave",
+            "max_leaves_allowed": 15,
+            "is_carry_forward": 1,
+            "max_carry_forwarded_leaves": 30,
+            "is_earned_leave": 1,
+            "earned_leave_frequency": "Monthly",
+            "include_holiday": 0
+        },
+        {
+            "name": "Compensatory Off",
+            "max_leaves_allowed": 5,
+            "is_carry_forward": 0,
+            "is_compensatory": 1,
+            "include_holiday": 0
+        },
+        {
+            "name": "Leave Without Pay",
+            "is_lwp": 1,
+            "include_holiday": 0
+        }
+    ]
+
+    for lt_data in leave_types:
+        name = lt_data.pop("name")
+        if not frappe.db.exists("Leave Type", name):
+            lt = frappe.new_doc("Leave Type")
+            lt.leave_type_name = name
+            for key, value in lt_data.items():
+                setattr(lt, key, value)
+            lt.insert()
+
+    frappe.db.commit()
+```
+
+### Leave Allocation
+
+Before an employee can apply, they need a Leave Allocation crediting days for the
+period. Earned Leave carries forward; the rest reset annually.
+
+```python title="scoopjoy/scoopjoy/hr/leave_setup.py"
+def allocate_leaves_for_year(employee, year="2026"):
+    """Allocate annual leaves for an employee."""
+    allocations = [
+        {"leave_type": "Casual Leave", "new_leaves_allocated": 12},
+        {"leave_type": "Sick Leave", "new_leaves_allocated": 10},
+        {"leave_type": "Earned Leave", "new_leaves_allocated": 15},
+    ]
+
+    for alloc_data in allocations:
+        alloc = frappe.new_doc("Leave Allocation")
+        alloc.employee = employee
+        alloc.leave_type = alloc_data["leave_type"]
+        alloc.from_date = f"{year}-01-01"
+        alloc.to_date = f"{year}-12-31"
+        alloc.new_leaves_allocated = alloc_data["new_leaves_allocated"]
+        alloc.carry_forward = 1 if alloc_data["leave_type"] == "Earned Leave" else 0
+        alloc.insert()
+        alloc.submit()
+
+    frappe.db.commit()
+```
+
+### Leave Application and Approval
+
+The employee submits a Leave Application; the approver then flips its status. The
+document moves through a clear lifecycle from open to approved (or rejected).
+
+<Mermaid title="Leave application lifecycle" height={300} code={`
+stateDiagram-v2
+  [*] --> Open: employee submits
+  Open --> Approved: approver accepts
+  Open --> Rejected: approver declines
+  Approved --> [*]
+  Rejected --> [*]
+`} />
+
+```python title="scoopjoy/scoopjoy/hr/leave_flow.py"
+# Employee applies for leave
+leave_app = frappe.new_doc("Leave Application")
+leave_app.employee = "HR-EMP-0005"
+leave_app.leave_type = "Casual Leave"
+leave_app.from_date = "2026-04-10"
+leave_app.to_date = "2026-04-11"
+leave_app.half_day = 0
+leave_app.description = "Family function"
+leave_app.leave_approver = "manager@scoopjoy.com"
+leave_app.insert()
+leave_app.submit()
+
+# Manager approves via UI or API
+leave_app.status = "Approved"
+leave_app.save()
+```
+
+## Payroll
+
+### Salary Components
+
+Salary Components are the building blocks of a salary structure — each is either an
+Earning or a Deduction, with flags that control taxation and how absences affect it.
+
+```python title="scoopjoy/scoopjoy/payroll/components.py"
+def setup_salary_components():
+    """Define salary components for ScoopJoy."""
+    components = [
+        # Earnings
+        {
+            "name": "Basic Salary",
+            "type": "Earning",
+            "is_tax_applicable": 1,
+            "depends_on_payment_days": 1
+        },
+        {
+            "name": "House Rent Allowance",
+            "type": "Earning",
+            "is_tax_applicable": 1,
+            "depends_on_payment_days": 1
+        },
+        {
+            "name": "Conveyance Allowance",
+            "type": "Earning",
+            "is_tax_applicable": 1,
+            "depends_on_payment_days": 1
+        },
+        {
+            "name": "Overtime Pay",
+            "type": "Earning",
+            "is_tax_applicable": 1,
+            "depends_on_payment_days": 0,
+            "is_additional_component": 1  # Paid via Additional Salary
+        },
+        # Deductions
+        {
+            "name": "Provident Fund (Employee)",
+            "type": "Deduction",
+            "is_tax_applicable": 0,
+            "depends_on_payment_days": 1
+        },
+        {
+            "name": "Provident Fund (Employer)",
+            "type": "Deduction",
+            "is_tax_applicable": 0,
+            "depends_on_payment_days": 1,
+            "do_not_include_in_total": 1  # Employer contribution
+        },
+        {
+            "name": "ESI (Employee)",
+            "type": "Deduction",
+            "is_tax_applicable": 0,
+            "depends_on_payment_days": 1
+        },
+        {
+            "name": "Professional Tax",
+            "type": "Deduction",
+            "is_tax_applicable": 0,
+            "depends_on_payment_days": 0
+        },
+        {
+            "name": "Income Tax",
+            "type": "Deduction",
+            "is_tax_applicable": 0,
+            "depends_on_payment_days": 0
+        }
+    ]
+
+    for comp_data in components:
+        name = comp_data.pop("name")
+        comp_type = comp_data.pop("type")
+        if not frappe.db.exists("Salary Component", name):
+            sc = frappe.new_doc("Salary Component")
+            sc.salary_component = name
+            sc.salary_component_abbr = "".join(
+                w[0] for w in name.split()
+            ).upper()
+            sc.type = comp_type
+            for key, value in comp_data.items():
+                setattr(sc, key, value)
+            sc.insert()
+
+    frappe.db.commit()
+```
+
+### Salary Structure
+
+A Salary Structure wires components together with formulas. The formulas reference
+`base` (the assigned base salary) and `gross_pay`, and `condition` strings gate a
+deduction on a threshold — e.g. PF only applies when Basic is at or below 15,000.
+
+```python title="scoopjoy/scoopjoy/payroll/structure.py" {21-27}
+def create_outlet_staff_salary_structure():
+    """
+    Salary structure for outlet staff:
+    Basic (50%) + HRA (20%) + Conveyance (10%) - PF - ESI - PT
+    """
+    ss = frappe.new_doc("Salary Structure")
+    ss.name = "Outlet Staff - 2026"
+    ss.company = "ScoopJoy Ice Creams Pvt Ltd"
+    ss.payroll_frequency = "Monthly"
+    ss.currency = "INR"
+
+    # Earnings
+    ss.append("earnings", {
+        "salary_component": "Basic Salary",
+        "formula": "base * 0.50",
+        "amount_based_on_formula": 1
+    })
+    ss.append("earnings", {
+        "salary_component": "House Rent Allowance",
+        "formula": "base * 0.20",
+        "amount_based_on_formula": 1
+    })
+    ss.append("earnings", {
+        "salary_component": "Conveyance Allowance",
+        "formula": "base * 0.10",
+        "amount_based_on_formula": 1
+    })
+
+    # Deductions
+    # PF: 12% of Basic (employee contribution)
+    ss.append("deductions", {
+        "salary_component": "Provident Fund (Employee)",
+        "formula": "base * 0.50 * 0.12",  # 12% of Basic
+        "amount_based_on_formula": 1,
+        "condition": "base * 0.50 <= 15000"  # PF applicable if basic <= 15000
+    })
+
+    # ESI: 0.75% of gross (applicable if gross <= 21000)
+    ss.append("deductions", {
+        "salary_component": "ESI (Employee)",
+        "formula": "gross_pay * 0.0075",
+        "amount_based_on_formula": 1,
+        "condition": "gross_pay <= 21000"
+    })
+
+    # Professional Tax: state-specific (Karnataka example)
+    ss.append("deductions", {
+        "salary_component": "Professional Tax",
+        "formula": (
+            "200 if gross_pay > 15000 else "
+            "(150 if gross_pay > 10000 else 0)"
+        ),
+        "amount_based_on_formula": 1
+    })
+
+    ss.insert()
+    ss.submit()
+    return ss.name
+```
+
+### Salary Structure Assignment
+
+The structure holds the formulas; the assignment supplies each employee's actual
+`base`. That's the value all the `base * …` formulas resolve against.
+
+```python title="scoopjoy/scoopjoy/payroll/structure.py"
+def assign_salary_structure(employee, structure, base_salary):
+    """Assign a salary structure to an employee."""
+    ssa = frappe.new_doc("Salary Structure Assignment")
+    ssa.employee = employee
+    ssa.salary_structure = structure
+    ssa.company = "ScoopJoy Ice Creams Pvt Ltd"
+    ssa.from_date = "2026-01-01"
+    ssa.base = base_salary
+    ssa.insert()
+    ssa.submit()
+    return ssa.name
+
+# Assign to outlet staff
+assign_salary_structure("HR-EMP-0005", "Outlet Staff - 2026", 20000)
+assign_salary_structure("HR-EMP-0006", "Outlet Staff - 2026", 18000)
+assign_salary_structure("HR-EMP-0007", "Outlet Staff - 2026", 22000)
+```
+
+For a base of INR 20,000, the formulas resolve to this payslip:
+
+```text
+Earnings:
+  Basic Salary:           10,000   (50% of base)
+  HRA:                     4,000   (20% of base)
+  Conveyance:              2,000   (10% of base)
+  ---
+  Gross Pay:              16,000
+
+Deductions:
+  PF (Employee 12%):       1,200   (12% of Basic)
+  ESI (0.75%):               120   (0.75% of Gross)
+  Professional Tax:          200   (gross > 15000)
+  ---
+  Total Deductions:        1,520
+
+Net Pay:                  14,480
+```
+
+### Salary Slip
+
+A Salary Slip is the individual payslip for an employee. While typically generated in
+bulk via Payroll Entry, you can create one manually — calling
+`get_emp_and_working_day_details` pulls the structure and computes the amounts.
+
+```python title="scoopjoy/scoopjoy/payroll/slip.py"
+salary_slip = frappe.new_doc("Salary Slip")
+salary_slip.employee = "HR-EMP-0005"
+salary_slip.salary_structure = "Outlet Staff - 2026"
+salary_slip.posting_date = "2026-03-31"
+salary_slip.payroll_frequency = "Monthly"
+salary_slip.start_date = "2026-03-01"
+salary_slip.end_date = "2026-03-31"
+
+# Pull structure and calculate
+salary_slip.run_method("get_emp_and_working_day_details")
+
+salary_slip.insert()
+salary_slip.submit()
+```
+
+### Payroll Entry (Batch Processing)
+
+The Payroll Entry processes salary slips for all employees in one go. It's a pipeline
+of `run_method` calls: gather employees, generate slips, submit them, and finally cut
+a single bank payment entry for the whole batch.
+
+<Mermaid title="Payroll Entry batch flow" height={360} code={`
+flowchart TB
+  PE["Payroll Entry<br/>(company · period · accounts)"] --> FE["fill_employee_details<br/>find eligible employees"]
+  FE --> CS["create_salary_slips<br/>one Salary Slip each"]
+  CS --> SUB["submit Payroll Entry"]
+  SUB --> SS["submit_salary_slips"]
+  SS --> PAY["make_payment_entry<br/>single bank entry"]
+`} />
+
+```python title="scoopjoy/scoopjoy/payroll/run.py"
+def run_monthly_payroll(month, year, department=None):
+    """Run payroll for all employees or a specific department."""
+    pe = frappe.new_doc("Payroll Entry")
+    pe.company = "ScoopJoy Ice Creams Pvt Ltd"
+    pe.payroll_frequency = "Monthly"
+    pe.posting_date = frappe.utils.get_last_day(f"{year}-{month:02d}-01")
+    pe.start_date = f"{year}-{month:02d}-01"
+    pe.end_date = frappe.utils.get_last_day(f"{year}-{month:02d}-01")
+    pe.currency = "INR"
+    pe.exchange_rate = 1
+    pe.payment_account = "Bank Account - SJ"
+    pe.cost_center = "Main - SJ"
+
+    if department:
+        pe.department = department
+
+    pe.insert()
+
+    # Fetch eligible employees
+    pe.run_method("fill_employee_details")
+
+    # Create Salary Slips for all employees
+    pe.run_method("create_salary_slips")
+
+    pe.submit()
+
+    # Submit all salary slips
+    pe.run_method("submit_salary_slips")
+
+    # Create bank entry for payment
+    pe.run_method("make_payment_entry")
+
+    return pe.name
+```
+
+### Statutory Compliance (India)
+
+Key statutory deductions and their configuration:
+
+| Statutory | Rate | Threshold | ERPNext Implementation |
+|---|---|---|---|
+| **EPF (Employee)** | 12% of Basic | `Basic <= INR 15,000` | Salary Component with formula |
+| **EPF (Employer)** | 12% of Basic (8.33% EPS + 3.67% EPF) | Same | Employer contribution component |
+| **ESI (Employee)** | 0.75% of Gross | `Gross <= INR 21,000` | Conditional formula |
+| **ESI (Employer)** | 3.25% of Gross | Same | Employer contribution component |
+| **Professional Tax** | State-specific slab | Varies by state | Formula-based deduction |
+| **Income Tax (TDS)** | Per tax slab | Per Payroll Period | Tax slab configuration |
+
+:::caution[Compliance moves fast — verify current rules]
+India's labour codes were consolidated in November 2025, and the new Income Tax Act
+2025 takes effect April 1, 2026. Ensure your Payroll Period and tax slabs are updated
+accordingly. Consult your CA for the latest compliance requirements.
+:::
+
+Income tax is driven by slabs on the Payroll Period. ERPNext supports both the old
+and new regimes; here are the new-regime slabs for FY 2026-27 (a `to_amount` of `0`
+means no upper limit):
+
+```python title="scoopjoy/scoopjoy/payroll/tax.py"
+# ERPNext supports old and new tax regimes
+# Configure via Payroll Period > Income Tax Slabs
+
+payroll_period = frappe.new_doc("Payroll Period")
+payroll_period.payroll_period_name = "FY 2026-27"
+payroll_period.company = "ScoopJoy Ice Creams Pvt Ltd"
+payroll_period.start_date = "2026-04-01"
+payroll_period.end_date = "2027-03-31"
+
+# New Tax Regime slabs (2026-27)
+payroll_period.append("taxable_salary_slabs", {
+    "from_amount": 0,
+    "to_amount": 400000,
+    "percent_deduction": 0
+})
+payroll_period.append("taxable_salary_slabs", {
+    "from_amount": 400001,
+    "to_amount": 800000,
+    "percent_deduction": 5
+})
+payroll_period.append("taxable_salary_slabs", {
+    "from_amount": 800001,
+    "to_amount": 1200000,
+    "percent_deduction": 10
+})
+payroll_period.append("taxable_salary_slabs", {
+    "from_amount": 1200001,
+    "to_amount": 1600000,
+    "percent_deduction": 15
+})
+payroll_period.append("taxable_salary_slabs", {
+    "from_amount": 1600001,
+    "to_amount": 2000000,
+    "percent_deduction": 20
+})
+payroll_period.append("taxable_salary_slabs", {
+    "from_amount": 2000001,
+    "to_amount": 2400000,
+    "percent_deduction": 25
+})
+payroll_period.append("taxable_salary_slabs", {
+    "from_amount": 2400001,
+    "to_amount": 0,  # 0 means no upper limit
+    "percent_deduction": 30
+})
+
+payroll_period.insert()
+payroll_period.submit()
+```
+
+## Expense Claims
+
+Employees can submit expense claims for reimbursement. Each claim carries one or more
+expense rows and an approver who sanctions the amount.
+
+```python title="scoopjoy/scoopjoy/hr/expense_claim.py"
+claim = frappe.new_doc("Expense Claim")
+claim.employee = "HR-EMP-0005"
+claim.expense_approver = "manager@scoopjoy.com"
+claim.company = "ScoopJoy Ice Creams Pvt Ltd"
+
+claim.append("expenses", {
+    "expense_date": "2026-03-15",
+    "expense_type": "Travel",
+    "description": "Travel to Central Warehouse for stock audit",
+    "amount": 1500,
+    "sanctioned_amount": 1500
+})
+
+claim.insert()
+claim.submit()
+```
+
+## Overtime Tracking (v16)
+
+ERPNext v16 (via Frappe HRMS v16) introduces automated overtime calculation, where
+overtime hours are derived from shift timings. For ad-hoc overtime, the Additional
+Salary DocType pays a one-off amount against a salary component without touching the
+structure.
+
+```python title="scoopjoy/scoopjoy/payroll/overtime.py"
+# v16: Overtime is calculated based on shift timings
+# and configurable rules
+
+# Define overtime rules in HRMS Settings
+# Overtime hours = Actual working hours - Standard shift hours
+
+# For manual overtime entry (Additional Salary approach):
+additional_salary = frappe.new_doc("Additional Salary")
+additional_salary.employee = "HR-EMP-0005"
+additional_salary.salary_component = "Overtime Pay"
+additional_salary.amount = 2500  # 10 hours * INR 250/hour
+additional_salary.payroll_date = "2026-03-31"
+additional_salary.company = "ScoopJoy Ice Creams Pvt Ltd"
+additional_salary.overwrite_salary_structure_amount = 0
+additional_salary.insert()
+additional_salary.submit()
+```
+
+## Employee Self-Service Portal
+
+ERPNext provides a self-service portal where employees can:
+
+- View their attendance and leave balance
+- Apply for leaves
+- Submit expense claims
+- View and download salary slips
+- Update personal information
+- Request attendance corrections (v16)
+
+This is accessible through the **Website** module with proper user permissions.
+Employees are assigned the "Employee Self Service" role.
+
+```python title="scoopjoy/scoopjoy/hr/self_service.py"
+# Enable employee self-service
+# In HR Settings:
+hr_settings = frappe.get_single("HR Settings")
+hr_settings.standard_working_hours = 8
+hr_settings.emp_created_by = "Naming Series"
+hr_settings.save()
+
+# Create a website user for the employee
+user = frappe.get_doc("User", "emp005@scoopjoy.com")
+user.add_roles("Employee Self Service")
+user.save()
+```
+
+## Practical Examples
+
+### Example 1: Department Setup for ScoopJoy Franchise
+
+This pulls the pieces together — branches, departments, designations, and a holiday
+list with weekly offs — into one bootstrap routine.
+
+```python title="scoopjoy/scoopjoy/hr/bootstrap.py"
+def setup_complete_hr_structure():
+    """Set up departments, designations, and branches."""
+
+    # Branches (physical locations)
+    branches = ["ScoopJoy Factory", "ScoopJoy Outlet 1",
+                "ScoopJoy Outlet 2", "ScoopJoy Outlet 3"]
+    for branch_name in branches:
+        if not frappe.db.exists("Branch", branch_name):
+            branch = frappe.new_doc("Branch")
+            branch.branch = branch_name
+            branch.insert()
+
+    # Departments (organizational structure)
+    setup_franchise_departments()  # From Department setup above
+
+    # Designations
+    setup_designations()  # From Department setup above
+
+    # Holiday List
+    holiday_list = frappe.new_doc("Holiday List")
+    holiday_list.holiday_list_name = "ScoopJoy 2026 Holiday List"
+    holiday_list.company = "ScoopJoy Ice Creams Pvt Ltd"
+    holiday_list.from_date = "2026-01-01"
+    holiday_list.to_date = "2026-12-31"
+
+    # Add national holidays
+    holidays = [
+        ("2026-01-26", "Republic Day"),
+        ("2026-03-30", "Holi"),
+        ("2026-04-14", "Ambedkar Jayanti"),
+        ("2026-05-01", "May Day"),
+        ("2026-08-15", "Independence Day"),
+        ("2026-10-02", "Gandhi Jayanti"),
+        ("2026-10-20", "Dussehra"),
+        ("2026-11-09", "Diwali"),
+        ("2026-12-25", "Christmas"),
+    ]
+
+    for date, desc in holidays:
+        holiday_list.append("holidays", {
+            "holiday_date": date,
+            "description": desc
+        })
+
+    # Add weekly offs (Sundays)
+    holiday_list.weekly_off = "Sunday"
+    holiday_list.run_method("get_weekly_off_dates")
+
+    holiday_list.insert()
+
+    frappe.db.commit()
+    print("HR structure setup complete!")
+```
+
+### Example 2: Salary Structure for Outlet Staff
+
+Building on the payroll section, here is a complete salary structure with a balancing
+**Special Allowance** that absorbs whatever the percentage components leave behind, so
+the earnings always sum to `base`.
+
+```python title="scoopjoy/scoopjoy/payroll/structure.py" {26-30}
+def create_comprehensive_salary_structure():
+    """
+    Complete salary structure for outlet staff:
+    Basic (50%) + HRA (20%) + Conveyance (10%) + Special Allowance (20%)
+    Deductions: PF, ESI, PT
+    """
+    ss = frappe.new_doc("Salary Structure")
+    ss.name = "Outlet Staff Comprehensive - 2026"
+    ss.company = "ScoopJoy Ice Creams Pvt Ltd"
+    ss.payroll_frequency = "Monthly"
+    ss.currency = "INR"
+
+    # Earnings
+    ss.append("earnings", {
+        "salary_component": "Basic Salary",
+        "formula": "base * 0.50",
+        "amount_based_on_formula": 1
+    })
+    ss.append("earnings", {
+        "salary_component": "House Rent Allowance",
+        "formula": "base * 0.20",
+        "amount_based_on_formula": 1
+    })
+    ss.append("earnings", {
+        "salary_component": "Conveyance Allowance",
+        "formula": "base * 0.10",
+        "amount_based_on_formula": 1
+    })
+    ss.append("earnings", {
+        "salary_component": "Special Allowance",
+        # Balancing component: whatever is left
+        "formula": "base - (base * 0.50 + base * 0.20 + base * 0.10)",
+        "amount_based_on_formula": 1
+    })
+
+    # Deductions
+    ss.append("deductions", {
+        "salary_component": "Provident Fund (Employee)",
+        "formula": "base * 0.50 * 0.12",
+        "amount_based_on_formula": 1,
+        "condition": "base * 0.50 <= 15000"
+    })
+    ss.append("deductions", {
+        "salary_component": "ESI (Employee)",
+        "formula": "gross_pay * 0.0075",
+        "amount_based_on_formula": 1,
+        "condition": "gross_pay <= 21000"
+    })
+    ss.append("deductions", {
+        "salary_component": "Professional Tax",
+        "formula": (
+            "200 if gross_pay > 15000 else "
+            "(150 if gross_pay > 10000 else 0)"
+        ),
+        "amount_based_on_formula": 1
+    })
+
+    ss.insert()
+    ss.submit()
+
+    # Assign to employees at different outlets
+    outlet_staff = [
+        ("HR-EMP-0010", 20000, "ScoopJoy Outlet 1"),
+        ("HR-EMP-0011", 18000, "ScoopJoy Outlet 1"),
+        ("HR-EMP-0012", 22000, "ScoopJoy Outlet 2"),
+        ("HR-EMP-0013", 20000, "ScoopJoy Outlet 2"),
+        ("HR-EMP-0014", 25000, "ScoopJoy Outlet 3"),
+        ("HR-EMP-0015", 18000, "ScoopJoy Outlet 3"),
+    ]
+
+    for emp_id, base, branch in outlet_staff:
+        ssa = frappe.new_doc("Salary Structure Assignment")
+        ssa.employee = emp_id
+        ssa.salary_structure = ss.name
+        ssa.company = "ScoopJoy Ice Creams Pvt Ltd"
+        ssa.from_date = "2026-01-01"
+        ssa.base = base
+        ssa.payroll_cost_center = f"{branch} - SJ"
+        ssa.insert()
+        ssa.submit()
+
+    return ss.name
+```
+
+### Example 3: Payroll Run for All 3 Outlets
+
+Running each outlet as its own Payroll Entry keeps costs attributable per cost
+center. The `validate_attendance` flag deducts for absences, and the inline print
+gives you a review summary before the slips are submitted.
+
+```python title="scoopjoy/scoopjoy/payroll/run.py" {18}
+def run_march_2026_payroll():
+    """
+    Complete payroll run for March 2026 across all 3 outlets.
+    Process each outlet separately for cost center tracking.
+    """
+    outlets = [
+        {"department": "Retail - Outlet 1", "branch": "ScoopJoy Outlet 1"},
+        {"department": "Retail - Outlet 2", "branch": "ScoopJoy Outlet 2"},
+        {"department": "Retail - Outlet 3", "branch": "ScoopJoy Outlet 3"},
+    ]
+
+    payroll_entries = []
+
+    for outlet in outlets:
+        pe = frappe.new_doc("Payroll Entry")
+        pe.company = "ScoopJoy Ice Creams Pvt Ltd"
+        pe.payroll_frequency = "Monthly"
+        pe.posting_date = "2026-03-31"
+        pe.start_date = "2026-03-01"
+        pe.end_date = "2026-03-31"
+        pe.currency = "INR"
+        pe.exchange_rate = 1
+        pe.payment_account = "HDFC Bank - SJ"
+        pe.cost_center = "Main - SJ"
+        pe.department = outlet["department"]
+        pe.branch = outlet["branch"]
+        pe.validate_attendance = 1  # Deduct for absences
+
+        pe.insert()
+        pe.run_method("fill_employee_details")
+        pe.run_method("create_salary_slips")
+        pe.submit()
+
+        # Review salary slips before batch submit
+        slips = frappe.get_all("Salary Slip", filters={
+            "payroll_entry": pe.name,
+            "docstatus": 0
+        }, fields=["employee", "employee_name", "gross_pay",
+                   "total_deduction", "net_pay"])
+
+        print(f"\n--- {outlet['branch']} ---")
+        print(f"{'Employee':<30} {'Gross':>10} {'Deductions':>12} {'Net':>10}")
+        print("-" * 65)
+        for slip in slips:
+            print(f"{slip.employee_name:<30} "
+                  f"{slip.gross_pay:>10,.0f} "
+                  f"{slip.total_deduction:>12,.0f} "
+                  f"{slip.net_pay:>10,.0f}")
+
+        # Submit all salary slips
+        pe.run_method("submit_salary_slips")
+
+        # Create bank payment entry
+        pe.run_method("make_payment_entry")
+
+        payroll_entries.append(pe.name)
+
+    return payroll_entries
+```
+
+**Expected output:**
+
+```text
+--- ScoopJoy Outlet 1 ---
+Employee                            Gross   Deductions        Net
+-----------------------------------------------------------------
+Rahul Kumar                        16,000        1,520     14,480
+Priya Sharma                       14,400        1,358     13,042
+
+--- ScoopJoy Outlet 2 ---
+Employee                            Gross   Deductions        Net
+-----------------------------------------------------------------
+Amit Patel                         17,600        1,682     15,918
+Sunita Devi                        16,000        1,520     14,480
+
+--- ScoopJoy Outlet 3 ---
+Employee                            Gross   Deductions        Net
+-----------------------------------------------------------------
+Vikram Singh                       20,000        1,550     18,450
+Neha Gupta                         14,400        1,358     13,042
+```
+
+:::tip[Pro tip]
+Use the `validate_attendance` flag on Payroll Entry to automatically deduct salary
+for Leave Without Pay days. This integrates attendance tracking directly into
+payroll, so absences reduce the salary proportionally based on
+`depends_on_payment_days` in the salary component.
+:::
+
+### Example 4: Leave Policy for Different Employee Grades
+
+A Leave Policy bundles annual allocations per leave type; a Leave Policy Assignment
+applies a policy to an employee for a leave period. Here managers get more days than
+frontline staff.
+
+```python title="scoopjoy/scoopjoy/hr/leave_policy.py"
+def setup_leave_policies():
+    """
+    Different leave allocations based on employee grade/designation.
+    Managers get more leaves than frontline staff.
+    """
+
+    # Define leave policies
+    policies = {
+        "Frontline Staff": {
+            "Casual Leave": 8,
+            "Sick Leave": 6,
+            "Earned Leave": 12
+        },
+        "Supervisors": {
+            "Casual Leave": 10,
+            "Sick Leave": 8,
+            "Earned Leave": 15
+        },
+        "Managers": {
+            "Casual Leave": 12,
+            "Sick Leave": 10,
+            "Earned Leave": 18,
+        }
+    }
+
+    for policy_name, leave_details in policies.items():
+        lp = frappe.new_doc("Leave Policy")
+        lp.title = f"ScoopJoy {policy_name} Leave Policy 2026"
+
+        for leave_type, count in leave_details.items():
+            lp.append("leave_policy_details", {
+                "leave_type": leave_type,
+                "annual_allocation": count
+            })
+
+        lp.insert()
+
+    # Assign leave policies via Leave Policy Assignment
+    # Frontline staff assignments
+    frontline_employees = frappe.get_all("Employee", filters={
+        "company": "ScoopJoy Ice Creams Pvt Ltd",
+        "designation": ["in", ["Cashier", "Production Worker",
+                               "Delivery Executive", "Store Keeper"]],
+        "status": "Active"
+    })
+
+    for emp in frontline_employees:
+        lpa = frappe.new_doc("Leave Policy Assignment")
+        lpa.employee = emp.name
+        lpa.leave_policy = "ScoopJoy Frontline Staff Leave Policy 2026"
+        lpa.effective_from = "2026-01-01"
+        lpa.assignment_based_on = "Leave Period"
+        lpa.leave_period = "Jan 2026 - Dec 2026"
+        lpa.insert()
+        lpa.submit()
+
+    # Manager assignments
+    managers = frappe.get_all("Employee", filters={
+        "company": "ScoopJoy Ice Creams Pvt Ltd",
+        "designation": ["in", ["Outlet Manager", "Production Supervisor"]],
+        "status": "Active"
+    })
+
+    for emp in managers:
+        lpa = frappe.new_doc("Leave Policy Assignment")
+        lpa.employee = emp.name
+        lpa.leave_policy = "ScoopJoy Managers Leave Policy 2026"
+        lpa.effective_from = "2026-01-01"
+        lpa.assignment_based_on = "Leave Period"
+        lpa.leave_period = "Jan 2026 - Dec 2026"
+        lpa.insert()
+        lpa.submit()
+
+    frappe.db.commit()
+```
+
+**Summary of leave allocation by grade:**
+
+| Grade | Casual | Sick | Earned | Total |
+|---|---|---|---|---|
+| Frontline Staff (Cashier, Worker) | 8 | 6 | 12 | 26 |
+| Supervisors | 10 | 8 | 15 | 33 |
+| Managers (Outlet Mgr, Prod Supv) | 12 | 10 | 18 | 40 |
+
+Earned Leave carries forward up to 30 days. Leave Without Pay is always available but
+triggers salary deduction. Compensatory Off can be applied when employees work on
+holidays.

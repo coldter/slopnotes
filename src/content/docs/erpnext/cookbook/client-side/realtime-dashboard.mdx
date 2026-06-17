@@ -1,0 +1,638 @@
+---
+title: Real-Time Sales Dashboard
+description: Build a live ScoopJoy command dashboard that updates KPIs, charts, and a feed the instant any outlet submits a sale, with sound and reconnection handling.
+sidebar:
+  order: 2
+---
+
+import { LinkCard, FileTree } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a live dashboard for the ScoopJoy franchise that updates the
+instant any outlet records a sale — a revenue counter, an hourly chart, a top-outlets
+list, and a scrolling feed — complete with a notification sound and graceful
+reconnection when the socket drops.
+
+**Solution:** Aggregate the data in a whitelisted Python endpoint, broadcast each new
+sale from the `Sales Invoice` `on_submit` hook with `frappe.publish_realtime`, and
+subscribe to that event from a custom Desk page. The client keeps running KPI totals
+for instant optimistic updates and re-syncs on a timer to correct any drift.
+
+The recipe spans several files — an API module, a submit override, a hook binding, and
+the custom page (HTML + CSS + JS + JSON):
+
+<FileTree>
+- scoopjoy/
+  - hooks.py the `doc_events` binding
+  - scoopjoy/
+    - api/
+      - **dashboard.py** aggregation endpoint
+    - overrides/
+      - sales_invoice.py broadcasts each sale
+    - scoopjoy/
+      - page/
+        - live_sales_dashboard/
+          - live_sales_dashboard.html KPI cards, chart, feed
+          - live_sales_dashboard.css
+          - live_sales_dashboard.js the realtime controller
+          - live_sales_dashboard.json the Page definition
+</FileTree>
+
+## Step 1: The aggregation endpoint
+
+A single whitelisted method returns everything the dashboard needs on first load:
+today's totals, an hour-by-hour breakdown for the chart, and the top outlets and
+items. The hourly loop fills in missing hours so the chart always has 24 bars.
+
+```python title="scoopjoy/scoopjoy/api/dashboard.py"
+import frappe
+from frappe import _
+from frappe.utils import nowdate, get_first_day, flt
+
+
+@frappe.whitelist()
+def get_dashboard_data():
+    """Aggregated data for the franchise command dashboard."""
+    today = nowdate()
+    month_start = get_first_day(today)
+
+    # Today's sales
+    today_sales = frappe.db.sql("""
+        SELECT
+            COUNT(*) as total_invoices,
+            COALESCE(SUM(grand_total), 0) as total_revenue,
+            COALESCE(SUM(total_qty), 0) as total_qty
+        FROM `tabSales Invoice`
+        WHERE posting_date = %s AND docstatus = 1
+    """, today, as_dict=True)[0]
+
+    # Hourly breakdown for chart
+    hourly = frappe.db.sql("""
+        SELECT
+            HOUR(creation) as hour,
+            COALESCE(SUM(grand_total), 0) as revenue,
+            COUNT(*) as count
+        FROM `tabSales Invoice`
+        WHERE posting_date = %s AND docstatus = 1
+        GROUP BY HOUR(creation)
+        ORDER BY hour
+    """, today, as_dict=True)
+
+    # Fill in missing hours
+    hourly_map = {row.hour: row for row in hourly}
+    hourly_data = []
+    for h in range(24):
+        row = hourly_map.get(h, {"hour": h, "revenue": 0, "count": 0})
+        hourly_data.append(row)
+
+    # Top 5 outlets today
+    top_outlets = frappe.db.sql("""
+        SELECT
+            custom_franchise_outlet as outlet,
+            SUM(grand_total) as revenue,
+            COUNT(*) as orders
+        FROM `tabSales Invoice`
+        WHERE posting_date = %s AND docstatus = 1
+            AND custom_franchise_outlet IS NOT NULL
+        GROUP BY custom_franchise_outlet
+        ORDER BY revenue DESC
+        LIMIT 5
+    """, today, as_dict=True)
+
+    # Top selling items today
+    top_items = frappe.db.sql("""
+        SELECT
+            sii.item_name,
+            SUM(sii.qty) as qty,
+            SUM(sii.amount) as amount
+        FROM `tabSales Invoice Item` sii
+        JOIN `tabSales Invoice` si ON si.name = sii.parent
+        WHERE si.posting_date = %s AND si.docstatus = 1
+        GROUP BY sii.item_code
+        ORDER BY qty DESC
+        LIMIT 5
+    """, today, as_dict=True)
+
+    return {
+        "today_sales": today_sales,
+        "hourly_data": hourly_data,
+        "top_outlets": top_outlets,
+        "top_items": top_items,
+    }
+```
+
+## Step 2: Broadcast each sale
+
+When a `Sales Invoice` is submitted, push the sale to every connected client. The
+critical flag is `after_commit=True` (line below) so the event only fires once the
+transaction is durably committed — clients never see a sale that later rolls back.
+
+```python title="scoopjoy/scoopjoy/overrides/sales_invoice.py" {18}
+import frappe
+
+
+def on_submit(doc, method):
+    """Broadcast sale event via realtime when a Sales Invoice is submitted."""
+    if not doc.custom_franchise_outlet:
+        return
+
+    frappe.publish_realtime(
+        event="scoopjoy_new_sale",
+        message={
+            "invoice":  doc.name,
+            "outlet":   doc.custom_franchise_outlet,
+            "amount":   doc.grand_total,
+            "qty":      doc.total_qty,
+            "customer": doc.customer_name,
+            "items":    [row.item_name for row in doc.items[:3]],  # first 3 items
+        },
+        # Broadcast to all users who have the dashboard open
+        after_commit=True,
+    )
+```
+
+Bind that override to the document event in `hooks.py`. In Express you'd register a
+middleware; in Frappe the `doc_events` dict wires a controller method onto a DocType's
+lifecycle without subclassing it.
+
+```python title="scoopjoy/hooks.py"
+doc_events = {
+    "Sales Invoice": {
+        "on_submit": "scoopjoy.scoopjoy.overrides.sales_invoice.on_submit",
+    }
+}
+```
+
+## Step 3: The page template
+
+The custom Desk page renders four KPI cards, an hourly chart container, two ranked
+lists, a scrolling feed, and a hidden `<audio>` element for the cash-register sound.
+The element IDs here are the hooks the JS controller targets.
+
+```html title="scoopjoy/scoopjoy/scoopjoy/page/live_sales_dashboard/live_sales_dashboard.html"
+<div class="live-sales-dashboard">
+    <!-- KPI Cards -->
+    <div class="row kpi-row mb-4">
+        <div class="col-md-3">
+            <div class="kpi-card" id="kpi-revenue">
+                <div class="kpi-label">Today's Revenue</div>
+                <div class="kpi-value" id="total-revenue">--</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="kpi-card" id="kpi-orders">
+                <div class="kpi-label">Orders</div>
+                <div class="kpi-value" id="total-orders">--</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="kpi-card" id="kpi-qty">
+                <div class="kpi-label">Items Sold</div>
+                <div class="kpi-value" id="total-qty">--</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="kpi-card kpi-live" id="kpi-live">
+                <div class="kpi-label">Live Feed</div>
+                <div class="kpi-value"><span class="live-dot"></span> Connected</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chart Row -->
+    <div class="row mb-4">
+        <div class="col-md-8">
+            <div class="dashboard-card">
+                <h6 class="card-title">Hourly Revenue</h6>
+                <div id="hourly-chart"></div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="dashboard-card">
+                <h6 class="card-title">Top Outlets</h6>
+                <div id="top-outlets-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Live Feed -->
+    <div class="row">
+        <div class="col-md-8">
+            <div class="dashboard-card">
+                <h6 class="card-title">Live Sales Feed</h6>
+                <div id="live-feed" style="max-height: 300px; overflow-y: auto;"></div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="dashboard-card">
+                <h6 class="card-title">Top Items</h6>
+                <div id="top-items-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hidden audio for notification -->
+    <audio id="sale-sound" preload="auto">
+        <source src="/assets/scoopjoy/sounds/cash-register.mp3" type="audio/mpeg">
+    </audio>
+</div>
+```
+
+The accompanying stylesheet adds the card styling plus two animations the JS triggers:
+a `flash` on a KPI card when a sale lands, and a pulsing `live-dot` that turns red when
+disconnected.
+
+```css title="scoopjoy/scoopjoy/scoopjoy/page/live_sales_dashboard/live_sales_dashboard.css"
+.live-sales-dashboard {
+    padding: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.kpi-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 20px;
+    text-align: center;
+    transition: transform 0.2s;
+}
+
+.kpi-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+}
+
+.kpi-label {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+}
+
+.kpi-value {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text-color);
+}
+
+.kpi-card.flash {
+    animation: kpi-flash 0.6s ease;
+}
+
+@keyframes kpi-flash {
+    0%   { background: var(--card-bg); }
+    50%  { background: #e8f5e9; }
+    100% { background: var(--card-bg); }
+}
+
+.live-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    background: #4caf50;
+    border-radius: 50%;
+    margin-right: 4px;
+    animation: pulse-dot 1.5s infinite;
+}
+
+.live-dot.disconnected {
+    background: #f44336;
+    animation: none;
+}
+
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.3; }
+}
+
+.dashboard-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 20px;
+    height: 100%;
+}
+
+.dashboard-card .card-title {
+    margin-bottom: 16px;
+    color: var(--heading-color);
+}
+
+.feed-item {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border-color);
+    animation: slide-in 0.3s ease;
+}
+
+.feed-item:last-child {
+    border-bottom: none;
+}
+
+@keyframes slide-in {
+    from { opacity: 0; transform: translateY(-10px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+.outlet-rank {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--light-border-color);
+}
+
+.outlet-rank:last-child { border-bottom: none; }
+```
+
+## Step 4: The realtime controller
+
+This is the centerpiece. The page module wires Frappe's lifecycle callbacks
+(`on_page_load`, `on_page_show`, `on_page_hide`) to a controller class. The
+`on_page_show`/`on_page_hide` pair re-attaches and detaches the realtime listeners as
+the user navigates — that detach is what prevents duplicate listeners stacking up.
+
+```javascript title="scoopjoy/scoopjoy/scoopjoy/page/live_sales_dashboard/live_sales_dashboard.js" {17,22}
+frappe.pages['live-sales-dashboard'].on_page_load = function(wrapper) {
+    const page = frappe.ui.make_app_page({
+        parent: wrapper,
+        title: 'Live Sales Dashboard',
+        single_column: true,
+    });
+
+    // Load the HTML template
+    $(frappe.render_template('live_sales_dashboard')).appendTo(page.body);
+
+    const dashboard = new ScoopJoyLiveDashboard(page);
+    page.dashboard_instance = dashboard;
+};
+
+frappe.pages['live-sales-dashboard'].on_page_show = function(wrapper) {
+    // Re-attach listeners when navigating back to this page
+    if (wrapper.page?.dashboard_instance) {
+        wrapper.page.dashboard_instance.attach_realtime();
+    }
+};
+
+frappe.pages['live-sales-dashboard'].on_page_hide = function(wrapper) {
+    if (wrapper.page?.dashboard_instance) {
+        wrapper.page.dashboard_instance.detach_realtime();
+    }
+};
+
+
+class ScoopJoyLiveDashboard {
+    constructor(page) {
+        this.page = page;
+        this.$wrapper = $(page.body);
+        this.hourly_chart = null;
+        this.refresh_timer = null;
+        this.sound_enabled = true;
+        this.running_revenue = 0;
+        this.running_orders = 0;
+        this.running_qty = 0;
+
+        this.setup_actions();
+        this.load_data();
+        this.attach_realtime();
+        this.start_auto_refresh();
+    }
+
+    setup_actions() {
+        this.page.set_secondary_action('Refresh', () => this.load_data(), 'refresh');
+
+        this.page.add_inner_button('Toggle Sound', () => {
+            this.sound_enabled = !this.sound_enabled;
+            frappe.show_alert({
+                message: `Notification sound ${this.sound_enabled ? 'enabled' : 'disabled'}`,
+                indicator: this.sound_enabled ? 'green' : 'grey',
+            });
+        });
+    }
+
+    async load_data() {
+        try {
+            const data = await frappe.xcall('scoopjoy.scoopjoy.api.dashboard.get_dashboard_data');
+            this.render_kpis(data.today_sales);
+            this.render_hourly_chart(data.hourly_data);
+            this.render_top_outlets(data.top_outlets);
+            this.render_top_items(data.top_items);
+
+            // Cache running totals for realtime increments
+            this.running_revenue = data.today_sales.total_revenue;
+            this.running_orders  = data.today_sales.total_invoices;
+            this.running_qty     = data.today_sales.total_qty;
+        } catch (e) {
+            frappe.show_alert({ message: 'Failed to load dashboard data', indicator: 'red' });
+        }
+    }
+
+    render_kpis(sales) {
+        this.$wrapper.find('#total-revenue').text(format_currency(sales.total_revenue, 'INR'));
+        this.$wrapper.find('#total-orders').text(sales.total_invoices);
+        this.$wrapper.find('#total-qty').text(sales.total_qty);
+    }
+
+    flash_kpi(selector) {
+        const $card = this.$wrapper.find(selector);
+        $card.addClass('flash');
+        setTimeout(() => $card.removeClass('flash'), 600);
+    }
+
+    render_hourly_chart(hourly_data) {
+        const labels = hourly_data.map(r => `${String(r.hour).padStart(2, '0')}:00`);
+        const values = hourly_data.map(r => r.revenue);
+
+        if (this.hourly_chart) {
+            // Update existing chart data in place
+            this.hourly_chart.update({
+                labels: labels,
+                datasets: [{ values: values }],
+            });
+        } else {
+            this.hourly_chart = new frappe.Chart('#hourly-chart', {
+                data: {
+                    labels: labels,
+                    datasets: [{ name: 'Revenue', values: values, chartType: 'bar' }],
+                },
+                type: 'axis-mixed',
+                height: 250,
+                colors: ['#7cd6fd'],
+                axisOptions: {
+                    xIsSeries: true,
+                },
+                tooltipOptions: {
+                    formatTooltipY: d => format_currency(d, 'INR'),
+                },
+            });
+        }
+    }
+
+    render_top_outlets(outlets) {
+        const html = outlets.length
+            ? outlets.map((o, i) => `
+                <div class="outlet-rank">
+                    <span>
+                        <span class="fw-bold text-muted">#${i + 1}</span>
+                        <a href="/desk/franchise-outlet/${o.outlet}">${o.outlet}</a>
+                    </span>
+                    <span class="fw-bold">${format_currency(o.revenue, 'INR')}</span>
+                </div>
+            `).join('')
+            : '<p class="text-muted">No sales recorded today.</p>';
+
+        this.$wrapper.find('#top-outlets-list').html(html);
+    }
+
+    render_top_items(items) {
+        const html = items.length
+            ? items.map(item => `
+                <div class="outlet-rank">
+                    <span>${item.item_name}</span>
+                    <span class="badge bg-primary">${item.qty} sold</span>
+                </div>
+            `).join('')
+            : '<p class="text-muted">No items sold today.</p>';
+
+        this.$wrapper.find('#top-items-list').html(html);
+    }
+
+    // --- Realtime ---
+
+    attach_realtime() {
+        this._sale_handler = (data) => this.on_new_sale(data);
+        frappe.realtime.on('scoopjoy_new_sale', this._sale_handler);
+
+        // Reconnection handling
+        if (frappe.socketio?.socket) {
+            frappe.socketio.socket.on('connect', () => {
+                this.$wrapper.find('.live-dot').removeClass('disconnected');
+                this.$wrapper.find('#kpi-live .kpi-value').html(
+                    '<span class="live-dot"></span> Connected'
+                );
+                // Re-fetch data on reconnect to catch missed events
+                this.load_data();
+            });
+
+            frappe.socketio.socket.on('disconnect', () => {
+                this.$wrapper.find('.live-dot').addClass('disconnected');
+                this.$wrapper.find('#kpi-live .kpi-value').html(
+                    '<span class="live-dot disconnected"></span> Reconnecting...'
+                );
+            });
+        }
+    }
+
+    detach_realtime() {
+        if (this._sale_handler) {
+            frappe.realtime.off('scoopjoy_new_sale', this._sale_handler);
+        }
+        this.stop_auto_refresh();
+    }
+
+    on_new_sale(data) {
+        // 1. Update running KPIs (optimistic)
+        this.running_revenue += data.amount;
+        this.running_orders  += 1;
+        this.running_qty     += data.qty;
+
+        this.$wrapper.find('#total-revenue').text(format_currency(this.running_revenue, 'INR'));
+        this.$wrapper.find('#total-orders').text(this.running_orders);
+        this.$wrapper.find('#total-qty').text(this.running_qty);
+
+        this.flash_kpi('#kpi-revenue');
+        this.flash_kpi('#kpi-orders');
+
+        // 2. Add to live feed
+        const items_text = data.items.join(', ');
+        const feed_html = `
+            <div class="feed-item">
+                <div class="d-flex justify-content-between">
+                    <span class="fw-bold">${data.outlet}</span>
+                    <span class="text-success fw-bold">${format_currency(data.amount, 'INR')}</span>
+                </div>
+                <small class="text-muted">${data.customer} &mdash; ${items_text}</small>
+            </div>`;
+
+        const $feed = this.$wrapper.find('#live-feed');
+        $feed.prepend(feed_html);
+
+        // Keep only last 50 entries
+        $feed.find('.feed-item').slice(50).remove();
+
+        // 3. Play notification sound
+        if (this.sound_enabled) {
+            const audio = this.$wrapper.find('#sale-sound')[0];
+            if (audio) {
+                audio.currentTime = 0;
+                audio.play().catch(() => {}); // ignore autoplay restrictions
+            }
+        }
+
+        // 4. Frappe toast notification
+        frappe.show_alert({
+            message: `New sale: ${format_currency(data.amount, 'INR')} at ${data.outlet}`,
+            indicator: 'green',
+        }, 5);
+    }
+
+    start_auto_refresh() {
+        // Full refresh every 5 minutes to sync chart data
+        this.refresh_timer = setInterval(() => this.load_data(), 5 * 60 * 1000);
+    }
+
+    stop_auto_refresh() {
+        if (this.refresh_timer) {
+            clearInterval(this.refresh_timer);
+            this.refresh_timer = null;
+        }
+    }
+}
+```
+
+The realtime path runs three layers: `attach_realtime` subscribes to the
+`scoopjoy_new_sale` event and binds socket `connect`/`disconnect` handlers; `on_new_sale`
+optimistically bumps the running KPI totals, prepends to the feed, plays the sound, and
+toasts; and `start_auto_refresh` does a full re-fetch every five minutes so the chart
+and any drifted totals stay accurate. On reconnect it re-fetches immediately to catch
+events missed while offline.
+
+## Step 5: The Page definition
+
+Finally the `Page` doctype JSON registers the route and restricts it to the franchise
+admin roles.
+
+```json title="scoopjoy/scoopjoy/scoopjoy/page/live_sales_dashboard/live_sales_dashboard.json"
+{
+    "content": null,
+    "creation": "2025-01-15 10:00:00",
+    "doctype": "Page",
+    "icon": "chart",
+    "module": "ScoopJoy",
+    "name": "live-sales-dashboard",
+    "page_name": "live-sales-dashboard",
+    "roles": [
+        { "role": "System Manager" },
+        { "role": "ScoopJoy Admin" }
+    ],
+    "standard": "Yes",
+    "system_page": 0,
+    "title": "Live Sales Dashboard"
+}
+```
+
+:::note[Why this works]
+`frappe.publish_realtime` fires after commit (`after_commit=True`), so clients only see
+confirmed sales. The client subscribes with `frappe.realtime.on` and calls
+`frappe.realtime.off` on page hide to prevent memory leaks. The optimistic KPI update
+makes the UI feel instant, while the periodic full refresh (every five minutes) corrects
+any drift between the running totals and the database.
+:::
+
+:::caution[Common mistake]
+Forgetting `after_commit=True` in `publish_realtime`. Without it, the event fires even if
+the transaction later rolls back, showing phantom sales. Equally, not calling
+`frappe.realtime.off` on page hide leaves listeners attached, so they stack into
+duplicates if the user navigates away and returns.
+:::

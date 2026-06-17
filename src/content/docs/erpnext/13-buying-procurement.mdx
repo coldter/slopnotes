@@ -1,0 +1,648 @@
+---
+title: Buying & Procurement
+description: ERPNext's procure-to-pay cycle — RFQs, purchase orders with approval workflows, quality inspection, subcontracting, and supplier scorecards.
+sidebar:
+  order: 13
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, Aside } from "@astrojs/starlight/components";
+
+The Buying module manages the entire procure-to-pay cycle. For ScoopJoy, this
+means sourcing milk, sugar, vanilla extract, packaging materials, and machinery —
+from multiple suppliers, at negotiated rates, with quality checks at every step.
+
+## The purchase cycle
+
+Procurement in ERPNext is a chain of documents, each handing off to the next. Most
+carry no accounting impact until goods physically arrive or a bill is recorded —
+the early stages are commitments and negotiations, not ledger entries.
+
+<Mermaid title="Procure-to-pay cycle" height={420} code={`
+flowchart LR
+  MR["Material Request"] --> SQ["Supplier Quotation"]
+  MR -.-> RFQ["Request for Quotation"]
+  RFQ --> SQ
+  SQ --> PO["Purchase Order"]
+  PO --> PR["Purchase Receipt"]
+  PR --> QI["Quality Inspection"]
+  PR --> PI["Purchase Invoice"]
+  PI --> PE["Payment Entry"]
+`} />
+
+| Document | Purpose | Accounting Impact |
+|---|---|---|
+| Material Request | Internal request for materials | None |
+| Request for Quotation | Sent to suppliers for quotes | None |
+| Supplier Quotation | Supplier's price response | None |
+| Purchase Order | Confirmed order to supplier | None (commitment) |
+| Purchase Receipt | Goods received at warehouse | Stock increased |
+| Purchase Invoice | Supplier's bill recorded | Expense/asset booked, payable created |
+| Payment Entry | Payment made to supplier | Payable settled |
+
+## Supplier master
+
+### Supplier groups
+
+Organize suppliers by category. Supplier Groups are a tree, so you can nest
+categories under broad headings:
+
+<Mermaid title="ScoopJoy supplier groups" height={360} code={`
+flowchart TB
+  All["All Supplier Groups"] --> RM["Raw Materials"]
+  All --> PKG["Packaging"]
+  All --> EQ["Equipment"]
+  All --> SVC["Services"]
+  RM --> Dairy["Dairy"]
+  RM --> Flav["Flavoring"]
+  RM --> Sweet["Sweeteners"]
+`} />
+
+### Creating a supplier
+
+A Supplier is just another DocType. Set its group, currency, and default price
+list so purchase documents inherit sensible defaults:
+
+```python title="scoopjoy/scoopjoy/buying.py"
+def create_ingredient_supplier(name, group, lead_time_days=7):
+    """Register a new ingredient supplier."""
+    supplier = frappe.new_doc("Supplier")
+    supplier.supplier_name = name
+    supplier.supplier_group = group
+    supplier.supplier_type = "Company"
+    supplier.country = "India"
+    supplier.default_currency = "INR"
+    supplier.default_price_list = "Standard Buying"
+
+    supplier.insert()
+    frappe.db.commit()
+    return supplier.name
+```
+
+### Approved supplier list
+
+Restrict which suppliers can provide specific items by appending them to the
+Item master's `supplier_items` child table:
+
+```python title="Restricting an item to approved suppliers"
+# In Item master, add approved suppliers
+item = frappe.get_doc("Item", "RM-MILK-WHOLE")
+item.append("supplier_items", {
+    "supplier": "SUP-0001",  # Amul Dairy
+    "supplier_part_no": "WM-500L",
+})
+item.append("supplier_items", {
+    "supplier": "SUP-0002",  # Mother Dairy
+    "supplier_part_no": "FM-500L",
+})
+item.save()
+```
+
+## Request for Quotation (RFQ)
+
+An RFQ is sent to multiple suppliers at once to get competitive quotes. You list
+the items you need plus the suppliers to ask, then `submit()` and `send_to_supplier()`
+to email them:
+
+```python title="Sending an RFQ to three packaging suppliers" {26-28}
+def create_rfq_for_packaging():
+    """Send RFQ to 3 suppliers for packaging materials."""
+    rfq = frappe.new_doc("Request for Quotation")
+    rfq.company = "ScoopJoy Ice Creams Pvt Ltd"
+    rfq.transaction_date = frappe.utils.today()
+    rfq.message_for_supplier = (
+        "Please provide your best quote for the following "
+        "packaging materials. Delivery required within 14 days."
+    )
+
+    # Items needed
+    rfq.append("items", {
+        "item_code": "PKG-TUB-500",
+        "item_name": "Ice Cream Tub 500ml",
+        "qty": 10000,
+        "warehouse": "Central Warehouse - SJ",
+        "uom": "Nos",
+        "schedule_date": frappe.utils.add_days(frappe.utils.today(), 14)
+    })
+    rfq.append("items", {
+        "item_code": "PKG-LID-500",
+        "item_name": "Tub Lid 500ml",
+        "qty": 10000,
+        "warehouse": "Central Warehouse - SJ",
+        "uom": "Nos",
+        "schedule_date": frappe.utils.add_days(frappe.utils.today(), 14)
+    })
+
+    # Suppliers to send RFQ to
+    rfq.append("suppliers", {"supplier": "SUP-PKG-01"})  # PackWell India
+    rfq.append("suppliers", {"supplier": "SUP-PKG-02"})  # GreenPack Ltd
+    rfq.append("suppliers", {"supplier": "SUP-PKG-03"})  # QuickPack Co
+
+    rfq.insert()
+    rfq.submit()
+
+    # Send emails to suppliers
+    rfq.send_to_supplier()
+
+    return rfq.name
+```
+
+Suppliers can respond through the **Supplier Portal** (if enabled) or the quotes
+can be entered manually as Supplier Quotations.
+
+### Comparing supplier quotations
+
+After receiving responses, use the **Supplier Quotation Comparison** tool.
+Navigate to **Buying › Supplier Quotation › Compare Supplier Quotations** and
+select the RFQ. The system displays a side-by-side comparison of prices, lead
+times, and terms.
+
+## Purchase Order with approval workflow
+
+### Creating a Purchase Order
+
+Once you've picked a supplier and rates, turn that into a confirmed Purchase
+Order:
+
+```python title="Creating a Purchase Order"
+def create_purchase_order(supplier, items, delivery_date):
+    """Create a PO from selected supplier quotation."""
+    po = frappe.new_doc("Purchase Order")
+    po.supplier = supplier
+    po.company = "ScoopJoy Ice Creams Pvt Ltd"
+    po.schedule_date = delivery_date
+
+    for item in items:
+        po.append("items", {
+            "item_code": item["item_code"],
+            "qty": item["qty"],
+            "rate": item["rate"],
+            "warehouse": "Central Warehouse - SJ",
+            "schedule_date": delivery_date
+        })
+
+    po.insert()
+    return po.name
+```
+
+### Approval workflow for high-value POs
+
+Set up a Workflow to require manager approval for POs above a threshold. The
+workflow defines **states** (which `doc_status` each maps to and who may edit it)
+and **transitions** (the actions that move a document between states, gated by a
+role and an optional condition):
+
+```python title="Purchase Order approval workflow" {28-33}
+def setup_po_approval_workflow():
+    """Create approval workflow for Purchase Orders above INR 50,000."""
+    workflow = frappe.new_doc("Workflow")
+    workflow.workflow_name = "Purchase Order Approval"
+    workflow.document_type = "Purchase Order"
+    workflow.is_active = 1
+    workflow.send_email_alert = 1
+
+    # States
+    workflow.append("states", {
+        "state": "Draft",
+        "doc_status": "0",
+        "allow_edit": "Purchase User"
+    })
+    workflow.append("states", {
+        "state": "Pending Approval",
+        "doc_status": "0",
+        "allow_edit": "Purchase Manager"
+    })
+    workflow.append("states", {
+        "state": "Approved",
+        "doc_status": "1",
+        "allow_edit": "Purchase Manager"
+    })
+    workflow.append("states", {
+        "state": "Rejected",
+        "doc_status": "0",  # Draft -- rejected PO returns to draft so it can be amended
+        "allow_edit": "Purchase Manager"
+    })
+
+    # Transitions
+    workflow.append("transitions", {
+        "state": "Draft",
+        "action": "Submit for Approval",
+        "next_state": "Pending Approval",
+        "allowed": "Purchase User",
+        "condition": "doc.grand_total > 50000"
+    })
+    workflow.append("transitions", {
+        "state": "Draft",
+        "action": "Submit",
+        "next_state": "Approved",
+        "allowed": "Purchase User",
+        "condition": "doc.grand_total <= 50000"
+    })
+    workflow.append("transitions", {
+        "state": "Pending Approval",
+        "action": "Approve",
+        "next_state": "Approved",
+        "allowed": "Purchase Manager"
+    })
+    workflow.append("transitions", {
+        "state": "Pending Approval",
+        "action": "Reject",
+        "next_state": "Rejected",
+        "allowed": "Purchase Manager"
+    })
+
+    workflow.insert()
+    return workflow.name
+```
+
+<Aside type="tip" title="Pro tip">
+Combine workflow approval with ERPNext's built-in Authorization Rule. Set
+**Buying › Authorization Rule** to block Purchase Orders above a certain amount
+unless approved by a specific role — this works as a safety net even without a
+workflow.
+</Aside>
+
+## Purchase Receipt and quality inspection
+
+### Purchase Receipt
+
+When goods arrive, create a Purchase Receipt directly from the PO. The helper
+`make_purchase_receipt` pre-fills items from the order so you only adjust
+received quantities:
+
+```python title="Receiving goods against a PO"
+from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
+
+pr = make_purchase_receipt("PO-00042")
+# Optionally adjust received quantities
+for item in pr.items:
+    item.received_qty = item.qty  # Full delivery
+    item.qty = item.qty
+pr.insert()
+pr.submit()
+```
+
+### Quality inspection
+
+For items requiring inspection (e.g. milk quality), enable quality inspection in
+the Item master and create an inspection template that lists the parameters and
+their acceptable ranges:
+
+```python title="Quality inspection template for milk"
+# Enable quality inspection for milk
+item = frappe.get_doc("Item", "RM-MILK-WHOLE")
+item.inspection_required_before_purchase = 1
+item.quality_inspection_template = "Milk Quality Check"
+item.save()
+
+# Create the quality inspection template
+template = frappe.new_doc("Quality Inspection Template")
+template.quality_inspection_template_name = "Milk Quality Check"
+template.append("item_quality_inspection_parameter", {
+    "specification": "Fat Content",
+    "min_value": 3.0,
+    "max_value": 4.5
+})
+template.append("item_quality_inspection_parameter", {
+    "specification": "Temperature (Celsius)",
+    "min_value": 2,
+    "max_value": 6
+})
+template.append("item_quality_inspection_parameter", {
+    "specification": "pH Level",
+    "min_value": 6.5,
+    "max_value": 6.8
+})
+template.insert()
+```
+
+When a Purchase Receipt is created for milk, the system enforces quality
+inspection before the receipt can be submitted.
+
+## Subcontracting
+
+Subcontracting in ERPNext means sending raw materials to a supplier who processes
+them into finished or semi-finished goods. ERPNext v16 enhances this with inward
+subcontracting and stock reservation.
+
+### Outward subcontracting
+
+ScoopJoy sends fruit pulp to a supplier for pasteurization. First, mark the item
+for subcontracting using the modern field (the legacy `is_sub_contracted_item`
+flag is gone) and give it a default BOM:
+
+```python title="Configuring a subcontracted item"
+item = frappe.get_doc("Item", "RM-MANGO-PULP-PASTEURIZED")
+# On the Item master, enable subcontracting.
+# The legacy `item.is_sub_contracted_item` field is no longer used.
+
+# Instead, set the correct v14+ field:
+item.supply_raw_materials_for_purchase = 1
+item.default_bom = "BOM-RM-MANGO-PULP-PASTEURIZED-001"
+item.save()
+
+# The BOM lists raw mango pulp as the input
+# BOM: Pasteurized Mango Pulp
+#   - Raw Mango Pulp: 1.1 kg (10% processing loss)
+```
+
+<Aside type="tip" title="Pro tip">
+In v15/v16, outward subcontracting uses the **Subcontracting Order** DocType
+instead of Purchase Orders with `is_subcontracted`. The legacy PO-based approach
+still works but is deprecated.
+</Aside>
+
+The modern flow is a three-document chain:
+
+<Mermaid title="v15/v16 subcontracting flow" height={300} code={`
+flowchart LR
+  SCO["Subcontracting Order"] --> SE["Stock Entry<br/>(Send to Subcontractor)"]
+  SE --> SCR["Subcontracting Receipt"]
+`} />
+
+Create a Subcontracting Order with the processing charge as the rate; ERPNext
+auto-generates the material transfer to the supplier's warehouse:
+
+```python title="Creating a Subcontracting Order"
+sc_order = frappe.new_doc("Subcontracting Order")
+sc_order.supplier = "SUP-PROCESS-01"  # Pasteurization supplier
+sc_order.supplier_warehouse = "Supplier Warehouse - SJ"
+
+sc_order.append("items", {
+    "item_code": "RM-MANGO-PULP-PASTEURIZED",
+    "qty": 500,  # kg
+    "rate": 25,  # Processing charge per kg
+    "warehouse": "Central Warehouse - SJ",
+    "bom": "BOM-RM-MANGO-PULP-PASTEURIZED-001"
+})
+
+sc_order.insert()
+sc_order.submit()
+
+# ERPNext auto-generates the material transfer (Stock Entry) from the
+# Subcontracting Order to send raw materials to the supplier.
+```
+
+### v16 inward subcontracting
+
+In v16, you can also handle the reverse: a customer sends you raw materials, and
+you manufacture finished goods for them. This uses new DocTypes like
+Subcontracted Sales Order and Subcontracting Inward Order.
+
+## Supplier scorecard
+
+Track supplier performance over time. A Supplier Scorecard weights several
+criteria into a single grade, and **standings** map grade bands to actions — a
+poor grade can automatically block future RFQs and POs:
+
+```python title="Setting up a supplier scorecard" {5,28-37}
+def setup_supplier_scorecard(supplier):
+    """Set up scorecard for a key supplier."""
+    scorecard = frappe.new_doc("Supplier Scorecard")
+    scorecard.supplier = supplier
+    scorecard.weighting_function = "{total_score} / {max_score} * 100"
+
+    # Evaluation criteria
+    scorecard.append("criteria", {
+        "criteria_name": "Delivery Timeliness",
+        "weight": 40  # 40% weight
+    })
+    scorecard.append("criteria", {
+        "criteria_name": "Quality of Materials",
+        "weight": 35  # 35% weight
+    })
+    scorecard.append("criteria", {
+        "criteria_name": "Price Competitiveness",
+        "weight": 25  # 25% weight
+    })
+
+    # Scoring standings (what happens at each score level)
+    scorecard.append("standings", {
+        "standing_name": "Excellent",
+        "standing_color": "Green",
+        "min_grade": 80,
+        "max_grade": 100
+    })
+    scorecard.append("standings", {
+        "standing_name": "Acceptable",
+        "standing_color": "Yellow",
+        "min_grade": 50,
+        "max_grade": 80
+    })
+    scorecard.append("standings", {
+        "standing_name": "Poor",
+        "standing_color": "Red",
+        "min_grade": 0,
+        "max_grade": 50,
+        "prevent_rfqs": 1,  # Block RFQs for poor suppliers
+        "prevent_pos": 1    # Block POs for poor suppliers
+    })
+
+    scorecard.insert()
+    return scorecard.name
+```
+
+The scorecard criteria formulas reference built-in variables like
+`{total_accepted_items}` and `{total_received_items}`:
+
+```text title="Delivery timeliness formula"
+({total_accepted_items} / {total_received_items}) * 100
+  if {total_received_items} > 0 else 100
+```
+
+## Buying Settings
+
+Navigate to **Buying Settings** for module-wide defaults:
+
+| Setting | Recommended Value | Purpose |
+|---|---|---|
+| Supplier Naming By | Naming Series | Auto-generate IDs |
+| Default Supplier Group | All Supplier Groups | Catch-all |
+| Buying Price List | Standard Buying | Default price list |
+| Purchase Order Required | Yes | Enforce PO before receipt |
+| Purchase Receipt Required | Yes | Enforce receipt before invoice |
+| Maintain Same Rate Throughout Purchase Cycle | Yes | Prevent rate changes |
+| Allow Multiple Purchase Orders Against a Supplier's Invoice | No | Prevent duplicates |
+
+## Practical examples
+
+### Procurement setup for ice cream ingredients
+
+This sets up the core ingredient items with reorder levels so ERPNext can manage
+replenishment. Each item gets a `reorder_levels` row defining when and how much
+to reorder per warehouse:
+
+```python title="Setting up ingredient procurement"
+def setup_ingredient_procurement():
+    """Set up complete procurement for ScoopJoy ingredients."""
+
+    # Define ingredient items
+    ingredients = [
+        {
+            "item_code": "RM-MILK-WHOLE",
+            "item_name": "Whole Milk",
+            "item_group": "Raw Materials - Dairy",
+            "stock_uom": "Litre",
+            "safety_stock": 500,
+            "reorder_level": 200,
+            "reorder_qty": 1000,
+            "lead_time_days": 1
+        },
+        {
+            "item_code": "RM-SUGAR-WHITE",
+            "item_name": "White Sugar",
+            "item_group": "Raw Materials - Sweeteners",
+            "stock_uom": "Kg",
+            "safety_stock": 200,
+            "reorder_level": 100,
+            "reorder_qty": 500,
+            "lead_time_days": 3
+        },
+        {
+            "item_code": "RM-VANILLA-EXTRACT",
+            "item_name": "Vanilla Extract",
+            "item_group": "Raw Materials - Flavoring",
+            "stock_uom": "Litre",
+            "safety_stock": 20,
+            "reorder_level": 10,
+            "reorder_qty": 50,
+            "lead_time_days": 7
+        }
+    ]
+
+    for ing in ingredients:
+        if not frappe.db.exists("Item", ing["item_code"]):
+            item = frappe.new_doc("Item")
+            item.item_code = ing["item_code"]
+            item.item_name = ing["item_name"]
+            item.item_group = ing["item_group"]
+            item.stock_uom = ing["stock_uom"]
+            item.is_stock_item = 1
+
+            # Reorder configuration
+            item.append("reorder_levels", {
+                "warehouse": "Central Warehouse - SJ",
+                "warehouse_reorder_level": ing["reorder_level"],
+                "warehouse_reorder_qty": ing["reorder_qty"],
+                "material_request_type": "Purchase"
+            })
+
+            item.safety_stock = ing["safety_stock"]
+            item.lead_time_days = ing["lead_time_days"]
+            item.insert()
+
+    frappe.db.commit()
+```
+
+### RFQ process for three packaging suppliers
+
+<Steps>
+
+1. **Create the RFQ** using the code in [Request for Quotation](#request-for-quotation-rfq) above.
+
+2. **Suppliers respond with quotations.** Use `make_supplier_quotation_from_rfq`
+   to scaffold each supplier's quote, then fill in their rates and lead times:
+
+   ```python title="Entering supplier responses to an RFQ"
+   def enter_supplier_quotation(rfq_name, supplier, quotes):
+       """Enter a supplier's response to an RFQ."""
+       from erpnext.buying.doctype.request_for_quotation.request_for_quotation import (
+           make_supplier_quotation_from_rfq,
+       )
+
+       sq = make_supplier_quotation_from_rfq(rfq_name, for_supplier=supplier)
+
+       for i, item in enumerate(sq.items):
+           item.rate = quotes[i]["rate"]
+           item.lead_time_days = quotes[i].get("lead_time_days", 14)
+
+       sq.insert()
+       sq.submit()
+       return sq.name
+
+   # Enter quotes from each supplier
+   enter_supplier_quotation("RFQ-00001", "SUP-PKG-01", [
+       {"rate": 3.50, "lead_time_days": 10},  # Tubs
+       {"rate": 1.20, "lead_time_days": 10}   # Lids
+   ])
+   enter_supplier_quotation("RFQ-00001", "SUP-PKG-02", [
+       {"rate": 3.20, "lead_time_days": 14},  # Tubs -- cheaper
+       {"rate": 1.35, "lead_time_days": 14}   # Lids
+   ])
+   enter_supplier_quotation("RFQ-00001", "SUP-PKG-03", [
+       {"rate": 3.80, "lead_time_days": 7},   # Tubs -- fastest
+       {"rate": 1.10, "lead_time_days": 7}    # Lids -- cheapest
+   ])
+   ```
+
+3. **Compare and select.** Navigate to **Buying › Supplier Quotation › Compare
+   Supplier Quotations**. The comparison report shows PackWell (SUP-PKG-01) is
+   balanced, GreenPack (SUP-PKG-02) is cheapest for tubs, and QuickPack
+   (SUP-PKG-03) is fastest.
+
+4. **Create the PO** from the selected quotation:
+
+   ```python title="Creating a PO from the chosen quotation"
+   from erpnext.buying.doctype.supplier_quotation.supplier_quotation import make_purchase_order
+
+   po = make_purchase_order("SQ-00002")  # GreenPack -- best overall value
+   po.schedule_date = frappe.utils.add_days(frappe.utils.today(), 14)
+   po.insert()
+   po.submit()
+   ```
+
+</Steps>
+
+### PO approval workflow in practice
+
+With the workflow from [Approval workflow for high-value POs](#approval-workflow-for-high-value-pos)
+in place, the threshold condition routes orders automatically:
+
+<Mermaid title="PO routing by amount" height={420} code={`
+flowchart TB
+  A["Purchase User creates PO<br/>INR 75,000"] --> B["Pending Approval"]
+  B --> C["Purchase Manager<br/>gets email notification"]
+  C --> D["Manager reviews & clicks Approve"]
+  D --> E["Approved<br/>(doc_status = 1, Submitted)"]
+  E --> F["Supplier receives PO via email"]
+  G["Purchase User creates PO<br/>INR 30,000"] -->|"amount <= 50,000"| H["Direct submit to Approved<br/>(no approval needed)"]
+`} />
+
+### Automated Material Request from reorder levels
+
+ERPNext can auto-generate Material Requests when stock falls below reorder levels.
+Enable it in **Stock Settings** and let the scheduler check daily:
+
+```python title="Enabling auto Material Requests"
+# Configure reorder in Stock Settings
+stock_settings = frappe.get_single("Stock Settings")
+stock_settings.auto_indent = 1  # Auto Material Request
+stock_settings.reorder_email_notify = 1
+stock_settings.save()
+```
+
+How it works:
+
+1. The scheduler runs `reorder_item()` periodically.
+2. For each item with reorder levels configured, it checks projected quantity.
+3. If projected qty falls below the reorder level, a Material Request is auto-created.
+4. The Material Request type (Purchase, Manufacture, Transfer) is set per the
+   item's reorder configuration.
+
+```python title="Checking an item's projected quantity"
+# Check projected quantity for an item
+from erpnext.stock.utils import get_latest_stock_qty
+
+projected = frappe.db.get_value("Bin", {
+    "item_code": "RM-MILK-WHOLE",
+    "warehouse": "Central Warehouse - SJ"
+}, "projected_qty")
+
+print(f"Projected qty: {projected}")
+# If projected_qty < reorder_level, Material Request is auto-created
+```
+
+<Aside type="tip" title="Pro tip">
+Set `safety_stock` on items to account for demand variability. The reorder
+calculation uses: `Reorder if projected_qty < (reorder_level + safety_stock)`.
+</Aside>

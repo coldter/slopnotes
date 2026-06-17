@@ -1,0 +1,566 @@
+---
+title: Docker Production Build Pipeline
+description: Build a custom, multi-stage Docker image with your Frappe apps and deploy with a zero-downtime rolling update pipeline.
+sidebar:
+  order: 8
+---
+
+import { LinkCard, Steps, FileTree } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a custom Docker image containing ScoopJoy's custom apps and deploy it to production using a reliable build and deployment pipeline.
+
+**Solution:** Establish a reproducible container build environment and automated deployment scripts. The pipeline uses a multi-stage Docker build to keep production images lightweight, a Docker Compose stack to scale services, a deployment shell script to achieve zero-downtime rolling updates, and a Makefile to simplify daily administration tasks.
+
+### Project Layout
+
+Here is the directory structure for your Docker build setup:
+
+<FileTree>
+- apps.json List of custom apps to build into the image
+- Containerfile Multi-stage Docker build file
+- docker-compose.yml Services stack (backend, workers, scheduler, web, database, caching)
+- .env.template Environment template file
+- Makefile Command runner for developer operations
+- scripts/
+  - build_and_deploy.sh Rolling update build and deployment script
+</FileTree>
+
+<Steps>
+
+1. **Define custom apps (`apps.json`)**
+
+   Create `apps.json` in the root of your build directory to define which apps will be pulled from Git and installed into the Frappe bench. This includes core Frappe/ERPNext repositories as well as custom apps (e.g., `scoopjoy-erp`).
+
+   ```json title="apps.json"
+   [
+       {
+           "url": "https://github.com/frappe/erpnext",
+           "branch": "version-16"
+       },
+       {
+           "url": "https://github.com/frappe/hrms",
+           "branch": "version-16"
+       },
+       {
+           "url": "https://github.com/scoopjoy/scoopjoy-erp.git",
+           "branch": "main"
+       }
+   ]
+   ```
+
+2. **Configure multi-stage build (`Containerfile`)**
+
+   The `Containerfile` executes a multi-stage Docker build. The `builder` stage resolves Python/Node dependencies and compiles frontend assets in a temporary `frappe/bench` container. The `production` stage starts with a clean runtime base (`frappe/frappe`) and copies only the compiled assets, dependencies, and apps from the builder, ensuring a minimal final image.
+
+   ```dockerfile title="Containerfile"
+   # Based on frappe_docker/images/custom/Containerfile
+   # Ref: https://github.com/frappe/frappe_docker/blob/main/images/custom/Containerfile
+
+   ARG FRAPPE_VERSION=16.0
+   ARG PYTHON_VERSION=3.12
+   ARG NODE_VERSION=20
+
+   # ============================================
+   # Stage 1: Build assets and install apps
+   # ============================================
+   FROM frappe/bench:latest AS builder
+
+   ARG FRAPPE_VERSION
+   ARG APPS_JSON_BASE64
+
+   USER frappe
+   WORKDIR /home/frappe/frappe-bench
+
+   # Initialize bench with Frappe
+   RUN bench init \
+       --frappe-branch version-${FRAPPE_VERSION} \
+       --skip-redis-config-generation \
+       --no-procfile \
+       --no-backups \
+       --skip-assets \
+       --verbose \
+       /home/frappe/frappe-bench
+
+   # Install apps from apps.json
+   RUN if [ -n "$APPS_JSON_BASE64" ]; then \
+           echo "$APPS_JSON_BASE64" | base64 -d > /home/frappe/frappe-bench/apps.json; \
+       fi
+
+   COPY apps.json /home/frappe/frappe-bench/apps.json 2>/dev/null || true
+
+   RUN bench setup requirements --dev \
+       && cat apps.json | python -c "
+   import sys, json
+   apps = json.load(sys.stdin)
+   for app in apps:
+       print(app['url'], app.get('branch', 'main'))
+   " | while read url branch; do \
+           app_name=\$(basename \$url .git); \
+           if [ "\$app_name" != "frappe" ]; then \
+               bench get-app --branch \$branch --skip-assets \$url; \
+           fi; \
+       done
+
+   # Build frontend assets
+   RUN bench build --production
+
+   # ============================================
+   # Stage 2: Production runtime image
+   # ============================================
+   FROM frappe/frappe:v${FRAPPE_VERSION} AS production
+
+   # Copy built apps and assets from builder
+   COPY --from=builder /home/frappe/frappe-bench/apps /home/frappe/frappe-bench/apps
+   COPY --from=builder /home/frappe/frappe-bench/sites/assets /home/frappe/frappe-bench/sites/assets
+   COPY --from=builder /home/frappe/frappe-bench/env /home/frappe/frappe-bench/env
+
+   # Custom: copy nginx template overrides if needed
+   # COPY resources/nginx-template.conf /templates/nginx/frappe.conf.template
+
+   USER frappe
+   WORKDIR /home/frappe/frappe-bench
+
+   # Health check
+   HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+       CMD curl -fsSL http://localhost:8000/api/method/ping || exit 1
+
+   EXPOSE 8000
+   ```
+
+3. **Define production services (`docker-compose.yml`)**
+
+   Define the complete production topology in `docker-compose.yml`. This splits the single-bench environment into decoupled containers for the web server, background workers (separated by queue priority), scheduler, websocket server, database, and Redis instances.
+
+   ```yaml title="docker-compose.yml"
+   # Production deployment for ScoopJoy ERP
+
+   x-common-env: &common-env
+     DB_HOST: mariadb
+     DB_PORT: "3306"
+     REDIS_CACHE: redis-cache:6379
+     REDIS_QUEUE: redis-queue:6379
+     SOCKETIO_PORT: "9000"
+
+   x-backend-defaults: &backend-defaults
+     image: ${SCOOPJOY_IMAGE:-ghcr.io/scoopjoy/erp:latest}
+     restart: unless-stopped
+     env_file:
+       - .env
+     environment:
+       <<: *common-env
+     volumes:
+       - sites-vol:/home/frappe/frappe-bench/sites
+       - logs-vol:/home/frappe/frappe-bench/logs
+
+   services:
+     # === Application Services ===
+
+     backend:
+       <<: *backend-defaults
+       command: >
+         bench serve
+         --port 8000
+         --with-request-logging
+       deploy:
+         replicas: 2
+         resources:
+           limits:
+             memory: 1G
+             cpus: "1.0"
+           reservations:
+             memory: 512M
+
+     websocket:
+       <<: *backend-defaults
+       command: node /home/frappe/frappe-bench/apps/frappe/socketio.js
+       deploy:
+         resources:
+           limits:
+             memory: 256M
+
+     queue-default:
+       <<: *backend-defaults
+       command: bench worker --queue default
+
+     queue-short:
+       <<: *backend-defaults
+       command: bench worker --queue short
+
+     queue-long:
+       <<: *backend-defaults
+       command: bench worker --queue long
+
+     scheduler:
+       <<: *backend-defaults
+       command: bench schedule
+
+     # === Infrastructure Services ===
+
+     frontend:
+       image: frappe/frappe-nginx:v16
+       restart: unless-stopped
+       depends_on:
+         - backend
+         - websocket
+       ports:
+         - "${HTTP_PORT:-8080}:8080"
+       volumes:
+         - sites-vol:/home/frappe/frappe-bench/sites:ro
+       environment:
+         BACKEND: backend:8000
+         SOCKETIO: websocket:9000
+         UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+         UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+         UPSTREAM_REAL_IP_RECURSIVE: "on"
+         PROXY_READ_TIMEOUT: "120"
+         CLIENT_MAX_BODY_SIZE: "50m"
+
+     mariadb:
+       image: mariadb:11.4
+       restart: unless-stopped
+       command:
+         - --character-set-server=utf8mb4
+         - --collation-server=utf8mb4_unicode_ci
+         - --skip-character-set-client-handshake
+         - --skip-innodb-read-only-compressed
+         - --innodb-buffer-pool-size=2G
+         - --innodb-log-file-size=256M
+         - --innodb-flush-log-at-trx-commit=2
+         - --max-connections=200
+         - --slow-query-log=1
+         - --slow-query-log-file=/var/log/mysql/slow.log
+         - --long-query-time=2
+       environment:
+         MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+       volumes:
+         - mariadb-vol:/var/lib/mysql
+         - mariadb-logs:/var/log/mysql
+       secrets:
+         - db_root_password
+       healthcheck:
+         test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "--password=$$MYSQL_ROOT_PASSWORD"]
+         interval: 10s
+         timeout: 5s
+         retries: 5
+
+     redis-cache:
+       image: redis:7-alpine
+       restart: unless-stopped
+       command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+       volumes:
+         - redis-cache-vol:/data
+       healthcheck:
+         test: ["CMD", "redis-cli", "ping"]
+         interval: 10s
+
+     redis-queue:
+       image: redis:7-alpine
+       restart: unless-stopped
+       command: redis-server --maxmemory 256mb --save 60 1000
+       volumes:
+         - redis-queue-vol:/data
+       healthcheck:
+         test: ["CMD", "redis-cli", "ping"]
+         interval: 10s
+
+   # === Volumes ===
+   volumes:
+     sites-vol:
+     logs-vol:
+     mariadb-vol:
+     mariadb-logs:
+     redis-cache-vol:
+     redis-queue-vol:
+
+   # === Secrets ===
+   secrets:
+     db_root_password:
+       file: ./secrets/db_root_password.txt
+   ```
+
+4. **Template environment variables (`.env.template`)**
+
+   Provide a template for environment variables (`.env.template`) specifying database connections, email setup, backups, and app-specific integrations. Copy this to `.env` on the host and customize the values (never check `.env` into version control).
+
+   ```bash title=".env.template"
+   # Copy to .env and fill in values. NEVER commit .env to git.
+
+   # === Image ===
+   SCOOPJOY_IMAGE=ghcr.io/scoopjoy/erp:latest
+
+   # === Networking ===
+   HTTP_PORT=8080
+
+   # === Frappe Site ===
+   FRAPPE_SITE_NAME_HEADER=erp.scoopjoy.com
+
+   # === Database ===
+   DB_HOST=mariadb
+   DB_PORT=3306
+
+   # === Redis ===
+   REDIS_CACHE=redis-cache:6379
+   REDIS_QUEUE=redis-queue:6379
+
+   # === Email ===
+   MAIL_SERVER=smtp.gmail.com
+   MAIL_PORT=587
+   MAIL_LOGIN=erp-notifications@scoopjoy.com
+   MAIL_PASSWORD=changeme
+   MAIL_USE_TLS=1
+
+   # === Backup ===
+   SCOOPJOY_BACKUP_BUCKET=scoopjoy-backups
+   SCOOPJOY_BACKUP_REGION=ap-south-1
+   AWS_ACCESS_KEY_ID=changeme
+   AWS_SECRET_ACCESS_KEY=changeme
+
+   # === App Secrets ===
+   SCOOPJOY_RAZORPAY_KEY_ID=rzp_live_changeme
+   SCOOPJOY_RAZORPAY_KEY_SECRET=changeme
+   ```
+
+5. **Orchestrate deployment (`scripts/build_and_deploy.sh`)**
+
+   Automate the compilation and rolling deployment process using `scripts/build_and_deploy.sh`. The deployment logic ensures zero-downtime updates by scaling the backend container (using `--scale backend=2`), performing rolling container updates, checking health status before proceeding, running migrations via `bench migrate`, and clearing cache.
+
+   ```bash title="scripts/build_and_deploy.sh"
+   #!/bin/bash
+   set -euo pipefail
+
+   # Configuration
+   REGISTRY="ghcr.io/scoopjoy"
+   IMAGE_NAME="erp"
+   COMPOSE_FILE="docker-compose.yml"
+   DEPLOY_DIR="/opt/scoopjoy"
+
+   # Parse arguments
+   ACTION="${1:-build}"
+   TAG="${2:-$(git rev-parse --short HEAD)}"
+   FULL_IMAGE="${REGISTRY}/${IMAGE_NAME}"
+
+   log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+   build() {
+       log "Building image ${FULL_IMAGE}:${TAG}"
+
+       # Encode apps.json as base64
+       APPS_JSON_BASE64=$(base64 -w 0 apps.json)
+
+       docker build \
+           --build-arg FRAPPE_VERSION=16.0 \
+           --build-arg APPS_JSON_BASE64="${APPS_JSON_BASE64}" \
+           --tag "${FULL_IMAGE}:${TAG}" \
+           --tag "${FULL_IMAGE}:latest" \
+           --file Containerfile \
+           .
+
+       log "Build complete: ${FULL_IMAGE}:${TAG}"
+   }
+
+   push() {
+       log "Pushing ${FULL_IMAGE}:${TAG} and :latest"
+       docker push "${FULL_IMAGE}:${TAG}"
+       docker push "${FULL_IMAGE}:latest"
+       log "Push complete"
+   }
+
+   deploy() {
+       log "Deploying ${FULL_IMAGE}:${TAG} to production"
+
+       # Save current image tag for rollback
+       if [ -f "${DEPLOY_DIR}/.current-tag" ]; then
+           cp "${DEPLOY_DIR}/.current-tag" "${DEPLOY_DIR}/.previous-tag"
+       fi
+       echo "${TAG}" > "${DEPLOY_DIR}/.current-tag"
+
+       cd "${DEPLOY_DIR}"
+
+       # Pull new image
+       export SCOOPJOY_IMAGE="${FULL_IMAGE}:${TAG}"
+
+       # Zero-downtime rolling update
+       # Update backend workers first (no traffic impact)
+       docker compose up -d --no-deps queue-default queue-short queue-long scheduler
+       log "Workers updated"
+
+       # Update backend with rolling restart (2 replicas means zero downtime)
+       docker compose up -d --no-deps --scale backend=2 backend
+       log "Backend updated"
+
+       # Wait for health checks
+       sleep 10
+       docker compose ps backend | grep -q "healthy" || {
+           log "ERROR: Backend health check failed"
+           rollback
+           exit 1
+       }
+
+       # Update websocket and frontend
+       docker compose up -d --no-deps websocket frontend
+       log "Frontend updated"
+
+       # Run migrations
+       docker compose exec backend bench --site erp.scoopjoy.com migrate
+       log "Migrations complete"
+
+       # Clear cache
+       docker compose exec backend bench --site erp.scoopjoy.com clear-cache
+       log "Cache cleared"
+
+       log "Deployment complete: ${TAG}"
+   }
+
+   rollback() {
+       log "Rolling back to previous version"
+       cd "${DEPLOY_DIR}"
+
+       if [ ! -f "${DEPLOY_DIR}/.previous-tag" ]; then
+           log "ERROR: No previous tag found for rollback"
+           exit 1
+       fi
+
+       PREV_TAG=$(cat "${DEPLOY_DIR}/.previous-tag")
+       export SCOOPJOY_IMAGE="${FULL_IMAGE}:${PREV_TAG}"
+
+       docker compose up -d
+       log "Rolled back to ${PREV_TAG}"
+
+       # Swap tags
+       echo "${PREV_TAG}" > "${DEPLOY_DIR}/.current-tag"
+   }
+
+   case "${ACTION}" in
+       build)   build ;;
+       push)    push ;;
+       deploy)  deploy ;;
+       rollback) rollback ;;
+       all)     build && push && deploy ;;
+       *)
+           echo "Usage: $0 {build|push|deploy|rollback|all} [tag]"
+           exit 1
+           ;;
+   esac
+   ```
+
+6. **Maintain stack using `Makefile`**
+
+   Use a `Makefile` to provide simple, standardized developer shortcuts for everyday production administration tasks like database backups, restoring from S3, tailing logs, running test suites, or checking service health.
+
+   ```makefile title="Makefile"
+   # ScoopJoy ERP Docker Build Pipeline
+
+   REGISTRY    := ghcr.io/scoopjoy
+   IMAGE       := erp
+   TAG         ?= $(shell git rev-parse --short HEAD)
+   FULL_IMAGE  := $(REGISTRY)/$(IMAGE)
+   COMPOSE     := docker compose
+   SITE        := erp.scoopjoy.com
+   DEPLOY_DIR  := /opt/scoopjoy
+
+   .PHONY: help build push deploy rollback shell logs backup restore test clean
+
+   help: ## Show this help
+   	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+   		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+
+   # === Build ===
+
+   build: ## Build Docker image (TAG=<git-sha>)
+   	@echo "Building $(FULL_IMAGE):$(TAG)"
+   	docker build \
+   		--build-arg FRAPPE_VERSION=16.0 \
+   		--build-arg APPS_JSON_BASE64=$$(base64 -w 0 apps.json) \
+   		--tag $(FULL_IMAGE):$(TAG) \
+   		--tag $(FULL_IMAGE):latest \
+   		--file Containerfile .
+
+   push: ## Push image to registry
+   	docker push $(FULL_IMAGE):$(TAG)
+   	docker push $(FULL_IMAGE):latest
+
+   # === Deploy ===
+
+   deploy: ## Deploy to production with zero-downtime
+   	@bash scripts/build_and_deploy.sh deploy $(TAG)
+
+   rollback: ## Rollback to previous version
+   	@bash scripts/build_and_deploy.sh rollback
+
+   # === Operations ===
+
+   shell: ## Open shell in backend container
+   	$(COMPOSE) exec backend bash
+
+   console: ## Open Frappe console
+   	$(COMPOSE) exec backend bench --site $(SITE) console
+
+   logs: ## Tail all service logs
+   	$(COMPOSE) logs -f --tail=100
+
+   logs-backend: ## Tail backend logs only
+   	$(COMPOSE) logs -f --tail=100 backend
+
+   migrate: ## Run bench migrate
+   	$(COMPOSE) exec backend bench --site $(SITE) migrate
+
+   clear-cache: ## Clear Frappe cache
+   	$(COMPOSE) exec backend bench --site $(SITE) clear-cache
+
+   # === Backup ===
+
+   backup: ## Run backup and upload to S3
+   	$(COMPOSE) exec backend python3 scripts/backup_to_s3.py --site $(SITE)
+
+   restore: ## Restore from S3 (DATE=YYYY-MM-DD required)
+   	@test -n "$(DATE)" || (echo "Usage: make restore DATE=2026-03-20" && exit 1)
+   	$(COMPOSE) exec backend python3 scripts/restore_from_s3.py --site $(SITE) --date $(DATE)
+
+   # === Testing ===
+
+   test: ## Run all tests
+   	$(COMPOSE) exec backend bench --site test_site run-tests --app scoopjoy
+
+   test-unit: ## Run unit tests only
+   	$(COMPOSE) exec backend bench --site test_site run-tests --app scoopjoy -k "Unit"
+
+   test-doctype: ## Run tests for a specific doctype (DT="Franchise Outlet")
+   	@test -n "$(DT)" || (echo "Usage: make test-doctype DT='Franchise Outlet'" && exit 1)
+   	$(COMPOSE) exec backend bench --site test_site run-tests --doctype "$(DT)"
+
+   # === Maintenance ===
+
+   up: ## Start all services
+   	$(COMPOSE) up -d
+
+   down: ## Stop all services
+   	$(COMPOSE) down
+
+   restart: ## Restart all services
+   	$(COMPOSE) restart
+
+   ps: ## Show running services
+   	$(COMPOSE) ps
+
+   health: ## Check health of all services
+   	@$(COMPOSE) ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
+
+   clean: ## Remove stopped containers and dangling images
+   	docker system prune -f
+   	docker image prune -f
+   ```
+
+</Steps>
+
+:::note[Why this works]
+- **Multi-stage `Containerfile`:** Build dependencies (such as Node.js, `npm` packages, and build tools) exist only in the temporary `builder` stage. The final production image only copies the compiled assets, virtual environment, and apps, keeping the production image compact, lightweight, and secure.
+- **Worker Separation:** The `docker-compose.yml` runs separate container processes for backend queues based on priority (`default`, `short`, `long`). This ensures long-running tasks (like bulk PDF exports) do not starve critical short tasks (like REST API responses).
+- **Rolling Deployment:** The deploy script scales `backend` to 2 replicas during deployment. By using `--scale backend=2 --no-deps` along with Docker's rolling restart, Nginx continues routing traffic to the healthy, running container while the other container is updated and verified via the `/api/method/ping` health check.
+:::
+
+:::caution[Common mistake]
+- **Dynamic app installation:** Running `bench get-app` inside a running production container creates a stateful container. It cannot be reliably reproduced, and the installed app will be lost when the container is replaced or scaled. Always define applications in `apps.json` and build a fresh image for every code or configuration change.
+- **Orphaned data volumes:** Forgetting to persist the `sites` volume. In a containerized Frappe setup, the `sites` directory contains `site_config.json` (with database credentials and encryption keys), site-specific public uploads, and the site's `private` directory (with backups and private attachments). Losing or failing to mount this volume means permanent loss of your site configurations and files.
+:::

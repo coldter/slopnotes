@@ -1,0 +1,274 @@
+---
+title: API Endpoint Testing
+description: Test whitelisted API methods, REST client calls, and rate-limiting from integration tests in Frappe.
+sidebar:
+  order: 3
+---
+
+import { LinkCard, Steps } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Test whitelisted API methods, role-based permissions, and rate limits in ScoopJoy as if calling from an external mobile or web client.
+
+**Solution:** Write integration tests in Frappe using the `IntegrationTestCase` class. By simulating sessions with `frappe.set_user()`, invoking whitelisted endpoints using `frappe.call()`, and using `frappe.client` CRUD operations, you can thoroughly test authentication, authorization, validation, file uploads, and rate limits without triggering actual HTTP requests.
+
+```python title="apps/scoopjoy/scoopjoy/tests/test_api_endpoints.py"
+import frappe
+import json
+from frappe.tests import IntegrationTestCase
+from unittest.mock import patch
+
+from scoopjoy.tests.factory import (
+    create_test_outlet,
+    create_test_agreement,
+    create_test_user,
+)
+
+EXTRA_TEST_RECORD_DEPENDENCIES = ["Item", "Customer"]
+
+
+class TestMobileAppAPI(IntegrationTestCase):
+    """Test the mobile app API layer end-to-end."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.outlet = create_test_outlet(outlet_name="API Test Outlet")
+        cls.agreement = create_test_agreement(outlet=cls.outlet, royalty_percentage=8.0)
+
+        # Create API test users
+        cls.manager_user = create_test_user(
+            "api-manager@scoopjoy.com",
+            roles=["Franchise Manager"],
+            franchise_outlet=cls.outlet.name,
+        )
+        cls.staff_user = create_test_user(
+            "api-staff@scoopjoy.com",
+            roles=["Franchise Staff"],
+            franchise_outlet=cls.outlet.name,
+        )
+        cls.outsider_user = create_test_user(
+            "api-outsider@scoopjoy.com",
+            roles=["Franchise Staff"],
+            # no outlet permission -- outsider
+        )
+
+    # --- Testing frappe.client methods ---
+
+    def test_get_outlet_details_via_client(self):
+        """Test reading outlet data via frappe.client.get."""
+        frappe.set_user("api-manager@scoopjoy.com")
+        try:
+            result = frappe.client.get(
+                "Franchise Outlet", self.outlet.name
+            )
+            self.assertEqual(result.outlet_name, "API Test Outlet")
+            self.assertIn("outlet_code", result)
+        finally:
+            frappe.set_user("Administrator")
+
+    def test_insert_via_client(self):
+        """Test creating a document via frappe.client.insert."""
+        frappe.set_user("Administrator")
+        doc = frappe.client.insert(
+            {
+                "doctype": "Franchise Outlet",
+                "outlet_name": "Client Insert Test",
+                "outlet_code": f"SJ-CLI-{frappe.generate_hash(length=4).upper()}",
+                "city": "Chennai",
+                "state": "Tamil Nadu",
+                "franchise_owner": "test-franchise@scoopjoy.com",
+                "status": "Active",
+                "seating_capacity": 20,
+                "monthly_rent": 40000,
+                "agreement_start_date": "2025-01-01",
+                "agreement_end_date": "2028-01-01",
+            }
+        )
+        self.assertTrue(doc.name)
+        self.assertEqual(doc.city, "Chennai")
+
+    # --- Testing whitelisted API methods ---
+
+    def test_get_outlet_dashboard_data(self):
+        """Test the whitelisted dashboard endpoint."""
+        frappe.set_user("api-manager@scoopjoy.com")
+        try:
+            result = frappe.call(
+                "scoopjoy.api.mobile.get_outlet_dashboard",
+                outlet=self.outlet.name,
+            )
+            self.assertIn("total_revenue", result)
+            self.assertIn("pending_orders", result)
+            self.assertIn("royalty_due", result)
+        finally:
+            frappe.set_user("Administrator")
+
+    def test_get_outlet_dashboard_wrong_user(self):
+        """Outsider user cannot access another outlet's dashboard."""
+        frappe.set_user("api-outsider@scoopjoy.com")
+        try:
+            with self.assertRaises(frappe.PermissionError):
+                frappe.call(
+                    "scoopjoy.api.mobile.get_outlet_dashboard",
+                    outlet=self.outlet.name,
+                )
+        finally:
+            frappe.set_user("Administrator")
+
+    # --- Testing authentication scenarios ---
+
+    def test_guest_cannot_access_api(self):
+        """Guest user is blocked from whitelisted methods."""
+        frappe.set_user("Guest")
+        try:
+            with self.assertRaises(frappe.PermissionError):
+                frappe.call(
+                    "scoopjoy.api.mobile.get_outlet_dashboard",
+                    outlet=self.outlet.name,
+                )
+        finally:
+            frappe.set_user("Administrator")
+
+    def test_api_with_token_auth_simulation(self):
+        """Simulate token-based auth by setting user from token."""
+        # Generate API keys for the manager user
+        user_doc = frappe.get_doc("User", "api-manager@scoopjoy.com")
+        api_key = frappe.generate_hash(length=15)
+        api_secret = frappe.generate_hash(length=15)
+        user_doc.api_key = api_key
+        user_doc.api_secret = api_secret
+        user_doc.save(ignore_permissions=True)
+
+        # Validate token resolves to correct user
+        validated_user = frappe.db.get_value(
+            "User", {"api_key": api_key}, "name"
+        )
+        self.assertEqual(validated_user, "api-manager@scoopjoy.com")
+
+    # --- Testing role-based access ---
+
+    def test_staff_cannot_delete_outlet(self):
+        """Franchise Staff role has no delete permission."""
+        frappe.set_user("api-staff@scoopjoy.com")
+        try:
+            self.assertFalse(
+                frappe.has_permission("Franchise Outlet", "delete", self.outlet.name)
+            )
+        finally:
+            frappe.set_user("Administrator")
+
+    def test_staff_can_read_outlet(self):
+        """Franchise Staff role can read their assigned outlet."""
+        frappe.set_user("api-staff@scoopjoy.com")
+        try:
+            self.assertTrue(
+                frappe.has_permission("Franchise Outlet", "read", self.outlet.name)
+            )
+        finally:
+            frappe.set_user("Administrator")
+
+    # --- Testing error responses ---
+
+    def test_invalid_outlet_returns_not_found(self):
+        """Requesting non-existent outlet returns DoesNotExistError."""
+        frappe.set_user("Administrator")
+        with self.assertRaises(frappe.DoesNotExistError):
+            frappe.get_doc("Franchise Outlet", "NONEXISTENT-OUTLET-999")
+
+    def test_validation_error_on_bad_input(self):
+        """API returns validation error for invalid data."""
+        frappe.set_user("Administrator")
+        with self.assertRaises(frappe.ValidationError):
+            frappe.call(
+                "scoopjoy.api.mobile.update_outlet_capacity",
+                outlet=self.outlet.name,
+                new_capacity=-10,  # invalid
+            )
+
+    # --- Testing file upload endpoint ---
+
+    def test_file_upload_to_outlet(self):
+        """Test uploading a compliance document to an outlet."""
+        frappe.set_user("api-manager@scoopjoy.com")
+        try:
+            file_doc = frappe.get_doc(
+                {
+                    "doctype": "File",
+                    "file_name": "test_fssai_license.pdf",
+                    "content": b"%PDF-1.4 test content",
+                    "attached_to_doctype": "Franchise Outlet",
+                    "attached_to_name": self.outlet.name,
+                    "is_private": 1,
+                }
+            )
+            file_doc.insert(ignore_permissions=False)  # test with permission check
+            self.assertTrue(file_doc.file_url)
+            self.assertEqual(file_doc.attached_to_name, self.outlet.name)
+        finally:
+            frappe.set_user("Administrator")
+
+    # --- Testing rate limiting ---
+
+    def test_rate_limit_decorator(self):
+        """Verify rate-limited endpoint raises after threshold."""
+        frappe.set_user("api-manager@scoopjoy.com")
+        try:
+            # The endpoint is decorated with @frappe.rate_limiter(limit=5, seconds=60)
+            for i in range(5):
+                frappe.call(
+                    "scoopjoy.api.mobile.get_item_availability",
+                    outlet=self.outlet.name,
+                )
+
+            # 6th call should be rate limited
+            with self.assertRaises(frappe.RateLimitExceededError):
+                frappe.call(
+                    "scoopjoy.api.mobile.get_item_availability",
+                    outlet=self.outlet.name,
+                )
+        finally:
+            frappe.set_user("Administrator")
+            # Clear rate limit cache
+            frappe.cache.delete_keys("rate_limit*")
+```
+
+### Walkthrough
+
+This test suite covers several integration testing strategies:
+
+- **REST Client Calls:** Methods starting with `test_..._via_client` test database interactions using `frappe.client.get()` and `frappe.client.insert()`, which simulates how external REST API clients interact with the schema.
+- **Whitelisted Endpoints:** `frappe.call()` simulates RPC/API requests to whitelisted methods like `scoopjoy.api.mobile.get_outlet_dashboard` with appropriate arguments.
+- **Context Switching:** Session context is manipulated via `frappe.set_user()` to test how the permission engine handles authorized users versus guest or outsider roles.
+- **Token Authentication:** Generation of keys and secrets on the `User` DocType is verified by matching the keys back to the validated user.
+- **File Operations:** Attachments are tested using the `File` DocType, ensuring private document restrictions are respected.
+- **Rate Limiting:** Consecutive calls are made to trigger `frappe.RateLimitExceededError` to confirm rate limit rules are enforced.
+
+### Running the Tests
+
+Follow these steps to run the API endpoint integration tests:
+
+<Steps>
+
+1. **Configure a Valid Site:**
+   Ensure you have a configured and running local test site (e.g., `scoopjoy.local`).
+
+2. **Execute the Test Command:**
+   Use the Bench CLI to run the specific test module:
+   ```bash
+   bench --site scoopjoy.local run-tests --module scoopjoy.tests.test_api_endpoints
+   ```
+
+3. **Observe Cache & Cleanup:**
+   Verify that the rate limiter's cache is cleared after the suite runs so subsequent tests are not blocked.
+
+</Steps>
+
+:::note[Why this works]
+`frappe.call()` invokes whitelisted methods the same way the HTTP layer does, including permission checks and rate limiting. `frappe.set_user()` switches the session context so you can test any role without actual HTTP requests. `frappe.client.get` and `frappe.client.insert` mirror the REST API behavior.
+:::
+
+:::caution[Common mistake]
+Not resetting the user back to `Administrator` in a `finally` block. If a test fails mid-execution with a non-admin user set, all subsequent tests in the class will run as that user, causing cascading permission failures.
+:::

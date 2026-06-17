@@ -1,0 +1,546 @@
+---
+title: Multi-Company & Multi-Tenant
+description: Choosing between multi-company, multi-site, and hybrid ERPNext topologies for a growing franchise — with inter-company transactions and consolidated reporting.
+sidebar:
+  order: 31
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+As ScoopJoy grows from a single outlet into a chain spanning cities, you have to
+choose the right architecture for data isolation, reporting, and operational
+independence. ERPNext offers several strategies: **multi-company** within a single
+site, **multi-site (multi-tenant)** with separate databases, or a hybrid. If you've
+ever weighed "one big Postgres database with a `tenant_id` column" against
+"a database per customer" in a Node.js SaaS, this is the same decision — Frappe just
+gives you both shapes out of the box. This chapter walks each option with concrete
+examples.
+
+## Multi-Company architecture in ERPNext
+
+ERPNext natively supports multiple companies within a single site. Each company gets
+its own chart of accounts, warehouses, cost centers, and financial statements, while
+sharing a common Item master, User pool, and system configuration.
+
+<Mermaid title="Parent + child company topology (single site)" height={360} code={`
+flowchart TB
+  G["ScoopJoy Group<br/>parent · is_group=1"] --> N["ScoopJoy - Outlet North"]
+  G --> S["ScoopJoy - Outlet South"]
+  G --> C["ScoopJoy - Central Kitchen"]
+  G --> H["ScoopJoy - Head Office"]
+  subgraph shared["Shared across all companies"]
+    I["Item master"]
+    U["Users"]
+    D["DocTypes / customizations"]
+  end
+`} />
+
+### Setting up the company hierarchy
+
+A company with `is_group=1` is a parent (a non-postable rollup node); the rest are
+children pointing at it via `parent_company`. Creating the parent first, then looping
+the outlets, is the whole setup.
+
+```python
+# Create the parent company
+parent = frappe.get_doc({
+    "doctype": "Company",
+    "company_name": "ScoopJoy Group",
+    "abbr": "SJG",
+    "country": "India",
+    "default_currency": "INR",
+    "is_group": 1,
+    "chart_of_accounts": "Standard"
+})
+parent.insert()
+
+# Create child companies for each outlet
+outlets = [
+    {"name": "ScoopJoy - Outlet North", "abbr": "SJN"},
+    {"name": "ScoopJoy - Outlet South", "abbr": "SJS"},
+    {"name": "ScoopJoy - Central Kitchen", "abbr": "SJC"},
+]
+
+for outlet in outlets:
+    child = frappe.get_doc({
+        "doctype": "Company",
+        "company_name": outlet["name"],
+        "abbr": outlet["abbr"],
+        "country": "India",
+        "default_currency": "INR",
+        "parent_company": "ScoopJoy Group",
+        "chart_of_accounts": "Standard"
+    })
+    child.insert()
+```
+
+When a child company is created, ERPNext automatically generates:
+
+- A full Chart of Accounts (copied from the template or parent)
+- Default warehouses (Stores, Finished Goods, etc.)
+- Default cost centers
+- Default accounts for payable, receivable, stock, etc.
+
+### Separate chart of accounts per company
+
+Each company maintains an independent chart of accounts. You can customize accounts
+per company while keeping a consistent structure — just filter by `company`:
+
+```python
+# Each company has its own accounts — query by company
+accounts = frappe.get_all("Account",
+    filters={"company": "ScoopJoy - Outlet North", "is_group": 0},
+    fields=["name", "account_type", "root_type"],
+    order_by="name"
+)
+```
+
+:::tip[Pro tip]
+Use the "Standard" chart of accounts template for all child companies to ensure
+consistency across outlets. This simplifies consolidated reporting.
+:::
+
+### Company-wise default accounts and settings
+
+Configure default accounts per company through the Company DocType. Note the
+account names carry the company abbreviation suffix (`- SJN`), which is how ERPNext
+namespaces accounts across companies in one database:
+
+```python
+company = frappe.get_doc("Company", "ScoopJoy - Outlet North")
+company.default_bank_account = "HDFC Bank - SJN"
+company.default_cash_account = "Cash - SJN"
+company.default_receivable_account = "Debtors - SJN"
+company.default_payable_account = "Creditors - SJN"
+company.default_expense_account = "Cost of Goods Sold - SJN"
+company.default_income_account = "Sales - SJN"
+company.cost_center = "Main - SJN"
+company.round_off_account = "Round Off - SJN"
+company.write_off_account = "Write Off - SJN"
+company.save()
+```
+
+### Shared Item master, separate stock per company
+
+Items are global — one "Vanilla Scoop 100ml" item serves all companies. Stock is
+tracked per warehouse, and warehouses belong to specific companies:
+
+```python
+# Same item, different warehouses per company
+# Outlet North warehouse
+warehouse_north = frappe.get_doc({
+    "doctype": "Warehouse",
+    "warehouse_name": "Finished Goods",
+    "company": "ScoopJoy - Outlet North",
+    "parent_warehouse": "All Warehouses - SJN"
+})
+warehouse_north.insert()
+
+# Check stock for same item across companies
+stock_north = frappe.db.get_value("Bin",
+    {"item_code": "VANILLA-100ML", "warehouse": "Finished Goods - SJN"},
+    "actual_qty"
+) or 0
+
+stock_south = frappe.db.get_value("Bin",
+    {"item_code": "VANILLA-100ML", "warehouse": "Finished Goods - SJS"},
+    "actual_qty"
+) or 0
+```
+
+## Inter-company transactions
+
+When the Central Kitchen produces ice cream and distributes to outlets, or when
+outlets transfer inventory to each other, ERPNext handles this through inter-company
+transactions. The flow is: declare which companies may transact, set up an internal
+customer/supplier pair, then post matching documents on both sides.
+
+<Mermaid title="Inter-company billing flow" height={300} code={`
+flowchart LR
+  C["Central Kitchen<br/>Sales Invoice"] -->|"to internal customer"| L["Inter-company link"]
+  L -->|"make_inter_company_purchase_invoice"| N["Outlet North<br/>Purchase Invoice"]
+`} />
+
+### Inter-company invoices
+
+First, declare which companies may transact with each other via the
+`allowed_to_transact_with` child table on the Company record (and mark the relevant
+accounts as "Inter Company Account" in each Chart of Accounts):
+
+```python
+# Enable inter-company transactions between companies
+# 1. Mark accounts as "Inter Company Account" in Chart of Accounts
+# 2. Set up "Allowed To Transact With" in Company settings
+
+company_north = frappe.get_doc("Company", "ScoopJoy - Outlet North")
+company_north.append("allowed_to_transact_with", {
+    "company": "ScoopJoy - Central Kitchen"
+})
+company_north.save()
+
+company_kitchen = frappe.get_doc("Company", "ScoopJoy - Central Kitchen")
+company_kitchen.append("allowed_to_transact_with", {
+    "company": "ScoopJoy - Outlet North"
+})
+company_kitchen.save()
+```
+
+Next, create an internal customer and supplier for inter-company billing. The
+`is_internal_customer`/`is_internal_supplier` flags plus `represents_company` are
+what link the two sides:
+
+```python
+# Create internal customer for Central Kitchen to bill Outlet North
+internal_customer = frappe.get_doc({
+    "doctype": "Customer",
+    "customer_name": "ScoopJoy - Outlet North (Internal)",
+    "customer_type": "Company",
+    "customer_group": "Internal",
+    "territory": "India",
+    "is_internal_customer": 1,
+    "represents_company": "ScoopJoy - Outlet North",
+    "companies": [
+        {"company": "ScoopJoy - Central Kitchen"}
+    ]
+})
+internal_customer.insert()
+
+# Create internal supplier for Outlet North to receive from Central Kitchen
+internal_supplier = frappe.get_doc({
+    "doctype": "Supplier",
+    "supplier_name": "ScoopJoy - Central Kitchen (Internal)",
+    "supplier_type": "Company",
+    "supplier_group": "Internal",
+    "is_internal_supplier": 1,
+    "represents_company": "ScoopJoy - Central Kitchen",
+    "companies": [
+        {"company": "ScoopJoy - Outlet North"}
+    ]
+})
+internal_supplier.insert()
+```
+
+Now when Central Kitchen creates a Sales Invoice to the internal customer, ERPNext
+can automatically generate the corresponding Purchase Invoice in Outlet North's books
+via `make_inter_company_purchase_invoice`:
+
+```python
+# Central Kitchen issues a Sales Invoice
+si = frappe.get_doc({
+    "doctype": "Sales Invoice",
+    "company": "ScoopJoy - Central Kitchen",
+    "customer": "ScoopJoy - Outlet North (Internal)",
+    "is_internal_customer": 1,
+    "update_stock": 1,
+    "set_warehouse": "Finished Goods - SJC",
+    "items": [{
+        "item_code": "VANILLA-100ML",
+        "qty": 500,
+        "rate": 40
+    }]
+})
+si.insert()
+si.submit()
+
+# After submission, click "Make Inter Company Purchase Invoice"
+# or automate via hook:
+from erpnext.accounts.doctype.sales_invoice.sales_invoice import (
+    make_inter_company_purchase_invoice
+)
+pi = make_inter_company_purchase_invoice(si.name)
+pi.set_warehouse = "Finished Goods - SJN"
+pi.insert()
+pi.submit()
+```
+
+### Inter-company journal entries
+
+For non-stock transactions like royalty payments, management fees, or cost
+allocations, use Inter Company Journal Entries. ERPNext mirrors the entry into the
+counterparty's books with reversed debit/credit:
+
+```python
+# Outlet North pays management fee to ScoopJoy Group
+jv = frappe.get_doc({
+    "doctype": "Journal Entry",
+    "voucher_type": "Inter Company Journal Entry",
+    "company": "ScoopJoy - Outlet North",
+    "accounts": [
+        {
+            "account": "Management Fee Expense - SJN",
+            "debit_in_account_currency": 50000,
+            "cost_center": "Main - SJN"
+        },
+        {
+            "account": "Inter Company Payable - SJN",
+            "credit_in_account_currency": 50000,
+            "party_type": "Supplier",
+            "party": "ScoopJoy Group (Internal)"
+        }
+    ]
+})
+jv.insert()
+jv.submit()
+
+# Creates a corresponding JV in ScoopJoy Group's books
+# with reversed debit/credit entries
+```
+
+### Inter-company stock transfer
+
+For transferring physical stock between companies (Central Kitchen to Outlet), the
+Delivery Note on one side links to a Purchase Receipt on the other, moving stock
+between warehouses:
+
+```python
+# Step 1: Central Kitchen creates a Delivery Note
+dn = frappe.get_doc({
+    "doctype": "Delivery Note",
+    "company": "ScoopJoy - Central Kitchen",
+    "customer": "ScoopJoy - Outlet North (Internal)",
+    "is_internal_customer": 1,
+    "set_warehouse": "Finished Goods - SJC",
+    "items": [{
+        "item_code": "VANILLA-100ML",
+        "qty": 200,
+        "rate": 40,
+        "target_warehouse": "Finished Goods - SJN"
+    }]
+})
+dn.insert()
+dn.submit()
+
+# Step 2: Outlet North creates a Purchase Receipt (auto-linked)
+# This moves stock into Outlet North's warehouse
+```
+
+### Consolidated financial statements
+
+ERPNext provides a Consolidated Financial Statement report for group companies.
+Access it via **Accounting > Consolidated Financial Statement**, or call it
+programmatically:
+
+```python
+from erpnext.accounts.report.consolidated_financial_statement.consolidated_financial_statement import execute
+
+filters = frappe._dict({
+    "company": "ScoopJoy Group",
+    "filter_based_on": "Fiscal Year",
+    "period_start_date": "2025-04-01",
+    "period_end_date": "2026-03-31",
+    "periodicity": "Yearly",
+    "report": "Profit and Loss Statement"
+})
+
+columns, data, message, chart = execute(filters)
+```
+
+The consolidated statement aggregates data from all child companies under the parent.
+Revenue, expenses, assets, and liabilities are rolled up hierarchically.
+
+:::caution[Intercompany elimination is not fully automated]
+As of v16, automatic intercompany elimination entries during consolidation are not
+fully automated. You may need to create manual elimination journal entries for
+intercompany revenue/expenses before generating truly clean consolidated statements.
+Track GitHub Issue #48351 for updates on this feature.
+:::
+
+### User permissions for franchise managers
+
+Restrict franchise managers to see only their company's data with a User Permission.
+Setting `allow="Company"` with `apply_to_all_doctypes=1` scopes every company-linked
+document for that user:
+
+```python
+# Create a user permission restricting to a single company
+frappe.get_doc({
+    "doctype": "User Permission",
+    "user": "manager.north@scoopjoy.com",
+    "allow": "Company",
+    "for_value": "ScoopJoy - Outlet North",
+    "apply_to_all_doctypes": 1
+}).insert()
+
+# The manager can now only see documents belonging to Outlet North
+# This applies across Sales Invoices, Purchase Orders, Stock Entries, etc.
+```
+
+For more granular control, combine User Permissions with Role Profiles:
+
+```python
+# Create a role profile for franchise managers
+role_profile = frappe.get_doc({
+    "doctype": "Role Profile",
+    "role_profile": "Franchise Manager",
+    "roles": [
+        {"role": "Sales User"},
+        {"role": "Stock User"},
+        {"role": "Accounts User"},
+        {"role": "POS User"}
+    ]
+})
+role_profile.insert()
+
+# Assign to user
+user = frappe.get_doc("User", "manager.north@scoopjoy.com")
+user.role_profile_name = "Franchise Manager"
+user.save()
+```
+
+See [Chapter 9](/erpnext/09-permissions-security/) for the full permission model
+behind User Permissions and Role Profiles.
+
+## Multi-Tenant (multi-site) architecture
+
+Multi-tenancy in Frappe means running multiple independent sites on a single bench
+installation. Each site has its own database, file storage, and configuration but
+shares the same Frappe/ERPNext codebase. This is the "database-per-tenant" model — the
+strongest isolation you can get without standing up separate servers.
+
+<Mermaid title="One bench, many isolated sites" height={320} code={`
+flowchart TB
+  Nginx["Nginx<br/>routes by Host header"] --> A["north.scoopjoy.com<br/>own DB · own files"]
+  Nginx --> B["south.scoopjoy.com<br/>own DB · own files"]
+  Nginx --> C["central.scoopjoy.com<br/>own DB · own files"]
+  subgraph bench["Single bench (shared code)"]
+    A
+    B
+    C
+  end
+`} />
+
+### Setting up DNS-based multi-tenancy
+
+With DNS-based multi-tenancy, each site is accessed via its domain name, and Nginx
+routes requests to the correct site based on the `Host` header:
+
+```bash
+# Enable DNS-based multi-tenancy
+bench config dns_multitenant on
+
+# Create separate sites for each franchise partner
+bench new-site north.scoopjoy.com \
+    --mariadb-root-password secret \
+    --admin-password admin123
+
+bench new-site south.scoopjoy.com \
+    --mariadb-root-password secret \
+    --admin-password admin123
+
+# Install ERPNext on each site
+bench --site north.scoopjoy.com install-app erpnext
+bench --site south.scoopjoy.com install-app erpnext
+
+# Install your custom app on each site
+bench --site north.scoopjoy.com install-app scoopjoy
+bench --site south.scoopjoy.com install-app scoopjoy
+
+# Regenerate nginx config for multi-site routing
+bench setup nginx
+sudo systemctl reload nginx
+```
+
+### Site management commands
+
+The `bench --site all` form fans an operation across every site on the bench, which
+is how you keep N tenants in sync after an app update:
+
+```bash
+# List all sites on this bench
+bench --site all list-apps
+
+# Backup a specific site
+bench --site north.scoopjoy.com backup --with-files
+
+# Migrate a specific site after app updates
+bench --site north.scoopjoy.com migrate
+
+# Migrate all sites at once
+bench --site all migrate
+
+# Drop a site (use with extreme caution)
+bench drop-site old-franchise.scoopjoy.com --force
+
+# Access the console for a specific site
+bench --site north.scoopjoy.com console
+```
+
+## When to use multi-company vs. multi-site
+
+| Criteria | Multi-Company (single site) | Multi-Site (multi-tenant) |
+|---|---|---|
+| **Data isolation** | Shared database, permission-based isolation | Fully separate databases |
+| **Shared masters** | Items, Users, DocTypes shared | Nothing shared between sites |
+| **Consolidated reports** | Built-in consolidated statements | Requires external aggregation |
+| **User management** | Single user pool, permissions per company | Separate users per site |
+| **Customization** | Same customizations across all companies | Independent customizations per site |
+| **Performance** | Single DB can become bottleneck at scale | Each site scales independently |
+| **Maintenance** | One site to backup, update, monitor | N sites to maintain separately |
+| **Cost** | Lower infrastructure cost | Higher (separate DBs, more resources) |
+| **Inter-company txns** | Native support | Requires API integration |
+
+## Franchise architecture decisions
+
+For a franchise business, three primary options emerge.
+
+### Option A: Single company with cost centers per outlet
+
+<Mermaid title="Option A — one company, cost centers per outlet" height={260} code={`
+flowchart TB
+  SJ["ScoopJoy<br/>(single company)"] --> CN["Cost Center: Outlet North"]
+  SJ --> CS["Cost Center: Outlet South"]
+  SJ --> CK["Cost Center: Central Kitchen"]
+  SJ --> CH["Cost Center: Head Office"]
+`} />
+
+**Pros:** Simplest setup, single chart of accounts, no inter-company complexity, easy
+reporting.
+**Cons:** No true financial isolation, all P&L in one company, harder to produce
+per-outlet balance sheets, difficult if outlets have different ownership.
+**Best for:** Small chains (2–5 outlets) under single ownership.
+
+### Option B: Parent + child companies per outlet (recommended)
+
+<Mermaid title="Option B — parent + child companies" height={260} code={`
+flowchart TB
+  G["ScoopJoy Group<br/>parent · is_group=1"] --> N["ScoopJoy - Outlet North"]
+  G --> S["ScoopJoy - Outlet South"]
+  G --> C["ScoopJoy - Central Kitchen"]
+  G --> H["ScoopJoy - Head Office"]
+`} />
+
+**Pros:** True financial separation per outlet, consolidated reporting via parent,
+inter-company transactions supported, per-outlet P&L and balance sheets.
+**Cons:** More setup complexity, need inter-company accounts, user permissions
+required, shared database still a single point of failure.
+**Best for:** Medium to large chains (5–50 outlets) under the same ownership group.
+
+### Option C: Separate sites per franchise partner
+
+<Mermaid title="Option C — separate sites per partner" height={280} code={`
+flowchart TB
+  Bench["Bench"] --> A["north.scoopjoy.com<br/>Franchise Partner A"]
+  Bench --> B["south.scoopjoy.com<br/>Franchise Partner B"]
+  Bench --> C["central.scoopjoy.com<br/>Company-owned"]
+  Bench --> H["hq.scoopjoy.com<br/>Head Office"]
+`} />
+
+**Pros:** Maximum data isolation, independent customizations, separate admin control,
+ideal for independently-owned franchise partners.
+**Cons:** No built-in consolidated reporting, separate maintenance per site,
+inter-site communication requires API calls, highest infrastructure cost.
+**Best for:** Franchise models where partners are independent businesses, or
+regulatory requirements demand data isolation.
+
+### Decision matrix
+
+| Factor | Option A (Cost Centers) | Option B (Child Companies) | Option C (Separate Sites) |
+|---|---|---|---|
+| Setup complexity | Low | Medium | High |
+| Financial isolation | None | Per company | Complete |
+| Consolidated reports | Native | Native | Custom |
+| Inter-outlet stock | Simple transfer | Inter-company txn | API-based |
+| Per-outlet P&L | Via cost center filter | Native per company | Native per site |
+| Franchisee independence | None | Limited | Full |
+| Scalability | Limited | Good | Best |
+| Recommended outlets | 2–5 | 5–50 | 50+ or independent |

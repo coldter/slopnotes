@@ -1,0 +1,976 @@
+---
+title: Scaling with Kubernetes
+description: Orchestrate ERPNext horizontally on Kubernetes — Helm charts, raw manifests, autoscaling, ingress, and zero-downtime deploys.
+sidebar:
+  order: 28
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+
+When your Frappe/ERPNext deployment outgrows a single server — whether due to user
+count, geographic distribution, or high-availability requirements — Kubernetes
+(K8s) provides the orchestration platform to scale horizontally. If you came from
+Node.js, this is the moment you stop running one `node server.js` behind PM2 and
+start letting a scheduler place, restart, and scale your processes for you.
+
+This chapter assumes you already have a working production image — see
+[Chapter 26](/erpnext/26-docker/) for building the custom Frappe image and
+[Chapter 27](/erpnext/27-production-deployment/) for the single-server baseline this
+scales beyond.
+
+## When to move to Kubernetes
+
+Kubernetes adds real operational complexity. Reach for it when you hit one or more
+of these thresholds, not before:
+
+| Indicator | Threshold | K8s solution |
+|-----------|-----------|--------------|
+| Concurrent users | > 100 | HPA on web pods |
+| Worker queue depth | Consistently > 50 | Scale worker replicas |
+| Deployment frequency | Multiple times/day | Rolling updates |
+| Uptime requirement | > 99.9% SLA | Pod redundancy, health checks |
+| Geographic distribution | Multiple regions | Multi-cluster deployment |
+| Multiple environments | Dev, staging, production | Namespace isolation |
+
+## Architecture on Kubernetes
+
+The cluster runs the stateless Frappe processes — web (Gunicorn), SocketIO, and
+the background workers — as independent deployments. Stateful services (the
+database and Redis/Valkey) live outside the cluster as managed offerings, while a
+shared `ReadWriteMany` volume holds the `sites` directory every pod needs.
+
+<Mermaid title="ScoopJoy on Kubernetes" height={560} code={`
+flowchart TB
+  Internet["Internet"] --> Ingress["Ingress Controller<br/>(nginx / traefik)"]
+  subgraph Cluster["Kubernetes Cluster"]
+    Ingress --> Web["Web Pods (Gunicorn)<br/>HPA: 2-10"]
+    Ingress --> Socket["SocketIO Pods<br/>2 replicas"]
+    subgraph Workers["Worker Pods"]
+      WS["Short queue · 2"]
+      WD["Default queue · 3"]
+      WL["Long queue · 2"]
+      Sched["Scheduler · 1"]
+    end
+    Web --- PVC["Shared PVC<br/>(sites volume, RWX)"]
+    Workers --- PVC
+    Socket --- PVC
+  end
+  Web --> DB["Managed DB<br/>(RDS / Cloud SQL)"]
+  Workers --> DB
+  Web --> Redis["Managed Redis/Valkey<br/>(ElastiCache / Memorystore)"]
+  Workers --> Redis
+  Socket --> Redis
+`} />
+
+:::tip[Pro tip]
+Use a managed database (AWS RDS, Google Cloud SQL, Azure Database for MariaDB) and
+managed Redis (ElastiCache, Memorystore) in production. Running stateful services on
+K8s adds operational complexity with minimal benefit.
+:::
+
+## Helm chart approach
+
+The official Frappe Helm chart at `helm.erpnext.com` is the recommended way to
+deploy on Kubernetes — it wires up every deployment, service, and PVC for you, so
+you mostly supply a values file.
+
+:::caution[Helm now defaults to Valkey]
+The official Frappe Helm chart (2025+) now defaults to **Valkey** instead of Redis
+as the in-memory datastore. Valkey is a Redis-compatible fork maintained by the
+Linux Foundation. Docker Compose setups can still use `redis:7-alpine` as a drop-in
+alternative, but Helm deployments should use `valkey/valkey:8-alpine` or the chart's
+built-in Valkey instances.
+:::
+
+```bash
+# Add the Frappe Helm repository
+helm repo add frappe https://helm.erpnext.com
+helm repo update
+
+# Create a namespace
+kubectl create namespace erpnext
+
+# Install with custom values
+helm upgrade --install frappe-bench \
+  --namespace erpnext \
+  frappe/erpnext \
+  -f custom-values.yaml
+```
+
+A production `custom-values.yaml` for the ScoopJoy ERP — note how each process type
+(nginx, gunicorn, the three worker queues, scheduler, socketio) gets its own replica
+count and resource envelope:
+
+```yaml title="custom-values.yaml"
+# Production Helm values for the ScoopJoy ERP
+
+# Custom image with the scoopjoy app baked in
+image:
+  repository: registry.example.com/scoopjoy-erp
+  tag: v16-latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: registry-secret
+
+# ─── Nginx ───────────────────────────────────────────
+nginx:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  environment:
+    upstreamRealIPAddress: "10.0.0.0/8"
+
+# ─── Gunicorn (Web) ─────────────────────────────────
+worker:
+  gunicorn:
+    replicaCount: 3
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+    args:
+      - --workers=4
+      - --timeout=120
+      - --preload
+    livenessProbe:
+      httpGet:
+        path: /api/method/ping
+        port: 8000
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+    readinessProbe:
+      httpGet:
+        path: /api/method/ping
+        port: 8000
+      initialDelaySeconds: 15
+      periodSeconds: 5
+      timeoutSeconds: 3
+
+  # ─── Background Workers ────────────────────────────
+  default:
+    replicaCount: 3
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+  short:
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  long:
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+
+  scheduler:
+    replicaCount: 1
+
+# ─── SocketIO ────────────────────────────────────────
+socketio:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# ─── Persistence ─────────────────────────────────────
+persistence:
+  worker:
+    enabled: true
+    size: 50Gi
+    storageClass: "gp3"  # AWS EBS gp3 or equivalent
+  logs:
+    enabled: true
+    size: 20Gi
+    storageClass: "gp3"
+
+# ─── External Database ──────────────────────────────
+dbHost: scoopjoy-db.cluster-abc123.us-east-1.rds.amazonaws.com
+dbPort: 3306
+dbRootUser: admin
+dbRootPassword: ""  # Set via --set or Secret reference
+
+# ─── External Redis/Valkey ───────────────────────────
+# Note: In newer chart versions these sections may appear as 'valkey-cache' and 'valkey-queue'
+redis-cache:
+  enabled: false
+redis-queue:
+  enabled: false
+
+redisCacheHost: redis://scoopjoy-redis-cache.abc123.ng.0001.use1.cache.amazonaws.com:6379
+redisQueueHost: redis://scoopjoy-redis-queue.abc123.ng.0001.use1.cache.amazonaws.com:6379
+redisSocketIOHost: redis://scoopjoy-redis-queue.abc123.ng.0001.use1.cache.amazonaws.com:6379
+
+# ─── Ingress ─────────────────────────────────────────
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+  hosts:
+    - host: scoopjoy.com
+      paths:
+        - path: /
+          pathType: Prefix
+    - host: outlet1.scoopjoy.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: scoopjoy-tls
+      hosts:
+        - scoopjoy.com
+        - outlet1.scoopjoy.com
+```
+
+## Deployment manifests (without Helm)
+
+For teams that prefer raw manifests or need fine-grained control, here are the same
+pieces written out by hand. They build up in dependency order: namespace and config
+first, then secrets, then the workloads.
+
+### Namespace and ConfigMap
+
+Non-secret configuration shared by every pod — database host, Redis URLs, the
+SocketIO port — lives in a ConfigMap that each deployment mounts via `envFrom`.
+
+```yaml title="namespace.yaml"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: erpnext
+---
+# configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: erpnext-config
+  namespace: erpnext
+data:
+  DB_HOST: "scoopjoy-db.abc123.rds.amazonaws.com"
+  DB_PORT: "3306"
+  REDIS_CACHE: "redis://redis-cache:6379"
+  REDIS_QUEUE: "redis://redis-queue:6379"
+  SOCKETIO_PORT: "9000"
+```
+
+### Secrets
+
+Passwords and the site encryption key go in a `Secret`, kept separate from the
+ConfigMap so they can be RBAC-restricted and sealed/sourced from a vault.
+
+```yaml title="secrets.yaml"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: erpnext-secrets
+  namespace: erpnext
+type: Opaque
+stringData:
+  DB_ROOT_PASSWORD: "your-db-root-password"
+  ADMIN_PASSWORD: "your-admin-password"
+  ENCRYPTION_KEY: "your-site-encryption-key"
+```
+
+### Web Deployment + Service
+
+The web tier runs Gunicorn. The liveness and readiness probes both hit
+`/api/method/ping`, so Kubernetes only routes traffic to a pod once it can serve
+requests, and restarts any pod that stops responding. Note the two volume mounts:
+the shared `sites` and `logs` PVCs.
+
+```yaml title="web-deployment.yaml" {11,55-72}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erpnext-web
+  namespace: erpnext
+  labels:
+    app: erpnext
+    component: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: erpnext
+      component: web
+  template:
+    metadata:
+      labels:
+        app: erpnext
+        component: web
+    spec:
+      containers:
+        - name: erpnext-web
+          image: registry.example.com/scoopjoy-erp:v16-latest
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: erpnext-config
+          env:
+            - name: GUNICORN_WORKERS
+              value: "4"
+            - name: WORKER_TIMEOUT
+              value: "120"
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /api/method/ping
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/method/ping
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: erpnext-sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: erpnext-logs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: erpnext-web
+  namespace: erpnext
+spec:
+  selector:
+    app: erpnext
+    component: web
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP
+```
+
+### Worker Deployments
+
+Each queue (short / default / long) is its own deployment so you can scale and
+resource them independently — long-running jobs get more memory and replicas than
+the quick ones. The only real difference between them is the `command` and the
+resource envelope.
+
+```yaml title="worker-short.yaml" {25}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erpnext-worker-short
+  namespace: erpnext
+  labels:
+    app: erpnext
+    component: worker-short
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: erpnext
+      component: worker-short
+  template:
+    metadata:
+      labels:
+        app: erpnext
+        component: worker-short
+    spec:
+      containers:
+        - name: worker
+          image: registry.example.com/scoopjoy-erp:v16-latest
+          command: ["bench", "worker", "--queue", "short"]
+          envFrom:
+            - configMapRef:
+                name: erpnext-config
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: erpnext-sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: erpnext-logs
+---
+# worker-default.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erpnext-worker-default
+  namespace: erpnext
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: erpnext
+      component: worker-default
+  template:
+    metadata:
+      labels:
+        app: erpnext
+        component: worker-default
+    spec:
+      containers:
+        - name: worker
+          image: registry.example.com/scoopjoy-erp:v16-latest
+          command: ["bench", "worker", "--queue", "default"]
+          envFrom:
+            - configMapRef:
+                name: erpnext-config
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: erpnext-sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: erpnext-logs
+---
+# worker-long.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erpnext-worker-long
+  namespace: erpnext
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: erpnext
+      component: worker-long
+  template:
+    metadata:
+      labels:
+        app: erpnext
+        component: worker-long
+    spec:
+      containers:
+        - name: worker
+          image: registry.example.com/scoopjoy-erp:v16-latest
+          command: ["bench", "worker", "--queue", "long"]
+          envFrom:
+            - configMapRef:
+                name: erpnext-config
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: erpnext-sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: erpnext-logs
+```
+
+### Scheduler Deployment
+
+The scheduler enqueues periodic jobs (the `hooks.py` `scheduler_events`). It is the
+one workload you must pin to a single replica.
+
+```yaml title="scheduler.yaml" {9}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erpnext-scheduler
+  namespace: erpnext
+spec:
+  replicas: 1  # Must be exactly 1
+  selector:
+    matchLabels:
+      app: erpnext
+      component: scheduler
+  template:
+    metadata:
+      labels:
+        app: erpnext
+        component: scheduler
+    spec:
+      containers:
+        - name: scheduler
+          image: registry.example.com/scoopjoy-erp:v16-latest
+          command: ["bench", "schedule"]
+          envFrom:
+            - configMapRef:
+                name: erpnext-config
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: erpnext-sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: erpnext-logs
+```
+
+:::caution[The scheduler must be a singleton]
+The scheduler must always run with exactly 1 replica. Running multiple schedulers
+causes duplicate job execution — every periodic task fires twice.
+:::
+
+### SocketIO Deployment
+
+The Node.js SocketIO server handles real-time updates. It needs the `sites` volume
+(to resolve the site from the host header) and exposes port 9000 via its own
+service. The `FRAPPE_SITE_NAME_HEADER` value of `$$host` is doubled so the literal
+`$host` survives shell/YAML interpolation.
+
+```yaml title="socketio.yaml" {22-24}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erpnext-socketio
+  namespace: erpnext
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: erpnext
+      component: socketio
+  template:
+    metadata:
+      labels:
+        app: erpnext
+        component: socketio
+    spec:
+      containers:
+        - name: socketio
+          image: registry.example.com/scoopjoy-erp:v16-latest
+          command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+          ports:
+            - containerPort: 9000
+          env:
+            - name: FRAPPE_SITE_NAME_HEADER
+              value: "$$host"
+          envFrom:
+            - configMapRef:
+                name: erpnext-config
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: erpnext-sites
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: erpnext-socketio
+  namespace: erpnext
+spec:
+  selector:
+    app: erpnext
+    component: socketio
+  ports:
+    - port: 9000
+      targetPort: 9000
+```
+
+### Persistent Volume Claims
+
+This is the part that trips most people up. Because web, worker, scheduler, and
+socketio pods all mount the same `sites` directory, the PVC must support
+`ReadWriteMany` — a normal block volume (EBS, default gp3) only allows
+`ReadWriteOnce` and will leave every pod after the first stuck in `Pending`.
+
+```yaml title="pvc.yaml" {8,28}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: erpnext-sites
+  namespace: erpnext
+spec:
+  accessModes:
+    - ReadWriteMany  # RWX required -- multiple pods share this volume
+  resources:
+    requests:
+      storage: 50Gi
+  storageClass: efs-sc  # AWS EFS, GCP Filestore, or NFS
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: erpnext-logs
+  namespace: erpnext
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  storageClass: efs-sc
+```
+
+:::tip[Pro tip]
+The `sites` PVC must use `ReadWriteMany` (RWX) access mode since web, worker,
+scheduler, and socketio pods all need simultaneous access. Use AWS EFS, GCP
+Filestore, Azure Files, or an NFS provisioner — not a plain block volume.
+:::
+
+## Horizontal Pod Autoscaler
+
+The HPA is what makes "scale on demand" real: it watches CPU/memory utilization and
+adjusts replica counts between `minReplicas` and `maxReplicas`. The web HPA also
+tunes the `behavior` so it scales up fast (two pods a minute) but scales down slowly
+(one pod every two minutes, after a five-minute stabilization window) to avoid
+thrashing.
+
+```yaml title="hpa-web.yaml" {11-12,31-44}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: erpnext-web-hpa
+  namespace: erpnext
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: erpnext-web
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+# hpa-worker-default.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: erpnext-worker-default-hpa
+  namespace: erpnext
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: erpnext-worker-default
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+```
+
+## Ingress with SSL (cert-manager)
+
+The `ClusterIssuer` lets cert-manager obtain and renew Let's Encrypt certificates
+automatically. The Ingress wires `scoopjoy.com` (and a wildcard for outlet
+subdomains) to the web service, and the `configuration-snippet` annotation upgrades
+`/socket.io` connections to WebSockets and routes them to the SocketIO service.
+
+```yaml title="ingress.yaml" {30-36}
+# cert-manager ClusterIssuer
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@scoopjoy.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: erpnext-ingress
+  namespace: erpnext
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    # WebSocket support
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      location /socket.io {
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_pass http://erpnext-socketio.erpnext.svc.cluster.local:9000;
+      }
+spec:
+  ingressClassName: nginx
+  tls:
+    - secretName: scoopjoy-tls
+      hosts:
+        - scoopjoy.com
+        - "*.scoopjoy.com"
+  rules:
+    - host: scoopjoy.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: erpnext-web
+                port:
+                  number: 8000
+    - host: outlet1.scoopjoy.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: erpnext-web
+                port:
+                  number: 8000
+```
+
+## CI/CD pipeline for Kubernetes deployment
+
+A GitHub Actions pipeline builds the custom image, pushes it to the registry, rolls
+the new tag onto every deployment, waits for the rollout, then runs `bench migrate`
+inside a live web pod. In Node.js terms this is the same shape as a "build → push →
+`kubectl set image` → migrate" pipeline, only the runtime is Frappe.
+
+```yaml title=".github/workflows/deploy.yml"
+name: Build and Deploy to K8s
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: registry.example.com
+  IMAGE_NAME: scoopjoy-erp
+  K8S_NAMESPACE: erpnext
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Generate image tag
+        id: meta
+        run: echo "version=v16-$(date +%Y%m%d)-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build apps.json
+        run: |
+          cat > apps.json <<'EOF'
+          [
+            {"url": "https://github.com/frappe/erpnext", "branch": "version-16"},
+            {"url": "https://github.com/${{ github.repository_owner }}/scoopjoy", "branch": "main"}
+          ]
+          EOF
+          echo "APPS_JSON_BASE64=$(base64 -w 0 apps.json)" >> $GITHUB_ENV
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: images/custom/Containerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          build-args: |
+            FRAPPE_PATH=https://github.com/frappe/frappe
+            FRAPPE_BRANCH=version-16
+            PYTHON_VERSION=3.12.7
+            NODE_VERSION=20.18.0
+            APPS_JSON_BASE64=${{ env.APPS_JSON_BASE64 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Set kubeconfig
+        run: echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+
+      - name: Update image in deployments
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+          kubectl set image deployment/erpnext-web erpnext-web=$IMAGE -n $K8S_NAMESPACE
+          kubectl set image deployment/erpnext-worker-short worker=$IMAGE -n $K8S_NAMESPACE
+          kubectl set image deployment/erpnext-worker-default worker=$IMAGE -n $K8S_NAMESPACE
+          kubectl set image deployment/erpnext-worker-long worker=$IMAGE -n $K8S_NAMESPACE
+          kubectl set image deployment/erpnext-scheduler scheduler=$IMAGE -n $K8S_NAMESPACE
+          kubectl set image deployment/erpnext-socketio socketio=$IMAGE -n $K8S_NAMESPACE
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/erpnext-web -n $K8S_NAMESPACE --timeout=300s
+          kubectl rollout status deployment/erpnext-worker-default -n $K8S_NAMESPACE --timeout=300s
+
+      - name: Run migrations
+        run: |
+          POD=$(kubectl get pod -n $K8S_NAMESPACE -l app=erpnext,component=web -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n $K8S_NAMESPACE $POD -- bench --site scoopjoy.com migrate
+```
+
+For the full pipeline design — tests, linting, staging gates — see
+[Chapter 34](/erpnext/34-cicd/).
+
+## Multi-tenant on Kubernetes
+
+Because every pod shares the `sites` volume, adding a new ScoopJoy outlet is the
+same `bench new-site` you'd run on a single server — issued as a one-off `exec` into
+a web pod — followed by patching the new host onto the Ingress.
+
+```bash
+# Create a new outlet site using a one-off exec
+kubectl exec -n erpnext deployment/erpnext-web -- \
+  bench new-site outlet1.scoopjoy.com \
+    --mariadb-root-password "$DB_ROOT_PASSWORD" \
+    --admin-password "$ADMIN_PASSWORD" \
+    --install-app erpnext \
+    --install-app scoopjoy
+
+# Add the site's domain to the Ingress
+kubectl patch ingress erpnext-ingress -n erpnext --type=json \
+  -p='[{"op": "add", "path": "/spec/rules/-",
+    "value": {"host": "outlet1.scoopjoy.com",
+    "http": {"paths": [{"path": "/", "pathType": "Prefix",
+    "backend": {"service": {"name": "erpnext-web", "port": {"number": 8000}}}}]}}}]'
+```
+
+Multi-company and multi-tenant data isolation are covered in depth in
+[Chapter 31](/erpnext/31-multi-company/).

@@ -1,0 +1,976 @@
+---
+title: Workflows & Automation
+description: Build approval chains, notifications, recurring documents, and assignment rules in Frappe — automating ScoopJoy's franchise operations with little to no code.
+sidebar:
+  order: 21
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Steps, Aside } from "@astrojs/starlight/components";
+
+Manual processes kill franchise efficiency. This chapter covers Frappe's built-in
+automation toolkit — workflows for approval chains, notifications for alerts, and
+automation rules for eliminating repetitive tasks. If you came from Node.js, think
+of this as the layer where you'd normally wire up a state-machine library, a
+cron-driven mailer, and a task queue by hand — except Frappe ships all of it as
+configurable DocTypes.
+
+## Workflow DocType
+
+A Workflow defines the state machine for a document — which states it can be in, who
+can transition it between states, and under what conditions.
+
+### Core concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Workflow State** | A named state (e.g., "Draft", "Pending Approval", "Approved") |
+| **Transition** | A rule: from State X, Role Y can perform Action Z to reach State W |
+| **Workflow Action** | The button label (e.g., "Approve", "Reject", "Submit for Review") |
+| **Workflow State Field** | A custom field on the DocType that stores the current workflow state |
+| **Doc Status** | Maps to Frappe's 0/1/2 system (Saved/Submitted/Cancelled) |
+
+### Creating a workflow via Desk
+
+<Steps>
+
+1. Go to **Workflow > + Add Workflow**.
+2. Set **Workflow Name** (e.g., "Purchase Order Approval").
+3. Set **Document Type** (e.g., "Purchase Order").
+4. Set **Is Active** to checked.
+5. Optionally check **Send Email Alert** (sends workflow action emails).
+
+</Steps>
+
+**Define States:**
+
+| State | Doc Status | Update Field | Update Value |
+|-------|-----------|--------------|--------------|
+| Draft | 0 | workflow_state | Draft |
+| Pending Approval | 0 | workflow_state | Pending Approval |
+| Approved | 1 | workflow_state | Approved |
+| Rejected | 0 | workflow_state | Rejected |
+| Ordered | 1 | workflow_state | Ordered |
+
+**Define Transitions:**
+
+| State | Action | Next State | Allowed | Condition |
+|-------|--------|------------|---------|-----------|
+| Draft | Submit for Approval | Pending Approval | Purchase User | |
+| Pending Approval | Approve | Approved | Purchase Manager | `doc.grand_total <= 100000` |
+| Pending Approval | Approve | Approved | Purchase Director | |
+| Pending Approval | Reject | Rejected | Purchase Manager, Purchase Director | |
+| Rejected | Revise | Draft | Purchase User | |
+| Approved | Order | Ordered | Purchase Manager | |
+
+<Aside type="caution">
+When a Workflow is active on a DocType, it overrides the standard
+Save/Submit/Cancel buttons. Users will only see workflow action buttons (Approve,
+Reject, etc.). Make sure your workflow covers all necessary transitions including
+cancellation, or users will be unable to cancel documents.
+</Aside>
+
+### Workflow actions: list view and email
+
+When **Send Email Alert** is checked, Frappe creates **Workflow Action** documents
+that:
+
+1. Appear as **action buttons in list view** for the assigned role.
+2. Send **email notifications** with Approve/Reject links directly in the email.
+3. Track pending actions in the **Workflow Action** DocType.
+
+Users can approve or reject directly from email without opening the document, which
+is excellent for busy franchise managers.
+
+### Conditions on transitions
+
+Conditions are Python expressions evaluated against the document:
+
+```python
+# Only allow approval if total is within budget
+doc.grand_total <= 100000
+
+# Only allow if supplier is verified
+doc.supplier_verified == 1
+
+# Only for specific item groups
+"Ice Cream" in [item.item_group for item in doc.items]
+
+# Time-based condition: only approve during business hours
+8 <= frappe.utils.now_datetime().hour < 18
+```
+
+### Creating a workflow via code (fixtures)
+
+For deployment across environments, define workflows as fixtures:
+
+```python title="scoopjoy/hooks.py"
+fixtures = [
+    {
+        "dt": "Workflow",
+        "filters": [["name", "in", ["Purchase Order Approval"]]]
+    },
+    {
+        "dt": "Workflow State",
+        "filters": [["name", "in", [
+            "Draft", "Pending Approval", "Approved", "Rejected", "Ordered"
+        ]]]
+    },
+    {
+        "dt": "Workflow Action Master",
+        "filters": [["name", "in", [
+            "Submit for Approval", "Approve", "Reject", "Revise", "Order"
+        ]]]
+    },
+]
+```
+
+Then export and import with:
+
+```bash
+bench --site icecream.localhost export-fixtures --app scoopjoy
+bench --site icecream.localhost import-fixtures --app scoopjoy
+```
+
+### Workflow hooks in a client script
+
+React to workflow transitions on the client side. Note the `before_workflow_action`
+hook returns a Promise — Frappe waits for it to resolve before completing the
+transition, so you can demand a rejection reason first.
+
+```javascript title="Client Script: Purchase Order"
+frappe.ui.form.on("Purchase Order", {
+    before_workflow_action: function (frm) {
+        // Require rejection reason before rejecting
+        if (frm.selected_workflow_action === "Reject") {
+            return new Promise((resolve, reject) => {
+                frappe.prompt(
+                    {
+                        fieldname: "rejection_reason",
+                        fieldtype: "Small Text",
+                        label: "Reason for Rejection",
+                        reqd: 1,
+                    },
+                    (values) => {
+                        frm.set_value("custom_rejection_reason", values.rejection_reason);
+                        resolve();
+                    },
+                    __("Rejection Reason"),
+                    __("Submit")
+                );
+            });
+        }
+    },
+
+    after_workflow_action: function (frm) {
+        // Show a success message with the new state
+        frappe.show_alert({
+            message: __("Purchase Order moved to {0}", [frm.doc.workflow_state]),
+            indicator: "green",
+        });
+    },
+});
+```
+
+## Notifications (Email / System / SMS)
+
+The **Notification** DocType lets you configure alerts triggered by document events
+or scheduled conditions — no code required.
+
+### Notification DocType
+
+Navigate to **Notification > + Add Notification** and configure:
+
+| Field | Description |
+|-------|-------------|
+| **Name** | Notification identifier |
+| **Channel** | Email, System Notification, Slack, or SMS |
+| **Trigger Event** | New, Save, Submit, Cancel, Value Change, Days Before/After |
+| **Document Type** | Which DocType triggers this |
+| **Condition** | Python expression (e.g., `doc.status == "Overdue"`) |
+| **Recipients** | Owner, specific roles, or custom fields containing email |
+| **Subject** | Jinja-enabled email subject |
+| **Message** | Jinja-enabled email body |
+
+### Email notifications with Jinja templates
+
+Here is a low-stock alert. The notification fires on a `Bin` value change, with a
+condition like `doc.actual_qty < doc.ordered_qty * 0.2`, on the `actual_qty` field.
+
+```html title="Notification Subject (Jinja)"
+Low Stock Alert: {{ doc.item_code }} at {{ doc.warehouse }}
+```
+
+The message body is HTML with embedded Jinja expressions:
+
+```html title="Notification Message (HTML + Jinja)"
+<h3>Low Stock Alert</h3>
+
+<p>The following item has fallen below the reorder threshold:</p>
+
+<table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
+    <tr>
+        <td><strong>Item Code</strong></td>
+        <td>{{ doc.item_code }}</td>
+    </tr>
+    <tr>
+        <td><strong>Item Name</strong></td>
+        <td>{{ frappe.db.get_value("Item", doc.item_code, "item_name") }}</td>
+    </tr>
+    <tr>
+        <td><strong>Warehouse</strong></td>
+        <td>{{ doc.warehouse }}</td>
+    </tr>
+    <tr>
+        <td><strong>Current Qty</strong></td>
+        <td style="color: red; font-weight: bold;">{{ doc.actual_qty }}</td>
+    </tr>
+    <tr>
+        <td><strong>Reorder Level</strong></td>
+        <td>{{ frappe.db.get_value("Item Reorder", {"parent": doc.item_code, "warehouse": doc.warehouse}, "warehouse_reorder_level") or "Not Set" }}</td>
+    </tr>
+</table>
+
+<p>
+    <a href="{{ frappe.utils.get_url_to_form('Bin', doc.name) }}"
+       style="background: #e74c3c; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px;">
+        View Stock Details
+    </a>
+</p>
+
+<p style="color: #888; font-size: 12px;">
+    This is an automated alert from {{ frappe.db.get_single_value("System Settings", "app_name") or "ERPNext" }}.
+</p>
+```
+
+### System notifications (bell icon)
+
+System notifications appear in the bell icon dropdown in Desk. Configure them the
+same way as email but set **Channel** to "System Notification":
+
+```text title="System Notification config"
+Channel: System Notification
+Document Type: Purchase Order
+Event: Workflow State Change (via Value Change on workflow_state)
+Condition: doc.workflow_state == "Pending Approval"
+Send To: All users with role "Purchase Manager"
+```
+
+These are less intrusive than email and ideal for in-app workflows.
+
+### SMS notifications
+
+Requires **SMS Settings** configured with a gateway provider:
+
+<Steps>
+
+1. Go to **SMS Settings**.
+2. Configure the SMS Gateway URL, HTTP method, and message parameter.
+3. Add static parameters (API key, sender ID).
+
+</Steps>
+
+Then create a Notification with **Channel: SMS**:
+
+```text title="SMS Notification config"
+Channel: SMS
+Document Type: POS Closing Entry
+Event: Submit
+Message: POS Closing submitted for {{ doc.pos_profile }}. Total: {{ doc.grand_total }}. Submitted by: {{ doc.owner }}.
+```
+
+### Slack/Webhook notifications
+
+Set **Channel** to "Slack" and configure:
+
+<Steps>
+
+1. Set up a **Slack Webhook URL** in Frappe.
+2. In the Notification, select the Slack channel.
+3. Write the message with Jinja.
+
+</Steps>
+
+```text title="Slack Notification config"
+Channel: Slack
+Slack Webhook URL: (configured in Slack Webhook URL DocType)
+Document Type: Quality Inspection
+Event: Submit
+Condition: doc.status == "Rejected"
+Message: :warning: Quality Inspection {{ doc.name }} REJECTED for item {{ doc.item_code }}. Inspector: {{ doc.inspector }}.
+```
+
+## Programmatic email with `frappe.sendmail()`
+
+For sending emails from server scripts, hooks, or API methods, call
+`frappe.sendmail()` directly. This is the equivalent of dropping into a Nodemailer
+call when the declarative Notification DocType isn't flexible enough.
+
+```python title="scoopjoy/scoopjoy/tasks.py"
+import frappe
+
+def send_daily_franchise_summary():
+    """Called via scheduled task (hooks.py)."""
+    from frappe.utils import nowdate, add_days, fmt_money
+
+    yesterday = add_days(nowdate(), -1)
+
+    # Gather data
+    outlets = frappe.get_all("Branch", filters={"disabled": 0}, pluck="name")
+
+    rows = []
+    for outlet in outlets:
+        revenue = frappe.db.sql("""
+            SELECT COALESCE(SUM(grand_total), 0)
+            FROM `tabSales Invoice`
+            WHERE docstatus=1 AND posting_date=%s AND outlet=%s
+        """, (yesterday, outlet))[0][0]
+
+        order_count = frappe.db.count("Sales Invoice", {
+            "docstatus": 1, "posting_date": yesterday, "outlet": outlet
+        })
+
+        rows.append({"outlet": outlet, "revenue": revenue, "orders": order_count})
+
+    # Build HTML table
+    table_rows = ""
+    total_revenue = 0
+    for r in rows:
+        total_revenue += r["revenue"]
+        table_rows += f"""
+        <tr>
+            <td>{r['outlet']}</td>
+            <td style="text-align: right;">{r['orders']}</td>
+            <td style="text-align: right;">{fmt_money(r['revenue'])}</td>
+        </tr>"""
+
+    message = f"""
+    <h2>Daily Franchise Sales Summary - {yesterday}</h2>
+    <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+        <thead>
+            <tr style="background: #e74c3c; color: white;">
+                <th>Outlet</th>
+                <th>Orders</th>
+                <th>Revenue</th>
+            </tr>
+        </thead>
+        <tbody>
+            {table_rows}
+        </tbody>
+        <tfoot>
+            <tr style="font-weight: bold; background: #f5f5f5;">
+                <td>TOTAL</td>
+                <td></td>
+                <td style="text-align: right;">{fmt_money(total_revenue)}</td>
+            </tr>
+        </tfoot>
+    </table>
+    """
+
+    # Get franchise owner email
+    owner_email = frappe.db.get_single_value("ScoopJoy Settings", "franchise_owner_email")
+
+    frappe.sendmail(
+        recipients=[owner_email],
+        subject=f"Daily Sales Summary - {yesterday}",
+        message=message,
+        reference_doctype="Sales Invoice",
+        reference_name=yesterday,  # for threading
+        now=True,  # send immediately, bypass queue
+    )
+```
+
+Schedule it in `hooks.py`:
+
+```python title="scoopjoy/hooks.py"
+scheduler_events = {
+    "daily": [
+        "scoopjoy.scoopjoy.tasks.send_daily_franchise_summary"
+    ],
+}
+```
+
+<Aside type="tip" title="Pro tip">
+Use `now=True` in `frappe.sendmail()` to bypass the email queue and send
+immediately. Without it, emails go to the Email Queue and are sent by the scheduler
+(usually within a minute). For critical alerts, always use `now=True`.
+</Aside>
+
+## Real-time UI updates with `frappe.publish_realtime()`
+
+Push live updates to connected browsers without a page refresh. On the server you
+publish an event; on the client you subscribe — the same publish/subscribe shape
+you'd build with `socket.io` in Express, here routed through Frappe's Socket.IO
+server.
+
+```python title="scoopjoy/scoopjoy/overrides/pos_closing_entry.py"
+import frappe
+
+def on_pos_closing_submit(doc, method):
+    """Notify franchise dashboard when a POS Closing Entry is submitted."""
+    frappe.publish_realtime(
+        event="pos_closing_update",
+        message={
+            "outlet": doc.pos_profile,
+            "total": doc.grand_total,
+            "date": str(doc.period_end_date),
+        },
+        user=frappe.db.get_value("Branch", doc.outlet, "franchise_owner"),
+        after_commit=True,
+    )
+```
+
+```javascript title="Client Script: listen for the event"
+frappe.realtime.on("pos_closing_update", (data) => {
+    frappe.show_alert({
+        message: __("POS Closed at {0}: Revenue {1}", [data.outlet, format_currency(data.total)]),
+        indicator: "green",
+    });
+
+    // Refresh dashboard if currently viewing it
+    if (cur_page && cur_page.page && cur_page.page.label === "Franchise Hub") {
+        location.reload();
+    }
+});
+```
+
+The `frappe.publish_realtime` parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `event` | Event name (string) |
+| `message` | Data payload (dict) |
+| `user` | Target specific user (or omit for all) |
+| `room` | Target a specific room |
+| `doctype` / `docname` | Target users viewing a specific document |
+| `after_commit` | Wait until DB transaction commits before publishing |
+
+## Auto Repeat: automated recurring documents
+
+Auto Repeat automatically creates copies of a document on a schedule. Ideal for
+recurring invoices, orders, or journal entries.
+
+### Setting up Auto Repeat
+
+Go to **Auto Repeat > + Add Auto Repeat** and configure:
+
+| Field | Example |
+|-------|---------|
+| **Reference DocType** | Sales Invoice |
+| **Reference Document** | ACC-SINV-2025-00100 (the template invoice) |
+| **Frequency** | Monthly |
+| **Start Date** | 2025-04-01 |
+| **End Date** | 2025-12-31 (optional) |
+| **Notify by Email** | Check |
+| **Recipients** | `franchise_owner@example.com` |
+
+**How it works:**
+
+- The scheduler creates a new draft document copying all field values from the template.
+- Date fields are auto-adjusted to the new period.
+- The new document's `auto_repeat` field links back to the Auto Repeat record.
+- If **Submit After Creation** is checked, the document is auto-submitted.
+
+### Enabling Auto Repeat for custom DocTypes
+
+Add your DocType to the allow list:
+
+```python title="scoopjoy/hooks.py"
+auto_repeat_doctypes = [
+    "Franchise Royalty Invoice",
+    "Franchise Inspection Checklist",
+]
+```
+
+Or via Desk: **Customize Form > [Your DocType] > Settings > Allow Auto Repeat**
+checkbox.
+
+<Aside type="caution">
+Auto Repeat creates documents based on the template's **current** state. If you
+modify the template (change amount, add items), all future auto-created documents
+will use the updated values. Be intentional about template changes.
+</Aside>
+
+## Assignment Rules
+
+Assignment Rules automatically assign documents to users based on conditions. They
+eliminate manual task distribution.
+
+### Creating an Assignment Rule
+
+Navigate to **Assignment Rule > + Add Assignment Rule**:
+
+| Field | Description |
+|-------|-------------|
+| **Name** | Auto-Assign Quality Inspection |
+| **Document Type** | Quality Inspection |
+| **Assign On** | Creation (or Save, Value Change) |
+| **Condition** | `doc.item_group == "Ice Cream"` |
+| **Assignment Rule** | Round Robin, Load Balancing, or Based on Field |
+| **Users** | QA Team members |
+
+**Assignment strategies:**
+
+| Strategy | Behaviour |
+|----------|-----------|
+| **Round Robin** | Cycles through the user list sequentially |
+| **Load Balancing** | Assigns to the user with fewest open assignments |
+| **Based on Field** | Assigns to the user specified in a document field |
+
+### Unassignment rules
+
+You can also configure when assignments are removed:
+
+| Field | Value |
+|-------|-------|
+| **Close Condition** | `doc.status == "Accepted"` |
+| **Unassign Condition** | `doc.docstatus == 2` (cancelled) |
+
+## Event Streaming (removed in v15)
+
+<Aside type="caution">
+Event Streaming (Event Producer/Consumer) was **removed from Frappe core in v15**
+and the standalone `frappe/event_streaming` app is archived and unmaintained. Do
+NOT use it for new projects.
+</Aside>
+
+For inter-site data synchronization in v16, use these alternatives:
+
+1. **Outgoing Webhooks** — configure the Webhook DocType to push document events to remote sites.
+2. **REST API polling** — periodically fetch changes from remote sites using `frappe.get_all` with `modified > last_sync_time`.
+3. **Custom integration via background jobs** — use `frappe.enqueue()` + `requests` to push/pull data on a schedule.
+4. **Message brokers** — for high-volume scenarios, use RabbitMQ or Apache Kafka as an intermediary.
+
+## Practical examples
+
+### Example 1: Workflow — Purchase Order approval chain
+
+A multi-level approval workflow for franchise purchase orders.
+
+First, add a custom field to Purchase Order to store the workflow state:
+
+```python title="Custom Field (via Customize Form or fixtures)"
+{
+    "doctype": "Custom Field",
+    "dt": "Purchase Order",
+    "fieldname": "workflow_state",
+    "fieldtype": "Link",
+    "options": "Workflow State",
+    "label": "Workflow State",
+    "hidden": 1,
+    "no_copy": 1,
+    "allow_on_submit": 1
+}
+```
+
+Then define the workflow itself as a fixture:
+
+```python title="Fixture: Workflow definition"
+{
+    "doctype": "Workflow",
+    "name": "PO Franchise Approval",
+    "document_type": "Purchase Order",
+    "is_active": 1,
+    "send_email_alert": 1,
+    "workflow_state_field": "workflow_state",
+    "states": [
+        {"state": "Draft", "doc_status": "0", "allow_edit": "Purchase User"},
+        {"state": "Pending Manager Approval", "doc_status": "0", "allow_edit": "Purchase Manager"},
+        {"state": "Pending Director Approval", "doc_status": "0", "allow_edit": "Purchase Director"},
+        {"state": "Approved", "doc_status": "1", "allow_edit": "Purchase Manager"},
+        {"state": "Rejected", "doc_status": "0", "allow_edit": "Purchase User"},
+        {"state": "Ordered", "doc_status": "1", "allow_edit": "Purchase Manager"}
+    ],
+    "transitions": [
+        {
+            "state": "Draft",
+            "action": "Submit for Approval",
+            "next_state": "Pending Manager Approval",
+            "allowed": "Purchase User"
+        },
+        {
+            "state": "Pending Manager Approval",
+            "action": "Approve",
+            "next_state": "Approved",
+            "allowed": "Purchase Manager",
+            "condition": "doc.grand_total <= 100000"
+        },
+        {
+            "state": "Pending Manager Approval",
+            "action": "Escalate",
+            "next_state": "Pending Director Approval",
+            "allowed": "Purchase Manager",
+            "condition": "doc.grand_total > 100000"
+        },
+        {
+            "state": "Pending Manager Approval",
+            "action": "Reject",
+            "next_state": "Rejected",
+            "allowed": "Purchase Manager"
+        },
+        {
+            "state": "Pending Director Approval",
+            "action": "Approve",
+            "next_state": "Approved",
+            "allowed": "Purchase Director"
+        },
+        {
+            "state": "Pending Director Approval",
+            "action": "Reject",
+            "next_state": "Rejected",
+            "allowed": "Purchase Director"
+        },
+        {
+            "state": "Rejected",
+            "action": "Revise",
+            "next_state": "Draft",
+            "allowed": "Purchase User"
+        },
+        {
+            "state": "Approved",
+            "action": "Order",
+            "next_state": "Ordered",
+            "allowed": "Purchase Manager"
+        }
+    ]
+}
+```
+
+**How the flow works:**
+
+<Mermaid title="Purchase Order approval state machine" height={460} code={`
+stateDiagram-v2
+  [*] --> Draft
+  Draft --> PendingManager: Submit for Approval
+  PendingManager --> Approved: Approve (≤ 1 lakh)
+  PendingManager --> PendingDirector: Escalate (> 1 lakh)
+  PendingManager --> Rejected: Reject
+  PendingDirector --> Approved: Approve
+  PendingDirector --> Rejected: Reject
+  Rejected --> Draft: Revise
+  Approved --> Ordered: Order
+  Ordered --> [*]
+`} />
+
+- Orders under 1 lakh: Manager approves directly.
+- Orders over 1 lakh: Manager escalates to Director.
+- Rejected orders can be revised and resubmitted.
+
+### Example 2: Notification — stock below reorder level
+
+A no-code email alert when any outlet's stock drops below reorder level:
+
+```text title="Low Stock Reorder Alert — Notification config"
+Name: Low Stock Reorder Alert
+Enabled: Yes
+Channel: Email
+Document Type: Bin
+Event: Value Change
+Value Changed: actual_qty
+
+Condition:
+doc.actual_qty <= frappe.db.get_value("Item Reorder",
+    {"parent": doc.item_code, "warehouse": doc.warehouse},
+    "warehouse_reorder_level") or 0
+
+Recipients:
+  - Role: Stock Manager
+  - Role: Purchase Manager
+```
+
+The subject and message use Jinja against the `Bin` document:
+
+```html title="Subject + Message (Jinja)"
+[REORDER] {{ doc.item_code }} at {{ doc.warehouse }} - Only {{ doc.actual_qty }} left
+
+<h3>Stock Reorder Alert</h3>
+<p>Stock for <strong>{{ doc.item_code }}</strong> has fallen below the reorder level.</p>
+<table border="1" cellpadding="5" style="border-collapse: collapse;">
+  <tr><td>Warehouse</td><td>{{ doc.warehouse }}</td></tr>
+  <tr><td>Current Qty</td><td style="color:red;">{{ doc.actual_qty }}</td></tr>
+  <tr><td>Reorder Level</td><td>{{ frappe.db.get_value("Item Reorder", {"parent": doc.item_code, "warehouse": doc.warehouse}, "warehouse_reorder_level") }}</td></tr>
+  <tr><td>Reorder Qty</td><td>{{ frappe.db.get_value("Item Reorder", {"parent": doc.item_code, "warehouse": doc.warehouse}, "warehouse_reorder_qty") }}</td></tr>
+</table>
+<p><a href="{{ frappe.utils.get_url_to_form('Item', doc.item_code) }}">View Item</a></p>
+```
+
+### Example 3: Notification — daily sales digest
+
+A scheduled daily digest sent to the franchise owner:
+
+```text title="Daily Sales Digest — Notification config"
+Name: Daily Sales Digest
+Enabled: Yes
+Channel: Email
+Document Type: POS Closing Entry
+Event: Days After
+Date Field: period_end_date
+Days Before or After: 0
+
+Condition: doc.docstatus == 1
+
+Recipients:
+  - Field: custom_franchise_owner_email (or a specific email)
+```
+
+The message body iterates the closing entry's payment rows with a Jinja loop:
+
+```html title="Message (HTML + Jinja)"
+Subject: Daily Sales Report: {{ doc.pos_profile }} - {{ doc.period_end_date }}
+
+<h2>POS Daily Summary</h2>
+<table border="1" cellpadding="8" style="border-collapse: collapse; width: 100%;">
+  <tr style="background: #e74c3c; color: white;">
+    <th>Metric</th><th>Value</th>
+  </tr>
+  <tr><td>Outlet</td><td>{{ doc.pos_profile }}</td></tr>
+  <tr><td>Date</td><td>{{ frappe.format(doc.period_end_date, {"fieldtype": "Date"}) }}</td></tr>
+  <tr><td>Total Sales</td><td>{{ frappe.format(doc.grand_total, {"fieldtype": "Currency"}) }}</td></tr>
+  <tr><td>Total Qty Sold</td><td>{{ doc.total_quantity }}</td></tr>
+  <tr><td>Number of Invoices</td><td>{{ doc.pos_transactions | length }}</td></tr>
+</table>
+
+{% if doc.payment_reconciliation %}
+<h3>Payment Breakdown</h3>
+<table border="1" cellpadding="8" style="border-collapse: collapse;">
+  <tr><th>Mode</th><th>Amount</th></tr>
+  {% for p in doc.payment_reconciliation %}
+  <tr><td>{{ p.mode_of_payment }}</td><td>{{ frappe.format(p.expected_amount, {"fieldtype": "Currency"}) }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+```
+
+### Example 4: Auto Repeat — monthly franchise royalty invoice
+
+A franchisor bills each franchise outlet a monthly royalty fee.
+
+```python title="Step 1: Create a template Sales Invoice"
+# One-time setup via script or manually
+template_invoice = frappe.get_doc({
+    "doctype": "Sales Invoice",
+    "customer": "Franchise Outlet - Mumbai Central",
+    "posting_date": "2025-04-01",
+    "due_date": "2025-04-30",
+    "items": [{
+        "item_code": "FRANCHISE-ROYALTY",
+        "item_name": "Monthly Franchise Royalty Fee",
+        "qty": 1,
+        "rate": 50000,
+        "description": "Monthly royalty fee as per franchise agreement"
+    }],
+    "taxes_and_charges": "Output GST - 18%",
+})
+template_invoice.insert()
+```
+
+```python title="Step 2: Create the Auto Repeat record"
+auto_repeat = frappe.get_doc({
+    "doctype": "Auto Repeat",
+    "reference_doctype": "Sales Invoice",
+    "reference_document": template_invoice.name,
+    "frequency": "Monthly",
+    "start_date": "2025-04-01",
+    "end_date": "2026-03-31",
+    "submit_on_creation": 1,
+    "notify_by_email": 1,
+    "recipients": [
+        {"recipient": "franchise_owner@outlet-mumbai.com"}
+    ],
+    "subject": "Monthly Royalty Invoice Generated",
+    "message": "Your monthly franchise royalty invoice has been generated. Please review and process payment.",
+})
+auto_repeat.insert()
+```
+
+Now every month, a new Sales Invoice is created, submitted, and the franchise owner
+is notified by email.
+
+### Example 5: Assignment Rule — auto-assign Quality Inspection to QA team
+
+```python title="Fixture: Assignment Rule"
+{
+    "doctype": "Assignment Rule",
+    "name": "QA-Ice-Cream-Assignment",
+    "document_type": "Quality Inspection",
+    "assign_condition": "doc.item_group in ('Ice Cream - Premium', 'Ice Cream - Standard', 'Frozen Desserts')",
+    "unassign_condition": "doc.status in ('Accepted', 'Rejected')",
+    "rule": "Load Balancing",
+    "users": [
+        {"user": "qa_lead@scoopjoy.com"},
+        {"user": "qa_inspector1@scoopjoy.com"},
+        {"user": "qa_inspector2@scoopjoy.com"}
+    ],
+    "description": "Auto-assign ice cream quality inspections to QA team using load balancing"
+}
+```
+
+The equivalent Desk setup:
+
+| Field | Value |
+|-------|-------|
+| Document Type | Quality Inspection |
+| Description | Assigns ice cream QA inspections to the QA team |
+| Assign Condition | `doc.item_group in ('Ice Cream - Premium', 'Ice Cream - Standard', 'Frozen Desserts')` |
+| Unassign Condition | `doc.status in ('Accepted', 'Rejected')` |
+| Rule | Load Balancing |
+| Users | qa_lead, qa_inspector1, qa_inspector2 |
+
+When a Quality Inspection is created for any ice cream item, it is automatically
+assigned to the QA team member with the fewest open inspections. Once the inspection
+is marked Accepted or Rejected, the assignment is closed.
+
+### Example 6: Complete automation — POS closing notification pipeline
+
+When a POS Closing Entry is submitted, automatically notify the franchise owner with
+a complete day's summary. This stitches together the building blocks above:
+`frappe.sendmail()` for the rich email and `frappe.publish_realtime()` for the live
+workspace alert.
+
+```python title="scoopjoy/scoopjoy/overrides/pos_closing_entry.py"
+import frappe
+from frappe import _
+from frappe.utils import fmt_money, get_url_to_form
+
+
+def after_submit(doc, method):
+    """Complete automation: notify franchise owner on POS closing."""
+
+    # 1. Gather detailed sales data
+    invoices = frappe.get_all(
+        "POS Invoice",
+        filters={
+            "pos_closing_entry": doc.name,
+            "docstatus": 1,
+        },
+        fields=["name", "customer_name", "grand_total", "total_qty"],
+    )
+
+    total_revenue = sum(inv.grand_total for inv in invoices)
+    total_items = sum(inv.total_qty for inv in invoices)
+
+    # 2. Get top selling items for the day
+    top_items = frappe.db.sql("""
+        SELECT
+            pii.item_name,
+            SUM(pii.qty) AS qty,
+            SUM(pii.amount) AS revenue
+        FROM `tabPOS Invoice Item` pii
+        JOIN `tabPOS Invoice` pi ON pi.name = pii.parent
+        WHERE pi.pos_closing_entry = %s AND pi.docstatus = 1
+        GROUP BY pii.item_name
+        ORDER BY qty DESC
+        LIMIT 5
+    """, doc.name, as_dict=True)
+
+    # 3. Build top items HTML
+    items_html = ""
+    for item in top_items:
+        items_html += f"<tr><td>{item.item_name}</td><td>{int(item.qty)}</td><td>{fmt_money(item.revenue)}</td></tr>"
+
+    # 4. Build complete email
+    message = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px;">
+        <div style="background: #e74c3c; color: white; padding: 20px; text-align: center;">
+            <h2 style="margin: 0;">Daily POS Summary</h2>
+            <p style="margin: 5px 0;">{doc.pos_profile} | {doc.period_end_date}</p>
+        </div>
+        <div style="padding: 20px; background: #f9f9f9;">
+            <div style="display: flex; justify-content: space-around; text-align: center; margin-bottom: 20px;">
+                <div style="flex: 1; padding: 10px;">
+                    <div style="font-size: 24px; font-weight: bold; color: #e74c3c;">{fmt_money(total_revenue)}</div>
+                    <div style="color: #666;">Total Revenue</div>
+                </div>
+                <div style="flex: 1; padding: 10px;">
+                    <div style="font-size: 24px; font-weight: bold; color: #3498db;">{len(invoices)}</div>
+                    <div style="color: #666;">Transactions</div>
+                </div>
+                <div style="flex: 1; padding: 10px;">
+                    <div style="font-size: 24px; font-weight: bold; color: #2ecc71;">{int(total_items)}</div>
+                    <div style="color: #666;">Items Sold</div>
+                </div>
+            </div>
+            <h3>Top Selling Items</h3>
+            <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+                <tr style="background: #34495e; color: white;"><th>Item</th><th>Qty</th><th>Revenue</th></tr>
+                {items_html}
+            </table>
+            <div style="margin-top: 20px; text-align: center;">
+                <a href="{get_url_to_form('POS Closing Entry', doc.name)}"
+                   style="background: #e74c3c; color: white; padding: 12px 30px;
+                          text-decoration: none; border-radius: 5px; display: inline-block;">
+                    View Full Report
+                </a>
+            </div>
+        </div>
+        <div style="padding: 10px; text-align: center; color: #999; font-size: 11px;">
+            Automated report from the ScoopJoy Franchise Management System
+        </div>
+    </div>
+    """
+
+    # 5. Get franchise owner email from POS Profile
+    franchise_owner = frappe.db.get_value(
+        "POS Profile", doc.pos_profile, "custom_franchise_owner_email"
+    )
+
+    if franchise_owner:
+        frappe.sendmail(
+            recipients=[franchise_owner],
+            subject=f"POS Daily Summary: {doc.pos_profile} - {doc.period_end_date}",
+            message=message,
+            reference_doctype="POS Closing Entry",
+            reference_name=doc.name,
+            now=True,
+        )
+
+    # 6. Real-time notification to users viewing the Franchise Hub workspace
+    frappe.publish_realtime(
+        event="pos_day_closed",
+        message={
+            "outlet": doc.pos_profile,
+            "revenue": total_revenue,
+            "transactions": len(invoices),
+        },
+        after_commit=True,
+    )
+```
+
+Hook it up in `hooks.py`:
+
+```python title="scoopjoy/hooks.py"
+doc_events = {
+    "POS Closing Entry": {
+        "on_submit": "scoopjoy.scoopjoy.overrides.pos_closing_entry.after_submit"
+    }
+}
+```
+
+And the client-side listener for the real-time event:
+
+```javascript title="Client Script or custom page"
+frappe.realtime.on("pos_day_closed", (data) => {
+    frappe.show_alert(
+        {
+            message: __("{0} closed for the day. Revenue: {1}", [
+                data.outlet,
+                format_currency(data.revenue),
+            ]),
+            indicator: "green",
+        },
+        10
+    );
+});
+```
+
+This gives you a complete automation pipeline: POS staff submit the closing entry,
+the franchise owner immediately gets a rich email summary, and anyone watching the
+workspace sees a real-time notification — all with zero manual intervention.
+
+<Aside type="tip" title="Pro tip">
+Combine workflows, notifications, and assignment rules for end-to-end process
+automation. For example: a Purchase Order workflow triggers a notification to the
+approver, an assignment rule assigns the resulting Quality Inspection to the QA
+team, and Auto Repeat handles recurring orders — all configured without writing code
+beyond the initial setup.
+</Aside>

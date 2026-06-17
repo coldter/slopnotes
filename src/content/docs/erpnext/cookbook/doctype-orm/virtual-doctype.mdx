@@ -1,0 +1,291 @@
+---
+title: Virtual DocType — External API as DocType
+description: Expose an external REST API as a read-only, browsable DocType in Desk using get_list, load_from_db, and Redis caching — no database table.
+sidebar:
+  order: 3
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Expose data from an external REST API — say weather forecasts for
+ScoopJoy outlet cities — as a browsable DocType in Desk, without storing anything
+in the database.
+
+**Solution:** Create a Virtual DocType (check **Is Virtual**) and implement
+`get_list`, `get_count`, and `load_from_db` with HTTP calls and Redis caching.
+Coming from Express you'd write a route handler that proxies the API; in Frappe you
+implement those three methods on a `Document` subclass and the whole Desk list/form
+UI works against the live API for free.
+
+## Step 1: DocType JSON (Is Virtual checked)
+
+The single flag that changes everything is `is_virtual`: 1. With it set, Frappe
+never creates a table for this DocType and routes reads to your controller methods
+instead of SQL.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_outlet_weather/sj_outlet_weather.json" {4}
+{
+  "name": "SJ Outlet Weather",
+  "module": "ScoopJoy",
+  "is_virtual": 1,
+  "fields": [
+    { "fieldname": "city", "fieldtype": "Data", "label": "City", "in_list_view": 1, "in_standard_filter": 1, "columns": 2 },
+    { "fieldname": "temperature_c", "fieldtype": "Float", "label": "Temperature (C)", "in_list_view": 1, "columns": 1 },
+    { "fieldname": "humidity", "fieldtype": "Int", "label": "Humidity %", "in_list_view": 1, "columns": 1 },
+    { "fieldname": "condition", "fieldtype": "Data", "label": "Condition", "in_list_view": 1, "columns": 2 },
+    { "fieldname": "wind_kph", "fieldtype": "Float", "label": "Wind (kph)", "in_list_view": 1, "columns": 1 },
+    { "fieldname": "forecast_date", "fieldtype": "Date", "label": "Forecast Date", "in_list_view": 1, "columns": 1 },
+    { "fieldname": "ice_cream_demand_index", "fieldtype": "Float", "label": "Ice Cream Demand Index", "description": "Computed: higher temp + lower humidity = higher demand" },
+    { "fieldname": "last_fetched", "fieldtype": "Datetime", "label": "Last Fetched", "read_only": 1 }
+  ],
+  "permissions": [
+    { "role": "System Manager", "read": 1 },
+    { "role": "Franchise Manager", "read": 1 }
+  ]
+}
+```
+
+## Step 2: Virtual DocType controller
+
+This is the centerpiece. A few module-level helpers fetch and cache the weather, and
+the `SJOutletWeather` class wires Frappe's data hooks to those helpers. The
+`fetch_weather_for_city` helper short-circuits on a Redis hit and otherwise calls the
+external API, computing a ScoopJoy-specific demand index before caching the result
+for 30 minutes.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_outlet_weather/sj_outlet_weather.py" {3-4}
+import frappe
+from frappe import _
+from frappe.model.document import Document
+import requests
+from datetime import datetime, date
+
+
+WEATHER_API_KEY = None  # loaded from site_config or ScoopJoy Settings
+WEATHER_API_URL = "https://api.weatherapi.com/v1"
+CACHE_TTL = 1800  # 30 minutes
+
+# All ScoopJoy outlet cities
+OUTLET_CITIES = [
+    "Mumbai", "Delhi", "Bangalore", "Chennai", "Hyderabad",
+    "Pune", "Ahmedabad", "Kolkata", "Jaipur", "Lucknow",
+    "Chandigarh", "Kochi", "Indore", "Nagpur", "Surat",
+]
+
+
+def get_api_key():
+    global WEATHER_API_KEY
+    if not WEATHER_API_KEY:
+        WEATHER_API_KEY = frappe.conf.get("weather_api_key") or frappe.db.get_single_value(
+            "ScoopJoy Settings", "weather_api_key"
+        )
+    return WEATHER_API_KEY
+
+
+def fetch_weather_for_city(city):
+    """Fetch weather data from API with Redis caching."""
+    cache_key = f"sj_weather:{city}"
+    cached = frappe.cache.get_value(cache_key)
+    if cached:
+        return cached
+
+    api_key = get_api_key()
+    if not api_key:
+        return _make_empty_record(city)
+
+    try:
+        response = requests.get(
+            f"{WEATHER_API_URL}/current.json",
+            params={"key": api_key, "q": city, "aqi": "no"},
+            timeout=5,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        record = {
+            "name": city,
+            "city": city,
+            "temperature_c": data["current"]["temp_c"],
+            "humidity": data["current"]["humidity"],
+            "condition": data["current"]["condition"]["text"],
+            "wind_kph": data["current"]["wind_kph"],
+            "forecast_date": str(date.today()),
+            "ice_cream_demand_index": _compute_demand_index(
+                data["current"]["temp_c"], data["current"]["humidity"]
+            ),
+            "last_fetched": datetime.now().isoformat(),
+        }
+        frappe.cache.set_value(cache_key, record, expires_in_sec=CACHE_TTL)
+        return record
+
+    except requests.RequestException:
+        frappe.log_error(f"Weather API failed for {city}", "SJ Outlet Weather")
+        return _make_empty_record(city)
+
+
+def _make_empty_record(city):
+    return {
+        "name": city,
+        "city": city,
+        "temperature_c": 0,
+        "humidity": 0,
+        "condition": "Unavailable",
+        "wind_kph": 0,
+        "forecast_date": str(date.today()),
+        "ice_cream_demand_index": 0,
+        "last_fetched": None,
+    }
+
+
+def _compute_demand_index(temp_c, humidity):
+    """Simple demand formula: scale 0-100. Hot + dry = high demand."""
+    temp_score = min(max((temp_c - 15) / 30 * 100, 0), 100)
+    humidity_penalty = max(humidity - 60, 0) * 0.5
+    return round(max(temp_score - humidity_penalty, 0), 1)
+```
+
+The class itself implements the framework's read hooks. `get_list` is what
+`frappe.get_list` and the Desk list view call; it must translate Frappe's filter,
+pagination, and sort arguments into operations on your live data. Both filter shapes
+the framework can hand you are handled — the dict form (`{"city": ["like", "%Mum%"]}`)
+and the list form (`[["SJ Outlet Weather", "city", "like", "%Mum%"]]`).
+
+```python title="scoopjoy/scoopjoy/doctype/sj_outlet_weather/sj_outlet_weather.py"
+class SJOutletWeather(Document):
+    """Virtual DocType — no database table. All data from Weather API."""
+
+    @staticmethod
+    def get_list(args):
+        """Called by frappe.get_list / list view. Returns list of dicts."""
+        cities = list(OUTLET_CITIES)
+
+        # Apply filters (dict form)
+        filters = args.get("filters") or {}
+        if isinstance(filters, dict):
+            if filters.get("city"):
+                filter_val = filters["city"]
+                if isinstance(filter_val, list):
+                    # Handle operators: ["like", "%Mum%"]
+                    op, val = filter_val
+                    if op.lower() == "like":
+                        pattern = val.replace("%", "").lower()
+                        cities = [c for c in cities if pattern in c.lower()]
+                    elif op == "=":
+                        cities = [c for c in cities if c == val]
+                else:
+                    cities = [c for c in cities if c == filter_val]
+
+        # Handle list filter form: [["SJ Outlet Weather", "city", "like", "%Mum%"]]
+        if isinstance(filters, list):
+            for f in filters:
+                if len(f) == 4 and f[1] == "city":
+                    op, val = f[2], f[3]
+                    if op.lower() == "like":
+                        pattern = val.replace("%", "").lower()
+                        cities = [c for c in cities if pattern in c.lower()]
+                    elif op == "=":
+                        cities = [c for c in cities if c == val]
+
+        # Pagination
+        start = args.get("start") or 0
+        page_length = args.get("page_length") or 20
+
+        # Sort
+        order_by = args.get("order_by") or ""
+        records = [fetch_weather_for_city(c) for c in cities]
+
+        if "temperature_c desc" in order_by:
+            records.sort(key=lambda r: r.get("temperature_c", 0), reverse=True)
+        elif "temperature_c asc" in order_by:
+            records.sort(key=lambda r: r.get("temperature_c", 0))
+        elif "ice_cream_demand_index desc" in order_by:
+            records.sort(key=lambda r: r.get("ice_cream_demand_index", 0), reverse=True)
+
+        return records[start : start + page_length]
+
+    @staticmethod
+    def get_count(args):
+        """Called for list view pagination count."""
+        filters = args.get("filters") or {}
+        cities = list(OUTLET_CITIES)
+
+        if isinstance(filters, dict) and filters.get("city"):
+            filter_val = filters["city"]
+            if isinstance(filter_val, list):
+                op, val = filter_val
+                if op.lower() == "like":
+                    pattern = val.replace("%", "").lower()
+                    cities = [c for c in cities if pattern in c.lower()]
+            else:
+                cities = [c for c in cities if c == filter_val]
+        return len(cities)
+
+    def load_from_db(self):
+        """Called when a single document is opened (e.g., /app/sj-outlet-weather/Mumbai)."""
+        city = self.name
+        record = fetch_weather_for_city(city)
+
+        for field in self.meta.get("fields"):
+            fieldname = field.fieldname
+            if fieldname in record:
+                self.set(fieldname, record[fieldname])
+
+        # Standard fields the framework expects
+        self.name = record["name"]
+        self.modified = record.get("last_fetched") or datetime.now().isoformat()
+        self.creation = self.modified
+        self.owner = "Administrator"
+        self.modified_by = "Administrator"
+
+    def db_insert(self, *args, **kwargs):
+        """Virtual DocType — inserts not supported."""
+        frappe.throw(_("Cannot create weather records. Data comes from external API."))
+
+    def db_update(self, *args, **kwargs):
+        """Virtual DocType — updates not supported."""
+        frappe.throw(_("Cannot update weather records. Data is read-only from external API."))
+
+    def delete(self, *args, **kwargs):
+        """Virtual DocType — deletes not supported."""
+        frappe.throw(_("Cannot delete weather records."))
+```
+
+`load_from_db` is the form-view counterpart to `get_list`: when someone opens
+`/app/sj-outlet-weather/Mumbai`, Frappe instantiates the document with its `name` set
+and calls this method to populate it. The three write hooks (`db_insert`, `db_update`,
+`delete`) all `frappe.throw`, making the DocType cleanly read-only.
+
+## Step 3: API endpoint to force-refresh cache
+
+A whitelisted method lets you bust the Redis cache for one city or all of them and
+pre-warm it, handy for a "Refresh" button in the list view or a scheduled job.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_outlet_weather/sj_outlet_weather.py"
+# (append to the same file)
+
+@frappe.whitelist()
+def refresh_weather_cache(city=None):
+    """Force-refresh weather cache for one or all cities."""
+    cities = [city] if city else OUTLET_CITIES
+    for c in cities:
+        cache_key = f"sj_weather:{c}"
+        frappe.cache.delete_value(cache_key)
+    # Pre-warm the cache
+    results = [fetch_weather_for_city(c) for c in cities]
+    return {"refreshed": len(results), "cities": cities}
+```
+
+:::note[Why this works]
+Virtual DocTypes bypass the database entirely. The framework calls `get_list`,
+`get_count`, and `load_from_db` instead of running SQL queries. Redis caching with a
+30-minute TTL keeps the Desk list view fast and prevents hammering the weather API on
+every load.
+:::
+
+:::caution[Common mistake]
+Forgetting to set `self.modified`, `self.creation`, `self.owner`, and
+`self.modified_by` in `load_from_db`. The framework expects these standard fields,
+and you will get an `AttributeError` without them.
+:::

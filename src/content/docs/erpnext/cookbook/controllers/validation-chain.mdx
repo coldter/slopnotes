@@ -1,0 +1,261 @@
+---
+title: Validation Chain Pattern
+description: Compose many interdependent business rules into one ordered validate() chain that fails fast and keeps each rule self-contained.
+sidebar:
+  order: 1
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** A ScoopJoy Franchise Agreement has to satisfy six-plus interdependent
+business rules before it can be saved — territory uniqueness, date-overlap
+detection, parent-company checks, and conditional state-based validation. Stuffing
+all of that into one giant `validate()` method is unreadable and impossible to test.
+
+**Solution:** Keep `validate()` as a thin orchestrator that calls one small method
+per business concern, in order. Each rule is self-contained and raises with
+`frappe.throw` the moment it fails, so later rules never run on bad data.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py" {10-15}
+import frappe
+from frappe import _
+from frappe.model.document import Document
+from frappe.utils import getdate, today, date_diff, flt
+
+
+class FranchiseAgreement(Document):
+    def validate(self):
+        self.validate_dates()
+        self.validate_franchise_fee()
+        self.validate_territory_uniqueness()
+        self.validate_date_overlap()
+        self.validate_parent_company_settings()
+        self.validate_state_transitions()
+```
+
+### Rule 1 — Basic date sanity
+
+Required dates, end after start, and a minimum one-year duration. Note the use of
+`exc=` to raise the right exception class (`MandatoryError` vs `ValidationError`),
+which lets callers and tests distinguish failure kinds.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py"
+    def validate_dates(self):
+        if not self.start_date or not self.end_date:
+            frappe.throw(
+                msg=_("Start Date and End Date are required."),
+                title=_("Missing Dates"),
+                exc=frappe.MandatoryError,
+            )
+
+        if getdate(self.end_date) <= getdate(self.start_date):
+            frappe.throw(
+                msg=_("End Date must be after Start Date."),
+                title=_("Invalid Date Range"),
+                exc=frappe.ValidationError,
+            )
+
+        agreement_days = date_diff(self.end_date, self.start_date)
+        if agreement_days < 365:
+            frappe.throw(
+                msg=_("Franchise agreements must be at least 1 year. Current duration: {0} days.").format(
+                    agreement_days
+                ),
+                title=_("Agreement Too Short"),
+                exc=frappe.ValidationError,
+            )
+```
+
+### Rule 2 — Fee within company-defined bounds
+
+The fee must be positive and below a configurable cap read from the `ScoopJoy
+Settings` single. `frappe.format_value` formats both numbers as Currency in the
+error message.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py"
+    def validate_franchise_fee(self):
+        if flt(self.franchise_fee) <= 0:
+            frappe.throw(
+                msg=_("Franchise Fee must be greater than zero."),
+                title=_("Invalid Fee"),
+                exc=frappe.ValidationError,
+            )
+
+        max_fee = frappe.db.get_single_value("ScoopJoy Settings", "max_franchise_fee")
+        if max_fee and flt(self.franchise_fee) > flt(max_fee):
+            frappe.throw(
+                msg=_("Franchise Fee {0} exceeds maximum allowed fee of {1}.").format(
+                    frappe.format_value(self.franchise_fee, {"fieldtype": "Currency"}),
+                    frappe.format_value(max_fee, {"fieldtype": "Currency"}),
+                ),
+                title=_("Fee Exceeds Limit"),
+                exc=frappe.ValidationError,
+            )
+```
+
+### Rule 3 — One active agreement per territory
+
+A cheap existence check: is there any other submitted (`docstatus: 1`) agreement
+for this territory that hasn't expired yet? The error links straight to the
+conflicting document with `frappe.utils.get_link_to_form`.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py"
+    def validate_territory_uniqueness(self):
+        if not self.territory:
+            return
+
+        existing = frappe.db.exists(
+            "Franchise Agreement",
+            {
+                "territory": self.territory,
+                "docstatus": 1,
+                "name": ("!=", self.name),
+                "end_date": (">=", today()),
+            },
+        )
+
+        if existing:
+            frappe.throw(
+                msg=_("Territory {0} already has an active Franchise Agreement: {1}").format(
+                    frappe.bold(self.territory),
+                    frappe.utils.get_link_to_form("Franchise Agreement", existing),
+                ),
+                title=_("Duplicate Territory"),
+                exc=frappe.DuplicateEntryError,
+            )
+```
+
+### Rule 4 — Date-overlap detection
+
+Two agreements for the same franchisee can't have overlapping date ranges. The
+overlap test is the classic `start_a <= end_b AND end_a >= start_b`, expressed as
+parameterised SQL.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py"
+    def validate_date_overlap(self):
+        if not self.franchisee:
+            return
+
+        overlapping = frappe.db.sql(
+            """
+            SELECT name, territory, start_date, end_date
+            FROM `tabFranchise Agreement`
+            WHERE franchisee = %(franchisee)s
+              AND name != %(name)s
+              AND docstatus = 1
+              AND start_date <= %(end_date)s
+              AND end_date >= %(start_date)s
+            LIMIT 1
+            """,
+            {
+                "franchisee": self.franchisee,
+                "name": self.name,
+                "start_date": self.start_date,
+                "end_date": self.end_date,
+            },
+            as_dict=True,
+        )
+
+        if overlapping:
+            overlap = overlapping[0]
+            frappe.throw(
+                msg=_(
+                    "Date range overlaps with existing agreement {0} for territory {1} "
+                    "({2} to {3})."
+                ).format(
+                    frappe.utils.get_link_to_form("Franchise Agreement", overlap.name),
+                    frappe.bold(overlap.territory),
+                    frappe.format_value(overlap.start_date, {"fieldtype": "Date"}),
+                    frappe.format_value(overlap.end_date, {"fieldtype": "Date"}),
+                ),
+                title=_("Overlapping Agreement"),
+                exc=frappe.ValidationError,
+            )
+```
+
+### Rule 5 — Cross-document parent-company checks
+
+This rule reaches outside the current document: the company must allow new
+franchises and must be under its active-outlet cap. `frappe.get_cached_doc` is used
+for the Company lookup so repeated reads in the same request hit the cache instead
+of the DB.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py" {6}
+    def validate_parent_company_settings(self):
+        if not self.company:
+            return
+
+        company_doc = frappe.get_cached_doc("Company", self.company)
+
+        franchise_enabled = frappe.db.get_single_value("ScoopJoy Settings", "enable_new_franchises")
+        if not franchise_enabled:
+            frappe.throw(
+                msg=_("New franchise onboarding is currently disabled in ScoopJoy Settings."),
+                title=_("Franchising Disabled"),
+                exc=frappe.ValidationError,
+            )
+
+        max_outlets = frappe.db.get_single_value("ScoopJoy Settings", "max_outlets_per_company")
+        if max_outlets:
+            current_count = frappe.db.count(
+                "Franchise Agreement",
+                {"company": self.company, "docstatus": 1, "end_date": (">=", today())},
+            )
+            if current_count >= max_outlets:
+                frappe.throw(
+                    msg=_("Company {0} has reached its maximum of {1} active franchise outlets.").format(
+                        frappe.bold(company_doc.company_name), max_outlets
+                    ),
+                    title=_("Outlet Limit Reached"),
+                    exc=frappe.ValidationError,
+                )
+```
+
+### Rule 6 — State-conditional validation
+
+State-machine guards only apply to existing documents, so the method bails early on
+`is_new()`. `get_doc_before_save()` returns the previously saved version, letting
+you compare old vs new status and reject illegal transitions.
+
+```python title="apps/scoopjoy/scoopjoy/scoopjoy/doctype/franchise_agreement/franchise_agreement.py" {2-7}
+    def validate_state_transitions(self):
+        if self.is_new():
+            return
+
+        old_doc = self.get_doc_before_save()
+        if not old_doc:
+            return
+
+        if old_doc.agreement_status == "Terminated" and self.agreement_status != "Terminated":
+            frappe.throw(
+                msg=_("A terminated agreement cannot be reactivated. Create a new agreement instead."),
+                title=_("Invalid State Change"),
+                exc=frappe.ValidationError,
+            )
+
+        if (
+            old_doc.agreement_status == "Active"
+            and self.agreement_status == "Pending"
+        ):
+            frappe.throw(
+                msg=_("An active agreement cannot be moved back to Pending status."),
+                title=_("Invalid State Change"),
+                exc=frappe.ValidationError,
+            )
+```
+
+:::note[Why this works]
+Each validation method is self-contained and tests one business concern. The chain
+in `validate()` runs top-to-bottom; if rule 1 throws, rules 2-6 never execute,
+preventing confusing cascading errors. Using `frappe.get_cached_doc` for the Company
+lookup avoids repeated DB hits on the same request.
+:::
+
+:::caution[Common mistake]
+Calling `frappe.db.commit()` inside `validate()`. In v16, `doc_event` hooks run
+inside an implicit transaction managed by the framework. Calling commit
+mid-validation will persist partial state even if a later validation fails. Only
+background jobs and scheduled tasks should call `frappe.db.commit()`.
+:::

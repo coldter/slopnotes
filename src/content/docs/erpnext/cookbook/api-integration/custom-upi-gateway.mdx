@@ -1,0 +1,463 @@
+---
+title: Custom UPI Payment Gateway
+description: Build a complete UPI payment gateway for ERPNext — settings DocType, QR generation, polling, and a signature-verified callback that books a Payment Entry.
+sidebar:
+  order: 4
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard, Steps } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** ScoopJoy wants customers to pay invoices over UPI (India's instant
+payment system). You need a complete custom payment gateway that plugs into
+ERPNext's Payment Request flow — generating UPI QR codes and reconciling
+confirmed payments automatically.
+
+**Solution:** Build it from four pieces: a **UPI Settings** DocType for credentials,
+a payment controller exposing the `get_payment_url()` method ERPNext calls, a guest
+QR-code endpoint customers scan, and a signature-verified callback that books a
+`Payment Entry`. The Settings DocType is registered as a `Payment Gateway` so
+ERPNext routes Payment Requests through it.
+
+## Payment flow
+
+The customer never logs into ERPNext — they scan a QR code, pay in their own UPI
+app, and the provider calls back to ScoopJoy's server, which records the payment.
+
+<Mermaid title="UPI payment lifecycle" height={460} code={`
+sequenceDiagram
+  actor Cust as Customer
+  participant ERP as ERPNext (Payment Request)
+  participant QR as QR page (guest)
+  participant Prov as UPI provider
+  ERP->>QR: get_payment_url() redirect
+  Cust->>QR: scan UPI QR code
+  Cust->>Prov: pay in UPI app
+  QR->>ERP: poll check_payment_status (every 5s)
+  Prov->>ERP: POST upi_callback (signed)
+  ERP->>ERP: verify HMAC, create Payment Entry
+  ERP-->>QR: paid = true → redirect
+`} />
+
+## Step 1: UPI Settings DocType
+
+A Single DocType holds the merchant VPA, gateway API credentials (as `Password`
+fields, so they're encrypted at rest), and the callback secret. The `enabled` flag
+acts as a kill switch.
+
+```json title="scoopjoy/scoopjoy/doctype/upi_settings/upi_settings.json"
+{
+    "name": "UPI Settings",
+    "module": "ScoopJoy",
+    "doctype": "DocType",
+    "issingle": 1,
+    "fields": [
+        {"fieldname": "enabled", "fieldtype": "Check", "label": "Enabled", "default": 0},
+        {"fieldname": "merchant_vpa", "fieldtype": "Data", "label": "Merchant UPI VPA", "reqd": 1, "description": "e.g. scoopjoy@okicici"},
+        {"fieldname": "merchant_name", "fieldtype": "Data", "label": "Merchant Display Name", "default": "ScoopJoy Ice Cream"},
+        {"fieldname": "api_key", "fieldtype": "Password", "label": "Payment Gateway API Key"},
+        {"fieldname": "api_secret", "fieldtype": "Password", "label": "Payment Gateway API Secret"},
+        {"fieldname": "api_base_url", "fieldtype": "Data", "label": "API Base URL", "default": "https://api.upiprovider.com/v1"},
+        {"fieldname": "callback_secret", "fieldtype": "Password", "label": "Callback Webhook Secret"},
+        {"fieldname": "section_gateway", "fieldtype": "Section Break", "label": "Gateway Setup"},
+        {"fieldname": "gateway_setup_help", "fieldtype": "HTML", "label": "Setup Help", "options": "<p>Run <code>bench execute scoopjoy.setup.payments.setup_upi_gateway</code> after saving.</p>"}
+    ],
+    "permissions": [
+        {"role": "System Manager", "read": 1, "write": 1}
+    ]
+}
+```
+
+## Step 2: Gateway setup script
+
+Run this once after configuring UPI Settings. It registers `UPI` as a `Payment
+Gateway` and creates a `Payment Gateway Account` (pointing at a bank account) for
+every company — that account is where reconciled payments will be booked.
+
+```python title="scoopjoy/setup/payments.py"
+import frappe
+
+
+def setup_upi_gateway():
+    """Register UPI as a Payment Gateway in ERPNext. Run once after configuring UPI Settings."""
+    # Create or update Payment Gateway
+    if not frappe.db.exists("Payment Gateway", "UPI"):
+        gateway = frappe.get_doc({
+            "doctype": "Payment Gateway",
+            "gateway": "UPI",
+            "gateway_settings": "UPI Settings",
+            "gateway_controller": "UPI Settings",
+        })
+        gateway.insert(ignore_permissions=True)
+        frappe.msgprint("Payment Gateway 'UPI' created.")
+
+    # Create Payment Gateway Account for each company
+    companies = frappe.get_all("Company", pluck="name")
+    for company in companies:
+        if not frappe.db.exists("Payment Gateway Account", {"payment_gateway": "UPI", "company": company}):
+            # Find a suitable bank account
+            payment_account = frappe.db.get_value(
+                "Account",
+                {"company": company, "account_type": "Bank", "is_group": 0},
+                "name"
+            )
+            if payment_account:
+                frappe.get_doc({
+                    "doctype": "Payment Gateway Account",
+                    "payment_gateway": "UPI",
+                    "payment_account": payment_account,
+                    "company": company,
+                    "currency": "INR",
+                }).insert(ignore_permissions=True)
+                frappe.msgprint(f"Payment Gateway Account created for {company}.")
+
+    frappe.db.commit()
+```
+
+## Step 3: UPI payment controller
+
+This is the contract ERPNext expects from any gateway settings DocType:
+`supported_currencies`, `validate_transaction_currency()`, and `get_payment_url()`.
+When a Payment Request is submitted, ERPNext calls `get_payment_url(**kwargs)` and
+redirects the customer to whatever URL it returns.
+
+```python title="scoopjoy/scoopjoy/doctype/upi_settings/upi_settings.py" {25,49}
+import frappe
+import hashlib
+import hmac
+import json
+import requests
+from frappe import _
+from frappe.model.document import Document
+from frappe.utils import nowdate, get_url, flt, cint
+from urllib.parse import urlencode
+
+
+class UPISettings(Document):
+
+    supported_currencies = ["INR"]
+
+    def validate(self):
+        if self.enabled and not self.merchant_vpa:
+            frappe.throw(_("Merchant UPI VPA is required when UPI is enabled."))
+
+    def validate_transaction_currency(self, currency):
+        if currency not in self.supported_currencies:
+            frappe.throw(
+                _("{0} is not supported by UPI. Use INR.").format(currency)
+            )
+
+    def get_payment_url(self, **kwargs):
+        """
+        Called by ERPNext Payment Request to generate a payment link.
+
+        kwargs contains: amount, title, description, reference_doctype,
+                        reference_docname, payer_email, payer_name, order_id, currency
+        """
+        amount = flt(kwargs.get("amount"))
+        reference_name = kwargs.get("reference_docname")
+        order_id = kwargs.get("order_id") or reference_name
+
+        # Option A: Generate a UPI deep link (works with any UPI app)
+        upi_params = {
+            "pa": self.merchant_vpa,  # payee address
+            "pn": self.merchant_name,  # payee name
+            "tr": order_id,  # transaction reference
+            "tn": kwargs.get("description", f"Payment for {reference_name}"),
+            "am": f"{amount:.2f}",
+            "cu": "INR",
+        }
+        upi_link = "upi://pay?" + urlencode(upi_params)
+
+        # Option B: If using a payment gateway API, create an order
+        if self.api_key:
+            gateway_order = self._create_gateway_order(
+                amount=amount,
+                order_id=order_id,
+                customer_email=kwargs.get("payer_email"),
+                customer_name=kwargs.get("payer_name"),
+            )
+            if gateway_order:
+                return gateway_order.get("payment_url", upi_link)
+
+        # For QR-based payments, redirect to our QR page
+        qr_url = get_url(
+            f"/api/method/scoopjoy.api.v1.payments.show_upi_qr?"
+            f"order_id={order_id}&amount={amount}"
+        )
+        return qr_url
+
+    def _create_gateway_order(self, amount, order_id, customer_email, customer_name):
+        """Create a payment order via the UPI provider's API."""
+        try:
+            api_key = self.get_password("api_key")
+            api_secret = self.get_password("api_secret")
+
+            response = requests.post(
+                f"{self.api_base_url}/orders",
+                json={
+                    "amount": int(amount * 100),  # paise
+                    "currency": "INR",
+                    "receipt": order_id,
+                    "payment_methods": ["upi"],
+                    "callback_url": get_url(
+                        "/api/method/scoopjoy.api.v1.payments.upi_callback"
+                    ),
+                    "customer": {
+                        "email": customer_email,
+                        "name": customer_name,
+                    },
+                },
+                auth=(api_key, api_secret),
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except Exception as e:
+            frappe.log_error(title="UPI Gateway Order Creation Failed", message=str(e))
+            return None
+```
+
+The line marked at `get_payment_url` returns either the provider's hosted page (if
+an API key is set) or a redirect to ScoopJoy's own QR page — that QR page is the
+next step.
+
+## Step 4: QR-code generation endpoint
+
+This endpoint is whitelisted with `allow_guest=True` — customers paying ScoopJoy
+don't have ERP accounts. It builds the `upi://pay?...` string, renders it to a PNG
+QR with `segno`, and serves a self-contained web page that polls
+`check_payment_status` every 5 seconds.
+
+```python title="scoopjoy/api/v1/payments.py" {35,53-58}
+import frappe
+from frappe import _
+from frappe.utils import flt, get_url
+from urllib.parse import urlencode
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+def show_upi_qr(order_id=None, amount=None):
+    """
+    Generate and display a UPI QR code page for payment.
+
+    GET /api/method/scoopjoy.api.v1.payments.show_upi_qr?order_id=PR-00042&amount=450
+    """
+    if not order_id or not amount:
+        frappe.throw(_("order_id and amount are required"))
+
+    settings = frappe.get_cached_doc("UPI Settings")
+    if not settings.enabled:
+        frappe.throw(_("UPI payments are not enabled"))
+
+    amount = flt(amount)
+
+    upi_params = {
+        "pa": settings.merchant_vpa,
+        "pn": settings.merchant_name,
+        "tr": order_id,
+        "tn": f"ScoopJoy Order {order_id}",
+        "am": f"{amount:.2f}",
+        "cu": "INR",
+    }
+    upi_string = "upi://pay?" + urlencode(upi_params)
+
+    # Generate QR code using segno (lightweight, pure-python)
+    import segno
+    import io
+    import base64
+
+    qr = segno.make(upi_string)
+    buffer = io.BytesIO()
+    qr.save(buffer, kind="png", scale=8, border=2)
+    qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+
+    # Return an HTML page (for browser redirect from Payment Request)
+    frappe.respond_as_web_page(
+        title=f"Pay {frappe.format(amount, 'Currency')} via UPI",
+        html=f"""
+        <div style="text-align: center; padding: 20px; font-family: sans-serif;">
+            <h2>ScoopJoy Payment</h2>
+            <p>Scan QR code with any UPI app to pay</p>
+            <img src="data:image/png;base64,{qr_base64}"
+                 alt="UPI QR Code" style="max-width: 300px; margin: 20px auto;" />
+            <p style="font-size: 24px; font-weight: bold; color: #e91e63;">
+                Amount: INR {amount:.2f}
+            </p>
+            <p style="color: #666;">Order: {order_id}</p>
+            <p style="color: #666;">UPI ID: {settings.merchant_vpa}</p>
+            <hr />
+            <p>Or open in UPI app:
+                <a href="{upi_string}" style="color: #4CAF50;">Pay Now</a>
+            </p>
+            <div id="status-check" style="margin-top: 20px; color: #999;">
+                Waiting for payment confirmation...
+            </div>
+            <script>
+                // Poll for payment status every 5 seconds
+                const orderId = "{order_id}";
+                const checkInterval = setInterval(async () => {{
+                    try {{
+                        const resp = await fetch(
+                            `/api/method/scoopjoy.api.v1.payments.check_payment_status?order_id=${{orderId}}`
+                        );
+                        const data = await resp.json();
+                        if (data.message && data.message.data && data.message.data.paid) {{
+                            clearInterval(checkInterval);
+                            document.getElementById("status-check").innerHTML =
+                                '<span style="color: green; font-size: 18px;">Payment received! Redirecting...</span>';
+                            setTimeout(() => window.location.href = "/printview?doctype=Sales+Invoice&name=" + orderId, 2000);
+                        }}
+                    }} catch (e) {{
+                        console.error("Status check failed", e);
+                    }}
+                }}, 5000);
+            </script>
+        </div>
+        """,
+    )
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+def check_payment_status(order_id=None):
+    """Poll endpoint for payment status (used by QR page JS)."""
+    if not order_id:
+        return {"paid": False}
+
+    # Check if a Payment Entry exists for this order
+    paid = frappe.db.exists("Payment Entry", {
+        "reference_no": order_id,
+        "docstatus": 1,
+    })
+
+    # Also check Sales Invoice outstanding
+    outstanding = frappe.db.get_value("Sales Invoice", order_id, "outstanding_amount")
+
+    return {"data": {
+        "paid": bool(paid) or (outstanding is not None and flt(outstanding) == 0),
+        "order_id": order_id,
+    }}
+```
+
+Note the Python f-string doubles its braces (`{{ ... }}`) inside the embedded
+JavaScript, so the JS object and template-literal braces survive the f-string
+interpolation untouched.
+
+## Step 5: UPI callback endpoint
+
+The provider POSTs here when a payment is captured. The first thing the handler
+does is verify the `X-Payment-Signature` header against an HMAC-SHA256 of the raw
+body — an unsigned or mismatched request is rejected with `401`. Only a `captured`
+status proceeds, and an existing `Payment Entry` for the same `payment_id` short-
+circuits as a duplicate (idempotency).
+
+```python title="scoopjoy/api/v1/payments.py" {16-22,31-32}
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def upi_callback():
+    """
+    Receive payment confirmation from UPI provider.
+
+    POST /api/method/scoopjoy.api.v1.payments.upi_callback
+    """
+    import hmac as hmac_mod
+    import hashlib
+
+    raw_body = frappe.request.get_data()
+    signature = frappe.request.headers.get("X-Payment-Signature", "")
+
+    # Verify signature
+    settings = frappe.get_cached_doc("UPI Settings")
+    callback_secret = settings.get_password("callback_secret")
+
+    expected = hmac_mod.new(
+        callback_secret.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+
+    if not hmac_mod.compare_digest(signature, expected):
+        frappe.local.response["http_status_code"] = 401
+        return {"status": "error", "message": "Invalid signature"}
+
+    import json
+    payload = json.loads(raw_body)
+
+    payment_id = payload.get("payment_id")
+    order_id = payload.get("order_id") or payload.get("receipt")
+    status = payload.get("status")  # "captured", "failed", etc.
+    amount_paise = payload.get("amount", 0)
+    amount = flt(amount_paise) / 100
+    upi_transaction_id = payload.get("upi_transaction_id", "")
+
+    # Log the callback
+    frappe.logger("upi").info(f"UPI callback: payment={payment_id}, order={order_id}, status={status}")
+
+    if status != "captured":
+        frappe.local.response["http_status_code"] = 200
+        return {"status": "noted", "message": f"Payment status: {status}"}
+
+    # Idempotency: check if Payment Entry already exists
+    if frappe.db.exists("Payment Entry", {"reference_no": payment_id, "docstatus": 1}):
+        return {"status": "duplicate", "message": "Payment already recorded"}
+
+    # Find the Sales Invoice
+    if not frappe.db.exists("Sales Invoice", order_id):
+        frappe.log_error(title="UPI Callback: Invoice not found", message=f"order_id={order_id}")
+        frappe.local.response["http_status_code"] = 200  # Ack anyway
+        return {"status": "error", "message": f"Invoice {order_id} not found"}
+
+    si = frappe.get_doc("Sales Invoice", order_id)
+
+    # Create Payment Entry
+    from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+
+    pe = get_payment_entry("Sales Invoice", si.name)
+    pe.reference_no = payment_id
+    pe.reference_date = frappe.utils.nowdate()
+    pe.mode_of_payment = "UPI"
+    pe.paid_amount = amount
+    pe.received_amount = amount
+    pe.remarks = f"UPI Payment {payment_id} | UPI Txn: {upi_transaction_id}"
+
+    # Find the UPI bank account
+    gateway_account = frappe.db.get_value(
+        "Payment Gateway Account",
+        {"payment_gateway": "UPI", "company": si.company},
+        "payment_account"
+    )
+    if gateway_account:
+        pe.paid_to = gateway_account
+
+    pe.flags.ignore_permissions = True
+    pe.insert()
+    pe.submit()
+
+    # Update invoice delivery status if needed
+    frappe.db.set_value("Sales Invoice", order_id, "custom_payment_confirmed", 1)
+
+    frappe.db.commit()
+
+    return {"status": "success", "message": "Payment recorded", "payment_entry": pe.name}
+```
+
+ERPNext's `get_payment_entry` helper does the accounting heavy lifting: it builds a
+`Payment Entry` that debits the bank account and credits the receivable, fully
+allocated against the invoice. You only set the reference number, mode of payment,
+amounts, and the `paid_to` account.
+
+:::note[Why this works]
+This follows ERPNext's standard Payment Gateway pattern: a Settings DocType with a
+`get_payment_url()` method, linked through the `Payment Gateway` DocType. The QR
+endpoint works without authentication because customers don't have ERP accounts.
+The callback creates a proper `Payment Entry` via ERPNext's `get_payment_entry`
+helper, which posts the accounting entries (debit bank, credit receivable)
+correctly — so the ledger stays consistent without manual journal work.
+:::
+
+:::caution[Common mistake]
+Generating QR codes with the `qrcode` library at import time. Use `segno` instead —
+it's a pure-Python library with no PIL/Pillow dependency, making it much lighter for
+server-side use. Add `segno` to your app's `requirements.txt`.
+:::
+

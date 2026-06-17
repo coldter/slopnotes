@@ -1,0 +1,401 @@
+---
+title: Advanced Child Table Operations
+description: Build a rich order-builder form with bulk add, row calculations, running totals, conditional formatting, and cross-document copy.
+sidebar:
+  order: 4
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build an "Ice Cream Order Builder" with complex child table
+interactions: bulk add, row calculations, running totals, conditional formatting,
+and cross-document copy.
+
+**Solution:** Drive everything from the parent form's client script. Use
+`frm.add_child('table_fieldname')` to create rows, child-table events
+`(frm, cdt, cdn)` for row-level calculations, and helper functions for totals and
+formatting. The blocks below all live in one client script file —
+`scoopjoy/scoopjoy/ice_cream_order/ice_cream_order.js` — split here by the pattern
+each part demonstrates.
+
+## Parent form events
+
+On `refresh`, while the document is a draft (`docstatus === 0`), add three custom
+buttons grouped under a `Build Order` menu: a quick-add dialog, a bulk-add from
+bestsellers, and a copy-from-previous-order action. The first opens a custom
+`frappe.ui.Dialog` and hands its values to the `add_item_to_order` helper.
+
+```javascript title="scoopjoy/scoopjoy/ice_cream_order/ice_cream_order.js"
+frappe.ui.form.on('Ice Cream Order', {
+
+    refresh(frm) {
+        if (frm.doc.docstatus === 0) {
+            // --- Pattern: Add rows with defaults from a custom dialog ---
+            frm.add_custom_button(__('Add Item'), () => {
+                const d = new frappe.ui.Dialog({
+                    title: 'Add Ice Cream Item',
+                    fields: [
+                        { fieldname: 'item_code', fieldtype: 'Link', label: 'Ice Cream',
+                          options: 'Item', reqd: 1,
+                          get_query: () => ({
+                              filters: { item_group: ['like', 'Ice Cream%'], disabled: 0 }
+                          })
+                        },
+                        { fieldname: 'flavour', fieldtype: 'Link', label: 'Flavour',
+                          options: 'Ice Cream Flavour', reqd: 1 },
+                        { fieldtype: 'Column Break' },
+                        { fieldname: 'size', fieldtype: 'Select', label: 'Size',
+                          options: 'Small\nMedium\nLarge\nFamily Pack', default: 'Medium' },
+                        { fieldname: 'qty', fieldtype: 'Int', label: 'Quantity', default: 1, reqd: 1 },
+                        { fieldtype: 'Section Break' },
+                        { fieldname: 'toppings', fieldtype: 'MultiSelect', label: 'Toppings',
+                          options: 'Chocolate Chips\nSprinkles\nNuts\nCaramel Drizzle\nWhipped Cream\nFruit' },
+                    ],
+                    primary_action_label: 'Add to Order',
+                    primary_action(values) {
+                        add_item_to_order(frm, values);
+                        d.hide();
+                    },
+                });
+                d.show();
+            }, __('Build Order'));
+```
+
+### Bulk add from a multi-select table
+
+A `Table` field inside a dialog lets the user tick rows and enter quantities
+against a list fetched from the server. On confirm, the selected rows are added
+with one `frm.add_child` per row, then a single `frm.refresh_field('order_items')`
+re-renders the grid.
+
+```javascript title="scoopjoy/scoopjoy/ice_cream_order/ice_cream_order.js"
+            // --- Pattern: Bulk add from a multi-select dialog ---
+            frm.add_custom_button(__('Bulk Add from Bestsellers'), async () => {
+                const bestsellers = await frappe.xcall(
+                    'scoopjoy.api.orders.get_bestsellers',
+                    { outlet: frm.doc.franchise_outlet, limit: 20 }
+                );
+
+                if (!bestsellers.length) {
+                    frappe.msgprint('No bestseller data available.');
+                    return;
+                }
+
+                const d = new frappe.ui.Dialog({
+                    title: 'Select Bestselling Items',
+                    size: 'large',
+                    fields: [
+                        {
+                            fieldname: 'items',
+                            fieldtype: 'Table',
+                            label: 'Bestsellers',
+                            cannot_add_rows: true,
+                            in_place_edit: true,
+                            data: bestsellers.map(item => ({
+                                item_code: item.item_code,
+                                item_name: item.item_name,
+                                rate: item.rate,
+                                qty: 0,   // user enters desired qty
+                                selected: 0,
+                            })),
+                            fields: [
+                                { fieldname: 'selected', fieldtype: 'Check', label: 'Select',
+                                  in_list_view: 1, columns: 1 },
+                                { fieldname: 'item_code', fieldtype: 'Data', label: 'Item Code',
+                                  in_list_view: 1, read_only: 1, columns: 2 },
+                                { fieldname: 'item_name', fieldtype: 'Data', label: 'Item',
+                                  in_list_view: 1, read_only: 1, columns: 3 },
+                                { fieldname: 'rate', fieldtype: 'Currency', label: 'Rate',
+                                  in_list_view: 1, read_only: 1, columns: 2 },
+                                { fieldname: 'qty', fieldtype: 'Int', label: 'Qty',
+                                  in_list_view: 1, columns: 2 },
+                            ],
+                        }
+                    ],
+                    primary_action_label: 'Add Selected',
+                    primary_action(values) {
+                        const selected = values.items.filter(r => r.selected && r.qty > 0);
+                        if (!selected.length) {
+                            frappe.msgprint('Select items and enter quantities.');
+                            return;
+                        }
+
+                        selected.forEach(item => {
+                            const row = frm.add_child('order_items');
+                            row.item_code = item.item_code;
+                            row.item_name = item.item_name;
+                            row.rate      = item.rate;
+                            row.qty       = item.qty;
+                            row.amount    = item.rate * item.qty;
+                        });
+
+                        frm.refresh_field('order_items');
+                        recalculate_order_totals(frm);
+                        d.hide();
+                        frappe.show_alert({
+                            message: `Added ${selected.length} items`,
+                            indicator: 'green'
+                        });
+                    },
+                });
+                d.show();
+            }, __('Build Order'));
+```
+
+### Copy rows from another document
+
+`frappe.ui.form.MultiSelectDialog` is the built-in picker for choosing existing
+documents. The `setters` pre-filter by outlet, `date_field` enables date sorting,
+and the `action` callback passes the chosen names to `copy_items_from_orders`.
+
+```javascript title="scoopjoy/scoopjoy/ice_cream_order/ice_cream_order.js"
+            // --- Pattern: Copy rows from another document ---
+            frm.add_custom_button(__('Copy from Previous Order'), () => {
+                new frappe.ui.form.MultiSelectDialog({
+                    doctype: 'Ice Cream Order',
+                    target: frm,
+                    setters: {
+                        franchise_outlet: frm.doc.franchise_outlet,
+                        customer: null,
+                    },
+                    date_field: 'order_date',
+                    get_query() {
+                        return {
+                            filters: {
+                                docstatus: 1,
+                                name: ['!=', frm.doc.name],
+                            }
+                        };
+                    },
+                    action(selections) {
+                        if (!selections.length) return;
+                        copy_items_from_orders(frm, selections);
+                        cur_dialog.hide();
+                    },
+                });
+            }, __('Build Order'));
+        }
+
+        // --- Pattern: Conditional row formatting ---
+        apply_row_formatting(frm);
+    },
+
+    validate(frm) {
+        // Final validation: no zero-qty rows
+        (frm.doc.order_items || []).forEach(row => {
+            if (!row.qty || row.qty <= 0) {
+                frappe.throw(__('Row {0}: Quantity must be at least 1.', [row.idx]));
+            }
+            if (!row.rate || row.rate <= 0) {
+                frappe.throw(__('Row {0}: Rate must be greater than zero.', [row.idx]));
+            }
+        });
+    },
+});
+```
+
+The `validate` handler runs before save and rejects any row with a non-positive
+quantity or rate, using `__('Row {0}: …', [row.idx])` so the message is
+translatable and points at the offending row.
+
+## Child table events
+
+Register a second `frappe.ui.form.on` against the child DocType — here
+`Ice Cream Order Item`. These handlers receive `(frm, cdt, cdn)`: `cdt` is the
+child DocType name and `cdn` is the row's name, so `locals[cdt][cdn]` resolves to
+the row object. Fetching the item's details on `item_code` change and recomputing
+the amount on `qty`/`rate`/`discount_percent` change keeps each row consistent.
+
+```javascript title="scoopjoy/scoopjoy/ice_cream_order/ice_cream_order.js" {3,18,22}
+frappe.ui.form.on('Ice Cream Order Item', {
+    item_code(frm, cdt, cdn) {
+        const row = locals[cdt][cdn];
+        if (row.item_code) {
+            frappe.db.get_value('Item', row.item_code,
+                ['item_name', 'standard_rate', 'stock_uom'], (r) => {
+                    frappe.model.set_value(cdt, cdn, {
+                        item_name: r.item_name,
+                        rate: r.standard_rate,
+                        uom: r.stock_uom,
+                        amount: r.standard_rate * (row.qty || 1),
+                    });
+                    recalculate_order_totals(frm);
+                }
+            );
+        }
+    },
+
+    // --- Pattern: Row-level calculations (qty * rate = amount) ---
+    qty(frm, cdt, cdn) {
+        calculate_row_amount(frm, cdt, cdn);
+    },
+
+    rate(frm, cdt, cdn) {
+        calculate_row_amount(frm, cdt, cdn);
+    },
+
+    discount_percent(frm, cdt, cdn) {
+        calculate_row_amount(frm, cdt, cdn);
+    },
+
+    order_items_remove(frm) {
+        recalculate_order_totals(frm);
+    },
+});
+```
+
+The `<table>_remove` event (here `order_items_remove`) fires when a row is deleted,
+so totals stay correct after removals too.
+
+## Calculation helpers
+
+`calculate_row_amount` derives one row's net amount from quantity, rate, and
+discount, writing it back with `frappe.model.set_value` — which updates a single
+field without re-rendering the whole grid. `recalculate_order_totals` then sums the
+table into the parent's totals, including a 5% GST line for ice cream in India.
+
+```javascript title="scoopjoy/scoopjoy/ice_cream_order/ice_cream_order.js"
+function calculate_row_amount(frm, cdt, cdn) {
+    const row = locals[cdt][cdn];
+    const gross = (row.qty || 0) * (row.rate || 0);
+    const discount = gross * ((row.discount_percent || 0) / 100);
+    const amount = gross - discount;
+
+    frappe.model.set_value(cdt, cdn, 'amount', amount);
+    recalculate_order_totals(frm);
+}
+
+function recalculate_order_totals(frm) {
+    let total_qty = 0;
+    let total_amount = 0;
+
+    (frm.doc.order_items || []).forEach(row => {
+        total_qty    += (row.qty || 0);
+        total_amount += (row.amount || 0);
+    });
+
+    frm.set_value('total_qty', total_qty);
+    frm.set_value('net_total', total_amount);
+
+    // Tax calculation (GST 5% for ice cream in India)
+    const tax = total_amount * 0.05;
+    frm.set_value('total_tax', Math.round(tax * 100) / 100);
+    frm.set_value('grand_total', Math.round((total_amount + tax) * 100) / 100);
+
+    // Refresh row formatting after total changes
+    apply_row_formatting(frm);
+}
+```
+
+### Conditional row formatting
+
+Reach into the grid's rendered DOM through `frm.fields_dict.order_items.grid` to
+tint rows: discounts above 20% get an orange background, out-of-stock items get
+red. Reset styles first, then re-apply on every recalculation.
+
+```javascript title="scoopjoy/scoopjoy/ice_cream_order/ice_cream_order.js"
+function apply_row_formatting(frm) {
+    // Highlight rows where discount > 20% in orange, out-of-stock items in red
+    frm.fields_dict.order_items.$wrapper
+        .find('.rows .frappe-control[data-fieldname="order_items"] .row-data, .frappe-control[data-fieldname="order_items"] .rows .form-group')
+        .each(function() {
+            // Reset
+            $(this).css('background', '');
+        });
+
+    (frm.doc.order_items || []).forEach((row, idx) => {
+        const $row = frm.fields_dict.order_items.grid.grid_rows[idx]?.row;
+        if (!$row) return;
+
+        if (row.discount_percent > 20) {
+            $row.css('background', '#fff3e0');  // orange tint
+        }
+        if (row.is_out_of_stock) {
+            $row.css('background', '#ffebee');  // red tint
+        }
+    });
+}
+```
+
+### Copy and quick-add helpers
+
+`copy_items_from_orders` freezes the screen, fetches each source order via
+`frappe.client.get`, and clones its rows into the current form — adding all rows
+first and calling `refresh_field` once at the end. `add_item_to_order` applies a
+size multiplier to the standard rate before adding the row from the quick-add
+dialog.
+
+```javascript title="scoopjoy/scoopjoy/ice_cream_order/ice_cream_order.js"
+async function copy_items_from_orders(frm, order_names) {
+    frappe.dom.freeze('Copying items...');
+    try {
+        for (const order_name of order_names) {
+            const doc = await frappe.xcall('frappe.client.get', {
+                doctype: 'Ice Cream Order',
+                name: order_name,
+            });
+
+            (doc.order_items || []).forEach(source_row => {
+                const row = frm.add_child('order_items');
+                row.item_code        = source_row.item_code;
+                row.item_name        = source_row.item_name;
+                row.rate             = source_row.rate;
+                row.qty              = source_row.qty;
+                row.uom              = source_row.uom;
+                row.discount_percent = source_row.discount_percent || 0;
+                row.amount           = source_row.amount;
+            });
+        }
+
+        frm.refresh_field('order_items');
+        recalculate_order_totals(frm);
+        frappe.show_alert({
+            message: `Copied items from ${order_names.length} order(s)`,
+            indicator: 'green'
+        });
+    } finally {
+        frappe.dom.unfreeze();
+    }
+}
+
+function add_item_to_order(frm, values) {
+    const size_multiplier = { 'Small': 0.75, 'Medium': 1, 'Large': 1.5, 'Family Pack': 3 };
+
+    frappe.db.get_value('Item', values.item_code,
+        ['item_name', 'standard_rate'], (r) => {
+            const base_rate = r.standard_rate || 0;
+            const rate = base_rate * (size_multiplier[values.size] || 1);
+
+            const row = frm.add_child('order_items');
+            row.item_code = values.item_code;
+            row.item_name = r.item_name;
+            row.flavour   = values.flavour;
+            row.size      = values.size;
+            row.qty       = values.qty;
+            row.rate      = rate;
+            row.amount    = rate * values.qty;
+            row.toppings  = values.toppings;
+
+            frm.refresh_field('order_items');
+            recalculate_order_totals(frm);
+        }
+    );
+}
+```
+
+:::note[Why this works]
+Child table manipulation uses `frm.add_child('table_fieldname')` to create rows,
+then `frm.refresh_field()` to re-render. Row-level events fire with
+`(frm, cdt, cdn)` where `cdt` is the child DocType and `cdn` is the row name —
+`locals[cdt][cdn]` gives you the row object. `frappe.model.set_value(cdt, cdn, ...)`
+updates individual row fields without a full form refresh.
+:::
+
+:::caution[Common mistake]
+Calling `frm.refresh_field('child_table')` inside each row's change event. This is
+expensive for bulk operations — batch your `add_child` calls, then call
+`refresh_field` once at the end. Also, `frm.add_child` returns the raw row object;
+you must call `refresh_field` for it to appear in the UI.
+:::

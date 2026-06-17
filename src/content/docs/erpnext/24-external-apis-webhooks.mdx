@@ -1,0 +1,711 @@
+---
+title: External APIs & Webhooks
+description: Send outgoing webhooks, receive signed incoming requests, call third-party APIs, and bridge ERPNext to mobile apps with Node.js middleware.
+sidebar:
+  order: 24
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Aside } from "@astrojs/starlight/components";
+
+ERPNext and Frappe give you robust tools for both sending data to external systems
+(outgoing webhooks) and receiving data from them (incoming API endpoints). This
+chapter covers the full spectrum of external communication for ScoopJoy — from
+notifying an external CRM about a new franchise lead to syncing a React Native
+mobile app through a Node.js middleware layer.
+
+## Outgoing Webhooks
+
+Frappe ships with a built-in **Webhook** DocType for firing HTTP requests when
+document events occur. For basic setups, no code is required — you configure it
+entirely from the Desk. If you've wired up webhooks in a Node.js app with a queue
+and a worker, this is the same idea, but the framework owns the delivery and
+logging for you.
+
+<Mermaid title="Outgoing webhook delivery" height={360} code={`
+flowchart LR
+  Doc["Document event<br/>(Lead after_insert)"] --> Cond{"Condition<br/>matches?"}
+  Cond -->|"no"| Skip["Skip"]
+  Cond -->|"yes"| Render["Render payload<br/>(Jinja template)"]
+  Render --> Sign["Sign payload<br/>HMAC-SHA256"]
+  Sign --> POST["POST to Request URL"]
+  POST --> Log["Webhook Request Log"]
+`} />
+
+### Webhook configuration
+
+Create a webhook from the Desk: **Search Bar > Webhook > New**. The key fields:
+
+| Field | Description |
+|-------|-------------|
+| `DocType` | The document type that triggers the webhook (e.g. Lead) |
+| `Doc Event` | When to fire: `after_insert`, `on_update`, `on_submit`, `on_cancel`, `on_trash` |
+| `Condition` | Optional Jinja condition (e.g. `doc.status == "Open"`) |
+| `Request URL` | The external endpoint to call |
+| `Request Method` | POST (default), PUT, PATCH, DELETE |
+| `Webhook Headers` | Custom headers (API keys, Content-Type, etc.) |
+| `Webhook Data` | Fields to include in the payload (form format or JSON) |
+| `Webhook Secret` | Shared secret for HMAC-SHA256 signature verification |
+
+### Notify an external CRM when a new franchise lead is created
+
+You can create the webhook programmatically (for example, in a `before_install`
+hook or a migration patch) instead of clicking through the Desk. This sets up a
+webhook that POSTs to ScoopJoy's external CRM on every new Lead, using a Jinja
+template to shape the JSON body.
+
+```python title="scoopjoy/scoopjoy/setup/webhooks.py" {12-13}
+import frappe
+
+def create_lead_webhook():
+    """Set up a webhook to notify the external CRM on new Lead creation."""
+    if frappe.db.exists("Webhook", {"webhook_doctype": "Lead", "doc_event": "after_insert"}):
+        return
+
+    webhook = frappe.get_doc({
+        "doctype": "Webhook",
+        "webhook_doctype": "Lead",
+        "doc_event": "after_insert",
+        "request_url": "https://crm.scoopjoy.com/api/webhooks/new-lead",
+        "request_method": "POST",
+        "enable_security": 1,
+        "webhook_secret": "your-shared-secret-here",
+        "webhook_headers": [
+            {"key": "Content-Type", "value": "application/json"},
+            {"key": "X-Source", "value": "erpnext-franchise"},
+        ],
+        "webhook_json": (
+            '{\n'
+            '  "lead_name": "{{ doc.lead_name }}",\n'
+            '  "email": "{{ doc.email_id }}",\n'
+            '  "phone": "{{ doc.phone }}",\n'
+            '  "company": "{{ doc.company_name }}",\n'
+            '  "source": "{{ doc.source }}",\n'
+            '  "territory": "{{ doc.territory }}",\n'
+            '  "created_at": "{{ doc.creation }}"\n'
+            '}'
+        ),
+        "request_structure": "JSON",
+    })
+    webhook.insert(ignore_permissions=True)
+    frappe.db.commit()
+```
+
+The `webhook_json` value is a Jinja template — placeholders like `{{ doc.lead_name }}`
+are evaluated against the triggering document at send time, so each Lead produces a
+filled-in payload such as `{"lead_name": "Anita Rao", "email": "anita@...", ...}`.
+
+### Webhook secret and verification
+
+When `enable_security` is checked and a `webhook_secret` is set, Frappe adds an
+`X-Frappe-Webhook-Signature` header. The value is a base64-encoded HMAC-SHA256 hash
+of the raw payload bytes. The receiver recomputes that hash with the shared secret
+and compares — exactly the GitHub-webhook pattern you may know from Node.js.
+
+```python title="receiver/verify.py"
+import hmac
+import hashlib
+import base64
+
+def verify_frappe_webhook(payload_bytes, signature_header, secret):
+    """Verify an incoming Frappe webhook signature."""
+    computed = base64.b64encode(
+        hmac.new(
+            secret.encode("utf-8"),
+            payload_bytes,
+            hashlib.sha256,
+        ).digest()
+    ).decode()
+
+    return hmac.compare_digest(computed, signature_header)
+```
+
+The same check from a Node.js receiver — note `timingSafeEqual` to avoid leaking
+the comparison via timing:
+
+```javascript title="receiver/verify.js"
+const crypto = require("crypto");
+
+function verifyFrappeWebhook(payload, signatureHeader, secret) {
+  const computed = crypto
+    .createHmac("sha256", secret)
+    .update(payload)
+    .digest("base64");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(computed),
+    Buffer.from(signatureHeader)
+  );
+}
+```
+
+### Webhook logs
+
+Every webhook request is logged in the **Webhook Request Log** DocType — your first
+stop when a delivery silently fails. Query it for a specific DocType:
+
+```python
+# Query recent webhook logs for a specific DocType
+logs = frappe.get_all(
+    "Webhook Request Log",
+    filters={"doctype_name": "Lead"},
+    fields=["name", "url", "response_code", "creation"],
+    order_by="creation desc",
+    limit=10,
+)
+for log in logs:
+    print(f"{log.name}: {log.url} -> HTTP {log.response_code}")
+```
+
+## Incoming Webhooks
+
+Frappe does **not** have a dedicated "Incoming Webhook" DocType. Instead, you
+create whitelisted API endpoints that external services call directly — the
+equivalent of writing an Express route, but the function is exposed automatically
+once it's decorated with `@frappe.whitelist()`.
+
+<Mermaid title="Incoming order webhook" height={420} code={`
+sequenceDiagram
+  participant SF as Next.js storefront
+  participant API as scoopjoy.api.storefront
+  participant DB as ERPNext / MariaDB
+  SF->>API: POST receive_order (signed)
+  API->>API: verify X-Storefront-Signature
+  API->>API: validate required fields
+  API->>DB: get_or_create_customer
+  API->>DB: insert + submit Sales Order
+  API-->>SF: { status, sales_order, grand_total }
+`} />
+
+### Receive order data from a React/Next.js storefront
+
+This whitelisted endpoint accepts a signed POST from ScoopJoy's online storefront,
+verifies the HMAC signature, validates the body, then finds-or-creates the customer
+and address before submitting a Sales Order. Note `allow_guest=True` — the request
+isn't authenticated as a Frappe user, so the signature check is what protects it.
+
+```python title="scoopjoy/scoopjoy/api/storefront.py" {7,16-19}
+import frappe
+import json
+import hmac
+import hashlib
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def receive_order():
+    """Receive order data from a Next.js storefront and create a Sales Order."""
+    # Verify the request signature
+    payload = frappe.request.data
+    signature = frappe.get_request_header("X-Storefront-Signature")
+
+    secret = frappe.conf.get("storefront_webhook_secret")
+    if not secret:
+        frappe.throw("Storefront webhook secret not configured")
+
+    expected = hmac.new(
+        secret.encode("utf-8"), payload, hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature or "", expected):
+        frappe.throw("Invalid webhook signature", frappe.AuthenticationError)
+
+    data = json.loads(payload)
+
+    # Validate required fields
+    required = ["customer_email", "items", "delivery_address"]
+    for field in required:
+        if field not in data:
+            frappe.throw(f"Missing required field: {field}")
+
+    customer = get_or_create_customer(data)
+
+    so = frappe.new_doc("Sales Order")
+    so.customer = customer
+    so.delivery_date = frappe.utils.add_days(frappe.utils.today(), 3)
+    so.company = "ScoopJoy Foods Pvt Ltd"
+    so.order_type = "Shopping Cart"
+
+    for item in data["items"]:
+        so.append("items", {
+            "item_code": item["sku"],
+            "qty": item["quantity"],
+            "rate": item.get("price"),  # Optional: let ERPNext use the price list
+            "delivery_date": so.delivery_date,
+        })
+
+    address = data["delivery_address"]
+    so.shipping_address_name = get_or_create_address(customer, address)
+
+    so.insert(ignore_permissions=True)
+    so.submit()
+    frappe.db.commit()
+
+    return {
+        "status": "success",
+        "sales_order": so.name,
+        "grand_total": so.grand_total,
+    }
+```
+
+The helpers find an existing customer by email (via the linked Contact) or create
+a fresh Customer, Contact, and shipping Address:
+
+```python title="scoopjoy/scoopjoy/api/storefront.py"
+def get_or_create_customer(data):
+    """Find existing customer by email or create a new one."""
+    email = data["customer_email"]
+    name = data.get("customer_name", email)
+
+    existing = frappe.db.get_value(
+        "Contact Email",
+        {"email_id": email, "parenttype": "Contact"},
+        "parent",
+    )
+    if existing:
+        contact = frappe.get_doc("Contact", existing)
+        for link in contact.links:
+            if link.link_doctype == "Customer":
+                return link.link_name
+
+    customer = frappe.get_doc({
+        "doctype": "Customer",
+        "customer_name": name,
+        "customer_group": "Retail",
+        "territory": "All Territories",
+        "customer_type": "Individual",
+    })
+    customer.insert(ignore_permissions=True)
+
+    frappe.get_doc({
+        "doctype": "Contact",
+        "first_name": name,
+        "email_ids": [{"email_id": email, "is_primary": 1}],
+        "links": [{"link_doctype": "Customer", "link_name": customer.name}],
+    }).insert(ignore_permissions=True)
+
+    return customer.name
+
+
+def get_or_create_address(customer, address_data):
+    """Create a shipping address for the customer."""
+    addr = frappe.get_doc({
+        "doctype": "Address",
+        "address_title": customer,
+        "address_type": "Shipping",
+        "address_line1": address_data.get("line1", ""),
+        "address_line2": address_data.get("line2", ""),
+        "city": address_data.get("city", ""),
+        "state": address_data.get("state", ""),
+        "pincode": address_data.get("pincode", ""),
+        "country": address_data.get("country", "India"),
+        "links": [{"link_doctype": "Customer", "link_name": customer}],
+    })
+    addr.insert(ignore_permissions=True)
+    return addr.name
+```
+
+Call this endpoint from your Next.js storefront, signing the payload with the same
+shared secret. On success the endpoint returns `{ status, sales_order, grand_total }`
+inside the standard Frappe `message` envelope:
+
+```javascript title="storefront/lib/erpnext.js"
+import crypto from "crypto";
+
+async function submitOrderToERPNext(orderData) {
+  const payload = JSON.stringify(orderData);
+  const signature = crypto
+    .createHmac("sha256", process.env.ERPNEXT_WEBHOOK_SECRET)
+    .update(payload)
+    .digest("hex");
+
+  const response = await fetch(
+    `${process.env.ERPNEXT_URL}/api/method/scoopjoy.api.storefront.receive_order`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Storefront-Signature": signature,
+      },
+      body: payload,
+    }
+  );
+
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.exc || "Failed to create order in ERPNext");
+  }
+  return result.message; // { status, sales_order, grand_total }
+}
+
+// Usage
+const erpnextOrder = await submitOrderToERPNext({
+  customer_email: "alice@example.com",
+  customer_name: "Alice Johnson",
+  items: [
+    { sku: "IC-CONE-VAN", quantity: 2, price: 80 },
+    { sku: "IC-SUN-FUDGE", quantity: 1, price: 180 },
+  ],
+  delivery_address: {
+    line1: "42 MG Road",
+    city: "Bangalore",
+    state: "Karnataka",
+    pincode: "560001",
+    country: "India",
+  },
+});
+
+console.log("Order created:", erpnextOrder.sales_order);
+```
+
+## Making External API Calls from Frappe
+
+Frappe gives you two ways to call out to external services: the standard `requests`
+library (use this when you want full control) or `frappe.integrations.utils.make_request`
+(a thin structured wrapper).
+
+### Fetch weather data for demand forecasting
+
+Hot weather means higher demand for cold treats, so ScoopJoy pulls a 5-period
+forecast and turns the temperature into a demand multiplier. Note the `timeout`,
+`raise_for_status()`, and `frappe.log_error` — always wrap outbound calls so a slow
+third party can't hang a request worker.
+
+```python title="scoopjoy/scoopjoy/api/weather.py" {18-19,25}
+import frappe
+import requests
+
+@frappe.whitelist()
+def fetch_weather_forecast(city="Mumbai"):
+    """Fetch weather data to help adjust ice cream demand forecasting."""
+    api_key = frappe.conf.get("openweather_api_key")
+    if not api_key:
+        frappe.throw("OpenWeather API key not configured in site_config.json")
+
+    try:
+        response = requests.get(
+            "https://api.openweathermap.org/data/2.5/forecast",
+            params={
+                "q": city,
+                "appid": api_key,
+                "units": "metric",
+                "cnt": 5,  # Next 5 periods (3-hour intervals)
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        frappe.log_error(f"Weather API error: {e}", "Weather Forecast")
+        frappe.throw(f"Could not fetch weather data: {e}")
+
+    data = response.json()
+
+    forecasts = []
+    for period in data.get("list", []):
+        temp = period["main"]["temp"]
+        forecasts.append({
+            "datetime": period["dt_txt"],
+            "temperature": temp,
+            "weather": period["weather"][0]["description"],
+            "demand_multiplier": calculate_demand_multiplier(temp),
+        })
+
+    return {"city": city, "forecasts": forecasts}
+
+
+def calculate_demand_multiplier(temperature_celsius):
+    """Estimate ice cream demand multiplier based on temperature."""
+    if temperature_celsius >= 40:
+        return 2.0   # Extreme heat -> double demand
+    elif temperature_celsius >= 35:
+        return 1.5
+    elif temperature_celsius >= 28:
+        return 1.2
+    elif temperature_celsius >= 20:
+        return 1.0   # Normal demand
+    else:
+        return 0.7   # Cold weather -> reduced demand
+```
+
+Because it's whitelisted, the endpoint is callable over the REST API with an API
+key/secret token:
+
+```bash
+curl -X POST https://icecream.localhost/api/method/scoopjoy.api.weather.fetch_weather_forecast \
+  -H "Authorization: token api_key:api_secret" \
+  -H "Content-Type: application/json" \
+  -d '{"city": "Mumbai"}'
+```
+
+For simpler integrations, `make_request` handles the request/response plumbing:
+
+```python
+from frappe.integrations.utils import make_request
+
+# GET request
+response = make_request("GET", "https://api.example.com/data", params={"key": "value"})
+
+# POST request with JSON body
+response = make_request(
+    "POST",
+    "https://api.example.com/orders",
+    headers={"Authorization": "Bearer token123"},
+    json={"item": "IC-CONE-VAN", "qty": 10},
+)
+```
+
+## Connected App (OAuth2)
+
+The **Connected App** DocType lets Frappe act as an OAuth2 *client* to access
+external services like Google, Microsoft 365, or any OAuth2 provider — Frappe
+handles the authorization code flow and token storage for you.
+
+### Connect to Google Workspace for franchise team calendars
+
+This sets up a Connected App pointing at Google's OAuth2 endpoints so ScoopJoy can
+sync franchise team calendars. Client ID and secret come from `site_config.json`,
+never hard-coded.
+
+```python title="scoopjoy/scoopjoy/setup/connected_apps.py"
+import frappe
+
+def setup_google_connected_app():
+    """Set up a Connected App for Google Workspace OAuth2 (calendar sync)."""
+    if frappe.db.exists("Connected App", {"provider_name": "Google"}):
+        return
+
+    connected_app = frappe.get_doc({
+        "doctype": "Connected App",
+        "provider_name": "Google",
+        "authorization_uri": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "revoke_uri": "https://oauth2.googleapis.com/revoke",
+        "client_id": frappe.conf.get("google_client_id"),
+        "client_secret": frappe.conf.get("google_client_secret"),
+        "redirect_uri": "https://icecream.example.com/api/method/frappe.integrations.oauth2_logins.login_via_oauth2",
+        "scopes": [
+            {"scope": "https://www.googleapis.com/auth/calendar"},
+            {"scope": "https://www.googleapis.com/auth/calendar.events"},
+        ],
+    })
+    connected_app.insert(ignore_permissions=True)
+    frappe.db.commit()
+```
+
+Once configured, users authorize the app by visiting the authorization URL. Tokens
+are stored in the **Token Cache** DocType and refreshed automatically — you just ask
+the Connected App for a token and use it:
+
+```python title="scoopjoy/scoopjoy/api/calendar.py"
+import frappe
+import requests
+
+def get_franchise_team_events(user):
+    """Fetch upcoming Google Calendar events for a franchise team member."""
+    connected_app = frappe.get_doc("Connected App", {"provider_name": "Google"})
+    token = connected_app.get_token(user)
+
+    if not token:
+        frappe.throw(
+            "Google account not connected. "
+            "Please authorize from your user settings."
+        )
+
+    response = requests.get(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        headers={"Authorization": f"Bearer {token.access_token}"},
+        params={
+            "timeMin": frappe.utils.now_datetime().isoformat() + "Z",
+            "maxResults": 10,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+
+    events = response.json().get("items", [])
+    return [{
+        "summary": e.get("summary", "No Title"),
+        "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date")),
+        "end": e.get("end", {}).get("dateTime", e.get("end", {}).get("date")),
+        "location": e.get("location", ""),
+    } for e in events]
+```
+
+## Inter-Site Data Sync (Replacing Event Streaming)
+
+<Aside type="caution" title="Event Streaming removed in v15">
+The Event Producer/Consumer feature was removed from Frappe core in v15. The
+`frappe/event_streaming` app is archived and unmaintained. Use one of the patterns
+below instead.
+</Aside>
+
+For syncing data between ScoopJoy's franchise sites in v16, pick one of three
+patterns:
+
+- **Pattern 1 — Webhook-based push.** Configure outgoing webhooks on the HQ site
+  to push document changes to outlet sites as they happen.
+- **Pattern 2 — API-based pull.** A scheduled job on the outlet site polls HQ for
+  records changed since the last sync.
+- **Pattern 3 — Message broker.** For high-volume, real-time sync, put RabbitMQ or
+  Redis Streams between the sites as an intermediary.
+
+The pull pattern is the simplest to reason about — a scheduled job on the outlet
+site asks HQ for items modified since the last run:
+
+```python title="scoopjoy/scoopjoy/sync/items.py"
+import json
+import requests
+
+@frappe.whitelist()
+def sync_items_from_hq():
+    """Scheduled job on the outlet site: pull new items from HQ."""
+    response = requests.get(
+        "https://hq.example.com/api/resource/Item",
+        params={
+            "filters": json.dumps([["modified", ">", get_last_sync_time()]]),
+            "fields": json.dumps(["name", "item_name", "item_group", "standard_rate"]),
+            "limit_page_length": 100,
+        },
+        headers={"Authorization": "token api_key:api_secret"},
+    )
+    for item_data in response.json().get("data", []):
+        sync_item_locally(item_data)
+```
+
+## Node.js Middleware Pattern
+
+Sometimes the cleanest place to glue ERPNext to an external app is a small Node.js
+service that owns the translation in both directions: it forwards mobile-app calls
+into ERPNext's REST API, and it receives ERPNext webhooks to push live updates back
+out to clients.
+
+<Mermaid title="Mobile app bridge" height={360} code={`
+flowchart LR
+  Mobile["React Native app"] -->|"POST /api/orders"| MW["Node.js middleware"]
+  MW -->|"REST (token auth)"| ERP["ERPNext"]
+  ERP -->|"webhook (signed)"| MW
+  MW -->|"push / WebSocket"| Mobile
+`} />
+
+### Node.js middleware syncing ERPNext and a mobile app
+
+The middleware exposes mobile-friendly routes (create order, fetch catalog) backed
+by ERPNext's REST API, and a `/webhooks/erpnext` receiver that verifies the
+`X-Frappe-Webhook-Signature` before broadcasting to clients.
+
+```javascript title="middleware/sync-server.js" {52-58}
+const express = require("express");
+const axios = require("axios");
+const crypto = require("crypto");
+
+const app = express();
+app.use(express.json());
+
+const ERPNEXT_URL = process.env.ERPNEXT_URL;
+const ERPNEXT_API_KEY = process.env.ERPNEXT_API_KEY;
+const ERPNEXT_API_SECRET = process.env.ERPNEXT_API_SECRET;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+
+// ERPNext API client
+const erpnext = axios.create({
+  baseURL: ERPNEXT_URL,
+  headers: {
+    Authorization: `token ${ERPNEXT_API_KEY}:${ERPNEXT_API_SECRET}`,
+    "Content-Type": "application/json",
+  },
+  timeout: 15000,
+});
+
+// --- Mobile App -> ERPNext ---
+
+app.post("/api/orders", async (req, res) => {
+  try {
+    const { customer, items, outlet_id } = req.body;
+
+    const response = await erpnext.post("/api/resource/Sales Order", {
+      customer,
+      company: "ScoopJoy Foods Pvt Ltd",
+      delivery_date: new Date().toISOString().split("T")[0],
+      custom_outlet_id: outlet_id,
+      items: items.map((item) => ({
+        item_code: item.sku,
+        qty: item.qty,
+        rate: item.price,
+      })),
+      docstatus: 1, // Auto-submit
+    });
+
+    res.json({
+      success: true,
+      order_id: response.data.data.name,
+      total: response.data.data.grand_total,
+    });
+  } catch (error) {
+    const msg = error.response?.data?.exc || error.message;
+    console.error("Order creation failed:", msg);
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
+app.get("/api/products", async (req, res) => {
+  try {
+    const response = await erpnext.get("/api/resource/Item", {
+      params: {
+        filters: JSON.stringify([
+          ["show_in_website", "=", 1],
+          ["disabled", "=", 0],
+        ]),
+        fields: JSON.stringify([
+          "item_code", "item_name", "standard_rate",
+          "image", "item_group", "description",
+        ]),
+        limit_page_length: 100,
+      },
+    });
+    res.json({ success: true, products: response.data.data });
+  } catch (error) {
+    console.error("Product fetch failed:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// --- ERPNext -> Mobile App (Webhook receiver) ---
+
+app.post("/webhooks/erpnext", (req, res) => {
+  const signature = req.headers["x-frappe-webhook-signature"];
+  const payload = JSON.stringify(req.body);
+
+  const expected = crypto
+    .createHmac("sha256", WEBHOOK_SECRET)
+    .update(payload)
+    .digest("base64");
+
+  if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature || ""))) {
+    return res.status(401).json({ error: "Invalid signature" });
+  }
+
+  const data = req.body;
+  broadcastToMobileClients({
+    type: "stock_update",
+    item_code: data.item_code,
+    actual_qty: data.actual_qty,
+  });
+
+  res.json({ status: "ok" });
+});
+
+function broadcastToMobileClients(message) {
+  // Implement via WebSocket, Firebase Cloud Messaging, etc.
+  console.log("Broadcasting to mobile clients:", message);
+}
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`Sync middleware running on port ${PORT}`));
+```
+
+<Aside type="tip" title="Pro tip">
+When building middleware between ERPNext and external apps, always implement
+idempotency. Store the ERPNext document name alongside the external system's ID so
+that retried requests don't create duplicate records. Use `frappe.db.exists()` or a
+custom mapping table to check before creating.
+</Aside>

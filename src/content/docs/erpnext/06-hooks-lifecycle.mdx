@@ -1,0 +1,866 @@
+---
+title: Hooks & App Lifecycle
+description: How Frappe's hooks.py wires document events, scheduled jobs, overrides, fixtures, and session hooks into your custom app without forking core.
+sidebar:
+  order: 6
+---
+
+Frappe's hook system is the nervous system of every custom app. Instead of
+modifying core framework or ERPNext source code, you declare behaviors in a
+single Python file — `hooks.py` — and Frappe wires everything together at
+runtime. Think of it as a central configuration manifest (similar in spirit to
+`package.json` for Node.js, but far more powerful, since it controls server
+events, UI assets, scheduled jobs, and more).
+
+## hooks.py: the central configuration file
+
+Every Frappe app has a `hooks.py` at its root (e.g. `scoopjoy/hooks.py`). When
+Frappe boots, it reads `hooks.py` from every installed app and merges them into
+a single configuration. This file uses plain Python data structures — strings,
+lists, and dicts — to declare:
+
+- Which events your app listens to
+- What assets to load
+- What scheduled jobs to run
+- What core behaviors to override
+
+```python title="scoopjoy/hooks.py"
+app_name = "scoopjoy"
+app_title = "ScoopJoy"
+app_publisher = "ScoopJoy Foods"
+app_description = "Manage franchise outlets, royalties, and compliance"
+app_email = "dev@scoopjoy.in"
+app_license = "MIT"
+
+# Required apps (dependencies)
+required_apps = ["frappe", "erpnext"]
+```
+
+:::tip[Pro tip]
+After changing `hooks.py`, you must run `bench build` (for JS/CSS changes) or
+`bench migrate` (for scheduler/fixture changes). For `doc_events`, a
+`bench restart` is sufficient in development. In production, `bench restart` is
+always needed.
+:::
+
+## doc_events: hooking into the document lifecycle
+
+The `doc_events` hook lets your app execute code when any DocType's documents go
+through lifecycle events — even DocTypes from other apps like ERPNext. This is
+the primary mechanism for extending ERPNext without forking it.
+
+Available events, in lifecycle order:
+
+| Event | When it fires |
+|-------|---------------|
+| `before_insert` | Before a new doc is saved for the first time |
+| `after_insert` | After a new doc is inserted (has a `name`) |
+| `validate` | Before save (both insert and update) — use for validation |
+| `before_save` | Just before writing to DB |
+| `after_save` | After DB write completes |
+| `before_naming` | Before the document name is generated |
+| `before_submit` | Before workflow status changes to Submitted |
+| `on_submit` | After document is submitted |
+| `before_cancel` | Before cancellation |
+| `on_cancel` | After cancellation |
+| `on_trash` | Before deletion |
+| `after_delete` | After deletion |
+| `on_update` | After any save (insert or update) |
+| `on_change` | After save, only if values actually changed |
+| `before_rename` | Before document is renamed |
+| `after_rename` | After document is renamed |
+| `on_update_after_submit` | After updating an already-submitted doc |
+
+The `doc_events` dict maps a DocType name to a dict of `event -> dotted path`.
+A `"*"` key hooks every DocType at once.
+
+```python title="scoopjoy/hooks.py"
+doc_events = {
+    # Hook into ERPNext's Sales Invoice from our custom app
+    "Sales Invoice": {
+        "validate": "scoopjoy.events.sales_invoice.validate_franchise_royalty",
+        "on_submit": "scoopjoy.events.sales_invoice.calculate_royalty_on_submit",
+        "on_cancel": "scoopjoy.events.sales_invoice.reverse_royalty_on_cancel",
+    },
+    # Hook into POS Invoice for real-time outlet tracking
+    "POS Invoice": {
+        "after_insert": "scoopjoy.events.pos_invoice.notify_hq_new_sale",
+    },
+    # Wildcard: runs on ALL DocTypes
+    "*": {
+        "after_insert": "scoopjoy.events.audit.log_document_creation",
+    },
+}
+```
+
+The handler functions receive two arguments: `doc` (the document object) and
+`method` (the event name as a string).
+
+```python title="scoopjoy/events/sales_invoice.py"
+import frappe
+
+def validate_franchise_royalty(doc, method):
+    """
+    Runs during Sales Invoice validate.
+    doc = the Sales Invoice document object
+    method = "validate" (the event name)
+    """
+    if not doc.custom_franchise_outlet:
+        return
+
+    outlet = frappe.get_cached_doc("Franchise Outlet", doc.custom_franchise_outlet)
+
+    # Enforce minimum order value per franchise agreement
+    if doc.grand_total < outlet.custom_minimum_order_value:
+        frappe.throw(
+            f"Order total {doc.grand_total} is below the minimum "
+            f"{outlet.custom_minimum_order_value} for outlet {outlet.name}"
+        )
+
+
+def calculate_royalty_on_submit(doc, method):
+    """Calculate and create a Royalty Entry when a franchise invoice is submitted."""
+    if not doc.custom_franchise_outlet:
+        return
+
+    outlet = frappe.get_cached_doc("Franchise Outlet", doc.custom_franchise_outlet)
+    royalty_pct = outlet.custom_royalty_percentage or 5.0
+    royalty_amount = doc.grand_total * (royalty_pct / 100)
+
+    royalty = frappe.get_doc({
+        "doctype": "Franchise Royalty",
+        "franchise_outlet": doc.custom_franchise_outlet,
+        "sales_invoice": doc.name,
+        "invoice_amount": doc.grand_total,
+        "royalty_percentage": royalty_pct,
+        "royalty_amount": royalty_amount,
+        "posting_date": doc.posting_date,
+    })
+    royalty.insert(ignore_permissions=True)
+    royalty.submit()
+
+    frappe.msgprint(f"Royalty of {royalty_amount} recorded for {doc.custom_franchise_outlet}")
+
+
+def reverse_royalty_on_cancel(doc, method):
+    """Cancel the associated Royalty Entry when a Sales Invoice is cancelled."""
+    royalties = frappe.get_all(
+        "Franchise Royalty",
+        filters={"sales_invoice": doc.name, "docstatus": 1},
+        pluck="name",
+    )
+    for name in royalties:
+        royalty = frappe.get_doc("Franchise Royalty", name)
+        royalty.cancel()
+```
+
+:::caution[Keep validate cheap]
+Avoid heavy operations (HTTP calls, large queries) in `validate` or
+`before_save` events. These run synchronously in the request cycle. Use
+`after_insert` or `on_submit` for side effects, and `frappe.enqueue()` for
+anything expensive.
+:::
+
+## scheduler_events: cron-like scheduled tasks
+
+Frappe includes a built-in job scheduler powered by Redis Queue (RQ). You define
+scheduled tasks in `hooks.py` and Frappe ensures they run at the specified
+intervals.
+
+```python title="scoopjoy/hooks.py"
+scheduler_events = {
+    # Runs every minute (use sparingly)
+    "all": [
+        "scoopjoy.tasks.sync_pos_transactions",
+    ],
+    # Runs once a day (after midnight)
+    "daily": [
+        "scoopjoy.tasks.calculate_daily_royalties",
+        "scoopjoy.tasks.check_expiring_franchise_agreements",
+    ],
+    # Runs once an hour
+    "hourly": [
+        "scoopjoy.tasks.sync_outlet_inventory",
+    ],
+    # Runs once a week (Sunday midnight)
+    "weekly": [
+        "scoopjoy.tasks.generate_weekly_outlet_report",
+    ],
+    # Runs once a month (1st of month)
+    "monthly": [
+        "scoopjoy.tasks.generate_monthly_franchise_statement",
+    ],
+    # Cron syntax for fine-grained control
+    "cron": {
+        # Every 15 minutes during business hours (8 AM - 10 PM)
+        "*/15 8-22 * * *": [
+            "scoopjoy.tasks.check_outlet_heartbeat",
+        ],
+        # Every day at 6 AM -- send daily briefing
+        "0 6 * * *": [
+            "scoopjoy.tasks.send_daily_briefing",
+        ],
+        # First Monday of every month at 9 AM
+        "0 9 * * 1#1": [
+            "scoopjoy.tasks.franchise_monthly_review_reminder",
+        ],
+    },
+}
+```
+
+The task function itself is a simple Python function — no `doc`/`method`
+arguments, since it isn't tied to a document.
+
+```python title="scoopjoy/tasks.py" {17}
+import frappe
+
+def calculate_daily_royalties():
+    """Calculate royalties for all franchise invoices submitted yesterday."""
+    from frappe.utils import add_days, today
+
+    yesterday = add_days(today(), -1)
+
+    invoices = frappe.get_all(
+        "Sales Invoice",
+        filters={
+            "posting_date": yesterday,
+            "docstatus": 1,
+            "custom_franchise_outlet": ["is", "set"],
+            "custom_royalty_processed": 0,
+        },
+        fields=["name", "custom_franchise_outlet", "grand_total"],
+    )
+
+    for inv in invoices:
+        try:
+            doc = frappe.get_doc("Sales Invoice", inv.name)
+            calculate_royalty_on_submit(doc, "on_submit")
+            frappe.db.set_value("Sales Invoice", inv.name, "custom_royalty_processed", 1)
+            frappe.db.commit()  # Safe here: standalone scheduled task, not a doc_event handler
+        except Exception:
+            frappe.db.rollback()
+            frappe.log_error(
+                title=f"Royalty Calculation Failed: {inv.name}",
+                reference_doctype="Sales Invoice",
+                reference_name=inv.name,
+            )
+
+
+def check_outlet_heartbeat():
+    """Check if any franchise outlet POS systems have gone silent."""
+    from frappe.utils import now_datetime, time_diff_in_hours
+
+    outlets = frappe.get_all(
+        "Franchise Outlet",
+        filters={"status": "Active"},
+        fields=["name", "outlet_name", "custom_last_pos_sync"],
+    )
+
+    for outlet in outlets:
+        if outlet.custom_last_pos_sync:
+            hours_since = time_diff_in_hours(now_datetime(), outlet.custom_last_pos_sync)
+            if hours_since > 2:
+                frappe.publish_realtime(
+                    event="outlet_offline",
+                    message={"outlet": outlet.name, "outlet_name": outlet.outlet_name},
+                    user="Administrator",
+                )
+```
+
+:::caution[Never commit inside a doc_event hook]
+In Frappe v16, calling `frappe.db.commit()` inside document event hooks
+(functions triggered via `doc_events` in `hooks.py`) is **prohibited** and will
+raise an error. The framework manages the transaction — your hook runs within
+the document's save transaction. Only use `frappe.db.commit()` in standalone
+scheduled tasks or background jobs (as in the highlighted line above).
+:::
+
+:::tip[Pro tip]
+After adding or changing `scheduler_events`, run `bench migrate` to register
+them in the Scheduled Job Type DocType. You can monitor scheduled jobs at
+`/app/scheduled-job-type`.
+:::
+
+## override_whitelisted_methods: replacing core API endpoints
+
+When you need to change the behavior of a core ERPNext API method (an
+`@frappe.whitelist()` function), use this hook. The replacement function must
+accept the same parameters.
+
+```python title="scoopjoy/hooks.py"
+override_whitelisted_methods = {
+    # Replace ERPNext's default get_item_details with our franchise-aware version
+    "erpnext.stock.get_item_details.get_item_details":
+        "scoopjoy.overrides.item_details.get_item_details_with_franchise_pricing",
+}
+```
+
+The pattern is to import the original, call it first, then layer your logic on
+top of the result.
+
+```python title="scoopjoy/overrides/item_details.py" {7}
+import frappe
+from erpnext.stock.get_item_details import get_item_details as original_get_item_details
+
+@frappe.whitelist()
+def get_item_details_with_franchise_pricing(args, doc=None, for_validate=False, overwrite_warehouse=True):
+    """Extend item details to apply franchise-specific pricing."""
+    # Call the original method first
+    result = original_get_item_details(args, doc, for_validate, overwrite_warehouse)
+
+    if isinstance(args, str):
+        args = frappe.parse_json(args)
+
+    # Apply franchise markup if applicable
+    franchise_outlet = args.get("franchise_outlet")
+    if franchise_outlet:
+        outlet = frappe.get_cached_doc("Franchise Outlet", franchise_outlet)
+        markup = outlet.custom_price_markup_percentage or 0
+        if markup and result.get("rate"):
+            result["rate"] = result["rate"] * (1 + markup / 100)
+
+    return result
+```
+
+## override_doctype_class: replacing a DocType controller
+
+This is the most powerful override — it replaces the entire controller class for
+a DocType. Your class must inherit from the original.
+
+```python title="scoopjoy/hooks.py"
+override_doctype_class = {
+    "Sales Invoice": "scoopjoy.overrides.sales_invoice.FranchiseSalesInvoice",
+}
+```
+
+```python title="scoopjoy/overrides/sales_invoice.py"
+import frappe
+from erpnext.accounts.doctype.sales_invoice.sales_invoice import SalesInvoice
+
+class FranchiseSalesInvoice(SalesInvoice):
+    def validate(self):
+        # Call parent validation first
+        super().validate()
+        self.validate_franchise_compliance()
+
+    def validate_franchise_compliance(self):
+        """Ensure franchise-specific business rules are met."""
+        if not self.custom_franchise_outlet:
+            return
+
+        outlet = frappe.get_cached_doc("Franchise Outlet", self.custom_franchise_outlet)
+
+        # Check if outlet's franchise agreement is still active
+        if outlet.custom_agreement_status != "Active":
+            frappe.throw(
+                f"Cannot create invoices for outlet {outlet.outlet_name}: "
+                f"franchise agreement is {outlet.custom_agreement_status}"
+            )
+
+        # Enforce approved menu items only
+        if outlet.custom_restrict_to_approved_menu:
+            approved_items = frappe.get_all(
+                "Franchise Menu Item",
+                filters={"parent": self.custom_franchise_outlet},
+                pluck="item_code",
+            )
+            for row in self.items:
+                if row.item_code not in approved_items:
+                    frappe.throw(
+                        f"Item {row.item_code} is not on the approved menu "
+                        f"for outlet {outlet.outlet_name}"
+                    )
+
+    def on_submit(self):
+        super().on_submit()
+        self.auto_create_royalty_entry()
+
+    def auto_create_royalty_entry(self):
+        if not self.custom_franchise_outlet:
+            return
+        # Royalty creation logic here...
+```
+
+:::caution[Only one app per DocType]
+Only one app can use `override_doctype_class` per DocType per site. If two apps
+override the same DocType, the last installed app wins. For extending behavior
+without full takeover, prefer `doc_events` — or `extend_doctype_class` below.
+:::
+
+### extend_doctype_class (v16 recommended)
+
+v16 introduces `extend_doctype_class` as the safe way for multiple apps to
+extend the same DocType without conflict. Your extension class does **not**
+inherit the original directly — Frappe weaves it into the controller's
+inheritance chain.
+
+```python title="scoopjoy/hooks.py"
+extend_doctype_class = {
+    "Sales Invoice": "scoopjoy.overrides.sales_invoice.CustomSalesInvoice"
+}
+```
+
+```python title="scoopjoy/overrides/sales_invoice.py"
+import frappe
+from frappe import _
+
+class CustomSalesInvoice:
+    def validate(self):
+        # Call parent's validate first via super()
+        super().validate()
+        self.calculate_franchise_royalty()
+
+    def calculate_franchise_royalty(self):
+        if self.franchise_outlet:
+            self.franchise_royalty = self.grand_total * 0.08
+```
+
+How the two overrides differ:
+
+| Feature | `override_doctype_class` | `extend_doctype_class` |
+|---------|--------------------------|------------------------|
+| Multiple apps | Last writer wins (conflict) | All extensions compose safely |
+| `super()` calls | May skip other overrides | Chains through all extensions |
+| Recommended for | Single-app scenarios | Multi-app scenarios (v16+) |
+
+:::tip[Pro tip]
+Always prefer `extend_doctype_class` in v16. It uses Python's MRO (Method
+Resolution Order) to compose multiple extensions, so all apps' hooks execute in
+order.
+:::
+
+## boot_session: injecting data into session boot
+
+When a user logs in and the Desk loads, Frappe sends a "boot" payload to the
+client. You can add custom data to this payload using the `boot_session` hook.
+
+```python title="scoopjoy/hooks.py"
+boot_session = "scoopjoy.boot.boot_session"
+```
+
+```python title="scoopjoy/boot.py"
+import frappe
+
+def boot_session(bootinfo):
+    """Add franchise-specific data to the session boot."""
+    if frappe.session.user == "Guest":
+        return
+
+    # Add user's assigned franchise outlets
+    outlets = frappe.get_all(
+        "Franchise Outlet",
+        filters={"custom_manager_user": frappe.session.user},
+        fields=["name", "outlet_name", "city", "status"],
+    )
+    bootinfo["franchise_outlets"] = outlets
+
+    # Add franchise config
+    bootinfo["franchise_config"] = {
+        "royalty_percentage": frappe.db.get_single_value(
+            "Franchise Settings", "default_royalty_percentage"
+        ) or 5.0,
+        "enable_real_time_sync": frappe.db.get_single_value(
+            "Franchise Settings", "enable_real_time_sync"
+        ),
+    }
+```
+
+On the client side, access this data via `frappe.boot.franchise_outlets`. This
+is roughly the Frappe equivalent of seeding `window.__INITIAL_STATE__` from your
+Express server so the SPA has data on first paint.
+
+## Asset loading: JS and CSS hooks
+
+Frappe lets you attach client-side assets globally, per-DocType, or to the
+website portal — all declaratively from `hooks.py`.
+
+```python title="scoopjoy/hooks.py"
+# Global assets -- loaded on EVERY Desk page (use sparingly)
+app_include_js = "/assets/scoopjoy/js/scoopjoy_common.js"
+app_include_css = "/assets/scoopjoy/css/scoopjoy_theme.css"
+
+# DocType-specific JS -- loaded only when viewing that DocType
+doctype_js = {
+    "Sales Invoice": "public/js/sales_invoice.js",
+    "POS Invoice": "public/js/pos_invoice.js",
+}
+
+# DocType list view JS -- loaded on the list view
+doctype_list_js = {
+    "Sales Invoice": "public/js/sales_invoice_list.js",
+}
+
+# Website assets (portal pages)
+web_include_js = "/assets/scoopjoy/js/scoopjoy_portal.js"
+web_include_css = "/assets/scoopjoy/css/scoopjoy_portal.css"
+```
+
+:::caution[Custom DocTypes don't use doctype_js]
+`doctype_js` and `doctype_list_js` only work with standard DocTypes (where
+`Custom=False`). They do not load for DocTypes created through the UI with
+`Custom=True`. For custom DocTypes from your app, use the standard
+`{doctype_folder}/{doctype_name}.js` convention instead.
+:::
+
+## Fixtures: exporting and importing configuration data
+
+Fixtures let you bundle configuration records (Custom Fields, Property Setters,
+custom Roles, etc.) with your app. They are synced automatically during
+`bench migrate`. A bare DocType name exports every record; a dict with `filters`
+scopes the export to just your app's records.
+
+```python title="scoopjoy/hooks.py" {3-4}
+fixtures = [
+    # Export ALL records of these DocTypes
+    "Custom Field",
+    "Property Setter",
+
+    # Export with filters -- only records belonging to your app
+    {
+        "doctype": "Custom Field",
+        "filters": [
+            ["module", "=", "ScoopJoy"],
+        ],
+    },
+    {
+        "doctype": "Property Setter",
+        "filters": [
+            ["module", "=", "ScoopJoy"],
+        ],
+    },
+    # Export specific roles created by your app
+    {
+        "doctype": "Role",
+        "filters": [
+            ["name", "in", ["Franchise Manager", "Franchise Staff", "Franchise Auditor"]],
+        ],
+    },
+    # Export Workspace
+    {
+        "doctype": "Workspace",
+        "filters": [
+            ["module", "=", "ScoopJoy"],
+        ],
+    },
+]
+```
+
+To generate the fixture JSON files, run:
+
+```bash
+bench export-fixtures
+```
+
+This creates JSON files in `scoopjoy/fixtures/`. These files are automatically
+imported during `bench migrate` or app installation.
+
+:::tip[Pro tip]
+Always use filtered fixtures in production apps. Exporting all Custom Fields
+without filters will include every Custom Field on the site, including those
+from other apps — causing conflicts during deployment.
+:::
+
+## jenv: custom Jinja methods and filters
+
+Extend Frappe's Jinja templating engine with custom functions and filters.
+Useful for Print Formats, Email Templates, and Web Templates.
+
+```python title="scoopjoy/hooks.py"
+jenv = {
+    "methods": [
+        "scoopjoy.utils.jinja.get_outlet_logo",
+        "scoopjoy.utils.jinja.format_franchise_address",
+    ],
+    "filters": [
+        "scoopjoy.utils.jinja.currency_in_words",
+    ],
+}
+```
+
+```python title="scoopjoy/utils/jinja.py"
+import frappe
+
+def get_outlet_logo(outlet_name):
+    """Get the logo URL for a franchise outlet. Use in Print Formats."""
+    logo = frappe.db.get_value("Franchise Outlet", outlet_name, "custom_logo")
+    return logo or "/assets/scoopjoy/images/default_logo.png"
+
+
+def format_franchise_address(outlet_name):
+    """Format the full address for a franchise outlet."""
+    outlet = frappe.get_cached_doc("Franchise Outlet", outlet_name)
+    parts = [
+        outlet.custom_address_line_1,
+        outlet.custom_address_line_2,
+        f"{outlet.city}, {outlet.state} {outlet.custom_zip_code}",
+    ]
+    return "<br>".join(p for p in parts if p)
+
+
+def currency_in_words(value):
+    """Jinja filter: convert currency amount to words."""
+    from frappe.utils import money_in_words
+    return money_in_words(value, "INR")
+```
+
+Once registered, these are callable from a Print Format template. Note the
+`{{ ... }}` Jinja expressions and the `|` filter syntax:
+
+```html
+<div class="outlet-header">
+    <img src="{{ get_outlet_logo(doc.custom_franchise_outlet) }}" />
+    <p>{{ format_franchise_address(doc.custom_franchise_outlet) }}</p>
+    <p>Amount: {{ doc.grand_total | currency_in_words }}</p>
+</div>
+```
+
+## Session & lifecycle hooks
+
+Beyond documents, `hooks.py` exposes the app's own lifecycle — login/logout,
+installation, migration, and website routing.
+
+```python title="scoopjoy/hooks.py"
+# Session lifecycle
+on_session_creation = [
+    "scoopjoy.events.session.on_login",
+]
+on_logout = [
+    "scoopjoy.events.session.on_logout",
+]
+
+# App installation lifecycle
+before_install = "scoopjoy.setup.install.before_install"
+after_install = "scoopjoy.setup.install.after_install"
+after_migrate = "scoopjoy.setup.install.after_migrate"
+
+# Website routing
+website_route_rules = [
+    {"from_route": "/franchise-portal", "to_route": "franchise_portal"},
+    {"from_route": "/franchise-portal/<outlet>", "to_route": "franchise_portal/outlet"},
+]
+
+website_redirects = [
+    {"source": "/old-franchise-page", "target": "/franchise-portal"},
+]
+```
+
+These map to the Node.js world you already know: `on_session_creation` /
+`on_logout` are like passport login/logout callbacks, and `website_route_rules`
+is Frappe's answer to Express route definitions.
+
+```python title="scoopjoy/events/session.py"
+import frappe
+
+def on_login():
+    """Set franchise context when a franchise user logs in."""
+    user = frappe.session.user
+    outlets = frappe.get_all(
+        "Franchise Outlet",
+        filters={"custom_manager_user": user},
+        pluck="name",
+    )
+    if outlets:
+        frappe.session["franchise_outlet"] = outlets[0]
+        frappe.publish_realtime(
+            event="franchise_manager_online",
+            message={"user": user, "outlet": outlets[0]},
+            after_commit=True,
+        )
+
+
+def on_logout():
+    """Clean up franchise session data."""
+    user = frappe.session.user
+    frappe.publish_realtime(
+        event="franchise_manager_offline",
+        message={"user": user},
+        after_commit=True,
+    )
+```
+
+The install/migrate hooks are where you seed roles and settings, and where you
+re-sync configuration on every deploy.
+
+```python title="scoopjoy/setup/install.py"
+import frappe
+
+def before_install():
+    """Validate prerequisites before installing the app."""
+    pass
+
+def after_install():
+    """Set up initial data after app installation."""
+    create_default_roles()
+    create_franchise_settings()
+
+def after_migrate():
+    """Run after every bench migrate -- update scheduled jobs, sync config."""
+    update_franchise_workspace()
+
+def create_default_roles():
+    for role_name in ["Franchise Manager", "Franchise Staff", "Franchise Auditor"]:
+        if not frappe.db.exists("Role", role_name):
+            frappe.get_doc({"doctype": "Role", "role_name": role_name}).insert(
+                ignore_permissions=True
+            )
+
+def create_franchise_settings():
+    if not frappe.db.exists("Franchise Settings"):
+        frappe.get_doc({
+            "doctype": "Franchise Settings",
+            "default_royalty_percentage": 5.0,
+            "enable_real_time_sync": 1,
+        }).insert(ignore_permissions=True)
+
+def update_franchise_workspace():
+    pass  # Workspace configuration updates
+```
+
+## How hooks are loaded: merge order
+
+When multiple apps define hooks for the same event, Frappe merges them based on
+**app installation order** on the site.
+
+**Extending hooks** (like `doc_events` and `scheduler_events`) are additive — all
+handlers from all apps run, in installation order:
+
+```text
+frappe (first) -> erpnext -> scoopjoy (last)
+```
+
+**Override hooks** (like `override_doctype_class` and
+`override_whitelisted_methods`) use "last writer wins" — only the handler from
+the last installed app takes effect.
+
+You can view and change the resolution order at **Setup > Installed Applications
+> Update Hooks Resolution Order**.
+
+| Hook type | Merge strategy | Example |
+|-----------|----------------|---------|
+| `doc_events` | All handlers run in order | All apps' `validate` hooks fire sequentially |
+| `scheduler_events` | All tasks run | All apps' `daily` tasks execute |
+| `override_doctype_class` | Last app wins | Only the last app's class is used |
+| `override_whitelisted_methods` | Last app wins | Only the last app's method is called |
+| `app_include_js` | All included | JS files from all apps are loaded |
+| `fixtures` | All synced | Each app's fixtures are imported independently |
+
+## The complete hooks.py for ScoopJoy
+
+Putting every section together, here is the full `hooks.py` for the ScoopJoy
+app — asset loading, document events, scheduled tasks, overrides, session hooks,
+install/migrate, fixtures, Jinja, and website routing in one manifest.
+
+```python title="scoopjoy/hooks.py"
+app_name = "scoopjoy"
+app_title = "ScoopJoy"
+app_publisher = "ScoopJoy Foods"
+app_description = "Franchise outlet management, royalties, and compliance"
+app_email = "dev@scoopjoy.in"
+app_license = "MIT"
+required_apps = ["frappe", "erpnext"]
+
+# ---------- Asset Loading ----------
+app_include_js = "/assets/scoopjoy/js/scoopjoy_common.js"
+app_include_css = "/assets/scoopjoy/css/scoopjoy_theme.css"
+
+doctype_js = {
+    "Sales Invoice": "public/js/sales_invoice.js",
+    "POS Invoice": "public/js/pos_invoice.js",
+    "Customer": "public/js/customer.js",
+}
+
+doctype_list_js = {
+    "Sales Invoice": "public/js/sales_invoice_list.js",
+}
+
+# ---------- Document Events ----------
+doc_events = {
+    "Sales Invoice": {
+        "validate": "scoopjoy.events.sales_invoice.validate_franchise_royalty",
+        "on_submit": "scoopjoy.events.sales_invoice.calculate_royalty_on_submit",
+        "on_cancel": "scoopjoy.events.sales_invoice.reverse_royalty_on_cancel",
+    },
+    "POS Invoice": {
+        "after_insert": "scoopjoy.events.pos_invoice.notify_hq_new_sale",
+    },
+    "Customer": {
+        "after_insert": "scoopjoy.events.customer.tag_franchise_customer",
+    },
+}
+
+# ---------- Scheduled Tasks ----------
+scheduler_events = {
+    "daily": [
+        "scoopjoy.tasks.calculate_daily_royalties",
+        "scoopjoy.tasks.check_expiring_franchise_agreements",
+    ],
+    "hourly": [
+        "scoopjoy.tasks.sync_outlet_inventory",
+    ],
+    "weekly": [
+        "scoopjoy.tasks.generate_weekly_outlet_report",
+    ],
+    "monthly": [
+        "scoopjoy.tasks.generate_monthly_franchise_statement",
+    ],
+    "cron": {
+        "*/15 8-22 * * *": [
+            "scoopjoy.tasks.check_outlet_heartbeat",
+        ],
+        "0 6 * * *": [
+            "scoopjoy.tasks.send_daily_briefing",
+        ],
+    },
+}
+
+# ---------- Overrides ----------
+override_doctype_class = {
+    "Sales Invoice": "scoopjoy.overrides.sales_invoice.FranchiseSalesInvoice",
+}
+
+override_whitelisted_methods = {
+    "erpnext.stock.get_item_details.get_item_details":
+        "scoopjoy.overrides.item_details.get_item_details_with_franchise_pricing",
+}
+
+# ---------- Session Hooks ----------
+boot_session = "scoopjoy.boot.boot_session"
+on_session_creation = ["scoopjoy.events.session.on_login"]
+on_logout = ["scoopjoy.events.session.on_logout"]
+
+# ---------- Install / Migrate ----------
+before_install = "scoopjoy.setup.install.before_install"
+after_install = "scoopjoy.setup.install.after_install"
+after_migrate = "scoopjoy.setup.install.after_migrate"
+
+# ---------- Fixtures ----------
+fixtures = [
+    {"doctype": "Custom Field", "filters": [["module", "=", "ScoopJoy"]]},
+    {"doctype": "Property Setter", "filters": [["module", "=", "ScoopJoy"]]},
+    {"doctype": "Role", "filters": [["name", "in", [
+        "Franchise Manager", "Franchise Staff", "Franchise Auditor",
+    ]]]},
+    {"doctype": "Workspace", "filters": [["module", "=", "ScoopJoy"]]},
+]
+
+# ---------- Jinja ----------
+jenv = {
+    "methods": [
+        "scoopjoy.utils.jinja.get_outlet_logo",
+        "scoopjoy.utils.jinja.format_franchise_address",
+    ],
+    "filters": [
+        "scoopjoy.utils.jinja.currency_in_words",
+    ],
+}
+
+# ---------- Website ----------
+website_route_rules = [
+    {"from_route": "/franchise-portal", "to_route": "franchise_portal"},
+    {"from_route": "/franchise-portal/<outlet>", "to_route": "franchise_portal/outlet"},
+]
+
+website_redirects = [
+    {"source": "/old-franchise-page", "target": "/franchise-portal"},
+]
+```

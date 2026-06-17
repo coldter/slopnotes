@@ -1,0 +1,576 @@
+---
+title: Multi-Step Wizard Dialog
+description: Build a multi-step franchise onboarding wizard with per-step validation, progress UI, and a single server-side document-creation call.
+sidebar:
+  order: 1
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a 4-step franchise onboarding wizard — Company Details →
+Location & Warehouse → Menu Selection → Review & Confirm. Each step must validate
+before advancing, and the final submission has to create several documents
+server-side in one go.
+
+**Solution:** Drive the whole flow from one `frappe.ui.Dialog`. Model each step as
+a `Section Break` field and toggle visibility with `section_field.df.hidden`; track
+the active step in JS, validate (locally and server-side via `frappe.xcall`) on
+each `Next`, and fire a single whitelisted method to create the documents.
+
+## Step 1: The wizard class (client JS)
+
+The class owns the step list, the collected `data`, and the dialog. Each entry in
+`this.steps` carries a `validate` callback, so advancing is just "run the current
+validator, stash values, go to the next step."
+
+```javascript title="scoopjoy/scoopjoy/public/js/franchise_onboarding_wizard.js" {3-12}
+frappe.provide('scoopjoy');
+
+scoopjoy.FranchiseOnboardingWizard = class {
+    constructor() {
+        this.current_step = 0;
+        this.steps = [
+            { title: 'Company Details',      icon: 'building',   validate: () => this.validate_company() },
+            { title: 'Location & Warehouse', icon: 'map-pin',    validate: () => this.validate_location() },
+            { title: 'Menu Selection',       icon: 'list',       validate: () => this.validate_menu() },
+            { title: 'Review & Confirm',     icon: 'check',      validate: () => Promise.resolve(true) },
+        ];
+        this.data = {};
+        this.show();
+    }
+
+    show() {
+        this.dialog = new frappe.ui.Dialog({
+            title: this.steps[0].title,
+            size: 'extra-large',
+            fields: this.build_fields(),
+            primary_action_label: 'Next',
+            primary_action: () => this.next_step(),
+            secondary_action_label: 'Back',
+            secondary_action: () => this.prev_step(),
+        });
+
+        this.dialog.$wrapper.find('.modal-dialog').css('max-width', '780px');
+        this.render_progress_bar();
+        this.goto_step(0);
+        this.dialog.show();
+    }
+};
+
+// Expose as a toolbar action or call from anywhere
+scoopjoy.start_onboarding = () => new scoopjoy.FranchiseOnboardingWizard();
+```
+
+## Step 2: All fields in one dialog
+
+Every step's fields live in the same dialog. The trick is one `Section Break` per
+step (`sec_step_0`…`sec_step_3`); all but the first are `hidden: 1` at build time,
+and the dialog reveals exactly one section at a time.
+
+```javascript title="scoopjoy/scoopjoy/public/js/franchise_onboarding_wizard.js"
+build_fields() {
+    return [
+        // --- Progress indicator (custom HTML) ---
+        { fieldtype: 'HTML', fieldname: 'progress_bar' },
+
+        // === Step 0: Company Details ===
+        { fieldtype: 'Section Break', fieldname: 'sec_step_0', label: '' },
+        { fieldtype: 'Data',   fieldname: 'franchise_name', label: 'Franchise Name', reqd: 1 },
+        { fieldtype: 'Select', fieldname: 'franchise_type', label: 'Franchise Type',
+          options: '\nPremium\nStandard\nExpress', reqd: 1 },
+        { fieldtype: 'Column Break' },
+        { fieldtype: 'Data',   fieldname: 'contact_person', label: 'Contact Person', reqd: 1 },
+        { fieldtype: 'Data',   fieldname: 'contact_email',  label: 'Email', reqd: 1, options: 'Email' },
+        { fieldtype: 'Data',   fieldname: 'contact_phone',  label: 'Phone', reqd: 1, options: 'Phone' },
+
+        // === Step 1: Location & Warehouse ===
+        { fieldtype: 'Section Break', fieldname: 'sec_step_1', label: '', hidden: 1 },
+        { fieldtype: 'Data',   fieldname: 'address_line1', label: 'Address Line 1', reqd: 1 },
+        { fieldtype: 'Data',   fieldname: 'address_line2', label: 'Address Line 2' },
+        { fieldtype: 'Column Break' },
+        { fieldtype: 'Data',   fieldname: 'city',    label: 'City', reqd: 1 },
+        { fieldtype: 'Data',   fieldname: 'state',   label: 'State', reqd: 1 },
+        { fieldtype: 'Data',   fieldname: 'pincode', label: 'PIN Code', reqd: 1 },
+        { fieldtype: 'Section Break', label: 'Warehouse Setup' },
+        { fieldtype: 'Select', fieldname: 'warehouse_type', label: 'Warehouse Type',
+          options: 'Owned\nRented\nShared', default: 'Owned' },
+        { fieldtype: 'Column Break' },
+        { fieldtype: 'Int',    fieldname: 'storage_capacity_litres', label: 'Cold Storage Capacity (L)',
+          default: 500 },
+
+        // === Step 2: Menu Selection ===
+        { fieldtype: 'Section Break', fieldname: 'sec_step_2', label: '', hidden: 1 },
+        { fieldtype: 'HTML',   fieldname: 'menu_selection_html' },
+
+        // === Step 3: Review & Confirm ===
+        { fieldtype: 'Section Break', fieldname: 'sec_step_3', label: '', hidden: 1 },
+        { fieldtype: 'HTML',   fieldname: 'review_html' },
+    ];
+}
+```
+
+## Step 3: Navigation and section toggling
+
+`goto_step` is the heart of the wizard: it flips section visibility, repaints the
+progress bar, swaps the primary button between `Next` and `Create Franchise`, and
+lazily renders the menu/review HTML when those steps come into view.
+
+```javascript title="scoopjoy/scoopjoy/public/js/franchise_onboarding_wizard.js" {4-10,28-34}
+goto_step(step) {
+    this.current_step = step;
+
+    // Toggle section visibility: only the active step's section is shown
+    this.steps.forEach((_, i) => {
+        const section_field = this.dialog.fields_dict[`sec_step_${i}`];
+        if (section_field) {
+            section_field.df.hidden = i !== step;
+            section_field.refresh();
+        }
+    });
+
+    this.dialog.set_title(this.steps[step].title);
+    this.update_progress_bar();
+
+    // Hide "Back" on the first step
+    if (step === 0) {
+        this.dialog.$wrapper.find('.btn-secondary').hide();
+    } else {
+        this.dialog.$wrapper.find('.btn-secondary').show();
+    }
+
+    // Last step: switch the primary action to submit
+    if (step === this.steps.length - 1) {
+        this.dialog.set_primary_action('Create Franchise', () => this.submit());
+        this.render_review();
+    } else {
+        this.dialog.set_primary_action('Next', () => this.next_step());
+    }
+
+    if (step === 2) {
+        this.render_menu_selection();
+    }
+}
+
+async next_step() {
+    const valid = await this.steps[this.current_step].validate();
+    if (!valid) return;
+
+    // Stash current values before moving on
+    Object.assign(this.data, this.dialog.get_values());
+    this.goto_step(this.current_step + 1);
+}
+
+prev_step() {
+    if (this.current_step > 0) {
+        this.goto_step(this.current_step - 1);
+    }
+}
+```
+
+The progress bar is custom HTML rendered into the `progress_bar` field, then
+re-styled on each step. Completed steps get a checkmark, the active step is
+highlighted, and the connector lines fill in as you advance.
+
+```javascript title="scoopjoy/scoopjoy/public/js/franchise_onboarding_wizard.js"
+render_progress_bar() {
+    const html = `
+        <div class="wizard-progress d-flex justify-content-between mb-4">
+            ${this.steps.map((step, i) => `
+                <div class="wizard-step text-center flex-fill" data-step="${i}">
+                    <div class="step-circle mx-auto mb-1 d-flex align-items-center justify-content-center
+                        rounded-circle border"
+                        style="width:36px;height:36px;transition:all 0.3s;">
+                        <span class="step-number">${i + 1}</span>
+                    </div>
+                    <small class="step-label text-muted">${step.title}</small>
+                </div>
+            `).join('<div class="step-connector flex-fill align-self-center" style="height:2px;background:#d1d8dd;margin-top:-18px;"></div>')}
+        </div>`;
+    this.dialog.fields_dict.progress_bar.$wrapper.html(html);
+}
+
+update_progress_bar() {
+    this.dialog.$wrapper.find('.wizard-step').each((i, el) => {
+        const $circle = $(el).find('.step-circle');
+        const $label  = $(el).find('.step-label');
+        $circle.removeClass('bg-primary text-white bg-success');
+        $label.removeClass('text-primary fw-bold');
+
+        if (i < this.current_step) {
+            $circle.addClass('bg-success text-white').html('<span>&#10003;</span>');
+        } else if (i === this.current_step) {
+            $circle.addClass('bg-primary text-white').html(`<span>${i + 1}</span>`);
+            $label.addClass('text-primary fw-bold');
+        } else {
+            $circle.html(`<span>${i + 1}</span>`);
+        }
+    });
+
+    // connector lines
+    this.dialog.$wrapper.find('.step-connector').each((i, el) => {
+        $(el).css('background', i < this.current_step ? 'var(--primary)' : '#d1d8dd');
+    });
+}
+```
+
+## Step 4: Per-step validators
+
+Each validator returns a promise resolving to `true`/`false`. They mix cheap local
+checks (a 6-digit PIN regex) with `frappe.xcall` round-trips that hit whitelisted
+server methods — so a duplicate franchise name or an unserviceable PIN is caught
+before the reader ever reaches Review.
+
+```javascript title="scoopjoy/scoopjoy/public/js/franchise_onboarding_wizard.js"
+async validate_company() {
+    const vals = this.dialog.get_values();
+    if (!vals) return false; // built-in reqd check
+
+    try {
+        const result = await frappe.xcall(
+            'scoopjoy.api.onboarding.validate_franchise_name',
+            { name: vals.franchise_name }
+        );
+        if (result.exists) {
+            frappe.msgprint({
+                title: 'Duplicate Name',
+                indicator: 'red',
+                message: `A franchise named <b>${vals.franchise_name}</b> already exists.`
+            });
+            return false;
+        }
+        return true;
+    } catch (e) {
+        frappe.msgprint({ title: 'Validation Error', indicator: 'red', message: e.message });
+        return false;
+    }
+}
+
+async validate_location() {
+    const vals = this.dialog.get_values();
+    if (!vals) return false;
+
+    if (vals.pincode && !/^\d{6}$/.test(vals.pincode)) {
+        frappe.msgprint({
+            title: 'Invalid PIN', indicator: 'orange',
+            message: 'PIN Code must be exactly 6 digits.'
+        });
+        return false;
+    }
+
+    // Server-side: check if pincode is in a serviceable area
+    const serviceable = await frappe.xcall(
+        'scoopjoy.api.onboarding.check_pincode_serviceable',
+        { pincode: vals.pincode }
+    );
+    if (!serviceable) {
+        frappe.msgprint({
+            title: 'Not Serviceable', indicator: 'orange',
+            message: `PIN Code ${vals.pincode} is not in a serviceable area yet.`
+        });
+        return false;
+    }
+    return true;
+}
+
+async validate_menu() {
+    if (!this.selected_items || this.selected_items.length === 0) {
+        frappe.msgprint({
+            title: 'No Items Selected', indicator: 'orange',
+            message: 'Please select at least one menu item.'
+        });
+        return false;
+    }
+    return true;
+}
+```
+
+## Step 5: Menu selection and review
+
+Step 2 fetches items for the chosen tier and renders clickable cards into the
+`menu_selection_html` field, maintaining `this.selected_items` as the reader toggles
+cards. Step 3 reads back everything in `this.data` plus the selected items into a
+read-only summary so nothing is submitted blind.
+
+```javascript title="scoopjoy/scoopjoy/public/js/franchise_onboarding_wizard.js"
+async render_menu_selection() {
+    const items = await frappe.xcall(
+        'scoopjoy.api.onboarding.get_menu_items',
+        { franchise_type: this.data.franchise_type }
+    );
+
+    this.selected_items = this.selected_items || [];
+
+    const html = `
+        <div class="menu-selection">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <span class="text-muted">
+                    Available items for <b>${this.data.franchise_type}</b> franchise
+                </span>
+                <span class="badge bg-primary selected-count">
+                    ${this.selected_items.length} selected
+                </span>
+            </div>
+            <div class="row">
+                ${items.map(item => `
+                    <div class="col-sm-6 col-md-4 mb-3">
+                        <div class="card menu-item-card p-3 cursor-pointer
+                            ${this.selected_items.includes(item.name) ? 'border-primary bg-light' : ''}"
+                            data-item="${item.name}">
+                            <div class="d-flex align-items-center">
+                                <input type="checkbox" class="me-2 menu-check"
+                                    ${this.selected_items.includes(item.name) ? 'checked' : ''}
+                                    data-item="${item.name}">
+                                <div>
+                                    <div class="fw-bold">${item.item_name}</div>
+                                    <small class="text-muted">${item.item_group}</small>
+                                    <div class="text-primary fw-bold">${format_currency(item.standard_rate)}</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>`;
+
+    const $wrapper = this.dialog.fields_dict.menu_selection_html.$wrapper;
+    $wrapper.html(html);
+
+    // Toggle selection on card click
+    $wrapper.find('.menu-item-card').on('click', (e) => {
+        const item_name = $(e.currentTarget).data('item');
+        const $check = $(e.currentTarget).find('.menu-check');
+        const idx = this.selected_items.indexOf(item_name);
+
+        if (idx > -1) {
+            this.selected_items.splice(idx, 1);
+            $(e.currentTarget).removeClass('border-primary bg-light');
+            $check.prop('checked', false);
+        } else {
+            this.selected_items.push(item_name);
+            $(e.currentTarget).addClass('border-primary bg-light');
+            $check.prop('checked', true);
+        }
+
+        $wrapper.find('.selected-count').text(`${this.selected_items.length} selected`);
+    });
+}
+
+render_review() {
+    const d = this.data;
+    const html = `
+        <div class="review-summary">
+            <div class="card mb-3">
+                <div class="card-header fw-bold">Company Details</div>
+                <div class="card-body">
+                    <table class="table table-sm mb-0">
+                        <tr><td class="text-muted">Franchise</td>
+                            <td>${d.franchise_name} (${d.franchise_type})</td></tr>
+                        <tr><td class="text-muted">Contact</td>
+                            <td>${d.contact_person} &mdash; ${d.contact_email}, ${d.contact_phone}</td></tr>
+                    </table>
+                </div>
+            </div>
+            <div class="card mb-3">
+                <div class="card-header fw-bold">Menu Items (${this.selected_items.length})</div>
+                <div class="card-body">
+                    <div class="d-flex flex-wrap gap-2">
+                        ${this.selected_items.map(item => `
+                            <span class="badge bg-light text-dark border">${item}</span>
+                        `).join('')}
+                    </div>
+                </div>
+            </div>
+        </div>`;
+
+    this.dialog.fields_dict.review_html.$wrapper.html(html);
+}
+```
+
+## Step 6: Final submission
+
+One `frappe.xcall` ships the three collected buckets — `company_details`,
+`location`, and `menu_items` — to a single whitelisted method. `frappe.dom.freeze`
+blocks the UI while the server works, and on success a `msgprint` links straight to
+the new records.
+
+```javascript title="scoopjoy/scoopjoy/public/js/franchise_onboarding_wizard.js" {2,4-26}
+async submit() {
+    frappe.dom.freeze('Creating franchise...');
+    try {
+        const result = await frappe.xcall(
+            'scoopjoy.api.onboarding.create_franchise',
+            {
+                company_details: {
+                    franchise_name:  this.data.franchise_name,
+                    franchise_type:  this.data.franchise_type,
+                    contact_person:  this.data.contact_person,
+                    contact_email:   this.data.contact_email,
+                    contact_phone:   this.data.contact_phone,
+                },
+                location: {
+                    address_line1:           this.data.address_line1,
+                    address_line2:           this.data.address_line2,
+                    city:                    this.data.city,
+                    state:                   this.data.state,
+                    pincode:                 this.data.pincode,
+                    warehouse_type:          this.data.warehouse_type,
+                    storage_capacity_litres: this.data.storage_capacity_litres,
+                },
+                menu_items: this.selected_items,
+            }
+        );
+
+        frappe.dom.unfreeze();
+        this.dialog.hide();
+
+        frappe.msgprint({
+            title: 'Franchise Created!',
+            indicator: 'green',
+            message: `
+                <p>The following documents were created:</p>
+                <ul>
+                    <li>${result.franchise}</li>
+                    <li>Warehouse: ${result.warehouse}</li>
+                    <li>Price List: ${result.price_list}</li>
+                </ul>
+            `,
+            primary_action: {
+                label: 'Open Franchise',
+                action: () => frappe.set_route('Form', 'Franchise Outlet', result.franchise),
+            }
+        });
+    } catch (e) {
+        frappe.dom.unfreeze();
+        frappe.msgprint({ title: 'Error', indicator: 'red', message: e.message });
+    }
+}
+```
+
+## Step 7: The server endpoints
+
+The wizard's validators and submit call into four whitelisted methods. The first
+three are quick lookups; `create_franchise` does the real work — creating the
+Franchise Outlet, its Warehouse, and a Price List with item prices, all committed
+together.
+
+```python title="scoopjoy/scoopjoy/api/onboarding.py"
+import frappe
+from frappe import _
+
+
+@frappe.whitelist()
+def validate_franchise_name(name: str) -> dict:
+    exists = frappe.db.exists("Franchise Outlet", {"franchise_name": name})
+    return {"exists": bool(exists)}
+
+
+@frappe.whitelist()
+def check_pincode_serviceable(pincode: str) -> bool:
+    """Check if PIN code falls within a serviceable zone."""
+    return frappe.db.exists(
+        "ScoopJoy Service Area",
+        {"pincode": pincode, "is_active": 1},
+    )
+
+
+@frappe.whitelist()
+def get_menu_items(franchise_type: str) -> list[dict]:
+    """Return items available for the given franchise tier."""
+    tier_filter = {"Premium": ["in", ["Premium", "Standard", "Express"]],
+                   "Standard": ["in", ["Standard", "Express"]],
+                   "Express": ["in", ["Express"]]}
+
+    return frappe.get_all(
+        "Item",
+        filters={
+            "item_group": ["like", "Ice Cream%"],
+            "custom_franchise_tier": tier_filter.get(franchise_type, "Express"),
+            "disabled": 0,
+        },
+        fields=["name", "item_name", "item_group", "standard_rate"],
+        order_by="item_name",
+    )
+```
+
+The `create_franchise` method inserts each document with
+`ignore_permissions=True`, links the warehouse back to the franchise, then commits
+once so the three records appear together or not at all.
+
+```python title="scoopjoy/scoopjoy/api/onboarding.py" {3,9,18,32}
+@frappe.whitelist()
+def create_franchise(company_details: dict, location: dict, menu_items: list) -> dict:
+    """Create Franchise Outlet, Warehouse, and Price List in one transaction."""
+    # 1. Franchise Outlet
+    franchise = frappe.get_doc({
+        "doctype": "Franchise Outlet",
+        "franchise_name": company_details["franchise_name"],
+        "franchise_type": company_details["franchise_type"],
+        "contact_person": company_details["contact_person"],
+        "contact_email":  company_details["contact_email"],
+        "contact_phone":  company_details["contact_phone"],
+        "address_line1":  location["address_line1"],
+        "address_line2":  location.get("address_line2"),
+        "city":           location["city"],
+        "state":          location["state"],
+        "pincode":        location["pincode"],
+    })
+    franchise.insert(ignore_permissions=True)
+
+    # 2. Warehouse
+    wh = frappe.get_doc({
+        "doctype": "Warehouse",
+        "warehouse_name": f"{company_details['franchise_name']} - Store",
+        "warehouse_type": location["warehouse_type"],
+        "custom_storage_capacity_litres": int(location.get("storage_capacity_litres", 500)),
+        "custom_franchise_outlet": franchise.name,
+    })
+    wh.insert(ignore_permissions=True)
+
+    # Link warehouse back to franchise
+    franchise.default_warehouse = wh.name
+    franchise.save(ignore_permissions=True)
+
+    # 3. Price List with selected items
+    price_list = frappe.get_doc({
+        "doctype": "Price List",
+        "price_list_name": f"{company_details['franchise_name']} Menu",
+        "currency": "INR",
+        "selling": 1,
+    })
+    price_list.insert(ignore_permissions=True)
+
+    # Add item prices
+    for item_name in menu_items:
+        rate = frappe.db.get_value("Item", item_name, "standard_rate") or 0
+        frappe.get_doc({
+            "doctype": "Item Price",
+            "item_code": item_name,
+            "price_list": price_list.name,
+            "price_list_rate": rate,
+        }).insert(ignore_permissions=True)
+
+    frappe.db.commit()
+
+    return {
+        "franchise": franchise.name,
+        "warehouse": wh.name,
+        "price_list": price_list.name,
+    }
+```
+
+:::note[Why this works]
+Each wizard step is a `Section Break` toggled via `section_field.df.hidden`, so the
+whole flow lives in one dialog instance with no page reloads. Because `frappe.xcall`
+returns promises, `async/await` keeps validation readable, and running server
+validation between steps stops bad data from ever reaching the final submission.
+:::
+
+:::caution[Common mistake]
+Calling `this.dialog.get_values()` on a step that has hidden required fields —
+Frappe validates ALL required fields, not just the visible ones, so the reader gets
+blocked by a field they can't even see. Set `reqd` dynamically per step, or read
+individual fields with `this.dialog.get_value('fieldname')` when you only need
+partial validation.
+:::

@@ -1,0 +1,970 @@
+---
+title: Third-Party Connectors
+description: Connect ERPNext to shipping carriers, e-commerce platforms, WhatsApp, and custom SaaS — with a reusable connector base class and idempotent sync patterns.
+sidebar:
+  order: 25
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Aside } from "@astrojs/starlight/components";
+
+This chapter covers connecting ERPNext to external services — shipping carriers,
+e-commerce platforms, communication tools, and custom SaaS integrations. Where
+[Chapter 24](/erpnext/24-external-apis-webhooks/) handled the raw plumbing of
+calling APIs and receiving webhooks, this chapter is about building durable,
+reusable **connectors** on top of that plumbing.
+
+If you're coming from Node.js, think of this as the difference between a one-off
+`fetch()` call and a well-structured service client with retries, auth, and
+logging baked in — except here it lives inside the Frappe app and rides on
+ScoopJoy's existing DocTypes and background queues.
+
+## ERPNext Shipping App
+
+The official **ERPNext Shipping** app integrates with multiple carriers through
+platforms like **Packlink**, **LetMeShip**, and **SendCloud**.
+
+```bash
+bench get-app erpnext_shipping
+bench --site icecream.localhost install-app erpnext_shipping
+bench --site icecream.localhost migrate
+```
+
+### Configuration
+
+Each shipping provider has its own Settings DocType. Credentials come from
+`frappe.conf` (your `site_config.json`) rather than being hardcoded:
+
+```python
+import frappe
+
+def setup_sendcloud():
+    """Configure SendCloud for franchise supply deliveries."""
+    settings = frappe.get_single("SendCloud Settings")
+    settings.enabled = 1
+    settings.api_key = frappe.conf.get("sendcloud_api_key")
+    settings.api_secret = frappe.conf.get("sendcloud_api_secret")
+    settings.save(ignore_permissions=True)
+    frappe.db.commit()
+```
+
+### Auto-generate shipping labels for franchise deliveries
+
+When ScoopJoy's central kitchen ships ice-cream supplies to a franchise outlet,
+we want to turn the Delivery Note into a carrier Shipment, fetch live rates, and
+print a label. The Shipping app exposes a `Shipment` DocType we build from the
+Delivery Note:
+
+```python title="scoopjoy/scoopjoy/api/shipping.py"
+import frappe
+
+@frappe.whitelist()
+def create_shipment_for_delivery(delivery_note_name):
+    """
+    Create a shipment and generate a label for a franchise delivery.
+    Uses the ERPNext Shipping app's Shipment DocType.
+    """
+    dn = frappe.get_doc("Delivery Note", delivery_note_name)
+
+    # Get the delivery address
+    shipping_address = frappe.get_doc("Address", dn.shipping_address_name)
+
+    # Create a Shipment document
+    shipment = frappe.get_doc({
+        "doctype": "Shipment",
+        "pickup_from_type": "Company",
+        "pickup_company": dn.company,
+        "pickup_address_name": frappe.get_value(
+            "Address",
+            {"is_your_company_address": 1, "address_type": "Warehouse"},
+            "name"
+        ),
+        "delivery_to_type": "Customer",
+        "delivery_customer": dn.customer,
+        "delivery_address_name": dn.shipping_address_name,
+        "shipment_delivery_notes": [{
+            "delivery_note": dn.name
+        }],
+        "shipment_parcels": [{
+            "length": 30,
+            "width": 30,
+            "height": 20,
+            "weight": calculate_parcel_weight(dn),
+            "count": 1
+        }],
+        "value_of_goods": dn.grand_total,
+        "description_of_content": f"Ice cream supplies for {dn.customer_name}"
+    })
+    shipment.insert(ignore_permissions=True)
+
+    # Fetch shipping rates from configured carriers
+    rates = get_shipping_rates(shipment)
+
+    return {
+        "shipment": shipment.name,
+        "rates": rates
+    }
+
+
+def calculate_parcel_weight(delivery_note):
+    """Calculate total weight from delivery note items."""
+    total_weight = 0
+    for item in delivery_note.items:
+        item_weight = frappe.get_value("Item", item.item_code, "weight_per_unit") or 0.5
+        total_weight += item_weight * item.qty
+    return max(total_weight, 0.5)  # Minimum 0.5 kg
+
+
+def get_shipping_rates(shipment):
+    """Fetch rates from available shipping providers."""
+    rates = []
+
+    # The ERPNext Shipping app provides fetch_shipping_rates
+    # which queries all configured carriers
+    try:
+        from erpnext_shipping.erpnext_shipping.utils import fetch_shipping_rates
+        rates = fetch_shipping_rates(shipment.name)
+    except ImportError:
+        frappe.log_error("ERPNext Shipping app not installed", "Shipping")
+
+    return rates
+```
+
+Call it like any whitelisted method:
+
+```bash
+# Create a shipment for a delivery note via API
+curl -X POST https://icecream.localhost/api/method/scoopjoy.api.shipping.create_shipment_for_delivery \
+  -H "Authorization: token api_key:api_secret" \
+  -H "Content-Type: application/json" \
+  -d '{"delivery_note_name": "MAT-DN-2026-00015"}'
+```
+
+After selecting a rate, book the shipment with the carrier and pull back the
+tracking number and label URL:
+
+```python title="scoopjoy/scoopjoy/api/shipping.py"
+@frappe.whitelist()
+def book_shipment_and_print_label(shipment_name, service_provider, service_name):
+    """Book the shipment with the chosen carrier and get the label."""
+    shipment = frappe.get_doc("Shipment", shipment_name)
+    shipment.service_provider = service_provider
+    shipment.shipment_id = service_name
+    shipment.save(ignore_permissions=True)
+
+    # The shipping app handles label generation via the carrier API
+    try:
+        from erpnext_shipping.erpnext_shipping.utils import create_shipment as carrier_create
+        result = carrier_create(shipment.name)
+        return {
+            "tracking_number": result.get("tracking_number"),
+            "label_url": result.get("label_url"),
+            "carrier": service_provider
+        }
+    except Exception as e:
+        frappe.log_error(f"Shipment booking failed: {e}", "Shipping")
+        frappe.throw(f"Could not book shipment: {e}")
+```
+
+## E-commerce platform integration
+
+While the official `ecommerce_integrations` app provides Shopify connectivity,
+you'll often build custom sync logic — pushing ScoopJoy's catalog up to a
+storefront and pulling orders back down as Sales Orders. The two-way flow looks
+like this:
+
+<Mermaid title="ScoopJoy ↔ Shopify sync" height={320} code={`
+flowchart LR
+  ERP["ERPNext Items"] -->|"push catalog"| SH["Shopify Products"]
+  SH -->|"poll orders (every 15m)"| SO["ERPNext Sales Orders"]
+  SO --> DB["MariaDB"]
+`} />
+
+The connector wraps the Shopify Admin API and keeps an ID mapping on both sides
+via custom fields (`custom_shopify_product_id`, `custom_shopify_order_id`):
+
+```python title="scoopjoy/scoopjoy/integrations/shopify.py"
+import frappe
+import requests
+
+class ShopifyConnector:
+    """Sync products and orders between ERPNext and Shopify."""
+
+    def __init__(self):
+        self.settings = frappe.get_single("Shopify Settings")
+        self.base_url = f"https://{self.settings.shop_name}.myshopify.com/admin/api/2025-01"
+        self.headers = {
+            "X-Shopify-Access-Token": self.settings.get_password("access_token"),
+            "Content-Type": "application/json"
+        }
+
+    def sync_products_to_shopify(self, item_group="Ice Cream Cones"):
+        """Push ERPNext items to Shopify as products."""
+        items = frappe.get_all(
+            "Item",
+            filters={
+                "item_group": item_group,
+                "show_in_website": 1,
+                "disabled": 0
+            },
+            fields=[
+                "item_code", "item_name", "description",
+                "standard_rate", "image", "weight_per_unit"
+            ]
+        )
+
+        results = []
+        for item in items:
+            shopify_product = {
+                "product": {
+                    "title": item.item_name,
+                    "body_html": item.description or "",
+                    "vendor": "ScoopJoy",
+                    "product_type": item_group,
+                    "variants": [{
+                        "price": str(item.standard_rate),
+                        "sku": item.item_code,
+                        "weight": item.weight_per_unit or 0.5,
+                        "weight_unit": "kg",
+                        "inventory_management": "shopify"
+                    }]
+                }
+            }
+
+            response = requests.post(
+                f"{self.base_url}/products.json",
+                headers=self.headers,
+                json=shopify_product,
+                timeout=15
+            )
+
+            if response.ok:
+                shopify_id = response.json()["product"]["id"]
+                # Store the mapping
+                frappe.db.set_value("Item", item.item_code,
+                                    "custom_shopify_product_id", str(shopify_id))
+                results.append({
+                    "item_code": item.item_code,
+                    "shopify_id": shopify_id,
+                    "status": "synced"
+                })
+            else:
+                results.append({
+                    "item_code": item.item_code,
+                    "status": "failed",
+                    "error": response.text
+                })
+
+        frappe.db.commit()
+        return results
+
+    def fetch_orders(self, since_id=None):
+        """Pull new orders from Shopify and create Sales Orders in ERPNext."""
+        params = {"status": "any", "limit": 50}
+        if since_id:
+            params["since_id"] = since_id
+
+        response = requests.get(
+            f"{self.base_url}/orders.json",
+            headers=self.headers,
+            params=params,
+            timeout=15
+        )
+        response.raise_for_status()
+
+        orders = response.json().get("orders", [])
+        created = []
+
+        for order in orders:
+            # Skip if already synced
+            if frappe.db.exists("Sales Order", {"custom_shopify_order_id": str(order["id"])}):
+                continue
+
+            so = self._create_sales_order(order)
+            if so:
+                created.append(so.name)
+
+        frappe.db.commit()
+        return created
+
+    def _create_sales_order(self, shopify_order):
+        """Convert a Shopify order to an ERPNext Sales Order."""
+        customer = self._get_or_create_customer(shopify_order.get("customer", {}))
+
+        so = frappe.new_doc("Sales Order")
+        so.customer = customer
+        so.company = "ScoopJoy Pvt Ltd"
+        so.delivery_date = frappe.utils.add_days(frappe.utils.today(), 5)
+        so.custom_shopify_order_id = str(shopify_order["id"])
+
+        for line in shopify_order.get("line_items", []):
+            item_code = frappe.db.get_value(
+                "Item", {"custom_shopify_product_id": str(line["product_id"])}, "name"
+            )
+            if not item_code:
+                frappe.log_error(
+                    f"Shopify product {line['product_id']} not mapped", "Shopify Sync"
+                )
+                continue
+
+            so.append("items", {
+                "item_code": item_code,
+                "qty": line["quantity"],
+                "rate": float(line["price"])
+            })
+
+        if so.items:
+            so.insert(ignore_permissions=True)
+            return so
+
+        return None
+
+    def _get_or_create_customer(self, shopify_customer):
+        """Map Shopify customer to ERPNext customer."""
+        if not shopify_customer:
+            return "Walk-in Customer"
+
+        email = shopify_customer.get("email", "")
+        existing = frappe.db.get_value("Customer", {"custom_shopify_customer_id": str(shopify_customer["id"])})
+
+        if existing:
+            return existing
+
+        name = f"{shopify_customer.get('first_name', '')} {shopify_customer.get('last_name', '')}".strip()
+        customer = frappe.get_doc({
+            "doctype": "Customer",
+            "customer_name": name or email,
+            "customer_group": "Online",
+            "territory": "All Territories",
+            "custom_shopify_customer_id": str(shopify_customer["id"])
+        })
+        customer.insert(ignore_permissions=True)
+        return customer.name
+```
+
+Notice the idempotency guard in `fetch_orders`: it checks `frappe.db.exists`
+against the stored `custom_shopify_order_id` before creating anything, so a
+re-run never duplicates orders. Schedule the pull as a background job:
+
+```python title="scoopjoy/scoopjoy/integrations/shopify.py"
+def sync_shopify_orders():
+    """Scheduled job to pull orders from Shopify."""
+    connector = ShopifyConnector()
+    created = connector.fetch_orders()
+    if created:
+        frappe.logger().info(f"Shopify sync: created {len(created)} Sales Orders")
+```
+
+```python title="scoopjoy/hooks.py"
+scheduler_events = {
+    "every_15_minutes": [
+        "scoopjoy.integrations.shopify.sync_shopify_orders"
+    ]
+}
+```
+
+## Communication integrations
+
+### WhatsApp order confirmations
+
+When a ScoopJoy customer's Sales Order is submitted, we send a WhatsApp
+confirmation via the **WhatsApp Business Cloud API**. The notifier wraps the
+Graph API and reads credentials from `site_config.json`:
+
+```python title="scoopjoy/scoopjoy/integrations/whatsapp.py"
+import frappe
+import requests
+
+class WhatsAppNotifier:
+    """Send WhatsApp notifications via the WhatsApp Business Cloud API."""
+
+    API_VERSION = "v21.0"
+
+    def __init__(self):
+        self.phone_number_id = frappe.conf.get("whatsapp_phone_number_id")
+        self.access_token = frappe.conf.get("whatsapp_access_token")
+
+        if not self.phone_number_id or not self.access_token:
+            frappe.throw(
+                "WhatsApp Business API credentials not configured in site_config.json"
+            )
+
+        self.base_url = (
+            f"https://graph.facebook.com/{self.API_VERSION}"
+            f"/{self.phone_number_id}/messages"
+        )
+
+    def send_template_message(self, to_phone, template_name, language="en_US", components=None):
+        """Send a pre-approved WhatsApp template message."""
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_phone,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language}
+            }
+        }
+
+        if components:
+            payload["template"]["components"] = components
+
+        return self._send(payload)
+
+    def send_text_message(self, to_phone, text):
+        """Send a plain text WhatsApp message (requires prior opt-in)."""
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_phone,
+            "type": "text",
+            "text": {"body": text}
+        }
+        return self._send(payload)
+
+    def _send(self, payload):
+        """Execute the API call."""
+        response = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=10
+        )
+
+        if not response.ok:
+            frappe.log_error(
+                f"WhatsApp API error: {response.text}",
+                "WhatsApp Notification"
+            )
+
+        return response.json()
+
+
+def send_order_confirmation(sales_order_name):
+    """
+    Send an order confirmation WhatsApp message when a Sales Order is submitted.
+    Hook this into Sales Order on_submit.
+    """
+    so = frappe.get_doc("Sales Order", sales_order_name)
+
+    # Get customer phone number
+    phone = frappe.get_value("Customer", so.customer, "mobile_no")
+    if not phone:
+        frappe.logger().warning(
+            f"No phone number for customer {so.customer}, skipping WhatsApp"
+        )
+        return
+
+    # Format phone number (must include country code, no + prefix)
+    phone = phone.replace("+", "").replace(" ", "").replace("-", "")
+
+    notifier = WhatsAppNotifier()
+
+    # Using a pre-approved template with dynamic parameters
+    notifier.send_template_message(
+        to_phone=phone,
+        template_name="order_confirmation",
+        language="en_US",
+        components=[{
+            "type": "body",
+            "parameters": [
+                {"type": "text", "text": so.customer_name},
+                {"type": "text", "text": so.name},
+                {"type": "text", "text": f"{so.currency} {so.grand_total}"},
+                {"type": "text", "text": str(so.delivery_date)},
+            ]
+        }]
+    )
+
+    frappe.logger().info(
+        f"WhatsApp order confirmation sent for {so.name} to {phone}"
+    )
+```
+
+Hook it into Sales Order submission, and enqueue the send rather than blocking
+the request:
+
+```python title="scoopjoy/hooks.py"
+doc_events = {
+    "Sales Order": {
+        "on_submit": "scoopjoy.integrations.whatsapp.send_order_confirmation_hook"
+    }
+}
+```
+
+```python title="scoopjoy/scoopjoy/integrations/whatsapp.py"
+def send_order_confirmation_hook(doc, method):
+    """Hook called when a Sales Order is submitted."""
+    frappe.enqueue(
+        send_order_confirmation,
+        sales_order_name=doc.name,
+        queue="short",
+        enqueue_after_commit=True
+    )
+```
+
+<Aside type="tip" title="Pro tip">
+Always use `frappe.enqueue` with `enqueue_after_commit=True` for sending external
+notifications in `doc_events` hooks. This ensures the notification is only sent
+after the database transaction commits successfully, preventing notifications for
+failed or rolled-back transactions.
+</Aside>
+
+## A reusable connector base class
+
+Every connector above repeats the same concerns: authentication, retries on
+transient failures, error handling, and logging. In Express you'd extract a
+shared HTTP client; in Frappe you write a base class that subclasses fill in.
+This `BaseConnector` provides a retrying `requests.Session`, structured logging
+to the Error Log, and `frappe.throw` on failure:
+
+```python title="scoopjoy/scoopjoy/integrations/base_connector.py"
+import frappe
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+class BaseConnector:
+    """
+    Base class for third-party API connectors.
+    Provides authentication, retry logic, error handling, and logging.
+
+    Usage:
+        class MyServiceConnector(BaseConnector):
+            SETTINGS_DOCTYPE = "My Service Settings"
+            SERVICE_NAME = "My Service"
+
+            def __init__(self):
+                super().__init__()
+                self.base_url = self.settings.api_url
+
+            def get_auth_headers(self):
+                return {
+                    "Authorization": f"Bearer {self.settings.get_password('api_key')}"
+                }
+
+            def fetch_items(self):
+                return self.get("/items")
+    """
+
+    SETTINGS_DOCTYPE = None   # Override in subclass
+    SERVICE_NAME = None       # Override in subclass
+    TIMEOUT = 15              # Default request timeout in seconds
+    MAX_RETRIES = 3           # Retry count for transient failures
+    RETRY_BACKOFF = 0.5       # Backoff factor between retries
+
+    def __init__(self):
+        if not self.SETTINGS_DOCTYPE:
+            raise NotImplementedError("Subclass must define SETTINGS_DOCTYPE")
+
+        self.settings = frappe.get_single(self.SETTINGS_DOCTYPE)
+        self.base_url = ""  # Override in subclass
+        self._session = None
+
+    @property
+    def session(self):
+        """Lazy-initialize a requests session with retry logic."""
+        if self._session is None:
+            self._session = requests.Session()
+
+            retry_strategy = Retry(
+                total=self.MAX_RETRIES,
+                backoff_factor=self.RETRY_BACKOFF,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "POST", "PUT", "PATCH"]
+            )
+
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            self._session.mount("https://", adapter)
+            self._session.mount("http://", adapter)
+
+            # Set default headers
+            self._session.headers.update({
+                "Content-Type": "application/json",
+                "User-Agent": f"ERPNext-{self.SERVICE_NAME or 'Connector'}/1.0",
+                **self.get_auth_headers()
+            })
+
+        return self._session
+
+    def get_auth_headers(self):
+        """Override to provide service-specific auth headers."""
+        return {}
+
+    def get(self, endpoint, params=None):
+        """Make a GET request to the external API."""
+        return self._request("GET", endpoint, params=params)
+
+    def post(self, endpoint, data=None):
+        """Make a POST request to the external API."""
+        return self._request("POST", endpoint, json=data)
+
+    def put(self, endpoint, data=None):
+        """Make a PUT request to the external API."""
+        return self._request("PUT", endpoint, json=data)
+
+    def _request(self, method, endpoint, **kwargs):
+        """Execute an HTTP request with logging and error handling."""
+        url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        kwargs.setdefault("timeout", self.TIMEOUT)
+
+        try:
+            response = self.session.request(method, url, **kwargs)
+            response.raise_for_status()
+
+            self._log_request(method, url, response.status_code)
+            return response.json()
+
+        except requests.exceptions.HTTPError as e:
+            self._log_error(method, url, e, response=e.response)
+            frappe.throw(
+                f"{self.SERVICE_NAME} API error ({e.response.status_code}): "
+                f"{e.response.text[:200]}"
+            )
+        except requests.exceptions.ConnectionError as e:
+            self._log_error(method, url, e)
+            frappe.throw(f"Cannot connect to {self.SERVICE_NAME}: {e}")
+        except requests.exceptions.Timeout as e:
+            self._log_error(method, url, e)
+            frappe.throw(f"{self.SERVICE_NAME} request timed out after {self.TIMEOUT}s")
+
+    def _log_request(self, method, url, status_code, level="info"):
+        """Log successful API requests."""
+        getattr(frappe.logger(), level)(
+            f"{self.SERVICE_NAME} {method} {url} -> {status_code}"
+        )
+
+    def _log_error(self, method, url, error, response=None):
+        """Log API errors to the Error Log."""
+        error_detail = str(error)
+        if response is not None:
+            error_detail = f"HTTP {response.status_code}: {response.text[:500]}"
+
+        frappe.log_error(
+            title=f"{self.SERVICE_NAME} API Error",
+            message=f"{method} {url}\n\n{error_detail}"
+        )
+```
+
+### A concrete connector: syncing franchise data to a mobile app
+
+Subclassing `BaseConnector` keeps a real connector tiny — you only declare the
+Settings DocType, the service name, the base URL, and the auth headers, then
+write the business methods. This one pushes ScoopJoy outlet and menu data to the
+React Native mobile app backend:
+
+```python title="scoopjoy/scoopjoy/integrations/mobile_sync.py"
+import frappe
+from scoopjoy.integrations.base_connector import BaseConnector
+
+class MobileAppConnector(BaseConnector):
+    """Sync franchise outlet data to the React Native mobile app backend."""
+
+    SETTINGS_DOCTYPE = "Mobile App Settings"
+    SERVICE_NAME = "Franchise Mobile App"
+
+    def __init__(self):
+        super().__init__()
+        self.base_url = self.settings.api_url
+
+    def get_auth_headers(self):
+        return {
+            "X-API-Key": self.settings.get_password("api_key")
+        }
+
+    def sync_menu_items(self, outlet_id=None):
+        """Push the current menu/price list to the mobile app."""
+        filters = {
+            "show_in_website": 1,
+            "disabled": 0
+        }
+        if outlet_id:
+            filters["custom_available_at"] = ["like", f"%{outlet_id}%"]
+
+        items = frappe.get_all(
+            "Item",
+            filters=filters,
+            fields=[
+                "item_code", "item_name", "item_group",
+                "standard_rate", "image", "description"
+            ]
+        )
+
+        return self.post("/api/v1/menu/sync", data={
+            "outlet_id": outlet_id,
+            "items": items,
+            "synced_at": frappe.utils.now()
+        })
+
+    def sync_outlet_info(self, outlet_id):
+        """Push outlet info (hours, address, status) to the mobile app."""
+        outlet = frappe.get_doc("Franchise Outlet", outlet_id)
+
+        return self.post("/api/v1/outlets/sync", data={
+            "outlet_id": outlet.name,
+            "name": outlet.outlet_name,
+            "address": outlet.address_display,
+            "latitude": outlet.latitude,
+            "longitude": outlet.longitude,
+            "opening_time": str(outlet.opening_time),
+            "closing_time": str(outlet.closing_time),
+            "is_active": outlet.is_active,
+            "synced_at": frappe.utils.now()
+        })
+
+    def push_order_status(self, sales_order_name, status):
+        """Notify the mobile app about order status changes."""
+        so = frappe.get_doc("Sales Order", sales_order_name)
+
+        return self.post("/api/v1/orders/status", data={
+            "order_id": so.name,
+            "customer_email": frappe.get_value("Customer", so.customer, "email_id"),
+            "status": status,
+            "updated_at": frappe.utils.now()
+        })
+
+
+# Scheduled sync job
+def sync_all_outlets():
+    """Push all outlet data to the mobile app (runs every hour)."""
+    connector = MobileAppConnector()
+
+    outlets = frappe.get_all(
+        "Franchise Outlet",
+        filters={"is_active": 1},
+        pluck="name"
+    )
+
+    synced = 0
+    for outlet_id in outlets:
+        try:
+            connector.sync_outlet_info(outlet_id)
+            synced += 1
+        except Exception as e:
+            frappe.log_error(
+                title=f"Mobile Sync Failed: {outlet_id}",
+                message=str(e)
+            )
+
+    frappe.logger().info(f"Mobile sync: {synced}/{len(outlets)} outlets synced")
+
+
+def sync_menu():
+    """Push menu items to the mobile app (runs every 15 minutes)."""
+    connector = MobileAppConnector()
+    connector.sync_menu_items()
+    frappe.logger().info("Mobile menu sync completed")
+```
+
+The credentials live on a singleton Settings DocType. The controller enforces
+HTTPS so a misconfigured URL never leaks an API key over plaintext:
+
+```python title="scoopjoy/scoopjoy/doctype/mobile_app_settings/mobile_app_settings.py"
+import frappe
+from frappe.model.document import Document
+
+class MobileAppSettings(Document):
+    def validate(self):
+        if self.api_url and not self.api_url.startswith("https://"):
+            frappe.throw("API URL must use HTTPS")
+```
+
+```json title="scoopjoy/scoopjoy/doctype/mobile_app_settings/mobile_app_settings.json"
+{
+    "doctype": "DocType",
+    "name": "Mobile App Settings",
+    "module": "ScoopJoy",
+    "is_single": 1,
+    "fields": [
+        {
+            "fieldname": "api_url",
+            "fieldtype": "Data",
+            "label": "Mobile App API URL",
+            "reqd": 1
+        },
+        {
+            "fieldname": "api_key",
+            "fieldtype": "Password",
+            "label": "API Key",
+            "reqd": 1
+        },
+        {
+            "fieldname": "sync_section",
+            "fieldtype": "Section Break",
+            "label": "Sync Settings"
+        },
+        {
+            "fieldname": "auto_sync_enabled",
+            "fieldtype": "Check",
+            "label": "Enable Auto Sync",
+            "default": 1
+        },
+        {
+            "fieldname": "sync_interval_minutes",
+            "fieldtype": "Int",
+            "label": "Sync Interval (minutes)",
+            "default": 15
+        }
+    ]
+}
+```
+
+Finally, register the scheduled jobs and the order-status hook:
+
+```python title="scoopjoy/hooks.py"
+scheduler_events = {
+    "every_15_minutes": [
+        "scoopjoy.integrations.mobile_sync.sync_menu"
+    ],
+    "hourly": [
+        "scoopjoy.integrations.mobile_sync.sync_all_outlets"
+    ]
+}
+
+# Hook order status changes
+doc_events = {
+    "Sales Order": {
+        "on_update": "scoopjoy.integrations.mobile_sync.on_order_status_change"
+    }
+}
+```
+
+```python title="scoopjoy/scoopjoy/integrations/mobile_sync.py"
+def on_order_status_change(doc, method):
+    """Push order status to mobile app when it changes."""
+    if doc.has_value_changed("status"):
+        frappe.enqueue(
+            push_order_status_to_mobile,
+            sales_order_name=doc.name,
+            status=doc.status,
+            queue="short",
+            enqueue_after_commit=True
+        )
+
+def push_order_status_to_mobile(sales_order_name, status):
+    connector = MobileAppConnector()
+    connector.push_order_status(sales_order_name, status)
+```
+
+The `doc.has_value_changed("status")` guard means we only push when the status
+actually changed, not on every save — a cheap way to avoid spamming the mobile
+backend.
+
+## Google services integration
+
+Frappe has built-in support for Google integrations through the **Connected App**
+pattern — it handles the OAuth dance and token refresh, so your code just asks
+for a token. Here we sync franchise customer contacts into Google Contacts:
+
+```python title="scoopjoy/scoopjoy/integrations/google_services.py"
+import frappe
+import requests
+
+@frappe.whitelist()
+def sync_franchise_contacts_to_google(user):
+    """Sync franchise customer contacts to Google Contacts."""
+    connected_app = frappe.get_doc("Connected App", {"provider_name": "Google"})
+    token = connected_app.get_token(user)
+
+    if not token:
+        frappe.throw("Google account not connected")
+
+    # Fetch customers without a Google contact ID
+    customers = frappe.get_all(
+        "Customer",
+        filters={
+            "customer_group": "Franchise",
+            "custom_google_contact_id": ["is", "not set"]
+        },
+        fields=["name", "customer_name", "mobile_no"],
+        limit=50
+    )
+
+    synced = 0
+    for customer in customers:
+        contact_data = {
+            "names": [{"givenName": customer.customer_name}],
+            "phoneNumbers": [{"value": customer.mobile_no}] if customer.mobile_no else [],
+            "organizations": [{"name": "ScoopJoy Franchise Customer"}]
+        }
+
+        response = requests.post(
+            "https://people.googleapis.com/v1/people:createContact",
+            headers={"Authorization": f"Bearer {token.access_token}"},
+            json=contact_data,
+            timeout=10
+        )
+
+        if response.ok:
+            resource_name = response.json().get("resourceName")
+            frappe.db.set_value("Customer", customer.name,
+                                "custom_google_contact_id", resource_name)
+            synced += 1
+
+    frappe.db.commit()
+    return {"synced": synced, "total": len(customers)}
+```
+
+## Integration best practices
+
+A summary of the patterns to follow when building any third-party connector.
+
+**1. Credential management**
+
+- Store credentials in Password fields on a singleton Settings DocType.
+- Never hardcode secrets — use `frappe.conf.get()` or `settings.get_password()`.
+- Separate sandbox and production credentials with a toggle.
+
+**2. Error handling and resilience**
+
+- Use `requests.Session()` with `Retry` for transient failures.
+- Log all errors to the Error Log with `frappe.log_error()`.
+- Use `frappe.enqueue()` for non-critical external calls so they don't block the user.
+
+**3. Idempotency**
+
+- Store external system IDs on the ERPNext document (custom fields).
+- Always check for existing records before creating duplicates.
+- Use `frappe.db.exists()` with the external ID as a filter.
+
+**4. Monitoring**
+
+- Use Integration Request for auditable logs of external API interactions.
+- Check Webhook Request Log for outgoing webhook debugging.
+- Set up Error Log notifications for integration failures.
+
+The check-before-create idiom is worth internalizing — it's the difference
+between a sync job you can safely re-run and one that floods your database with
+duplicates:
+
+```python
+# Pattern: Check before creating to maintain idempotency
+def sync_external_item(external_id, data):
+    existing = frappe.db.get_value(
+        "Item",
+        {"custom_external_id": external_id},
+        "name"
+    )
+
+    if existing:
+        item = frappe.get_doc("Item", existing)
+        item.update(data)
+        item.save(ignore_permissions=True)
+        return {"action": "updated", "item": item.name}
+    else:
+        item = frappe.new_doc("Item")
+        item.update(data)
+        item.custom_external_id = external_id
+        item.insert(ignore_permissions=True)
+        return {"action": "created", "item": item.name}
+```
+
+<Aside type="tip" title="Pro tip">
+For high-volume integrations (syncing thousands of records), use
+`frappe.enqueue()` with `queue="long"` and process records in batches. Call
+`frappe.db.commit()` every 100 records to avoid holding long database
+transactions. Monitor the RQ dashboard at
+`/api/method/frappe.utils.doctor.get_jobs_status` to track background job health.
+</Aside>

@@ -1,0 +1,753 @@
+---
+title: Health Check & Monitoring Endpoint
+description: Expose a guest-accessible health endpoint and a Prometheus metrics exporter, then wire up Prometheus, Grafana, and Alertmanager.
+sidebar:
+  order: 8
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard, FileTree, Steps } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a `/api/method/health`-style endpoint that load balancers and
+monitoring tools can poll to know whether the ScoopJoy bench is actually serving
+traffic — database, Redis, workers, scheduler, and disk all included.
+
+**Solution:** Ship two unauthenticated whitelisted methods — a JSON `health_check`
+that returns HTTP 503 when any component is unhealthy, and a `prometheus_metrics`
+exporter in the Prometheus text exposition format — then point a Prometheus +
+Grafana + Alertmanager stack at them.
+
+<Mermaid title="Monitoring data flow" height={420} code={`
+flowchart LR
+  LB["Load balancer / Nginx"] -->|"GET health_check"| F["ScoopJoy bench"]
+  P["Prometheus"] -->|"scrape metrics"| F
+  P --> A["Alertmanager"]
+  P --> G["Grafana"]
+  A -->|"email / Slack"| OPS["ScoopJoy ops"]
+`} />
+
+This recipe creates the two API methods inside the app plus a self-contained
+`monitoring/` directory for the stack config:
+
+<FileTree>
+- apps/scoopjoy/scoopjoy/
+  - api/
+    - **health.py** the JSON health endpoint
+    - **metrics.py** the Prometheus exporter
+- monitoring/
+  - prometheus.yml scrape config
+  - alert_rules.yml alerting rules
+  - grafana-dashboard.json the ops dashboard
+  - docker-compose.yml the monitoring stack
+  - alertmanager.yml routing + receivers
+  - grafana-provisioning/ datasource + dashboard providers
+</FileTree>
+
+## Step 1: Health Check API
+
+The endpoint runs one cheap probe per component, collects each into a `checks`
+dict, and flips the overall status to `unhealthy` if any probe fails. The
+`allow_guest=True` decorator lets a load balancer call it without a session, and
+setting `frappe.local.response.http_status_code = 503` is what makes an unhealthy
+result detectable by Nginx upstream checks and AWS ALBs.
+
+```python title="scoopjoy/scoopjoy/api/health.py" {6,38-40}
+import frappe
+import time
+import os
+import shutil
+
+
+@frappe.whitelist(allow_guest=True)
+def health_check():
+    """Comprehensive health check endpoint for load balancers and monitoring.
+
+    GET /api/method/scoopjoy.scoopjoy.api.health.health_check
+
+    Returns:
+        JSON with component statuses and overall health.
+    """
+    start = time.monotonic()
+    checks = {}
+    overall_healthy = True
+
+    # 1. Database connectivity
+    checks["database"] = _check_database()
+
+    # 2. Redis cache connectivity
+    checks["redis_cache"] = _check_redis("cache")
+
+    # 3. Redis queue connectivity
+    checks["redis_queue"] = _check_redis("queue")
+
+    # 4. Worker status
+    checks["workers"] = _check_workers()
+
+    # 5. Scheduler status
+    checks["scheduler"] = _check_scheduler()
+
+    # 6. Disk space
+    checks["disk"] = _check_disk_space()
+
+    # Determine overall status
+    for component, result in checks.items():
+        if result["status"] == "unhealthy":
+            overall_healthy = False
+
+    elapsed_ms = round((time.monotonic() - start) * 1000, 2)
+
+    response = {
+        "status": "healthy" if overall_healthy else "unhealthy",
+        "timestamp": frappe.utils.now_datetime().isoformat(),
+        "version": {
+            "frappe": frappe.__version__,
+            "scoopjoy": _get_app_version("scoopjoy"),
+        },
+        "response_time_ms": elapsed_ms,
+        "checks": checks,
+    }
+
+    # Return 503 if unhealthy (for load balancer to detect)
+    if not overall_healthy:
+        frappe.local.response.http_status_code = 503
+
+    return response
+```
+
+Each probe is its own helper so a single failing component doesn't take down the
+whole endpoint. Note the scheduler and disk checks return a third `degraded`
+status — distinct from `unhealthy` — for warning thresholds that shouldn't pull
+the node out of rotation.
+
+```python title="scoopjoy/scoopjoy/api/health.py"
+def _check_database():
+    """Check MariaDB/PostgreSQL connectivity."""
+    try:
+        start = time.monotonic()
+        result = frappe.db.sql("SELECT 1 as ok", as_dict=True)
+        elapsed = round((time.monotonic() - start) * 1000, 2)
+
+        if result and result[0].get("ok") == 1:
+            return {
+                "status": "healthy",
+                "response_time_ms": elapsed,
+                "details": {"type": frappe.conf.db_type or "mariadb"},
+            }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+    return {"status": "unhealthy", "error": "Unexpected result from DB ping"}
+
+
+def _check_redis(purpose):
+    """Check Redis connectivity for cache or queue."""
+    try:
+        start = time.monotonic()
+
+        if purpose == "cache":
+            r = frappe.cache
+            r.set_value("_health_check_ping", "pong", expires_in_sec=30)
+            val = r.get_value("_health_check_ping")
+        else:
+            import redis
+            queue_url = frappe.conf.redis_queue
+            r = redis.from_url(queue_url)
+            r.ping()
+            val = "pong"
+
+        elapsed = round((time.monotonic() - start) * 1000, 2)
+
+        return {
+            "status": "healthy" if val else "unhealthy",
+            "response_time_ms": elapsed,
+        }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+def _check_workers():
+    """Check if RQ workers are running."""
+    try:
+        import redis
+        from rq import Worker
+
+        conn = redis.from_url(frappe.conf.redis_queue)
+        workers = Worker.all(connection=conn)
+        active_workers = [w for w in workers if w.state != "suspended"]
+
+        return {
+            "status": "healthy" if len(active_workers) > 0 else "unhealthy",
+            "details": {
+                "total": len(workers),
+                "active": len(active_workers),
+                "queues": list({q.name for w in active_workers for q in w.queues}),
+            },
+        }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+def _check_scheduler():
+    """Check if the scheduler is active."""
+    try:
+        scheduler_disabled = frappe.db.get_single_value("System Settings", "disable_scheduler") or False
+        last_job = frappe.db.get_value(
+            "Scheduled Job Log",
+            filters={},
+            fieldname=["name", "creation"],
+            order_by="creation desc",
+            as_dict=True,
+        )
+
+        status = "healthy"
+        details = {"enabled": not scheduler_disabled}
+
+        if scheduler_disabled:
+            status = "unhealthy"
+            details["reason"] = "Scheduler is disabled in System Settings"
+        elif last_job:
+            age_minutes = (
+                frappe.utils.now_datetime() - frappe.utils.get_datetime(last_job.creation)
+            ).total_seconds() / 60
+
+            details["last_job"] = last_job.name
+            details["last_job_age_minutes"] = round(age_minutes, 1)
+
+            if age_minutes > 30:
+                status = "degraded"
+                details["reason"] = f"Last scheduled job ran {age_minutes:.0f} minutes ago"
+
+        return {"status": status, "details": details}
+
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+def _check_disk_space():
+    """Check available disk space."""
+    try:
+        site_path = frappe.get_site_path()
+        usage = shutil.disk_usage(site_path)
+        free_pct = (usage.free / usage.total) * 100
+
+        status = "healthy"
+        if free_pct < 5:
+            status = "unhealthy"
+        elif free_pct < 15:
+            status = "degraded"
+
+        return {
+            "status": status,
+            "details": {
+                "total_gb": round(usage.total / (1024**3), 1),
+                "used_gb": round(usage.used / (1024**3), 1),
+                "free_gb": round(usage.free / (1024**3), 1),
+                "free_percent": round(free_pct, 1),
+            },
+        }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+def _get_app_version(app_name):
+    """Get the installed version of an app."""
+    try:
+        return frappe.get_attr(f"{app_name}.__version__")
+    except Exception:
+        return "unknown"
+```
+
+## Step 2: Prometheus Metrics Exporter
+
+The metrics endpoint hand-builds the Prometheus text exposition format — a list of
+`# HELP` / `# TYPE` comment lines followed by `metric_name{labels} value` samples.
+The key trick is overriding the response type so Frappe returns `text/plain`
+instead of JSON.
+
+```python title="scoopjoy/scoopjoy/api/metrics.py" {64-68}
+import frappe
+import time
+
+
+@frappe.whitelist(allow_guest=True)
+def prometheus_metrics():
+    """Prometheus-compatible metrics endpoint.
+
+    GET /api/method/scoopjoy.scoopjoy.api.metrics.prometheus_metrics
+
+    Returns plain text in Prometheus exposition format.
+    """
+    lines = []
+
+    # -- App Info --
+    lines.append('# HELP scoopjoy_info Application info')
+    lines.append('# TYPE scoopjoy_info gauge')
+    lines.append(f'scoopjoy_info{{frappe_version="{frappe.__version__}"}} 1')
+
+    # -- Active Users --
+    lines.append('# HELP scoopjoy_active_sessions Number of active sessions')
+    lines.append('# TYPE scoopjoy_active_sessions gauge')
+    active_sessions = frappe.db.sql(
+        "SELECT COUNT(DISTINCT user) FROM `tabSessions` WHERE status='Active'"
+    )[0][0]
+    lines.append(f'scoopjoy_active_sessions {active_sessions}')
+
+    # -- Background Jobs --
+    lines.append('# HELP scoopjoy_background_jobs Background job counts by status')
+    lines.append('# TYPE scoopjoy_background_jobs gauge')
+    try:
+        import redis
+        from rq import Queue
+        conn = redis.from_url(frappe.conf.redis_queue)
+        for queue_name in ("default", "short", "long"):
+            q = Queue(queue_name, connection=conn)
+            lines.append(f'scoopjoy_background_jobs{{queue="{queue_name}",status="queued"}} {q.count}')
+            lines.append(f'scoopjoy_background_jobs{{queue="{queue_name}",status="failed"}} {q.failed_job_registry.count}')
+    except Exception:
+        pass
+
+    # -- Database Queries (response time) --
+    lines.append('# HELP scoopjoy_db_ping_seconds Database ping response time')
+    lines.append('# TYPE scoopjoy_db_ping_seconds gauge')
+    start = time.monotonic()
+    frappe.db.sql("SELECT 1")
+    db_time = time.monotonic() - start
+    lines.append(f'scoopjoy_db_ping_seconds {db_time:.6f}')
+
+    # -- Document Counts (business metrics) --
+    lines.append('# HELP scoopjoy_documents_total Total document counts')
+    lines.append('# TYPE scoopjoy_documents_total gauge')
+    for doctype in ("Sales Invoice", "Purchase Order", "Customer", "Item"):
+        try:
+            count = frappe.db.count(doctype)
+            label = doctype.lower().replace(" ", "_")
+            lines.append(f'scoopjoy_documents_total{{doctype="{label}"}} {count}')
+        except Exception:
+            pass
+
+    # -- Today's Sales --
+    lines.append('# HELP scoopjoy_sales_today_total Total sales amount today')
+    lines.append('# TYPE scoopjoy_sales_today_total gauge')
+    today_sales = frappe.db.sql(
+        "SELECT COALESCE(SUM(grand_total), 0) FROM `tabSales Invoice` "
+        "WHERE posting_date = CURDATE() AND docstatus = 1"
+    )[0][0]
+    lines.append(f'scoopjoy_sales_today_total {today_sales}')
+
+    # -- Scheduler Status --
+    lines.append('# HELP scoopjoy_scheduler_enabled Whether scheduler is enabled')
+    lines.append('# TYPE scoopjoy_scheduler_enabled gauge')
+    scheduler_disabled = frappe.db.get_single_value("System Settings", "disable_scheduler") or 0
+    lines.append(f'scoopjoy_scheduler_enabled {0 if scheduler_disabled else 1}')
+
+    # -- Error Log Count (last hour) --
+    lines.append('# HELP scoopjoy_errors_last_hour Error log entries in the last hour')
+    lines.append('# TYPE scoopjoy_errors_last_hour gauge')
+    error_count = frappe.db.count("Error Log", {
+        "creation": (">=", frappe.utils.add_to_date(frappe.utils.now_datetime(), hours=-1))
+    })
+    lines.append(f'scoopjoy_errors_last_hour {error_count}')
+
+    # -- Disk Space --
+    import shutil
+    usage = shutil.disk_usage(frappe.get_site_path())
+    lines.append('# HELP scoopjoy_disk_free_bytes Free disk space in bytes')
+    lines.append('# TYPE scoopjoy_disk_free_bytes gauge')
+    lines.append(f'scoopjoy_disk_free_bytes {usage.free}')
+    lines.append('# HELP scoopjoy_disk_total_bytes Total disk space in bytes')
+    lines.append('# TYPE scoopjoy_disk_total_bytes gauge')
+    lines.append(f'scoopjoy_disk_total_bytes {usage.total}')
+
+    # Set content type for Prometheus
+    frappe.local.response.update({
+        "type": "text",
+        "content_type": "text/plain; version=0.0.4; charset=utf-8",
+    })
+
+    return "\n".join(lines) + "\n"
+```
+
+The exporter mixes infrastructure gauges (`scoopjoy_db_ping_seconds`,
+`scoopjoy_disk_free_bytes`) with business gauges (`scoopjoy_sales_today_total`,
+`scoopjoy_documents_total`) so the same scrape feeds both ops dashboards and
+sales monitoring.
+
+## Step 3: Prometheus Configuration
+
+Point Prometheus at the metrics method's full dotted path and scrape over HTTPS.
+
+```yaml title="monitoring/prometheus.yml"
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+
+scrape_configs:
+  - job_name: "scoopjoy"
+    metrics_path: "/api/method/scoopjoy.scoopjoy.api.metrics.prometheus_metrics"
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    static_configs:
+      - targets:
+          - "scoopjoy.com:443"
+    scheme: https
+
+  # Also monitor the server itself
+  - job_name: "node"
+    static_configs:
+      - targets:
+          - "localhost:9100"  # node_exporter
+```
+
+## Step 4: Alert Rules
+
+The rules combine infrastructure alerts (`ScoopJoyDown`, `DiskSpaceCritical`,
+`DatabaseSlow`) with a business alert (`NoSalesActivity` during business hours).
+The `expr` fields are PromQL — Prometheus evaluates them every
+`evaluation_interval`, and the `for` window suppresses flapping.
+
+```yaml title="monitoring/alert_rules.yml"
+groups:
+  - name: scoopjoy_alerts
+    rules:
+      # Health check failures
+      - alert: ScoopJoyDown
+        expr: up{job="scoopjoy"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ScoopJoy application is down"
+          description: "The ScoopJoy health endpoint has been unreachable for 2 minutes."
+
+      # High error rate
+      - alert: HighErrorRate
+        expr: scoopjoy_errors_last_hour > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "More than 50 errors in the last hour."
+
+      # Scheduler stopped
+      - alert: SchedulerDisabled
+        expr: scoopjoy_scheduler_enabled == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Frappe scheduler is disabled"
+          description: "The background scheduler has been disabled. Recurring jobs will not run."
+
+      # Background job queue growing
+      - alert: JobQueueBacklog
+        expr: scoopjoy_background_jobs{status="queued"} > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Background job queue backlog"
+          description: "Queue {{ $labels.queue }} has {{ $value }} queued jobs."
+
+      # Failed jobs
+      - alert: FailedBackgroundJobs
+        expr: scoopjoy_background_jobs{status="failed"} > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Failed background jobs detected"
+          description: "Queue {{ $labels.queue }} has {{ $value }} failed jobs."
+
+      # Disk space critical
+      - alert: DiskSpaceCritical
+        expr: (scoopjoy_disk_free_bytes / scoopjoy_disk_total_bytes) * 100 < 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk space critically low"
+          description: "Less than 10% disk space remaining."
+
+      # Database slow
+      - alert: DatabaseSlow
+        expr: scoopjoy_db_ping_seconds > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Database response time high"
+          description: "Database ping time is {{ $value }}s (threshold: 0.5s)."
+
+      # No sales (business hours check)
+      - alert: NoSalesActivity
+        expr: scoopjoy_sales_today_total == 0 and hour() >= 10 and hour() <= 22
+        for: 60m
+        labels:
+          severity: info
+        annotations:
+          summary: "No sales recorded today"
+          description: "No sales invoices have been submitted today during business hours."
+```
+
+## Step 5: Grafana Dashboard JSON
+
+A trimmed dashboard: an "Application Health" stat panel mapping `up` to UP/DOWN
+plus business and infrastructure panels driven by the metrics above. Import this
+JSON via Grafana provisioning (Step 6) rather than clicking through the UI.
+
+```json title="monitoring/grafana-dashboard.json"
+{
+  "dashboard": {
+    "title": "ScoopJoy Operations",
+    "uid": "scoopjoy-ops",
+    "timezone": "Asia/Kolkata",
+    "refresh": "30s",
+    "panels": [
+      {
+        "title": "Application Health",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+        "targets": [
+          {"expr": "up{job=\"scoopjoy\"}", "legendFormat": "Health"}
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}}},
+              {"type": "value", "options": {"1": {"text": "UP", "color": "green"}}}
+            ]
+          }
+        }
+      },
+      {
+        "title": "Today's Sales",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+        "targets": [
+          {"expr": "scoopjoy_sales_today_total", "legendFormat": "Sales"}
+        ],
+        "fieldConfig": {"defaults": {"unit": "currencyINR"}}
+      },
+      {
+        "title": "DB Response Time",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+        "targets": [
+          {"expr": "scoopjoy_db_ping_seconds * 1000", "legendFormat": "DB Ping"}
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 100, "color": "yellow"},
+                {"value": 500, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "title": "Background Job Queues",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+        "targets": [
+          {"expr": "scoopjoy_background_jobs{status=\"queued\"}", "legendFormat": "{{ queue }} - queued"},
+          {"expr": "scoopjoy_background_jobs{status=\"failed\"}", "legendFormat": "{{ queue }} - failed"}
+        ]
+      },
+      {
+        "title": "Disk Usage",
+        "type": "gauge",
+        "gridPos": {"h": 6, "w": 8, "x": 0, "y": 12},
+        "targets": [
+          {"expr": "100 - ((scoopjoy_disk_free_bytes / scoopjoy_disk_total_bytes) * 100)", "legendFormat": "Disk Used %"}
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent", "min": 0, "max": 100,
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 75, "color": "yellow"},
+                {"value": 90, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "title": "Scheduler Status",
+        "type": "stat",
+        "gridPos": {"h": 6, "w": 8, "x": 16, "y": 12},
+        "targets": [
+          {"expr": "scoopjoy_scheduler_enabled", "legendFormat": "Scheduler"}
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {"type": "value", "options": {"0": {"text": "DISABLED", "color": "red"}}},
+              {"type": "value", "options": {"1": {"text": "ENABLED", "color": "green"}}}
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
+## Step 6: Docker Compose for the Monitoring Stack
+
+Run Prometheus, Grafana, Alertmanager, and node_exporter as a self-contained
+stack next to (or separate from) the bench.
+
+```yaml title="monitoring/docker-compose.yml"
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./alert_rules.yml:/etc/prometheus/alert_rules.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=scoopjoy_grafana
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/scoopjoy.json
+      - ./grafana-provisioning:/etc/grafana/provisioning
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.0
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
+```
+
+Alertmanager routes critical alerts to a tighter `repeat_interval` and fans every
+alert out to both email and Slack.
+
+```yaml title="monitoring/alertmanager.yml"
+global:
+  smtp_smarthost: "smtp.gmail.com:587"
+  smtp_from: "alerts@scoopjoy.com"
+  smtp_auth_username: "alerts@scoopjoy.com"
+  smtp_auth_password: "app-password-here"
+
+route:
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: "scoopjoy-ops"
+
+  routes:
+    - match:
+        severity: critical
+      receiver: "scoopjoy-ops-critical"
+      repeat_interval: 30m
+
+receivers:
+  - name: "scoopjoy-ops"
+    email_configs:
+      - to: "ops@scoopjoy.com"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+        channel: "#scoopjoy-alerts"
+
+  - name: "scoopjoy-ops-critical"
+    email_configs:
+      - to: "ops@scoopjoy.com,cto@scoopjoy.com"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+        channel: "#scoopjoy-alerts-critical"
+```
+
+Two small provisioning files wire the datasource and auto-load the dashboard on
+Grafana startup.
+
+```yaml title="monitoring/grafana-provisioning/datasources/prometheus.yml"
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+```
+
+```yaml title="monitoring/grafana-provisioning/dashboards/default.yml"
+apiVersion: 1
+providers:
+  - name: Default
+    folder: ScoopJoy
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+```
+
+Once the files are in place, bring the stack up:
+
+<Steps>
+
+1. From the `monitoring/` directory, start everything: `docker compose up -d`.
+
+2. Open Prometheus at `http://localhost:9090/targets` and confirm the `scoopjoy`
+   target is `UP`.
+
+3. Open Grafana at `http://localhost:3000` (admin / `scoopjoy_grafana`) — the
+   "ScoopJoy Operations" dashboard is auto-provisioned.
+
+</Steps>
+
+:::note[Why this works]
+The health check endpoint uses `allow_guest=True` so load balancers can hit it
+without authentication, and it returns HTTP 503 when unhealthy — which ALBs and
+Nginx upstream health checks detect automatically. The Prometheus metrics endpoint
+exports data in the standard exposition format, making it scrapable by any
+Prometheus instance without custom exporters. The alert rules cover both
+infrastructure (disk, DB, workers) and business (no sales) scenarios.
+:::
+
+:::caution[Common mistake]
+Making the health check too expensive. If it runs complex queries or full system
+diagnostics on every request, it becomes a DoS vector since it is unauthenticated.
+Keep individual checks lightweight (simple pings, count queries). For expensive
+diagnostics, use a separate authenticated endpoint or run them on a schedule and
+cache the results.
+:::

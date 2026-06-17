@@ -1,0 +1,321 @@
+---
+title: Dynamic Link for Polymorphic References
+description: Attach a single Note DocType to any document — Outlet, Employee, Sales Order — using Frappe's Link + Dynamic Link field pair.
+sidebar:
+  order: 4
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a "Note" system that can attach to ANY DocType — Franchise
+Outlet, Employee, Sales Order, and more — without creating a separate note table
+for each one.
+
+**Solution:** Use Frappe's Dynamic Link field pair: a `Link` field that points at
+`DocType` plus a `Dynamic Link` field whose `options` name that first field. The
+Dynamic Link resolves its target at runtime from whatever DocType the Link field
+holds, so one `SJ Note` table can reference everything.
+
+## Step 1: DocType JSON
+
+The pairing lives in the field definitions: `reference_doctype` is a `Link` to the
+`DocType` registry, and `reference_name` is a `Dynamic Link` whose `options` is the
+fieldname `reference_doctype` (not a DocType name). That `options` indirection is
+what makes the second field polymorphic.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_note/sj_note.json" {6-25}
+{
+  "name": "SJ Note",
+  "module": "ScoopJoy",
+  "naming_rule": "Expression",
+  "autoname": "SJ-NOTE-.#####",
+  "fields": [
+    {
+      "fieldname": "reference_doctype",
+      "fieldtype": "Link",
+      "label": "Reference Type",
+      "options": "DocType",
+      "reqd": 1,
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "columns": 2
+    },
+    {
+      "fieldname": "reference_name",
+      "fieldtype": "Dynamic Link",
+      "label": "Reference Document",
+      "options": "reference_doctype",
+      "reqd": 1,
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "columns": 2
+    },
+    { "fieldname": "column_break_1", "fieldtype": "Column Break" },
+    {
+      "fieldname": "note_type",
+      "fieldtype": "Select",
+      "label": "Note Type",
+      "options": "\nGeneral\nComplaint\nFollowup\nAudit\nCompliance",
+      "default": "General",
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "columns": 1
+    },
+    {
+      "fieldname": "priority",
+      "fieldtype": "Select",
+      "label": "Priority",
+      "options": "\nLow\nMedium\nHigh\nCritical",
+      "default": "Medium",
+      "in_list_view": 1,
+      "columns": 1
+    },
+    { "fieldname": "section_content", "fieldtype": "Section Break", "label": "Content" },
+    {
+      "fieldname": "subject",
+      "fieldtype": "Data",
+      "label": "Subject",
+      "reqd": 1,
+      "in_list_view": 1,
+      "columns": 3
+    },
+    { "fieldname": "content", "fieldtype": "Text Editor", "label": "Content", "reqd": 1 },
+    { "fieldname": "section_meta", "fieldtype": "Section Break", "label": "Metadata" },
+    { "fieldname": "resolved", "fieldtype": "Check", "label": "Resolved", "default": "0" },
+    {
+      "fieldname": "resolved_by",
+      "fieldtype": "Link",
+      "label": "Resolved By",
+      "options": "User",
+      "depends_on": "eval:doc.resolved",
+      "mandatory_depends_on": "eval:doc.resolved"
+    },
+    {
+      "fieldname": "resolved_on",
+      "fieldtype": "Datetime",
+      "label": "Resolved On",
+      "depends_on": "eval:doc.resolved",
+      "read_only": 1
+    }
+  ],
+  "permissions": [
+    { "role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1 },
+    { "role": "Franchise Manager", "read": 1, "write": 1, "create": 1 }
+  ],
+  "sort_field": "creation",
+  "sort_order": "DESC",
+  "track_changes": 1
+}
+```
+
+## Step 2: Controller with cross-DocType validation
+
+Because any DocType *could* be selected, the controller polices which ones *should*
+be. An allow-list keeps notes from attaching to junk types, and `frappe.db.exists`
+confirms the referenced document is real before saving.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_note/sj_note.py" {21-26,28-35}
+import frappe
+from frappe import _
+from frappe.model.document import Document
+
+# DocTypes that are allowed to have notes attached
+ALLOWED_DOCTYPES = [
+    "SJ Franchise Outlet",
+    "SJ Franchise Agreement",
+    "Employee",
+    "Sales Order",
+    "Sales Invoice",
+    "Customer",
+    "Supplier",
+    "Item",
+]
+
+
+class SJNote(Document):
+    def validate(self):
+        self.validate_reference_doctype()
+        self.validate_reference_exists()
+        self.handle_resolution()
+
+    def validate_reference_doctype(self):
+        """Restrict which DocTypes can have notes."""
+        if self.reference_doctype not in ALLOWED_DOCTYPES:
+            frappe.throw(
+                _("Notes cannot be attached to {0}. Allowed types: {1}").format(
+                    self.reference_doctype, ", ".join(ALLOWED_DOCTYPES)
+                )
+            )
+
+    def validate_reference_exists(self):
+        """Ensure the referenced document actually exists."""
+        if not frappe.db.exists(self.reference_doctype, self.reference_name):
+            frappe.throw(
+                _("{0} '{1}' does not exist.").format(
+                    self.reference_doctype, self.reference_name
+                )
+            )
+
+    def handle_resolution(self):
+        """Auto-set resolved_on when resolved is checked."""
+        if self.resolved and not self.resolved_on:
+            self.resolved_on = frappe.utils.now_datetime()
+            if not self.resolved_by:
+                self.resolved_by = frappe.session.user
+
+
+@frappe.whitelist()
+def get_notes_for_document(reference_doctype, reference_name):
+    """API: Get all notes for a specific document."""
+    frappe.has_permission("SJ Note", "read", throw=True)
+    return frappe.get_all(
+        "SJ Note",
+        filters={
+            "reference_doctype": reference_doctype,
+            "reference_name": reference_name,
+        },
+        fields=["name", "subject", "note_type", "priority", "resolved", "creation", "owner"],
+        order_by="creation desc",
+    )
+
+
+@frappe.whitelist()
+def get_note_count_for_document(reference_doctype, reference_name):
+    """API: Quick count for badge display."""
+    return frappe.db.count(
+        "SJ Note",
+        filters={
+            "reference_doctype": reference_doctype,
+            "reference_name": reference_name,
+        },
+    )
+```
+
+## Step 3: Auto-delete notes via a `doc_events` hook
+
+A polymorphic link has no foreign-key cascade, so when a referenced document is
+trashed its notes would be orphaned. Wire an `on_trash` handler for each DocType
+that can carry notes.
+
+```python title="scoopjoy/hooks.py"
+doc_events = {
+    "SJ Franchise Outlet": {
+        "on_trash": "scoopjoy.utils.notes.delete_linked_notes",
+    },
+    "SJ Franchise Agreement": {
+        "on_trash": "scoopjoy.utils.notes.delete_linked_notes",
+    },
+    "Customer": {
+        "on_trash": "scoopjoy.utils.notes.delete_linked_notes",
+    },
+    "Sales Order": {
+        "on_trash": "scoopjoy.utils.notes.delete_linked_notes",
+    },
+    # Add more DocTypes as needed
+}
+```
+
+The shared handler looks up every note pointing at the document and force-deletes
+them, then alerts the user.
+
+```python title="scoopjoy/scoopjoy/utils/notes.py"
+import frappe
+
+
+def delete_linked_notes(doc, method):
+    """Delete all SJ Notes linked to a document being trashed."""
+    notes = frappe.get_all(
+        "SJ Note",
+        filters={
+            "reference_doctype": doc.doctype,
+            "reference_name": doc.name,
+        },
+        pluck="name",
+    )
+    for note_name in notes:
+        frappe.delete_doc("SJ Note", note_name, force=True, ignore_permissions=True)
+
+    if notes:
+        frappe.msgprint(
+            f"Deleted {len(notes)} linked note(s).",
+            indicator="orange",
+            alert=True,
+        )
+```
+
+## Step 4: Client script — show notes on any form
+
+A single reusable function reads the note count, drops a dashboard indicator, and
+adds "View Notes" / "Add Note" buttons that pre-fill the Dynamic Link pair from the
+current form. The buttons pass `frm.doc.doctype` and `frm.doc.name`, so the same
+code works on every form you bind it to.
+
+```javascript title="scoopjoy/public/js/sj_notes_widget.js"
+// Include in hooks.py: app_include_js = ["/assets/scoopjoy/js/sj_notes_widget.js"]
+
+frappe.ui.form.on("SJ Franchise Outlet", {
+    refresh(frm) {
+        scoopjoy.notes.add_notes_section(frm);
+    },
+});
+
+// Reusable for any DocType
+frappe.provide("scoopjoy.notes");
+
+scoopjoy.notes.add_notes_section = function (frm) {
+    if (frm.is_new()) return;
+
+    frappe.call({
+        method: "scoopjoy.scoopjoy.doctype.sj_note.sj_note.get_note_count_for_document",
+        args: {
+            reference_doctype: frm.doc.doctype,
+            reference_name: frm.doc.name,
+        },
+        callback: function (r) {
+            const count = r.message || 0;
+            frm.dashboard.add_indicator(
+                `Notes: ${count}`,
+                count > 0 ? "blue" : "grey"
+            );
+        },
+    });
+
+    frm.add_custom_button(
+        __("View Notes ({0})", [""]),
+        function () {
+            frappe.set_route("List", "SJ Note", {
+                reference_doctype: frm.doc.doctype,
+                reference_name: frm.doc.name,
+            });
+        },
+        __("Notes")
+    );
+
+    frm.add_custom_button(
+        __("Add Note"),
+        function () {
+            frappe.new_doc("SJ Note", {
+                reference_doctype: frm.doc.doctype,
+                reference_name: frm.doc.name,
+            });
+        },
+        __("Notes")
+    );
+};
+```
+
+:::note[Why this works]
+The Dynamic Link field pair (`reference_doctype` + `reference_name`) lets a single
+`SJ Note` table hold references to any DocType. Frappe resolves the link target at
+runtime based on the `reference_doctype` value, so the Desk shows proper link
+formatting and navigation.
+:::
+
+:::caution[Common mistake]
+Not registering `on_trash` hooks for every DocType that can have notes — orphaned
+notes pile up silently. Use the wildcard `"*"` hook if your list of allowed
+DocTypes is large, but filter inside the handler to avoid the performance overhead
+of running on every delete.
+:::

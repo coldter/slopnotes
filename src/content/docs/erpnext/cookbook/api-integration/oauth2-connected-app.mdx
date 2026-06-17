@@ -1,0 +1,356 @@
+---
+title: OAuth2 Connected App
+description: Connect ScoopJoy to Google Calendar using Frappe's Connected App DocType for OAuth2 token storage, automatic refresh, and a scheduled sync job.
+sidebar:
+  order: 7
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard, Steps } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** ScoopJoy wants to sync franchise employees' Google Workspace
+calendars into ERPNext so shift schedules and outlet events line up — which means
+talking to Google's API over OAuth2 and keeping access tokens fresh.
+
+**Solution:** Use Frappe's built-in `Connected App` DocType for OAuth2 token
+management, build a client that refreshes tokens automatically, and schedule a
+sync job via `hooks.py`. Frappe stores the access and refresh tokens in the
+`Token Cache` DocType (encrypted at rest), so you never roll your own token store.
+
+The OAuth2 handshake plus the recurring refresh looks like this:
+
+<Mermaid title="OAuth2 authorization and token refresh" height={460} code={`
+sequenceDiagram
+  participant U as User (Desk)
+  participant F as Frappe (Connected App)
+  participant G as Google OAuth2
+  participant API as Calendar API
+  U->>F: Click "Authorize"
+  F->>G: Redirect to authorization_uri
+  G-->>U: Consent screen
+  U->>G: Approve scopes
+  G->>F: Redirect with auth code
+  F->>G: Exchange code at token_uri
+  G-->>F: access_token + refresh_token
+  F->>F: Store in Token Cache (encrypted)
+  Note over F,API: Later, during scheduled sync
+  F->>F: get_expires_in() < 300s?
+  F->>G: Refresh with refresh_token
+  G-->>F: New access_token
+  F->>API: GET /calendars/primary/events (Bearer token)
+  API-->>F: Events JSON
+`} />
+
+## Step 1: Create the Connected App
+
+A one-time setup script registers the Connected App with Google's endpoints and
+scopes. The `client_id` and `client_secret` are read from `site_config.json`
+(via `frappe.conf`) rather than hard-coded, and the `redirect_uri` points at
+Frappe's built-in OAuth2 callback.
+
+```python title="scoopjoy/setup/google_calendar.py"
+import frappe
+
+
+def setup_google_connected_app():
+    """
+    One-time setup: create a Connected App for Google Calendar.
+    Run: bench execute scoopjoy.setup.google_calendar.setup_google_connected_app
+    """
+    if frappe.db.exists("Connected App", {"provider_name": "Google Calendar"}):
+        frappe.msgprint("Google Calendar Connected App already exists.")
+        return
+
+    app = frappe.get_doc({
+        "doctype": "Connected App",
+        "provider_name": "Google Calendar",
+        "authorization_uri": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "revoke_uri": "https://oauth2.googleapis.com/revoke",
+        "client_id": frappe.conf.get("google_client_id"),
+        "client_secret": frappe.conf.get("google_client_secret"),
+        "redirect_uri": frappe.utils.get_url("/api/method/frappe.integrations.oauth2_logins.redirect_to_connected_app"),
+        "scopes": [
+            {"scope": "https://www.googleapis.com/auth/calendar.readonly"},
+            {"scope": "https://www.googleapis.com/auth/calendar.events"},
+        ],
+    })
+    app.insert(ignore_permissions=True)
+    frappe.db.commit()
+    frappe.msgprint(f"Connected App created: {app.name}")
+    frappe.msgprint(f"Authorize at: {frappe.utils.get_url()}/app/connected-app/{app.name}")
+```
+
+After running this, visit the Connected App in Desk and click **Authorize** to
+walk through the consent flow shown in the diagram above. The resulting tokens
+land in `Token Cache`, keyed by Connected App and user.
+
+## Step 2: Google Calendar integration module
+
+The client wraps the Connected App. The interesting method is `_get_token`: it
+reads the user's `Token Cache` document and, if the token has under 5 minutes of
+life left (`get_expires_in() < 300`), refreshes it through the Connected App's
+own `get_token()` helper before any request goes out.
+
+```python title="scoopjoy/integrations/google_calendar.py" {44-58}
+import frappe
+import requests
+from frappe import _
+from frappe.utils import now_datetime, add_days, get_datetime
+
+
+class GoogleCalendarClient:
+    """
+    Google Calendar API client using Frappe Connected App for OAuth2.
+    Handles token refresh automatically.
+    """
+
+    BASE_URL = "https://www.googleapis.com/calendar/v3"
+
+    def __init__(self, connected_app_name=None):
+        if not connected_app_name:
+            connected_app_name = frappe.db.get_value(
+                "Connected App",
+                {"provider_name": "Google Calendar"},
+                "name"
+            )
+        if not connected_app_name:
+            frappe.throw(_("Google Calendar Connected App not found. Run setup first."))
+
+        self.connected_app = frappe.get_doc("Connected App", connected_app_name)
+
+    def _get_token(self, user=None):
+        """
+        Get a valid access token. Refreshes automatically if expired.
+        Returns the access token string.
+        """
+        user = user or frappe.session.user
+
+        # Get the token document for this user
+        token_name = frappe.db.get_value(
+            "Token Cache",
+            {"connected_app": self.connected_app.name, "user": user},
+            "name"
+        )
+
+        if not token_name:
+            frappe.throw(
+                _("No Google Calendar authorization found for {0}. "
+                  "Please authorize via Connected App settings.").format(user)
+            )
+
+        token_doc = frappe.get_doc("Token Cache", token_name)
+
+        # Check if token is expired (with 5-minute buffer)
+        if token_doc.get_expires_in() < 300:
+            # Use Connected App's built-in refresh
+            try:
+                token_doc = self.connected_app.get_token(
+                    token_doc.get("refresh_token"),
+                    grant_type="refresh_token"
+                )
+            except Exception as e:
+                frappe.log_error(
+                    title="Google Calendar Token Refresh Failed",
+                    message=f"User: {user}\nError: {e}"
+                )
+                frappe.throw(
+                    _("Google Calendar token expired and refresh failed. "
+                      "Please re-authorize.")
+                )
+
+        return token_doc.get_password("access_token")
+
+    def _request(self, method, endpoint, user=None, **kwargs):
+        """Make an authenticated request to Google Calendar API."""
+        token = self._get_token(user)
+
+        headers = kwargs.pop("headers", {})
+        headers["Authorization"] = f"Bearer {token}"
+        headers["Accept"] = "application/json"
+
+        url = f"{self.BASE_URL}{endpoint}"
+        response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+
+        if response.status_code == 401:
+            # Token might have been revoked -- clear and retry once
+            frappe.log_error(title="Google Calendar 401", message=response.text)
+            raise frappe.AuthenticationError("Google Calendar authentication failed")
+
+        response.raise_for_status()
+        return response.json()
+
+    def get_events(self, calendar_id="primary", time_min=None, time_max=None, user=None):
+        """Fetch events from a Google Calendar."""
+        params = {"singleEvents": True, "orderBy": "startTime", "maxResults": 250}
+        if time_min:
+            params["timeMin"] = get_datetime(time_min).isoformat() + "Z"
+        if time_max:
+            params["timeMax"] = get_datetime(time_max).isoformat() + "Z"
+
+        return self._request(
+            "GET", f"/calendars/{calendar_id}/events", user=user, params=params
+        )
+
+    def create_event(self, calendar_id="primary", event_data=None, user=None):
+        """Create an event on Google Calendar."""
+        return self._request(
+            "POST", f"/calendars/{calendar_id}/events", user=user, json=event_data
+        )
+
+    def update_event(self, calendar_id="primary", event_id=None, event_data=None, user=None):
+        """Update an existing event."""
+        return self._request(
+            "PUT", f"/calendars/{calendar_id}/events/{event_id}", user=user, json=event_data
+        )
+```
+
+The `get_password("access_token")` call decrypts the token on read — Frappe keeps
+it encrypted in the `Token Cache` row. Every API call routes through `_request`,
+which attaches the `Bearer` header and treats a `401` as a revoked grant.
+
+## Step 3: Scheduled sync job
+
+The scheduled job fans out over every user who has authorized Google Calendar
+(one `Token Cache` row each), pulls the past week and next month of events, and
+upserts them into Frappe's `Event` DocType. A `custom_google_event_id` field is
+the idempotency key so re-runs update rather than duplicate.
+
+```python title="scoopjoy/integrations/google_calendar.py (continued)"
+def sync_franchise_calendars():
+    """
+    Scheduled job: sync Google Calendar events to/from Frappe Events.
+    Runs every 30 minutes.
+    """
+    # Get all users who have authorized Google Calendar
+    authorized_users = frappe.get_all(
+        "Token Cache",
+        filters={
+            "connected_app": frappe.db.get_value(
+                "Connected App", {"provider_name": "Google Calendar"}, "name"
+            ),
+        },
+        pluck="user",
+    )
+
+    if not authorized_users:
+        return
+
+    client = GoogleCalendarClient()
+    synced = 0
+    errors = 0
+
+    for user in authorized_users:
+        try:
+            _sync_user_calendar(client, user)
+            synced += 1
+        except frappe.AuthenticationError:
+            frappe.log_error(
+                title=f"Google Calendar Auth Failed: {user}",
+                message="Token expired or revoked. User needs to re-authorize."
+            )
+            errors += 1
+        except Exception as e:
+            frappe.log_error(
+                title=f"Google Calendar Sync Error: {user}",
+                message=str(e)
+            )
+            errors += 1
+
+    frappe.logger("google_calendar").info(
+        f"Calendar sync complete: {synced} users synced, {errors} errors"
+    )
+
+
+def _sync_user_calendar(client, user):
+    """Sync events for a single user."""
+    today = now_datetime()
+    time_min = add_days(today, -7)   # past week
+    time_max = add_days(today, 30)   # next month
+
+    result = client.get_events(
+        calendar_id="primary", time_min=time_min, time_max=time_max, user=user
+    )
+
+    for event in result.get("items", []):
+        google_event_id = event.get("id")
+        summary = event.get("summary", "Untitled Event")
+        start = event.get("start", {}).get("dateTime") or event.get("start", {}).get("date")
+        end = event.get("end", {}).get("dateTime") or event.get("end", {}).get("date")
+
+        if not start:
+            continue
+
+        # Check if we already have this event
+        existing = frappe.db.get_value(
+            "Event",
+            {"custom_google_event_id": google_event_id, "owner": user},
+            "name"
+        )
+
+        if existing:
+            frappe.db.set_value("Event", existing, {
+                "subject": summary,
+                "starts_on": get_datetime(start),
+                "ends_on": get_datetime(end) if end else None,
+                "description": event.get("description", ""),
+            })
+        else:
+            frappe.get_doc({
+                "doctype": "Event",
+                "subject": summary,
+                "starts_on": get_datetime(start),
+                "ends_on": get_datetime(end) if end else None,
+                "description": event.get("description", ""),
+                "event_type": "Public",
+                "owner": user,
+                "custom_google_event_id": google_event_id,
+                "custom_synced_from": "Google Calendar",
+            }).insert(ignore_permissions=True)
+
+    frappe.db.commit()
+```
+
+## Step 4: hooks.py configuration
+
+Wire the job into the scheduler with a cron entry, and keep the OAuth credentials
+in `site_config.json` — never in code.
+
+```python title="scoopjoy/hooks.py"
+# Scheduler for Google Calendar sync
+scheduler_events = {
+    "cron": {
+        "*/30 * * * *": [  # Every 30 minutes
+            "scoopjoy.integrations.google_calendar.sync_franchise_calendars"
+        ],
+    }
+}
+```
+
+The credentials live in `site_config.json`, read at runtime via `frappe.conf`:
+
+```json title="sites/scoopjoy.localhost/site_config.json"
+{
+  "google_client_id": "xxxxx.apps.googleusercontent.com",
+  "google_client_secret": "GOCSPX-xxxxx"
+}
+```
+
+:::note[Why this works]
+Frappe's `Connected App` DocType handles the full OAuth2 flow: authorization URL
+generation, the code-for-token exchange, and token storage in `Token Cache`. The
+`get_expires_in()` method on the token document reports how many seconds remain
+until expiry, which is what enables proactive refresh before a request rather than
+reacting to a `401`. Keeping `google_client_id` and `google_client_secret` in
+`site_config.json` keeps secrets out of version control.
+:::
+
+:::caution[Common mistake]
+Storing OAuth tokens in custom fields on the `User` DocType. Use Frappe's built-in
+`Token Cache` DocType — it encrypts the access and refresh tokens at rest and
+provides expiry tracking. Rolling your own token storage is both insecure and
+redundant.
+:::
+

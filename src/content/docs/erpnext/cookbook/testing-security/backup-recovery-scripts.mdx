@@ -1,0 +1,737 @@
+---
+title: Database Backup & Recovery Scripts
+description: Automate Frappe site backups to AWS S3 with GPG encryption, retention rotation, and recovery verification.
+sidebar:
+  order: 7
+---
+
+import { LinkCard, FileTree } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+:::note[Problem]
+Build automated backup with S3 upload, encryption, and point-in-time recovery for ScoopJoy's production database and files.
+:::
+
+### Solution
+
+For ScoopJoy's production infrastructure, we implement a robust backup system comprised of an automated Python backup script, a corresponding recovery/verification script, and a cron deployment script. The files are organized as follows:
+
+<FileTree>
+- docs/
+  - disaster-recovery-runbook.txt Runbook documentation
+- scripts/
+  - backup_to_s3.py Backup automation script
+  - restore_from_s3.py Restore automation script
+  - setup_backup_cron.sh Cron job installation script
+</FileTree>
+
+#### Automated Backup Script
+
+The backup script, `backup_to_s3.py`, automates running the `bench backup` command, encrypts the resulting archives with GPG, uploads them to AWS S3 using server-side KMS encryption, and applies a grandfather-father-son (GFS) retention rotation policy.
+
+```python title="scripts/backup_to_s3.py"
+#!/usr/bin/env python3
+"""
+Automated backup script with encryption, S3 upload, and rotation.
+
+Usage:
+    python scripts/backup_to_s3.py --site erp.scoopjoy.com
+    python scripts/backup_to_s3.py --site erp.scoopjoy.com --skip-files
+"""
+import os
+import sys
+import glob
+import subprocess
+import argparse
+import smtplib
+import logging
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from pathlib import Path
+
+import boto3
+from botocore.exceptions import ClientError
+
+# Configuration (from environment variables)
+S3_BUCKET = os.environ.get("SCOOPJOY_BACKUP_BUCKET", "scoopjoy-backups")
+S3_REGION = os.environ.get("SCOOPJOY_BACKUP_REGION", "ap-south-1")
+S3_PREFIX = os.environ.get("SCOOPJOY_BACKUP_PREFIX", "frappe-backups")
+GPG_RECIPIENT = os.environ.get("SCOOPJOY_GPG_RECIPIENT", "backup@scoopjoy.com")
+ALERT_EMAIL = os.environ.get("SCOOPJOY_ALERT_EMAIL", "devops@scoopjoy.com")
+SMTP_SERVER = os.environ.get("SCOOPJOY_SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SCOOPJOY_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SCOOPJOY_SMTP_USER", "")
+SMTP_PASS = os.environ.get("SCOOPJOY_SMTP_PASS", "")
+BENCH_PATH = os.environ.get("SCOOPJOY_BENCH_PATH", "/home/frappe/frappe-bench")
+
+# Retention policy
+KEEP_DAILY = 7
+KEEP_WEEKLY = 4
+KEEP_MONTHLY = 12
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("backup")
+
+
+def run_bench_backup(site: str, with_files: bool = True) -> dict:
+    """Run bench backup and return paths to backup files."""
+    cmd = ["bench", "--site", site, "backup", "--compress"]
+    if with_files:
+        cmd.append("--with-files")
+
+    log.info(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(
+        cmd,
+        cwd=BENCH_PATH,
+        capture_output=True,
+        text=True,
+        timeout=1800,  # 30 min timeout
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Backup failed: {result.stderr}")
+
+    log.info("Bench backup completed successfully")
+
+    # Find the latest backup files
+    backup_dir = Path(BENCH_PATH) / "sites" / site / "private" / "backups"
+    latest_files = sorted(backup_dir.glob("*.sql.gz"), key=os.path.getmtime, reverse=True)
+
+    if not latest_files:
+        raise FileNotFoundError("No backup files found")
+
+    # Get the timestamp prefix from the latest SQL file
+    latest_sql = latest_files[0]
+    prefix = latest_sql.name.split("_")[0]  # e.g., "20260320_120000"
+
+    backup_paths = {"database": str(latest_sql)}
+
+    # Find matching files backup
+    for pattern in ["*-files.tar.gz", "*-private-files.tar.gz"]:
+        matches = list(backup_dir.glob(f"{prefix}*{pattern.split('*')[1]}"))
+        if matches:
+            key = "public_files" if "private" not in pattern else "private_files"
+            backup_paths[key] = str(matches[0])
+
+    # Include site_config.json
+    site_config = Path(BENCH_PATH) / "sites" / site / "site_config.json"
+    if site_config.exists():
+        backup_paths["site_config"] = str(site_config)
+
+    return backup_paths
+
+
+def encrypt_file(filepath: str) -> str:
+    """Encrypt a file with GPG. Returns path to encrypted file."""
+    encrypted_path = f"{filepath}.gpg"
+    cmd = [
+        "gpg",
+        "--batch",
+        "--yes",
+        "--recipient", GPG_RECIPIENT,
+        "--trust-model", "always",
+        "--encrypt",
+        "--output", encrypted_path,
+        filepath,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Encryption failed: {result.stderr}")
+
+    log.info(f"Encrypted: {os.path.basename(filepath)} -> {os.path.basename(encrypted_path)}")
+    return encrypted_path
+
+
+def upload_to_s3(filepath: str, site: str) -> str:
+    """Upload a file to S3 with date-based prefix."""
+    s3 = boto3.client("s3", region_name=S3_REGION)
+    now = datetime.now()
+
+    # S3 key: frappe-backups/erp.scoopjoy.com/2026/03/20/filename.sql.gz.gpg
+    s3_key = (
+        f"{S3_PREFIX}/{site}/{now.strftime('%Y/%m/%d')}/{os.path.basename(filepath)}"
+    )
+
+    log.info(f"Uploading to s3://{S3_BUCKET}/{s3_key}")
+    s3.upload_file(
+        filepath,
+        S3_BUCKET,
+        s3_key,
+        ExtraArgs={
+            "ServerSideEncryption": "aws:kms",
+            "StorageClass": "STANDARD_IA",
+        },
+    )
+
+    return s3_key
+
+
+def apply_rotation_policy(site: str):
+    """Delete old backups based on retention policy."""
+    s3 = boto3.client("s3", region_name=S3_REGION)
+    prefix = f"{S3_PREFIX}/{site}/"
+
+    # List all backup dates
+    paginator = s3.get_paginator("list_objects_v2")
+    all_keys = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            all_keys.append(obj["Key"])
+
+    # Group by date
+    dates_with_keys = {}
+    for key in all_keys:
+        parts = key.replace(prefix, "").split("/")
+        if len(parts) >= 3:
+            date_str = f"{parts[0]}-{parts[1]}-{parts[2]}"
+            try:
+                date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                dates_with_keys.setdefault(date, []).append(key)
+            except ValueError:
+                continue
+
+    today = datetime.now().date()
+    dates_to_keep = set()
+
+    # Keep daily backups for KEEP_DAILY days
+    for i in range(KEEP_DAILY):
+        dates_to_keep.add(today - timedelta(days=i))
+
+    # Keep weekly backups (Sundays) for KEEP_WEEKLY weeks
+    for i in range(KEEP_WEEKLY):
+        week_start = today - timedelta(days=today.weekday() + 7 * i)
+        sunday = week_start + timedelta(days=6)
+        # Find closest available date
+        for d in sorted(dates_with_keys.keys(), reverse=True):
+            if abs((d - sunday).days) <= 1:
+                dates_to_keep.add(d)
+                break
+
+    # Keep monthly backups (1st of month) for KEEP_MONTHLY months
+    for i in range(KEEP_MONTHLY):
+        month = today.month - i
+        year = today.year
+        while month <= 0:
+            month += 12
+            year -= 1
+        first_of_month = datetime(year, month, 1).date()
+        # Find closest available date
+        for d in sorted(dates_with_keys.keys()):
+            if d.month == first_of_month.month and d.year == first_of_month.year:
+                dates_to_keep.add(d)
+                break
+
+    # Delete backups not in retention set
+    keys_to_delete = []
+    for date, keys in dates_with_keys.items():
+        if date not in dates_to_keep:
+            keys_to_delete.extend(keys)
+
+    if keys_to_delete:
+        # S3 delete in batches of 1000
+        for i in range(0, len(keys_to_delete), 1000):
+            batch = keys_to_delete[i : i + 1000]
+            s3.delete_objects(
+                Bucket=S3_BUCKET,
+                Delete={"Objects": [{"Key": k} for k in batch]},
+            )
+        log.info(f"Rotation: deleted {len(keys_to_delete)} old backup files")
+    else:
+        log.info("Rotation: no old backups to delete")
+
+
+def send_alert(subject: str, body: str):
+    """Send email alert on failure."""
+    if not SMTP_USER:
+        log.warning("SMTP not configured, skipping email alert")
+        return
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = ALERT_EMAIL
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        log.info(f"Alert sent to {ALERT_EMAIL}")
+    except Exception as e:
+        log.error(f"Failed to send alert: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Frappe backup to S3 with encryption")
+    parser.add_argument("--site", required=True, help="Frappe site name")
+    parser.add_argument("--skip-files", action="store_true", help="Skip file backups")
+    parser.add_argument("--no-encrypt", action="store_true", help="Skip GPG encryption")
+    parser.add_argument("--no-rotate", action="store_true", help="Skip rotation policy")
+    args = parser.parse_args()
+
+    start_time = datetime.now()
+    log.info(f"=== Backup started for {args.site} at {start_time} ===")
+
+    try:
+        # Step 1: Run bench backup
+        backup_paths = run_bench_backup(args.site, with_files=not args.skip_files)
+        log.info(f"Backup files: {list(backup_paths.keys())}")
+
+        # Step 2: Encrypt each file
+        upload_paths = {}
+        for key, path in backup_paths.items():
+            if args.no_encrypt:
+                upload_paths[key] = path
+            else:
+                upload_paths[key] = encrypt_file(path)
+
+        # Step 3: Upload to S3
+        s3_keys = {}
+        for key, path in upload_paths.items():
+            s3_keys[key] = upload_to_s3(path, args.site)
+
+        # Step 4: Apply rotation policy
+        if not args.no_rotate:
+            apply_rotation_policy(args.site)
+
+        # Step 5: Cleanup local encrypted files
+        if not args.no_encrypt:
+            for key, path in upload_paths.items():
+                if path.endswith(".gpg"):
+                    os.remove(path)
+                    log.info(f"Cleaned up local file: {os.path.basename(path)}")
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        log.info(f"=== Backup completed in {elapsed:.0f}s ===")
+        log.info(f"S3 keys: {s3_keys}")
+
+    except Exception as e:
+        log.error(f"Backup FAILED: {e}", exc_info=True)
+        send_alert(
+            subject=f"[CRITICAL] ScoopJoy Backup Failed - {args.site}",
+            body=(
+                f"Backup failed for site: {args.site}\n"
+                f"Time: {datetime.now()}\n"
+                f"Error: {e}\n\n"
+                f"Action required: check server logs and run backup manually."
+            ),
+        )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+#### Recovery and Validation Script
+
+To restore the site and verify database integrity, the `restore_from_s3.py` script downloads the backup files from S3, decrypts them using GPG, restores the site structure, and runs post-restore sanity checks.
+
+```python title="scripts/restore_from_s3.py"
+#!/usr/bin/env python3
+"""
+Restore a Frappe site from an encrypted S3 backup.
+
+Usage:
+    python scripts/restore_from_s3.py --site erp.scoopjoy.com --date 2026-03-20
+    python scripts/restore_from_s3.py --site erp.scoopjoy.com --date 2026-03-20 --dry-run
+"""
+import os
+import sys
+import subprocess
+import argparse
+import tempfile
+import logging
+from pathlib import Path
+
+import boto3
+
+S3_BUCKET = os.environ.get("SCOOPJOY_BACKUP_BUCKET", "scoopjoy-backups")
+S3_REGION = os.environ.get("SCOOPJOY_BACKUP_REGION", "ap-south-1")
+S3_PREFIX = os.environ.get("SCOOPJOY_BACKUP_PREFIX", "frappe-backups")
+GPG_PASSPHRASE_FILE = os.environ.get("SCOOPJOY_GPG_PASSPHRASE_FILE", "")
+BENCH_PATH = os.environ.get("SCOOPJOY_BENCH_PATH", "/home/frappe/frappe-bench")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("restore")
+
+
+def list_available_backups(site: str, date: str = None) -> list:
+    """List available backups for a site, optionally filtered by date."""
+    s3 = boto3.client("s3", region_name=S3_REGION)
+    prefix = f"{S3_PREFIX}/{site}/"
+    if date:
+        # date format: 2026-03-20 -> 2026/03/20
+        date_path = date.replace("-", "/")
+        prefix += f"{date_path}/"
+
+    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+    objects = response.get("Contents", [])
+    return sorted(objects, key=lambda x: x["LastModified"], reverse=True)
+
+
+def download_from_s3(s3_key: str, local_dir: str) -> str:
+    """Download a file from S3 to local directory."""
+    s3 = boto3.client("s3", region_name=S3_REGION)
+    filename = os.path.basename(s3_key)
+    local_path = os.path.join(local_dir, filename)
+
+    log.info(f"Downloading s3://{S3_BUCKET}/{s3_key} -> {local_path}")
+    s3.download_file(S3_BUCKET, s3_key, local_path)
+    return local_path
+
+
+def decrypt_file(filepath: str) -> str:
+    """Decrypt a GPG-encrypted file. Returns path to decrypted file."""
+    if not filepath.endswith(".gpg"):
+        return filepath  # not encrypted
+
+    decrypted_path = filepath[:-4]  # remove .gpg
+    cmd = ["gpg", "--batch", "--yes", "--decrypt", "--output", decrypted_path]
+
+    if GPG_PASSPHRASE_FILE:
+        cmd.extend(["--passphrase-file", GPG_PASSPHRASE_FILE])
+
+    cmd.append(filepath)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Decryption failed: {result.stderr}")
+
+    log.info(f"Decrypted: {os.path.basename(filepath)}")
+    return decrypted_path
+
+
+def restore_site(site: str, db_path: str, public_files: str = None, private_files: str = None):
+    """Restore a Frappe site from backup files."""
+    cmd = ["bench", "--site", site, "restore", db_path]
+
+    if public_files:
+        cmd.extend(["--with-public-files", public_files])
+    if private_files:
+        cmd.extend(["--with-private-files", private_files])
+
+    log.info(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(
+        cmd,
+        cwd=BENCH_PATH,
+        capture_output=True,
+        text=True,
+        timeout=3600,  # 1 hour timeout
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Restore failed: {result.stderr}")
+
+    log.info("Restore completed successfully")
+
+
+def post_restore_validation(site: str) -> dict:
+    """Run validation queries after restore."""
+    checks = {}
+
+    validation_script = f"""
+import frappe
+frappe.init(site='{site}')
+frappe.connect()
+
+results = {{}}
+
+# Check 1: Core tables exist and have data
+for dt in ['User', 'DocType', 'Franchise Outlet', 'Franchise Agreement']:
+    try:
+        count = frappe.db.count(dt)
+        results[dt] = {{'count': count, 'ok': count > 0}}
+    except Exception as e:
+        results[dt] = {{'count': 0, 'ok': False, 'error': str(e)}}
+
+# Check 2: Admin user exists
+admin = frappe.db.exists('User', 'Administrator')
+results['admin_exists'] = admin is not None
+
+# Check 3: Site config is intact
+results['site_name'] = frappe.local.site
+results['db_name'] = frappe.conf.db_name
+
+# Check 4: Check for encryption key (needed for password fields)
+results['encryption_key_present'] = bool(frappe.conf.get('encryption_key'))
+
+import json
+print('VALIDATION_RESULT:' + json.dumps(results))
+
+frappe.destroy()
+"""
+
+    result = subprocess.run(
+        ["bench", "--site", site, "execute", validation_script],
+        cwd=BENCH_PATH,
+        capture_output=True,
+        text=True,
+    )
+
+    # Alternative: run individual bench commands
+    for check_name, cmd in [
+        ("migrate_check", ["bench", "--site", site, "migrate", "--dry-run"]),
+        ("doctor_check", ["bench", "doctor"]),
+    ]:
+        check_result = subprocess.run(
+            cmd, cwd=BENCH_PATH, capture_output=True, text=True
+        )
+        checks[check_name] = {
+            "ok": check_result.returncode == 0,
+            "output": check_result.stdout[:500],
+        }
+
+    return checks
+
+
+def run_post_restore_migrate(site: str):
+    """Run bench migrate after restore to apply any schema changes."""
+    log.info("Running bench migrate...")
+    result = subprocess.run(
+        ["bench", "--site", site, "migrate"],
+        cwd=BENCH_PATH,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        log.warning(f"Migration had issues: {result.stderr[:500]}")
+    else:
+        log.info("Migration completed successfully")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Restore Frappe site from S3 backup")
+    parser.add_argument("--site", required=True, help="Frappe site name")
+    parser.add_argument("--date", required=True, help="Backup date (YYYY-MM-DD)")
+    parser.add_argument("--dry-run", action="store_true", help="List files only, don't restore")
+    parser.add_argument("--skip-migrate", action="store_true", help="Skip bench migrate")
+    parser.add_argument("--skip-validation", action="store_true", help="Skip post-restore checks")
+    args = parser.parse_args()
+
+    # Step 1: List available backups
+    backups = list_available_backups(args.site, args.date)
+    if not backups:
+        log.error(f"No backups found for {args.site} on {args.date}")
+        sys.exit(1)
+
+    log.info(f"Found {len(backups)} backup files for {args.date}:")
+    for obj in backups:
+        size_mb = obj["Size"] / (1024 * 1024)
+        log.info(f"  {obj['Key']} ({size_mb:.1f} MB)")
+
+    if args.dry_run:
+        log.info("Dry run -- exiting without restore")
+        return
+
+    # Step 2: Download files
+    with tempfile.TemporaryDirectory(prefix="scoopjoy-restore-") as tmpdir:
+        downloaded = {}
+        for obj in backups:
+            key = obj["Key"]
+            local_path = download_from_s3(key, tmpdir)
+
+            # Categorize files
+            basename = os.path.basename(key).lower()
+            if ".sql" in basename:
+                downloaded["database"] = local_path
+            elif "public" in basename and "files" in basename:
+                downloaded["public_files"] = local_path
+            elif "private" in basename and "files" in basename:
+                downloaded["private_files"] = local_path
+            elif "site_config" in basename:
+                downloaded["site_config"] = local_path
+
+        if "database" not in downloaded:
+            log.error("Database backup file not found in S3 listing")
+            sys.exit(1)
+
+        # Step 3: Decrypt
+        for key in list(downloaded.keys()):
+            downloaded[key] = decrypt_file(downloaded[key])
+
+        # Step 4: Restore site_config.json first (contains encryption key)
+        if "site_config" in downloaded:
+            site_config_dest = Path(BENCH_PATH) / "sites" / args.site / "site_config.json"
+            log.info(f"Restoring site_config.json to {site_config_dest}")
+            import shutil
+            shutil.copy2(downloaded["site_config"], str(site_config_dest))
+
+        # Step 5: Restore database and files
+        restore_site(
+            site=args.site,
+            db_path=downloaded["database"],
+            public_files=downloaded.get("public_files"),
+            private_files=downloaded.get("private_files"),
+        )
+
+        # Step 6: Run migrate
+        if not args.skip_migrate:
+            run_post_restore_migrate(args.site)
+
+        # Step 7: Post-restore validation
+        if not args.skip_validation:
+            log.info("Running post-restore validation...")
+            checks = post_restore_validation(args.site)
+            for check, result in checks.items():
+                status = "PASS" if result.get("ok") else "FAIL"
+                log.info(f"  [{status}] {check}")
+            all_ok = all(r.get("ok", False) for r in checks.values())
+            if not all_ok:
+                log.warning("Some validation checks failed -- review manually")
+
+    log.info("=== Restore process complete ===")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+#### Cron Setup Script
+
+To schedule the backups daily, we use `setup_backup_cron.sh` to install the cron job under the `frappe` system user and configure log rotation.
+
+```bash title="scripts/setup_backup_cron.sh"
+#!/bin/bash
+# Setup automated backup cron jobs
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH_USER="frappe"
+
+# Daily backup at 2:00 AM IST
+DAILY_CRON="0 2 * * * /usr/bin/python3 ${SCRIPT_DIR}/backup_to_s3.py --site erp.scoopjoy.com >> /var/log/scoopjoy/backup.log 2>&1"
+
+# Verify the script exists
+if [ ! -f "${SCRIPT_DIR}/backup_to_s3.py" ]; then
+    echo "ERROR: backup_to_s3.py not found in ${SCRIPT_DIR}"
+    exit 1
+fi
+
+# Add cron job for the bench user
+(crontab -u ${BENCH_USER} -l 2>/dev/null | grep -v "backup_to_s3.py"; echo "${DAILY_CRON}") | crontab -u ${BENCH_USER} -
+
+echo "Cron job installed:"
+crontab -u ${BENCH_USER} -l | grep backup_to_s3
+
+# Create log directory
+mkdir -p /var/log/scoopjoy
+chown ${BENCH_USER}:${BENCH_USER} /var/log/scoopjoy
+
+# Setup log rotation
+cat > /etc/logrotate.d/scoopjoy-backup << 'EOF'
+/var/log/scoopjoy/backup.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+EOF
+
+echo "Log rotation configured"
+```
+
+#### Disaster Recovery Runbook
+
+Store this markdown-formatted runbook as `docs/disaster-recovery-runbook.txt` for DevOps reference during emergencies. It covers full site recovery (P1), data corruption recovery (P2), and partial data recovery (P3).
+
+```text title="docs/disaster-recovery-runbook.txt"
+# ScoopJoy ERP Disaster Recovery Runbook
+# ========================================
+#
+# SEVERITY LEVELS:
+#   P1 - Full site down, no access
+#   P2 - Data corruption, site accessible
+#   P3 - Partial data loss, operations continue
+#
+# === P1: Full Site Recovery ===
+#
+# 1. Provision new server (or restore from VM snapshot)
+#    - Minimum: 4 vCPU, 8GB RAM, 100GB SSD
+#    - OS: Ubuntu 24.04 LTS or Debian 12
+#
+# 2. Install Frappe bench:
+#    sudo apt update && sudo apt install -y python3-pip python3-venv mariadb-server redis-server
+#    pip3 install frappe-bench
+#    bench init --frappe-branch version-16 frappe-bench
+#    cd frappe-bench
+#
+# 3. Create site:
+#    bench new-site erp.scoopjoy.com --mariadb-root-password <ROOT_PWD> --admin-password <TEMP_PWD>
+#
+# 4. List available backups:
+#    python3 scripts/restore_from_s3.py --site erp.scoopjoy.com --date $(date +%Y-%m-%d) --dry-run
+#
+# 5. Restore from latest backup:
+#    python3 scripts/restore_from_s3.py --site erp.scoopjoy.com --date $(date +%Y-%m-%d)
+#
+# 6. Install custom apps:
+#    bench get-app scoopjoy https://github.com/scoopjoy/scoopjoy-erp.git --branch main
+#    bench --site erp.scoopjoy.com install-app scoopjoy
+#
+# 7. Run migrations:
+#    bench --site erp.scoopjoy.com migrate
+#
+# 8. Verify:
+#    bench --site erp.scoopjoy.com doctor
+#    bench --site erp.scoopjoy.com execute frappe.db.count --args '["User"]'
+#
+# 9. Setup production:
+#    sudo bench setup production frappe
+#    bench setup lets-encrypt erp.scoopjoy.com
+#
+# 10. Update DNS records to point to new server IP
+#
+# === P2: Data Corruption Recovery ===
+#
+# 1. Take a backup of the corrupted state (for forensics):
+#    bench --site erp.scoopjoy.com backup --with-files
+#
+# 2. Identify corruption scope:
+#    bench --site erp.scoopjoy.com mariadb
+#    > CHECK TABLE `tabSales Invoice`;
+#    > CHECK TABLE `tabGL Entry`;
+#
+# 3. Restore from last known good backup:
+#    python3 scripts/restore_from_s3.py --site erp.scoopjoy.com --date <LAST_GOOD_DATE>
+#
+# 4. Replay any transactions entered after backup date (manual process)
+#
+# === P3: Partial Data Recovery ===
+#
+# 1. Restore backup to a temporary site:
+#    bench new-site temp-restore.local
+#    python3 scripts/restore_from_s3.py --site temp-restore.local --date <DATE>
+#
+# 2. Export specific data from temp site:
+#    bench --site temp-restore.local execute frappe.client.get_list \
+#      --args '["Sales Invoice", {"posting_date": [">=", "2026-03-15"]}]'
+#
+# 3. Import into production site
+#
+# 4. Drop temp site:
+#    bench drop-site temp-restore.local --force
+#
+# === RTO/RPO Targets ===
+#
+# Recovery Time Objective (RTO): 4 hours
+# Recovery Point Objective (RPO): 24 hours (daily backups)
+#
+# To reduce RPO to 1 hour, enable MariaDB binary logging
+# and configure continuous archival to S3.
+```
+
+:::note[Why this works]
+The backup script runs `bench backup` (which handles MariaDB dumps and file archives), encrypts with GPG (asymmetric encryption so the backup server never holds the private key), uploads to S3 with KMS server-side encryption (belt and suspenders), and applies a rotation policy that keeps 7 daily + 4 weekly + 12 monthly snapshots. The restore script reverses every step and validates the result.
+:::
+
+:::caution[Common mistake]
+Forgetting to backup `site_config.json` — it contains the `encryption_key` that Frappe uses to encrypt password fields in the database. Without it, restored passwords are unreadable and all users must reset. Also, not testing your restore process regularly — an untested backup is not a backup.
+:::

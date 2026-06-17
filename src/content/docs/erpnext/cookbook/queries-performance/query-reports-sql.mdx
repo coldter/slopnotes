@@ -1,0 +1,354 @@
+---
+title: Query Reports (Complex SQL)
+description: Build parameterized SQL Query Reports in Frappe with column-encoded headers, optional filters, tiered calculations, and a heatmap formatter.
+sidebar:
+  order: 3
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** ScoopJoy needs three production-grade reports — franchise royalties,
+inventory aging, and peak-hours analysis — each driven by hand-written SQL with
+parameterized, optional filters. A Script Report would be overkill; the logic lives
+naturally in SQL.
+
+**Solution:** Use Frappe's **Query Report** type. You write a single `.sql` file
+whose column aliases encode the label, fieldtype, and width, plus a small `.js`
+companion that declares the filters. Frappe passes filter values as named
+parameters (`%(from_date)s`) and substitutes them safely at execution time.
+
+## Report A: Franchise Royalty Report
+
+The royalty calculation is tiered — first 500K at the base rate, the next 500K at
+base+2%, anything above 1M at base+5% — then floored by a per-outlet minimum
+guarantee with `GREATEST` and reduced by deductions. The column aliases use
+Frappe's `Label:Fieldtype/Options:Width` convention, so `fo.name AS` `Outlet:Link/Franchise Outlet:180`
+renders as a 180px link column to the Franchise Outlet DocType.
+
+```sql title="scoopjoy/scoopjoy/report/franchise_royalty_report/franchise_royalty_report.sql" {77-78}
+SELECT
+    fo.name AS `Outlet:Link/Franchise Outlet:180`,
+    fo.outlet_name AS `Outlet Name:Data:200`,
+    fo.franchise_owner AS `Owner:Link/Supplier:160`,
+    fo.royalty_rate AS `Base Rate %:Percent:100`,
+
+    COALESCE(sales.total_revenue, 0) AS `Gross Revenue:Currency:140`,
+
+    -- Tiered royalty calculation:
+    -- First 500K at base rate, next 500K at base+2%, above 1M at base+5%
+    ROUND(
+        CASE
+            WHEN COALESCE(sales.total_revenue, 0) <= 500000
+                THEN COALESCE(sales.total_revenue, 0) * (fo.royalty_rate / 100)
+            WHEN COALESCE(sales.total_revenue, 0) <= 1000000
+                THEN (500000 * (fo.royalty_rate / 100))
+                   + ((COALESCE(sales.total_revenue, 0) - 500000) * ((fo.royalty_rate + 2) / 100))
+            ELSE
+                (500000 * (fo.royalty_rate / 100))
+                + (500000 * ((fo.royalty_rate + 2) / 100))
+                + ((COALESCE(sales.total_revenue, 0) - 1000000) * ((fo.royalty_rate + 5) / 100))
+        END, 2
+    ) AS `Calculated Royalty:Currency:140`,
+
+    -- Minimum guarantee check
+    fo.minimum_royalty AS `Minimum Guarantee:Currency:140`,
+
+    GREATEST(
+        ROUND(
+            CASE
+                WHEN COALESCE(sales.total_revenue, 0) <= 500000
+                    THEN COALESCE(sales.total_revenue, 0) * (fo.royalty_rate / 100)
+                WHEN COALESCE(sales.total_revenue, 0) <= 1000000
+                    THEN (500000 * (fo.royalty_rate / 100))
+                       + ((COALESCE(sales.total_revenue, 0) - 500000) * ((fo.royalty_rate + 2) / 100))
+                ELSE
+                    (500000 * (fo.royalty_rate / 100))
+                    + (500000 * ((fo.royalty_rate + 2) / 100))
+                    + ((COALESCE(sales.total_revenue, 0) - 1000000) * ((fo.royalty_rate + 5) / 100))
+            END, 2
+        ),
+        COALESCE(fo.minimum_royalty, 0)
+    ) AS `Royalty Due:Currency:140`,
+
+    -- Deductions (marketing fund, returns)
+    COALESCE(deductions.total_deductions, 0) AS `Deductions:Currency:120`,
+
+    -- Net payable
+    GREATEST(
+        ROUND(
+            CASE
+                WHEN COALESCE(sales.total_revenue, 0) <= 500000
+                    THEN COALESCE(sales.total_revenue, 0) * (fo.royalty_rate / 100)
+                WHEN COALESCE(sales.total_revenue, 0) <= 1000000
+                    THEN (500000 * (fo.royalty_rate / 100))
+                       + ((COALESCE(sales.total_revenue, 0) - 500000) * ((fo.royalty_rate + 2) / 100))
+                ELSE
+                    (500000 * (fo.royalty_rate / 100))
+                    + (500000 * ((fo.royalty_rate + 2) / 100))
+                    + ((COALESCE(sales.total_revenue, 0) - 1000000) * ((fo.royalty_rate + 5) / 100))
+            END, 2
+        ),
+        COALESCE(fo.minimum_royalty, 0)
+    ) - COALESCE(deductions.total_deductions, 0) AS `Net Payable:Currency:140`
+
+FROM `tabFranchise Outlet` fo
+
+LEFT JOIN (
+    SELECT franchise_outlet, SUM(grand_total) AS total_revenue
+    FROM `tabSales Invoice`
+    WHERE docstatus = 1
+      AND posting_date BETWEEN %(from_date)s AND %(to_date)s
+    GROUP BY franchise_outlet
+) sales ON sales.franchise_outlet = fo.name
+
+LEFT JOIN (
+    SELECT franchise_outlet,
+           SUM(CASE WHEN deduction_type = 'Marketing Fund' THEN amount
+                    WHEN deduction_type = 'Returns' THEN amount
+                    ELSE 0 END) AS total_deductions
+    FROM `tabFranchise Deduction`
+    WHERE docstatus = 1
+      AND posting_date BETWEEN %(from_date)s AND %(to_date)s
+    GROUP BY franchise_outlet
+) deductions ON deductions.franchise_outlet = fo.name
+
+WHERE fo.is_active = 1
+  AND (%(outlet)s IS NULL OR %(outlet)s = '' OR fo.name = %(outlet)s)
+  AND (%(region)s IS NULL OR %(region)s = '' OR fo.region = %(region)s)
+
+ORDER BY COALESCE(sales.total_revenue, 0) DESC
+```
+
+The filters file declares two required dates plus two optional links. The fieldnames
+here (`from_date`, `outlet`, …) are exactly the parameter names the SQL expects.
+
+```javascript title="scoopjoy/scoopjoy/report/franchise_royalty_report/franchise_royalty_report.js"
+frappe.query_reports["Franchise Royalty Report"] = {
+    filters: [
+        {
+            fieldname: "from_date",
+            label: __("From Date"),
+            fieldtype: "Date",
+            default: frappe.datetime.month_start(),
+            reqd: 1,
+        },
+        {
+            fieldname: "to_date",
+            label: __("To Date"),
+            fieldtype: "Date",
+            default: frappe.datetime.month_end(),
+            reqd: 1,
+        },
+        {
+            fieldname: "outlet",
+            label: __("Franchise Outlet"),
+            fieldtype: "Link",
+            options: "Franchise Outlet",
+        },
+        {
+            fieldname: "region",
+            label: __("Region"),
+            fieldtype: "Link",
+            options: "Territory",
+        },
+    ],
+};
+```
+
+## Report B: Inventory Aging Report
+
+This report buckets each batch by age and flags expiry status, ordering soon-to-expire
+stock first. Note the `item.item_group LIKE %(item_group)s` filter paired with a
+default of `%` in the JS — a blank filter still matches every group.
+
+```sql title="scoopjoy/scoopjoy/report/inventory_aging_report/inventory_aging_report.sql"
+SELECT
+    sle.item_code AS `Item:Link/Item:150`,
+    item.item_name AS `Item Name:Data:200`,
+    item.item_group AS `Category:Link/Item Group:120`,
+    sle.warehouse AS `Warehouse:Link/Warehouse:160`,
+    sle.batch_no AS `Batch:Link/Batch:120`,
+    batch.expiry_date AS `Expiry Date:Date:110`,
+
+    -- Current stock for this batch
+    SUM(sle.actual_qty) AS `Stock Qty:Float:90`,
+    item.stock_uom AS `UOM:Data:60`,
+
+    -- Age in days
+    DATEDIFF(CURDATE(), batch.manufacturing_date) AS `Age (Days):Int:90`,
+
+    -- Days to expiry
+    DATEDIFF(batch.expiry_date, CURDATE()) AS `Days to Expiry:Int:100`,
+
+    -- Aging bucket
+    CASE
+        WHEN DATEDIFF(CURDATE(), batch.manufacturing_date) <= 7 THEN '0-7 Days (Fresh)'
+        WHEN DATEDIFF(CURDATE(), batch.manufacturing_date) <= 14 THEN '8-14 Days'
+        WHEN DATEDIFF(CURDATE(), batch.manufacturing_date) <= 21 THEN '15-21 Days'
+        WHEN DATEDIFF(CURDATE(), batch.manufacturing_date) <= 30 THEN '22-30 Days'
+        ELSE '30+ Days (Critical)'
+    END AS `Age Bucket:Data:140`,
+
+    -- Expiry status with color coding via indicator
+    CASE
+        WHEN batch.expiry_date < CURDATE() THEN 'Expired'
+        WHEN DATEDIFF(batch.expiry_date, CURDATE()) <= 3 THEN 'Expiring Today-3d'
+        WHEN DATEDIFF(batch.expiry_date, CURDATE()) <= 7 THEN 'Expiring 4-7d'
+        WHEN DATEDIFF(batch.expiry_date, CURDATE()) <= 14 THEN 'Expiring 8-14d'
+        ELSE 'Safe'
+    END AS `Status:Data:120`,
+
+    -- Estimated value
+    SUM(sle.actual_qty) * item.valuation_rate AS `Value:Currency:120`
+
+FROM `tabStock Ledger Entry` sle
+JOIN `tabItem` item ON item.name = sle.item_code
+LEFT JOIN `tabBatch` batch ON batch.name = sle.batch_no
+
+WHERE sle.is_cancelled = 0
+  AND item.item_group LIKE %(item_group)s
+  AND (%(warehouse)s IS NULL OR %(warehouse)s = '' OR sle.warehouse = %(warehouse)s)
+  AND (%(item_code)s IS NULL OR %(item_code)s = '' OR sle.item_code = %(item_code)s)
+
+GROUP BY sle.item_code, sle.warehouse, sle.batch_no
+HAVING SUM(sle.actual_qty) > 0
+
+ORDER BY
+    CASE
+        WHEN batch.expiry_date < CURDATE() THEN 0
+        WHEN DATEDIFF(batch.expiry_date, CURDATE()) <= 3 THEN 1
+        WHEN DATEDIFF(batch.expiry_date, CURDATE()) <= 7 THEN 2
+        ELSE 3
+    END,
+    batch.expiry_date ASC
+```
+
+```javascript title="scoopjoy/scoopjoy/report/inventory_aging_report/inventory_aging_report.js"
+frappe.query_reports["Inventory Aging Report"] = {
+    filters: [
+        {
+            fieldname: "warehouse",
+            label: __("Warehouse"),
+            fieldtype: "Link",
+            options: "Warehouse",
+        },
+        {
+            fieldname: "item_code",
+            label: __("Item"),
+            fieldtype: "Link",
+            options: "Item",
+        },
+        {
+            fieldname: "item_group",
+            label: __("Item Group"),
+            fieldtype: "Link",
+            options: "Item Group",
+            default: "%",
+            // '%' returns all groups; link value overrides
+        },
+    ],
+};
+```
+
+## Report C: Peak Hours Analysis
+
+This one groups orders by outlet, weekday, and hour, then computes a per-outlet
+heatmap intensity with a window function (`MAX(...) OVER (PARTITION BY ...)`). The
+companion JS adds a `formatter` that paints each intensity cell with a background
+color.
+
+```sql title="scoopjoy/scoopjoy/report/peak_hours_analysis/peak_hours_analysis.sql" {17-21}
+SELECT
+    si.franchise_outlet AS `Outlet:Link/Franchise Outlet:160`,
+    DAYNAME(si.posting_date) AS `Day:Data:100`,
+    DAYOFWEEK(si.posting_date) AS `Day Num:Int:0`,
+    HOUR(si.posting_time) AS `Hour:Int:60`,
+
+    COUNT(si.name) AS `Orders:Int:80`,
+    SUM(si.grand_total) AS `Revenue:Currency:120`,
+    AVG(si.grand_total) AS `Avg Order:Currency:110`,
+    SUM(sii.qty) AS `Items Sold:Float:90`,
+
+    -- Heatmap intensity (0-100 scale relative to outlet max)
+    ROUND(
+        COUNT(si.name) * 100.0 / NULLIF(
+            MAX(COUNT(si.name)) OVER (PARTITION BY si.franchise_outlet), 0
+        ), 1
+    ) AS `Intensity %:Percent:100`
+
+FROM `tabSales Invoice` si
+JOIN `tabSales Invoice Item` sii ON sii.parent = si.name
+
+WHERE si.docstatus = 1
+  AND si.posting_date BETWEEN %(from_date)s AND %(to_date)s
+  AND (%(outlet)s IS NULL OR %(outlet)s = '' OR si.franchise_outlet = %(outlet)s)
+
+GROUP BY si.franchise_outlet, DAYOFWEEK(si.posting_date), HOUR(si.posting_time)
+
+ORDER BY si.franchise_outlet, DAYOFWEEK(si.posting_date), HOUR(si.posting_time)
+```
+
+The `formatter` callback wraps the intensity cell value in a colored `<div>`,
+keying off `column.fieldname === "intensity_pct"`. This is how Query Reports inject
+custom cell rendering without a Script Report.
+
+```javascript title="scoopjoy/scoopjoy/report/peak_hours_analysis/peak_hours_analysis.js"
+frappe.query_reports["Peak Hours Analysis"] = {
+    filters: [
+        {
+            fieldname: "from_date",
+            label: __("From Date"),
+            fieldtype: "Date",
+            default: frappe.datetime.add_months(frappe.datetime.get_today(), -1),
+            reqd: 1,
+        },
+        {
+            fieldname: "to_date",
+            label: __("To Date"),
+            fieldtype: "Date",
+            default: frappe.datetime.get_today(),
+            reqd: 1,
+        },
+        {
+            fieldname: "outlet",
+            label: __("Franchise Outlet"),
+            fieldtype: "Link",
+            options: "Franchise Outlet",
+        },
+    ],
+
+    formatter: function (value, row, column, data, default_formatter) {
+        value = default_formatter(value, row, column, data);
+
+        // Heatmap coloring for intensity
+        if (column.fieldname === "intensity_pct" && data) {
+            const intensity = data["intensity_pct"] || 0;
+            let bg;
+            if (intensity >= 80) bg = "#ff4d4d30";
+            else if (intensity >= 60) bg = "#ff990030";
+            else if (intensity >= 40) bg = "#ffcc0030";
+            else bg = "#33cc3330";
+
+            value = `<div style="background:${bg}; padding: 2px 8px; border-radius: 3px; text-align:center;">${value}</div>`;
+        }
+
+        return value;
+    },
+};
+```
+
+:::note[Why this works]
+Query Reports use `%(filter_name)s` for parameterized inputs, and Frappe safely
+substitutes these at execution time. The `IS NULL OR = ''` pattern makes filters
+optional — if the user leaves a filter blank, all records are returned. Column
+aliases carry their own `Label:Fieldtype/Options:Width` metadata, so the report
+renders typed, linkable columns straight from the SQL.
+:::
+
+:::caution[Common mistake]
+Using `%s` instead of `%(name)s` in Query Reports. Query Reports use **named**
+parameters, not positional ones — a bare `%s` will not bind to a filter and the
+query will fail.
+:::

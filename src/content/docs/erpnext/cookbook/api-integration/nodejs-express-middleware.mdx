@@ -1,0 +1,689 @@
+---
+title: Node.js/Express Middleware for Frappe
+description: Build a stateless Express API gateway that proxies to Frappe, reshapes responses for React, and forwards realtime events over Socket.IO.
+sidebar:
+  order: 8
+---
+
+import { LinkCard, FileTree } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Build a lightweight Node.js API gateway that sits between your React
+frontend and Frappe backend, handling session management, response transformation,
+and WebSocket proxying.
+
+**Solution:** An Express server that proxies to Frappe, reshapes responses for the
+frontend, and forwards real-time events via Socket.IO. This is the one place in the
+course where the runtime is genuinely Node.js — a Backend-for-Frontend (BFF) layer
+in front of Frappe rather than Frappe code itself.
+
+## Step 1: Project structure
+
+The gateway is its own Node project, separate from your Frappe app. Middleware,
+proxy, realtime, and route concerns each get their own folder.
+
+<FileTree>
+- scoopjoy-gateway/
+  - package.json
+  - server.js entry point — wires up middleware and proxies
+  - src/
+    - middleware/
+      - auth.js verifies token/session against Frappe
+      - errorHandler.js
+      - responseTransformer.js shared response envelope
+    - proxy/
+      - frappeProxy.js pass-through for `/api/*`
+    - realtime/
+      - socketProxy.js Socket.IO bridge to Frappe
+    - routes/
+      - index.js custom BFF routes
+  - Dockerfile
+  - docker-compose.yml
+</FileTree>
+
+## Step 2: package.json
+
+Express 5 with the usual security and proxy middleware, plus both the Socket.IO
+server and client (the gateway is a server to React and a client to Frappe). Note
+`"type": "module"` — the whole project uses ESM `import` syntax.
+
+```json title="scoopjoy-gateway/package.json"
+{
+  "name": "scoopjoy-gateway",
+  "version": "1.0.0",
+  "description": "API Gateway for ScoopJoy React frontend -> Frappe backend",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^5.0.1",
+    "http-proxy-middleware": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "helmet": "^8.0.0",
+    "morgan": "^1.10.0",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "node-fetch": "^3.3.2"
+  }
+}
+```
+
+## Step 3: Main server
+
+The entry point wires everything together: security middleware, CORS with
+`credentials: true` so session cookies survive cross-origin, the custom `/gateway`
+routes, the `/api/*` pass-through proxy, and the Socket.IO bridge. Config comes
+from environment variables with sensible local defaults.
+
+```javascript title="scoopjoy-gateway/server.js" {32-37}
+import express from "express";
+import { createServer } from "http";
+import cors from "cors";
+import helmet from "helmet";
+import morgan from "morgan";
+import cookieParser from "cookie-parser";
+import { setupFrappeProxy } from "./src/proxy/frappeProxy.js";
+import { setupSocketProxy } from "./src/realtime/socketProxy.js";
+import { errorHandler } from "./src/middleware/errorHandler.js";
+import routes from "./src/routes/index.js";
+
+const app = express();
+const server = createServer(app);
+
+// --- Configuration ---
+const config = {
+  port: process.env.PORT || 4000,
+  frappeUrl: process.env.FRAPPE_URL || "http://frappe-web:8080",
+  frontendUrl: process.env.FRONTEND_URL || "http://localhost:3000",
+  cookieSecret: process.env.COOKIE_SECRET || "change-me-in-production",
+};
+
+// --- Middleware ---
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(
+  cors({
+    origin: config.frontendUrl,
+    credentials: true, // Forward cookies
+  })
+);
+app.use(morgan("combined"));
+app.use(cookieParser(config.cookieSecret));
+
+// Parse JSON for our custom routes
+app.use("/gateway", express.json());
+
+// --- Custom Gateway Routes ---
+// These reshape Frappe responses for the React frontend
+app.use("/gateway", routes(config));
+
+// --- Frappe API Proxy ---
+// Forward /api/* directly to Frappe
+setupFrappeProxy(app, config);
+
+// --- Error Handler ---
+app.use(errorHandler);
+
+// --- WebSocket Proxy for Frappe Realtime ---
+setupSocketProxy(server, config);
+
+server.listen(config.port, () => {
+  console.log(`ScoopJoy API Gateway running on port ${config.port}`);
+  console.log(`Proxying to Frappe at ${config.frappeUrl}`);
+});
+```
+
+## Step 4: Frappe proxy (pass-through)
+
+For requests that don't need reshaping, forward `/api/*` straight to Frappe. The
+key detail is auth forwarding: the `sid` cookie (session auth) and the
+`Authorization` header (token auth) are passed through untouched, and Frappe's
+`Set-Cookie` responses are relayed back to the browser.
+
+```javascript title="scoopjoy-gateway/src/proxy/frappeProxy.js" {11-13,16-18}
+import { createProxyMiddleware } from "http-proxy-middleware";
+
+export function setupFrappeProxy(app, config) {
+  const frappeProxy = createProxyMiddleware({
+    target: config.frappeUrl,
+    changeOrigin: true,
+    // Forward cookies (Frappe session auth)
+    cookieDomainRewrite: "",
+    // Don't parse the body -- let Frappe handle it
+    on: {
+      proxyReq: (proxyReq, req) => {
+        // Forward the sid cookie as-is for session auth
+        if (req.cookies && req.cookies.sid) {
+          proxyReq.setHeader("Cookie", `sid=${req.cookies.sid}`);
+        }
+        // Forward Authorization header for token auth
+        if (req.headers.authorization) {
+          proxyReq.setHeader("Authorization", req.headers.authorization);
+        }
+      },
+      proxyRes: (proxyRes, req, res) => {
+        // Forward Set-Cookie headers from Frappe to the browser
+        const cookies = proxyRes.headers["set-cookie"];
+        if (cookies) {
+          res.setHeader("set-cookie", cookies);
+        }
+      },
+    },
+  });
+
+  // Proxy all /api/* requests to Frappe
+  app.use("/api", frappeProxy);
+
+  // Proxy file downloads
+  app.use("/files", frappeProxy);
+  app.use("/private/files", frappeProxy);
+}
+```
+
+## Step 5: Custom gateway routes (response transformation)
+
+This is the BFF payoff. The `/gateway/dashboard` route fires two Frappe calls in
+parallel and merges them; `/gateway/menu/:outlet` flattens the nested category
+structure into a single array for easy React rendering; `/gateway/orders` maps the
+React cart shape onto Frappe's `place_order` payload. Each unwraps Frappe's
+`message.data` envelope and re-wraps it through `transformResponse`.
+
+```javascript title="scoopjoy-gateway/src/routes/index.js" {21-29,55-67}
+import { Router } from "express";
+import { authMiddleware } from "../middleware/auth.js";
+import { transformResponse } from "../middleware/responseTransformer.js";
+
+export default function routes(config) {
+  const router = Router();
+  const frappeUrl = config.frappeUrl;
+
+  /**
+   * GET /gateway/dashboard
+   * Combines multiple Frappe API calls into a single response
+   * for the React dashboard component.
+   */
+  router.get("/dashboard", authMiddleware(config), async (req, res, next) => {
+    try {
+      const token = req.headers.authorization;
+      const headers = { Authorization: token, Accept: "application/json" };
+
+      // Parallel requests to Frappe
+      const [dashboardRes, notificationsRes] = await Promise.all([
+        fetch(
+          `${frappeUrl}/api/method/ice_cream_shop.api.v1.dashboard.get_dashboard`,
+          { headers }
+        ),
+        fetch(
+          `${frappeUrl}/api/method/frappe.client.get_count?doctype=Notification+Log&filters={"seen":0}`,
+          { headers }
+        ),
+      ]);
+
+      const dashboard = await dashboardRes.json();
+      const notifications = await notificationsRes.json();
+
+      // Reshape for React frontend
+      res.json(
+        transformResponse({
+          dashboard: dashboard.message?.data || {},
+          unread_notifications: notifications.message || 0,
+        })
+      );
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * GET /gateway/menu/:outlet
+   * Returns menu items in a mobile-app-friendly flat structure.
+   */
+  router.get(
+    "/menu/:outlet",
+    authMiddleware(config),
+    async (req, res, next) => {
+      try {
+        const { outlet } = req.params;
+        const token = req.headers.authorization;
+
+        const menuRes = await fetch(
+          `${frappeUrl}/api/method/ice_cream_shop.api.v1.menu.get_menu?outlet=${outlet}`,
+          { headers: { Authorization: token, Accept: "application/json" } }
+        );
+        const menu = await menuRes.json();
+
+        const categories = menu.message?.data?.categories || [];
+
+        // Flatten for easier React rendering + add image URLs
+        const flatItems = categories.flatMap((cat) =>
+          (cat.items || []).map((item) => ({
+            id: item.item_code,
+            name: item.item_name,
+            category: cat.name,
+            price: item.price,
+            image: item.image
+              ? `${config.frappeUrl}${item.image}`
+              : null,
+            inStock: item.in_stock,
+            isVeg: item.custom_is_veg,
+            allergens: item.custom_allergens,
+          }))
+        );
+
+        res.json(
+          transformResponse({
+            categories: categories.map((c) => c.name),
+            items: flatItems,
+            total: flatItems.length,
+          })
+        );
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  /**
+   * POST /gateway/orders
+   * Transforms React frontend order format to Frappe API format.
+   */
+  router.post(
+    "/orders",
+    authMiddleware(config),
+    async (req, res, next) => {
+      try {
+        const { outlet, cart, paymentMethod, customerId } = req.body;
+        const token = req.headers.authorization;
+
+        // Transform React cart format to Frappe format
+        const frappePayload = {
+          outlet,
+          customer: customerId || "Walk-in Customer",
+          payment_mode: paymentMethod || "Cash",
+          items: cart.map((item) => ({
+            item_code: item.id,
+            qty: item.quantity,
+          })),
+        };
+
+        const orderRes = await fetch(
+          `${frappeUrl}/api/method/ice_cream_shop.api.v1.orders.place_order`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: token,
+              "Content-Type": "application/json",
+              Accept: "application/json",
+            },
+            body: JSON.stringify(frappePayload),
+          }
+        );
+
+        const order = await orderRes.json();
+
+        if (!orderRes.ok) {
+          return res.status(orderRes.status).json(
+            transformResponse(null, order.message?.message || "Order failed")
+          );
+        }
+
+        // Reshape for React
+        const data = order.message?.data;
+        res.status(201).json(
+          transformResponse({
+            orderId: data?.order_id,
+            total: data?.grand_total,
+            currency: data?.currency,
+            items: data?.items?.map((i) => ({
+              id: i.item_code,
+              name: i.item_name,
+              quantity: i.qty,
+              price: i.rate,
+              subtotal: i.amount,
+            })),
+          })
+        );
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  return router;
+}
+```
+
+## Step 6: Auth & response middleware
+
+The auth middleware is deliberately thin: it forwards whatever credential the
+client sent (token or `sid` cookie) to Frappe's `frappe.auth.get_logged_user`
+endpoint and trusts Frappe's verdict. The gateway holds no session state of its own.
+
+```javascript title="scoopjoy-gateway/src/middleware/auth.js" {16-22}
+export function authMiddleware(config) {
+  return async (req, res, next) => {
+    const token = req.headers.authorization;
+    const sid = req.cookies?.sid;
+
+    if (!token && !sid) {
+      return res.status(401).json({
+        ok: false,
+        error: "Authentication required. Provide Authorization header or session cookie.",
+      });
+    }
+
+    // Verify the token/session with Frappe
+    try {
+      const headers = {};
+      if (token) headers["Authorization"] = token;
+      if (sid) headers["Cookie"] = `sid=${sid}`;
+
+      const verifyRes = await fetch(
+        `${config.frappeUrl}/api/method/frappe.auth.get_logged_user`,
+        { headers }
+      );
+
+      if (!verifyRes.ok) {
+        return res.status(401).json({
+          ok: false,
+          error: "Invalid or expired authentication.",
+        });
+      }
+
+      const userData = await verifyRes.json();
+      req.frappeUser = userData.message; // e.g., "outlet@scoopjoy.com"
+      next();
+    } catch (err) {
+      return res.status(502).json({
+        ok: false,
+        error: "Unable to verify authentication with backend.",
+      });
+    }
+  };
+}
+```
+
+A single response shape (`{ ok, data, error, timestamp }`) keeps the React client's
+handling generic — one helper produces both success and error envelopes.
+
+```javascript title="scoopjoy-gateway/src/middleware/responseTransformer.js"
+/**
+ * Standard response format for the React frontend.
+ * All gateway responses use this shape.
+ */
+export function transformResponse(data, error = null) {
+  if (error) {
+    return {
+      ok: false,
+      data: null,
+      error: typeof error === "string" ? error : "Something went wrong",
+      timestamp: Date.now(),
+    };
+  }
+  return {
+    ok: true,
+    data,
+    error: null,
+    timestamp: Date.now(),
+  };
+}
+```
+
+The Express error handler is the last middleware in the chain; it hides internal
+error messages in production and surfaces them in development.
+
+```javascript title="scoopjoy-gateway/src/middleware/errorHandler.js"
+export function errorHandler(err, req, res, _next) {
+  console.error(`[Gateway Error] ${req.method} ${req.path}:`, err.message);
+
+  const status = err.status || 500;
+  res.status(status).json({
+    ok: false,
+    data: null,
+    error:
+      process.env.NODE_ENV === "production"
+        ? "Internal server error"
+        : err.message,
+    timestamp: Date.now(),
+  });
+}
+```
+
+## Step 7: WebSocket proxy for Frappe realtime
+
+The gateway runs its own Socket.IO server for React clients and, per connection,
+opens a Socket.IO client back to Frappe's realtime server (Frappe runs it on port
+9000). It forwards a whitelist of events in one direction and tears down the Frappe
+connection when the React client disconnects.
+
+```javascript title="scoopjoy-gateway/src/realtime/socketProxy.js" {28-30,38-47}
+import { Server } from "socket.io";
+import { io as SocketClient } from "socket.io-client";
+
+export function setupSocketProxy(httpServer, config) {
+  // Socket.IO server facing the React frontend
+  const frontendIO = new Server(httpServer, {
+    cors: {
+      origin: config.frontendUrl,
+      credentials: true,
+    },
+    path: "/realtime",
+  });
+
+  frontendIO.on("connection", (frontendSocket) => {
+    console.log(`[WS] React client connected: ${frontendSocket.id}`);
+
+    // Extract auth from handshake
+    const token = frontendSocket.handshake.auth?.token;
+    const sid = frontendSocket.handshake.headers?.cookie
+      ?.split(";")
+      .find((c) => c.trim().startsWith("sid="))
+      ?.split("=")[1];
+
+    if (!token && !sid) {
+      frontendSocket.disconnect(true);
+      return;
+    }
+
+    // Connect to Frappe's Socket.IO server
+    const frappeSocketUrl = config.frappeUrl.replace(/:\d+$/, ":9000");
+    const frappeSocket = SocketClient(frappeSocketUrl, {
+      extraHeaders: token
+        ? { Authorization: token }
+        : { Cookie: `sid=${sid}` },
+      transports: ["websocket"],
+    });
+
+    // Forward Frappe realtime events to React client
+    const eventsToForward = [
+      "bulk_upload_progress",
+      "bulk_upload_complete",
+      "order_update",
+      "stock_alert",
+      "new_notification",
+    ];
+
+    for (const event of eventsToForward) {
+      frappeSocket.on(event, (data) => {
+        frontendSocket.emit(event, data);
+      });
+    }
+
+    // Handle Frappe doc updates
+    frappeSocket.on("doc_update", (data) => {
+      frontendSocket.emit("doc_update", data);
+    });
+
+    // Handle disconnection
+    frontendSocket.on("disconnect", () => {
+      console.log(`[WS] React client disconnected: ${frontendSocket.id}`);
+      frappeSocket.disconnect();
+    });
+
+    frappeSocket.on("connect_error", (err) => {
+      console.error(`[WS] Frappe socket error:`, err.message);
+    });
+  });
+}
+```
+
+## Step 8: Docker Compose integration
+
+The gateway and frontend join Frappe's existing Docker network (`external: true`)
+so they can reach `frappe-web` by service name. The gateway is stateless, so
+`restart: unless-stopped` is all the resilience it needs.
+
+```yaml title="scoopjoy-gateway/docker-compose.yml"
+services:
+  gateway:
+    build: .
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      FRAPPE_URL: http://frappe-web:8080
+      FRONTEND_URL: http://localhost:3000
+      COOKIE_SECRET: ${COOKIE_SECRET:-super-secret-change-me}
+      NODE_ENV: production
+    depends_on:
+      - frappe-web
+    networks:
+      - frappe-network
+    restart: unless-stopped
+
+  # Your React frontend
+  frontend:
+    build: ../scoopjoy-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:4000
+      REACT_APP_WS_URL: ws://localhost:4000
+    depends_on:
+      - gateway
+    networks:
+      - frappe-network
+
+networks:
+  frappe-network:
+    external: true  # Assumes Frappe's Docker Compose created this
+```
+
+A minimal multi-stage-free Dockerfile on the Node 22 Alpine base, running as the
+non-root `node` user.
+
+```dockerfile title="scoopjoy-gateway/Dockerfile"
+FROM node:22-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --production
+COPY . .
+EXPOSE 4000
+USER node
+CMD ["node", "server.js"]
+```
+
+## Step 9: React frontend usage example
+
+From the React side, login and raw API calls hit `/api/*` (proxied straight to
+Frappe), while `getDashboard` and `getMenu` hit the reshaped `/gateway/*` routes.
+The client just stores the token and replays it as the `Authorization` header.
+
+```javascript title="scoopjoy-frontend/src/api/client.js"
+const API_URL = process.env.REACT_APP_API_URL || "http://localhost:4000";
+
+class ScoopJoyAPI {
+  constructor() {
+    this.token = localStorage.getItem("scoopjoy_token");
+  }
+
+  async login(email, password) {
+    const res = await fetch(`${API_URL}/api/method/ice_cream_shop.api.v1.auth.login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ usr: email, pwd: password }),
+    });
+    const data = await res.json();
+    if (data.message?.data?.token) {
+      this.token = data.message.data.token;
+      localStorage.setItem("scoopjoy_token", this.token);
+    }
+    return data.message;
+  }
+
+  async getDashboard() {
+    // Uses the gateway route (combined + reshaped)
+    const res = await fetch(`${API_URL}/gateway/dashboard`, {
+      headers: { Authorization: this.token },
+    });
+    return res.json();
+  }
+
+  async getMenu(outlet) {
+    const res = await fetch(`${API_URL}/gateway/menu/${outlet}`, {
+      headers: { Authorization: this.token },
+    });
+    return res.json();
+  }
+
+  async placeOrder(outlet, cart, paymentMethod) {
+    const res = await fetch(`${API_URL}/gateway/orders`, {
+      method: "POST",
+      headers: {
+        Authorization: this.token,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ outlet, cart, paymentMethod }),
+    });
+    return res.json();
+  }
+}
+
+export const api = new ScoopJoyAPI();
+```
+
+:::note[Why this works]
+The gateway serves two purposes: (1) it acts as a BFF (Backend for Frontend) that
+combines multiple Frappe API calls into single requests and reshapes snake_case
+Frappe responses into camelCase React-friendly structures, and (2) it proxies raw
+`/api/*` requests through to Frappe for cases where you need direct access. Session
+cookies and `Authorization` headers are forwarded transparently.
+:::
+
+:::caution[Common mistake]
+Building the gateway to store its own authentication state. The gateway should be
+stateless — it simply forwards Frappe's session cookie (`sid`) or
+`Authorization: token` header. Let Frappe remain the single source of truth for
+auth. If the gateway caches user sessions, you'll have stale-auth bugs when
+passwords change or sessions expire on the Frappe side.
+:::
+
+## Quick reference: API authentication methods in Frappe
+
+| Method | Header / Cookie | Best for |
+|--------|----------------|----------|
+| **Token (API Key + Secret)** | `Authorization: token api_key:api_secret` | Mobile apps, service-to-service |
+| **Session Cookie** | `Cookie: sid=<session_id>` | Browser-based SPAs via proxy |
+| **Basic Auth** | `Authorization: Basic base64(api_key:api_secret)` | Quick scripts, testing |
+| **OAuth2 Bearer** | `Authorization: Bearer <access_token>` | Third-party integrations |
+| **Guest (allow_guest)** | None required | Public endpoints, webhooks |
+
+## Quick reference: Frappe rate limiting
+
+Add the following to `site_config.json` to throttle all users globally:
+
+```json title="site_config.json"
+{
+  "rate_limit": {
+    "limit": 600,
+    "window": 3600
+  }
+}
+```
+
+For per-user limits, use a Redis-based `RateLimiter` class inside your Frappe app
+instead — see [Mobile App REST API Layer](/erpnext/cookbook/api-integration/mobile-rest-api/).

@@ -1,0 +1,333 @@
+---
+title: Incoming Webhook Handler with Idempotency
+description: Receive delivery-partner webhooks safely with HMAC verification, idempotency keys, and correct HTTP status codes — no duplicate records on retries.
+sidebar:
+  order: 3
+---
+
+import { LinkCard, Steps } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** ScoopJoy's delivery partner POSTs order status updates to your ERP.
+Their API retries on timeout, so the same `delivery.status_changed` event can
+arrive two or three times. You need to ingest these updates without creating
+duplicate records or double-applying state.
+
+**Solution:** Expose a whitelisted guest endpoint that does three things before it
+touches your data: verify an HMAC signature on the raw body, reject duplicates by a
+unique idempotency key, and return honest HTTP status codes so the sender knows
+whether to retry. Every call gets logged for an audit trail.
+
+## Step 1: Incoming Webhook Log DocType
+
+The audit log is the backbone of idempotency. The `idempotency_key` field is
+marked `unique` and `reqd` — that single constraint is what guarantees we can never
+record the same delivery event twice, even under a race.
+
+```json title="scoopjoy/scoopjoy/doctype/incoming_webhook_log/incoming_webhook_log.json" {5}
+{
+    "name": "Incoming Webhook Log",
+    "module": "ScoopJoy",
+    "doctype": "DocType",
+    "fields": [
+        {"fieldname": "idempotency_key", "fieldtype": "Data", "label": "Idempotency Key", "unique": 1, "reqd": 1},
+        {"fieldname": "source", "fieldtype": "Data", "label": "Source"},
+        {"fieldname": "event", "fieldtype": "Data", "label": "Event"},
+        {"fieldname": "payload", "fieldtype": "Code", "label": "Payload", "options": "JSON"},
+        {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "Received\nProcessed\nFailed\nIgnored"},
+        {"fieldname": "processing_result", "fieldtype": "Code", "label": "Processing Result"},
+        {"fieldname": "ip_address", "fieldtype": "Data", "label": "IP Address"},
+        {"fieldname": "received_at", "fieldtype": "Datetime", "label": "Received At"}
+    ],
+    "permissions": [
+        {"role": "System Manager", "read": 1, "write": 1, "delete": 1}
+    ]
+}
+```
+
+## Step 2: Webhook Handler Endpoint
+
+This is the centerpiece. The handler runs as a guest (`allow_guest=True`) because
+the delivery partner has no Frappe login — trust comes from the HMAC signature, not
+a session. The flow is: validate headers, verify the signature, short-circuit on a
+duplicate key, log, then dispatch by event type.
+
+A few details worth calling out:
+
+- **Read the raw body, not `frappe.form_dict`.** HMAC must be computed over the
+  exact bytes the partner signed, so we use `frappe.request.get_data()`.
+- **The duplicate check returns `200`, not an error.** Telling the sender "already
+  processed" with a success code stops its retry loop — a `4xx`/`5xx` would make it
+  keep hammering you.
+- **Every branch updates the log and commits.** `Received` → `Processed` /
+  `Failed` / `Ignored`, giving you a full audit trail regardless of outcome.
+
+```python title="scoopjoy/scoopjoy/api/v1/webhooks.py" {54-55,67-78}
+import frappe
+import hashlib
+import hmac
+import json
+from frappe import _
+from frappe.utils import now_datetime
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def delivery_update():
+    """
+    Receive delivery status updates from delivery partner.
+
+    POST /api/method/scoopjoy.api.v1.webhooks.delivery_update
+
+    Expected headers:
+        X-Webhook-Signature: sha256=<hmac_hex>
+        X-Idempotency-Key: <unique_id>
+        Content-Type: application/json
+    """
+    # Step 1: Extract raw body and headers
+    raw_body = frappe.request.get_data()
+    signature_header = frappe.request.headers.get("X-Webhook-Signature", "")
+    idempotency_key = frappe.request.headers.get("X-Idempotency-Key", "")
+    ip_address = frappe.request.remote_addr
+
+    # Step 2: Validate required headers
+    if not signature_header:
+        frappe.local.response["http_status_code"] = 401
+        return {"status": "error", "message": "Missing X-Webhook-Signature header"}
+
+    if not idempotency_key:
+        frappe.local.response["http_status_code"] = 400
+        return {"status": "error", "message": "Missing X-Idempotency-Key header"}
+
+    # Step 3: Verify HMAC signature
+    webhook_secret = frappe.conf.get("delivery_partner_webhook_secret", "")
+    expected_signature = "sha256=" + hmac.new(
+        webhook_secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature_header, expected_signature):
+        frappe.local.response["http_status_code"] = 401
+        return {"status": "error", "message": "Invalid signature"}
+
+    # Step 4: Check idempotency -- reject duplicates
+    if frappe.db.exists("Incoming Webhook Log", {"idempotency_key": idempotency_key}):
+        existing = frappe.db.get_value(
+            "Incoming Webhook Log",
+            {"idempotency_key": idempotency_key},
+            ["status", "processing_result"],
+            as_dict=True,
+        )
+        # Return 200 (not an error) -- the request was already processed
+        frappe.local.response["http_status_code"] = 200
+        return {
+            "status": "duplicate",
+            "message": f"Already processed (status: {existing.status})",
+        }
+
+    # Step 5: Parse payload
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        frappe.local.response["http_status_code"] = 400
+        return {"status": "error", "message": "Invalid JSON body"}
+
+    # Step 6: Log the incoming webhook
+    log = frappe.get_doc({
+        "doctype": "Incoming Webhook Log",
+        "idempotency_key": idempotency_key,
+        "source": "Delivery Partner",
+        "event": payload.get("event", "unknown"),
+        "payload": json.dumps(payload, indent=2),
+        "status": "Received",
+        "ip_address": ip_address,
+        "received_at": now_datetime(),
+    })
+    log.insert(ignore_permissions=True)
+    frappe.db.commit()
+
+    # Step 7: Process the webhook based on event type
+    try:
+        event = payload.get("event")
+        result = {}
+
+        if event == "delivery.status_changed":
+            result = _handle_delivery_status(payload)
+        elif event == "delivery.assigned":
+            result = _handle_delivery_assigned(payload)
+        elif event == "delivery.cancelled":
+            result = _handle_delivery_cancelled(payload)
+        else:
+            log.status = "Ignored"
+            log.processing_result = f"Unknown event: {event}"
+            log.save(ignore_permissions=True)
+            frappe.db.commit()
+            frappe.local.response["http_status_code"] = 200
+            return {"status": "ignored", "message": f"Unknown event type: {event}"}
+
+        log.status = "Processed"
+        log.processing_result = json.dumps(result)
+        log.save(ignore_permissions=True)
+        frappe.db.commit()
+
+        frappe.local.response["http_status_code"] = 200
+        return {"status": "success", "message": "Webhook processed", "data": result}
+
+    except Exception as e:
+        log.status = "Failed"
+        log.processing_result = str(e)
+        log.save(ignore_permissions=True)
+        frappe.db.commit()
+        frappe.log_error(title=f"Webhook processing failed: {idempotency_key}")
+
+        frappe.local.response["http_status_code"] = 500
+        return {"status": "error", "message": "Internal processing error"}
+```
+
+The event handlers map the partner's vocabulary onto ScoopJoy's Sales Invoice
+custom fields. They raise `ValueError` for unknown orders or statuses — and because
+the dispatcher wraps them in `try/except`, a raise becomes a logged `Failed` plus an
+HTTP `500`, which is exactly the signal that tells the partner to retry later.
+
+```python title="scoopjoy/scoopjoy/api/v1/webhooks.py"
+def _handle_delivery_status(payload):
+    """Update Sales Invoice with delivery status."""
+    order_id = payload.get("order_id")
+    if not order_id or not frappe.db.exists("Sales Invoice", order_id):
+        raise ValueError(f"Order not found: {order_id}")
+
+    status_map = {
+        "picked_up": "Out for Delivery",
+        "in_transit": "Out for Delivery",
+        "delivered": "Delivered",
+        "failed": "Delivery Failed",
+    }
+
+    delivery_status = status_map.get(payload.get("status"))
+    if not delivery_status:
+        raise ValueError(f"Unknown delivery status: {payload.get('status')}")
+
+    frappe.db.set_value("Sales Invoice", order_id, {
+        "custom_delivery_status": delivery_status,
+        "custom_delivery_partner_id": payload.get("delivery_id"),
+        "custom_driver_name": payload.get("driver_name"),
+    })
+
+    if payload.get("status") == "delivered":
+        frappe.db.set_value("Sales Invoice", order_id, {
+            "custom_delivered_at": payload.get("delivered_at"),
+            "custom_proof_of_delivery_url": payload.get("proof_of_delivery_url"),
+        })
+
+    return {"order_id": order_id, "delivery_status": delivery_status}
+
+
+def _handle_delivery_assigned(payload):
+    """Handle delivery driver assignment."""
+    order_id = payload.get("order_id")
+    if not order_id or not frappe.db.exists("Sales Invoice", order_id):
+        raise ValueError(f"Order not found: {order_id}")
+
+    frappe.db.set_value("Sales Invoice", order_id, {
+        "custom_delivery_status": "Driver Assigned",
+        "custom_driver_name": payload.get("driver_name"),
+        "custom_driver_phone": payload.get("driver_phone"),
+        "custom_estimated_delivery_time": payload.get("eta"),
+    })
+
+    return {"order_id": order_id, "status": "Driver Assigned"}
+
+
+def _handle_delivery_cancelled(payload):
+    """Handle delivery cancellation."""
+    order_id = payload.get("order_id")
+    if not order_id or not frappe.db.exists("Sales Invoice", order_id):
+        raise ValueError(f"Order not found: {order_id}")
+
+    frappe.db.set_value("Sales Invoice", order_id, {
+        "custom_delivery_status": "Cancelled",
+    })
+
+    # Add comment with cancellation reason
+    doc = frappe.get_doc("Sales Invoice", order_id)
+    doc.add_comment("Info", f"Delivery cancelled: {payload.get('reason', 'No reason given')}")
+
+    return {"order_id": order_id, "status": "Cancelled"}
+```
+
+The handler expects a JSON body shaped like
+`{"event": "delivery.status_changed", "order_id": "ACC-SINV-2025-00042", "status": "delivered", ...}`,
+with the partner's signed digest in the `X-Webhook-Signature` header and the unique
+key in `X-Idempotency-Key`.
+
+## Step 3: Test it with curl
+
+<Steps>
+
+1. Generate a valid HMAC signature over the exact payload bytes. The `SECRET` must
+   match `delivery_partner_webhook_secret` in your `site_config.json`.
+
+   ```bash
+   # Must match site_config.json > delivery_partner_webhook_secret
+   SECRET="my-delivery-partner-secret"
+   PAYLOAD='{"event":"delivery.status_changed","delivery_id":"DEL-12345","order_id":"ACC-SINV-2025-00042","status":"delivered","delivered_at":"2025-03-15T14:30:00Z","driver_name":"Rajesh K."}'
+
+   SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
+   ```
+
+2. Send the webhook. The first call processes and returns success.
+
+   ```bash
+   curl -X POST 'https://erp.scoopjoy.com/api/method/scoopjoy.api.v1.webhooks.delivery_update' \
+     -H 'Content-Type: application/json' \
+     -H "X-Webhook-Signature: $SIGNATURE" \
+     -H 'X-Idempotency-Key: webhook-del-12345-status-001' \
+     -d "$PAYLOAD"
+
+   # {"message": {"status": "success", "message": "Webhook processed",
+   #   "data": {"order_id": "ACC-SINV-2025-00042", "delivery_status": "Delivered"}}}
+   ```
+
+3. Resend the identical request. The unique key short-circuits it as a duplicate —
+   still HTTP `200`, so the partner stops retrying.
+
+   ```bash
+   curl -X POST 'https://erp.scoopjoy.com/api/method/scoopjoy.api.v1.webhooks.delivery_update' \
+     -H 'Content-Type: application/json' \
+     -H "X-Webhook-Signature: $SIGNATURE" \
+     -H 'X-Idempotency-Key: webhook-del-12345-status-001' \
+     -d "$PAYLOAD"
+
+   # {"message": {"status": "duplicate", "message": "Already processed (status: Processed)"}}
+   ```
+
+4. Send a tampered request with a bad signature. The HMAC check rejects it with
+   HTTP `401` before any data is touched.
+
+   ```bash
+   curl -X POST 'https://erp.scoopjoy.com/api/method/scoopjoy.api.v1.webhooks.delivery_update' \
+     -H 'Content-Type: application/json' \
+     -H 'X-Webhook-Signature: sha256=invalid' \
+     -H 'X-Idempotency-Key: webhook-test-bad-sig' \
+     -d "$PAYLOAD"
+
+   # HTTP 401 -> {"message": {"status": "error", "message": "Invalid signature"}}
+   ```
+
+</Steps>
+
+:::note[Why this works]
+The idempotency key, stored as a `unique` field, prevents duplicate processing even
+when the delivery partner retries. HMAC verification ensures the payload hasn't been
+tampered with in transit. Returning HTTP `200` for duplicates tells the sender "I
+got it" so it stops retrying. And every webhook is logged regardless of outcome,
+giving you a full audit trail.
+:::
+
+:::caution[Common mistake]
+Using `frappe.form_dict` to read the body of an incoming webhook. `form_dict` is
+parsed from query params and form data — it won't contain the raw JSON body, and
+the HMAC computed over it won't match. Use `frappe.request.get_data()` for the raw
+bytes, then `json.loads()` to parse.
+:::

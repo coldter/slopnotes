@@ -1,0 +1,632 @@
+---
+title: Data Migration & Bulk Ops
+description: Getting data into ERPNext at scale — the Data Import Tool, API-based imports, direct database operations, legacy migration, and bench patches.
+sidebar:
+  order: 32
+---
+
+import { Steps } from "@astrojs/starlight/components";
+
+Every ERPNext implementation involves getting data into the system — whether it
+is master data during initial setup, historical transactions from a legacy
+system, or ongoing bulk operations. This chapter covers every approach from the
+built-in Data Import Tool to custom migration scripts and writing framework
+patches. If you've ever written a one-off Node.js script to seed a Postgres
+database, this is the Frappe equivalent — but with several layers of safety (and
+several ways to bypass them).
+
+## Data Import Tool (Built-In)
+
+ERPNext's Data Import Tool provides a web-based interface for importing records
+from CSV or Excel files. It's the right starting point for non-developers and for
+one-time master-data loads.
+
+### Importing from CSV/Excel
+
+Navigate to **Home > Settings > Data Import** or search for "Data Import" in the
+Awesome Bar:
+
+<Steps>
+
+1. Click "New Data Import".
+2. Select the DocType (e.g., "Item", "Customer", "Sales Invoice").
+3. Select Import Type: "Insert New Records" or "Update Existing Records".
+4. Download the template (CSV or Excel).
+5. Fill in the data.
+6. Upload the completed file.
+7. Click "Start Import".
+
+</Steps>
+
+### Download Template and Fill
+
+The template includes all fields for the DocType, with mandatory fields
+highlighted:
+
+```csv title="item-import-template.csv"
+Item Code,Item Name,Item Group,Stock UOM,Valuation Rate
+VANILLA-100ML,Vanilla Scoop 100ml,Ice Cream,Nos,30
+CHOCO-100ML,Chocolate Scoop 100ml,Ice Cream,Nos,32
+MANGO-100ML,Mango Scoop 100ml,Ice Cream,Nos,35
+WAFFLE-CONE,Waffle Cone,Packaging,Nos,5
+```
+
+### Handling Link Fields
+
+Link fields (foreign keys) require the exact `name` value of the linked record.
+If the linked record does not exist, the import fails for that row:
+
+```csv title="customer-import.csv"
+Customer Name,Customer Type,Customer Group,Territory
+Outlet North Walk-In,Individual,Retail,North Zone
+Metro Mall Food Court,Company,B2B,South Zone
+```
+
+:::tip[Pro tip]
+Import master data in dependency order — Item Groups before Items, Territories
+before Customers, Chart of Accounts before Journal Entries.
+:::
+
+### Importing Child Tables
+
+For DocTypes with child tables (like Sales Invoice with items), the template uses
+one row per child row. Parent fields are repeated or left blank after the first
+row:
+
+```csv title="sales-invoice-import.csv"
+Customer,Posting Date,Item Code (Items),Qty (Items),Rate (Items)
+Walk-In Customer,2025-06-01,VANILLA-100ML,2,60
+,,CHOCO-100ML,1,65
+,,WAFFLE-CONE,2,15
+Walk-In Customer,2025-06-01,MANGO-100ML,3,70
+```
+
+The blank Customer/Posting Date cells indicate continuation of the previous
+parent row.
+
+### Update Existing Records
+
+Set Import Type to "Update Existing Records" and include the `name` (ID) column:
+
+```csv title="item-update.csv"
+ID,Valuation Rate,Description
+VANILLA-100ML,35,Premium vanilla bean ice cream
+CHOCO-100ML,38,Rich Belgian chocolate ice cream
+```
+
+### Error Handling and Logs
+
+The Data Import tool provides:
+
+- **Row-by-row status:** Success or failure per row.
+- **Error messages:** Specific validation errors (missing mandatory fields,
+  invalid Link values, duplicate names).
+- **Partial import:** Successfully imported rows are committed even if other rows
+  fail.
+- **Import log:** Accessible via the Data Import record's timeline.
+
+## API-Based Bulk Import
+
+For programmatic imports, especially from legacy systems, use Frappe's Python API.
+This is where a Node.js developer feels at home: it's just code, looping over
+records and creating documents.
+
+### Using `frappe.get_doc().insert()`
+
+The document API runs every validation, hook, and naming rule — exactly as if a
+user had saved the record in the Desk. That safety has a cost, so commit in
+batches and roll back individual failures rather than aborting the whole run.
+
+```python title="scoopjoy/utils/migration.py" {19,22-25}
+import frappe
+import csv
+
+def import_items_from_csv(file_path):
+    """Import items from a CSV file using the document API."""
+    success_count = 0
+    error_rows = []
+
+    with open(file_path, "r") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader, start=2):  # start=2 accounts for header
+            try:
+                item = frappe.get_doc({
+                    "doctype": "Item",
+                    "item_code": row["item_code"],
+                    "item_name": row["item_name"],
+                    "item_group": row["item_group"],
+                    "stock_uom": row.get("uom", "Nos"),
+                    "valuation_rate": float(row.get("valuation_rate", 0)),
+                    "is_stock_item": 1,
+                    "has_batch_no": 1 if row.get("has_batch") == "Yes" else 0,
+                    "has_expiry_date": 1 if row.get("has_expiry") == "Yes" else 0,
+                })
+                item.insert(ignore_permissions=True)
+                success_count += 1
+
+                # Commit every 100 records to avoid holding long transactions
+                if success_count % 100 == 0:
+                    frappe.db.commit()
+
+            except Exception as e:
+                error_rows.append({"row": i, "item_code": row.get("item_code"), "error": str(e)})
+                frappe.db.rollback()  # rollback this single failed record
+                frappe.clear_messages()
+
+    frappe.db.commit()
+    return {"success": success_count, "errors": error_rows}
+```
+
+### Renaming Documents in Bulk
+
+`frappe.rename_doc` updates the primary key *and* every link that references it,
+so it's the only safe way to rename a document — never `UPDATE` the name column
+directly.
+
+```python title="scoopjoy/utils/migration.py"
+import frappe
+
+def standardize_item_codes(prefix="SJ"):
+    """Rename items to follow a standard naming convention."""
+    items = frappe.get_all("Item",
+        filters={"item_code": ["not like", f"{prefix}-%"]},
+        fields=["name", "item_code", "item_name"]
+    )
+
+    for item in items:
+        new_name = f"{prefix}-{item.item_code}"
+        try:
+            frappe.rename_doc("Item", item.name, new_name, merge=False)
+        except Exception as e:
+            frappe.log_error(f"Failed to rename {item.name}: {e}")
+
+    frappe.db.commit()
+```
+
+### Bulk Operations with `frappe.enqueue()`
+
+For large datasets, run imports as background jobs to avoid request timeouts —
+the same reason you'd push heavy work onto a queue worker in Node.js instead of
+blocking the HTTP handler.
+
+```python title="scoopjoy/utils/migration.py"
+import frappe
+
+@frappe.whitelist()
+def enqueue_bulk_import(file_url):
+    """Enqueue a bulk import job for background processing."""
+    frappe.enqueue(
+        "scoopjoy.utils.migration.run_legacy_import",
+        queue="long",
+        timeout=3600,
+        file_url=file_url,
+        job_name="legacy_pos_import"
+    )
+    return {"message": "Import job queued. Check Background Jobs for status."}
+
+
+def run_legacy_import(file_url):
+    """Background job: import historical POS invoices from legacy system."""
+    import json
+
+    file_doc = frappe.get_doc("File", {"file_url": file_url})
+    file_path = file_doc.get_full_path()
+
+    with open(file_path, "r") as f:
+        records = json.load(f)
+
+    total = len(records)
+    for i, record in enumerate(records):
+        try:
+            create_pos_invoice_from_legacy(record)
+
+            if (i + 1) % 100 == 0:
+                frappe.db.commit()
+                frappe.publish_progress(
+                    percent=(i + 1) / total * 100,
+                    title="Legacy POS Import",
+                    description=f"Processed {i + 1} of {total}"
+                )
+
+        except Exception as e:
+            frappe.log_error(
+                message=f"Row {i}: {str(e)}\nData: {json.dumps(record)}",
+                title="Legacy POS Import Error"
+            )
+
+    frappe.db.commit()
+    frappe.publish_realtime("legacy_import_complete", {"total": total})
+
+
+def create_pos_invoice_from_legacy(record):
+    """Convert a legacy POS record into an ERPNext POS Invoice."""
+    si = frappe.get_doc({
+        "doctype": "POS Invoice",
+        "company": record["company"],
+        "customer": record.get("customer", "Walk-In Customer"),
+        "posting_date": record["date"],
+        "posting_time": record.get("time", "12:00:00"),
+        "is_pos": 1,
+        "pos_profile": record.get("pos_profile"),
+        "items": [{
+            "item_code": item["code"],
+            "qty": item["qty"],
+            "rate": item["rate"],
+            "warehouse": record.get("warehouse")
+        } for item in record["items"]],
+        "payments": [{
+            "mode_of_payment": record.get("payment_mode", "Cash"),
+            "amount": record["total"]
+        }]
+    })
+    si.insert(ignore_permissions=True)
+
+    # Only submit if explicitly requested (historical data may need review)
+    if record.get("auto_submit"):
+        si.submit()
+```
+
+`frappe.publish_progress` and `frappe.publish_realtime` push updates over
+Socket.IO, so the user can watch a long import advance in the browser instead of
+staring at a spinner.
+
+## Database Direct Operations
+
+For maximum speed on very large datasets, bypass the document API and use direct
+database operations.
+
+:::danger[This skips every safety net]
+Direct database writes skip **all** validations, hooks, and audit trails. No
+`before_save` runs, the `modified` timestamp isn't auto-updated, no version
+history is recorded, and caches go stale. Use only when you fully understand the
+schema you're writing to, and always back up the site first.
+:::
+
+### `frappe.db.sql()` for Bulk Updates
+
+```python title="scoopjoy/utils/migration.py"
+import frappe
+
+def bulk_update_item_prices(item_group, percentage_increase):
+    """Increase valuation rate for all items in a group."""
+    frappe.db.sql("""
+        UPDATE `tabItem`
+        SET valuation_rate = valuation_rate * (1 + %(pct)s / 100),
+            modified = NOW(),
+            modified_by = %(user)s
+        WHERE item_group = %(group)s
+    """, {
+        "pct": percentage_increase,
+        "group": item_group,
+        "user": frappe.session.user
+    })
+    frappe.db.commit()
+```
+
+:::caution
+Direct SQL updates bypass the ORM entirely. No `before_save` hooks fire,
+`modified` is not auto-updated (you must set it manually, as above), no audit
+trail is created, and caches become stale. Always clear the relevant cache after
+direct updates with `frappe.clear_cache(doctype="Item")`.
+:::
+
+### `frappe.db.bulk_insert()` for Mass Inserts
+
+```python title="scoopjoy/utils/migration.py"
+import frappe
+from frappe.utils import now, getdate
+
+def bulk_insert_batch_records(items_with_batches):
+    """Insert batch records using bulk_insert for maximum speed."""
+    fields = [
+        "name", "batch_id", "item", "expiry_date",
+        "manufacturing_date", "batch_qty",
+        "owner", "creation", "modified", "modified_by", "docstatus"
+    ]
+
+    values = []
+    timestamp = now()
+    user = frappe.session.user
+
+    for item in items_with_batches:
+        batch_name = f"BATCH-{item['item_code']}-{item['batch_id']}"
+        values.append([
+            batch_name,               # name (must set manually)
+            item["batch_id"],          # batch_id
+            item["item_code"],         # item
+            item.get("expiry_date"),   # expiry_date
+            item.get("mfg_date"),      # manufacturing_date
+            item.get("qty", 0),        # batch_qty
+            user,                      # owner
+            timestamp,                 # creation
+            timestamp,                 # modified
+            user,                      # modified_by
+            0                          # docstatus
+        ])
+
+    # bulk_insert handles chunking internally (default chunk_size=10_000)
+    frappe.db.bulk_insert("Batch", fields=fields, values=values,
+                          ignore_duplicates=True)
+    frappe.db.commit()
+```
+
+Key notes on `bulk_insert`:
+
+- **Does not trigger autoname** — you must set `doc.name` explicitly.
+- **Does not set system fields** — manually provide `creation`, `modified`,
+  `owner`, `modified_by`.
+- **Does not run hooks** — no `before_insert`, `after_insert`, etc.
+- **Chunks automatically** — default `chunk_size=10_000` prevents memory issues.
+- `ignore_duplicates=True` skips rows with duplicate primary keys.
+
+## Migration from Legacy Systems
+
+Bringing a live business onto ERPNext means seeding opening balances so the books
+and stock ledgers start from the right numbers.
+
+### Opening Stock Entry
+
+After importing your Item master, enter opening stock for all warehouses:
+
+```python title="scoopjoy/utils/migration.py"
+def create_opening_stock_entry(company, warehouse, items_with_qty):
+    """Create a stock entry for opening balances."""
+    se = frappe.get_doc({
+        "doctype": "Stock Entry",
+        "stock_entry_type": "Material Receipt",
+        "company": company,
+        "posting_date": "2025-04-01",  # financial year start
+        "items": [{
+            "item_code": item["item_code"],
+            "qty": item["qty"],
+            "basic_rate": item["valuation_rate"],
+            "t_warehouse": warehouse,
+            "batch_no": item.get("batch_no"),
+            "cost_center": frappe.db.get_value("Company", company, "cost_center")
+        } for item in items_with_qty]
+    })
+    se.insert(ignore_permissions=True)
+    se.submit()
+    return se.name
+```
+
+### Opening Account Balances
+
+Opening entries must balance, so any net difference is parked against the
+**Temporary Opening** account until the rest of the books are reconciled:
+
+```python title="scoopjoy/utils/migration.py"
+def create_opening_journal_entry(company, opening_balances):
+    """Create opening balance journal entries for accounts."""
+    accounts = []
+    net_amount = 0
+
+    for bal in opening_balances:
+        accounts.append({
+            "account": bal["account"],
+            "debit_in_account_currency": bal.get("debit", 0),
+            "credit_in_account_currency": bal.get("credit", 0),
+            "party_type": bal.get("party_type"),
+            "party": bal.get("party"),
+            "cost_center": frappe.db.get_value("Company", company, "cost_center"),
+            "is_opening": "Yes"
+        })
+        net_amount += bal.get("debit", 0) - bal.get("credit", 0)
+
+    # Add Temporary Opening account to balance
+    if net_amount != 0:
+        temp_account = frappe.db.get_value("Account",
+            {"account_name": "Temporary Opening", "company": company}, "name")
+        accounts.append({
+            "account": temp_account,
+            "debit_in_account_currency": max(-net_amount, 0),
+            "credit_in_account_currency": max(net_amount, 0),
+            "is_opening": "Yes"
+        })
+
+    jv = frappe.get_doc({
+        "doctype": "Journal Entry",
+        "voucher_type": "Opening Entry",
+        "company": company,
+        "posting_date": "2025-04-01",
+        "is_opening": "Yes",
+        "accounts": accounts
+    })
+    jv.insert(ignore_permissions=True)
+    jv.submit()
+    return jv.name
+```
+
+### Customer/Supplier Master Migration
+
+Legacy data is messy, so guard against duplicates with `frappe.db.exists` and map
+free-text categories onto real ERPNext masters as you go:
+
+```python title="scoopjoy/utils/migration.py" {5-6}
+def migrate_customers_from_legacy(legacy_records):
+    """Migrate customer data from legacy system to ERPNext."""
+    for record in legacy_records:
+        # Check if customer already exists
+        if frappe.db.exists("Customer", {"customer_name": record["name"]}):
+            continue
+
+        customer = frappe.get_doc({
+            "doctype": "Customer",
+            "customer_name": record["name"],
+            "customer_type": record.get("type", "Individual"),
+            "customer_group": map_customer_group(record.get("category")),
+            "territory": map_territory(record.get("city")),
+            "mobile_no": record.get("phone"),
+            "email_id": record.get("email"),
+            "customer_primary_address": None  # create separately
+        })
+        customer.insert(ignore_permissions=True)
+
+        # Create address if provided
+        if record.get("address"):
+            address = frappe.get_doc({
+                "doctype": "Address",
+                "address_title": record["name"],
+                "address_line1": record["address"].get("line1", ""),
+                "city": record["address"].get("city", ""),
+                "state": record["address"].get("state", ""),
+                "pincode": record["address"].get("pincode", ""),
+                "country": "India",
+                "links": [{
+                    "link_doctype": "Customer",
+                    "link_name": customer.name
+                }]
+            })
+            address.insert(ignore_permissions=True)
+
+    frappe.db.commit()
+```
+
+## `bench migrate`: Running Patches After App Updates
+
+When you update an app or install a new version, `bench migrate` runs two critical
+processes:
+
+1. **Schema sync:** Updates database tables to match DocType JSON definitions.
+2. **Patch execution:** Runs pending patches listed in `patches.txt`.
+
+```bash
+# Standard migration after app update
+bench --site mysite.local migrate
+
+# Migration with verbose output
+bench --site mysite.local migrate --verbose
+
+# Migrate all sites after a bench-wide update
+bench --site all migrate
+
+# Rebuild assets after migration (if frontend changes)
+bench build
+```
+
+## Writing Migration Patches
+
+Patches are one-time scripts that run during `bench migrate`. They are tracked in
+`tabPatch Log` and never re-executed — the closest Frappe analogue to a one-shot
+SQL migration file, except the framework owns the "has this run?" bookkeeping.
+
+### `patches.txt` Structure
+
+The two sections matter: `pre_model_sync` patches run **before** DocType schemas
+are pushed to the database (while old columns still exist), and `post_model_sync`
+patches run **after** (when new columns are in place).
+
+```ini title="scoopjoy/patches.txt"
+[pre_model_sync]
+# Patches here run BEFORE DocType schemas are synced to database
+# Use when: renaming fields, moving data before a field is removed
+scoopjoy.patches.v1_1.rename_outlet_field
+scoopjoy.patches.v1_2.migrate_legacy_franchise_data
+
+[post_model_sync]
+# Patches here run AFTER DocType schemas are synced
+# Use when: populating new fields, computing default values
+scoopjoy.patches.v1_1.populate_franchise_code
+scoopjoy.patches.v1_2.compute_royalty_defaults
+scoopjoy.patches.v1_3.cleanup_duplicate_outlets
+
+# One-off statements (simple enough to not need a file)
+execute:frappe.db.set_single_value("Franchise Settings", "royalty_percentage", 5)
+```
+
+### Patch File Structure
+
+A patch is just a module exposing an `execute()` function. This one runs
+`post_model_sync`, so the new `franchise_code` column already exists when it
+back-fills values:
+
+```python title="scoopjoy/patches/v1_1/populate_franchise_code.py"
+import frappe
+
+
+def execute():
+    """Populate franchise_code for existing Franchise Outlet records.
+
+    This patch runs after the franchise_code field is added to the DocType
+    (post_model_sync), so the column already exists in the database.
+    """
+    outlets = frappe.get_all("Franchise Outlet",
+        filters={"franchise_code": ["in", ["", None]]},
+        fields=["name", "outlet_name", "city"]
+    )
+
+    for outlet in outlets:
+        code = generate_franchise_code(outlet.outlet_name, outlet.city)
+        frappe.db.set_value("Franchise Outlet", outlet.name,
+                           "franchise_code", code, update_modified=False)
+
+    frappe.db.commit()
+
+
+def generate_franchise_code(name, city):
+    """Generate a unique franchise code from outlet name and city."""
+    prefix = "".join(word[0] for word in name.split()[:3]).upper()
+    city_code = city[:3].upper() if city else "XXX"
+    return f"FR-{prefix}-{city_code}"
+```
+
+### Pre-Model-Sync Patch Example
+
+Renaming a field is the classic reason to use `pre_model_sync`: the DocType JSON
+already declares the new name, so you must migrate data off the old column
+*before* schema sync drops it. `rename_field` moves the data and updates
+dependent metadata for you.
+
+```python title="scoopjoy/patches/v1_2/rename_outlet_field.py" {15-16}
+import frappe
+from frappe.model.utils.rename_field import rename_field
+
+
+def execute():
+    """Rename 'outlet_manager' to 'franchise_manager' before schema sync.
+
+    The DocType JSON already has the new field name. This patch runs
+    pre_model_sync to migrate data from the old column before it is dropped.
+    """
+    doctype = "Franchise Outlet"
+
+    # Check if old column still exists
+    if frappe.db.has_column(doctype, "outlet_manager"):
+        rename_field(doctype, "outlet_manager", "franchise_manager")
+
+    frappe.db.commit()
+```
+
+### Data Cleanup Script
+
+```python title="scoopjoy/patches/v1_3/cleanup_duplicate_outlets.py"
+import frappe
+
+
+def execute():
+    """Fix inconsistent outlet naming across the system.
+
+    Some outlets were created with trailing spaces or inconsistent
+    capitalization. This patch standardizes all names.
+    """
+    outlets = frappe.get_all("Franchise Outlet",
+        fields=["name", "outlet_name"]
+    )
+
+    for outlet in outlets:
+        clean_name = " ".join(outlet.outlet_name.strip().split())
+        clean_name = clean_name.title()
+
+        if clean_name != outlet.outlet_name:
+            frappe.db.set_value("Franchise Outlet", outlet.name,
+                               "outlet_name", clean_name,
+                               update_modified=False)
+
+    frappe.db.commit()
+```
+
+:::tip[Pro tip]
+Always pass `update_modified=False` when back-filling data in patches. This
+preserves the original `modified` timestamp so users don't see records as
+"recently changed" when they were only patched.
+:::

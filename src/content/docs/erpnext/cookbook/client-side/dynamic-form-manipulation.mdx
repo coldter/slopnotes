@@ -1,0 +1,445 @@
+---
+title: Dynamic Form Manipulation
+description: Drive show/hide, mandatory, read-only, query filters, and computed fields from form events in a single Frappe client script.
+sidebar:
+  order: 3
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** A ScoopJoy Franchise Outlet form that changes behavior based on its
+`franchise_type` (Premium / Standard / Express): some sections appear only for
+Premium, some fields become mandatory only for Express, Select options and defaults
+differ per tier, and child-table rows auto-populate and recompute totals. The goal
+is to show 15+ form-manipulation patterns living together in one client script.
+
+**Solution:** One `frappe.ui.form.on('Franchise Outlet', { ... })` handler, split by
+event. Each event (`setup`, `refresh`, `onload`, field-change, `validate`,
+`before_save`) owns a clear slice of behavior. The canonical APIs are
+`frm.toggle_display` / `frm.toggle_reqd` / `frm.toggle_enable` for conditional UI,
+and `frm.set_df_property` for everything the toggles do not cover.
+
+The patterns below come from one file,
+`scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js`, broken out event by event
+so you can read each in isolation. They all sit inside the same
+`frappe.ui.form.on('Franchise Outlet', { ... })` object (plus a child-table handler
+and a couple of module-level helpers at the end).
+
+### setup: query filters that run once
+
+`setup` runs a single time when the form controller loads. It is the right place to
+register `frm.set_query` filters — including a query on a Link field inside a child
+table, where the third argument is the child fieldname and the callback receives
+`(doc, cdt, cdn)`.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+frappe.ui.form.on('Franchise Outlet', {
+
+    setup(frm) {
+        // Pattern: set query filters on Link fields from other field values
+        frm.set_query('default_warehouse', () => {
+            return {
+                filters: {
+                    company: frm.doc.company,
+                    custom_franchise_outlet: frm.doc.name,
+                }
+            };
+        });
+
+        frm.set_query('area_manager', () => {
+            return {
+                filters: {
+                    department: 'Franchise Operations',
+                    status: 'Active',
+                }
+            };
+        });
+
+        // Pattern: set query on a Link field inside a child table
+        frm.set_query('item_code', 'menu_items', (doc, cdt, cdn) => {
+            const row = locals[cdt][cdn];
+            return {
+                filters: {
+                    item_group: ['like', 'Ice Cream%'],
+                    custom_franchise_tier: ['in',
+                        doc.franchise_type === 'Premium'
+                            ? ['Premium', 'Standard', 'Express']
+                            : doc.franchise_type === 'Standard'
+                                ? ['Standard', 'Express']
+                                : ['Express']
+                    ],
+                }
+            };
+        });
+    },
+    // ... events continue below
+});
+```
+
+### refresh: headline alert, dashboard indicators, and custom buttons
+
+`refresh` fires on every form refresh, so it is where you rebuild UI that depends on
+the current document state: a color-coded status pill in the dashboard headline,
+numeric indicators, and state-dependent action buttons grouped under an `Actions`
+dropdown.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+    refresh(frm) {
+        // Pattern: color-coded status indicator
+        frm.dashboard.clear_headline();
+        const status_colors = {
+            'Active':     'green',
+            'Inactive':   'darkgrey',
+            'Suspended':  'red',
+            'Onboarding': 'blue',
+        };
+        if (frm.doc.status) {
+            frm.dashboard.set_headline_alert(
+                `<div class="d-flex align-items-center gap-2">
+                    <span class="indicator-pill ${status_colors[frm.doc.status] || 'grey'}">
+                        ${frm.doc.status}
+                    </span>
+                    <span>since ${frappe.datetime.str_to_user(frm.doc.status_changed_on)}</span>
+                </div>`
+            );
+        }
+
+        // Pattern: dashboard indicators
+        if (!frm.is_new()) {
+            frm.dashboard.add_indicator(
+                __('Monthly Revenue: {0}', [format_currency(frm.doc.current_month_revenue)]),
+                frm.doc.current_month_revenue > 100000 ? 'green' : 'orange'
+            );
+            frm.dashboard.add_indicator(
+                __('Avg Rating: {0}', [frm.doc.avg_customer_rating || 'N/A']),
+                (frm.doc.avg_customer_rating || 0) >= 4.0 ? 'green' : 'red'
+            );
+        }
+
+        // Pattern: add/remove custom buttons based on document state
+        if (!frm.is_new() && frm.doc.docstatus === 0) {
+            if (frm.doc.status === 'Onboarding') {
+                frm.add_custom_button(__('Mark as Active'), () => {
+                    frm.set_value('status', 'Active');
+                    frm.save();
+                }, __('Actions'));
+
+                frm.add_custom_button(__('Schedule Inspection'), async () => {
+                    const d = await frappe.prompt([
+                        { fieldname: 'date', fieldtype: 'Date', label: 'Inspection Date', reqd: 1 },
+                        { fieldname: 'inspector', fieldtype: 'Link', label: 'Inspector',
+                          options: 'Employee', reqd: 1 },
+                    ], null, __('Schedule Inspection'));
+
+                    await frappe.xcall('scoopjoy.api.franchise.schedule_inspection', {
+                        outlet: frm.doc.name,
+                        date: d.date,
+                        inspector: d.inspector,
+                    });
+                    frappe.show_alert({ message: 'Inspection scheduled', indicator: 'green' });
+                }, __('Actions'));
+            }
+
+            if (frm.doc.status === 'Active') {
+                frm.add_custom_button(__('Suspend Outlet'), () => {
+                    frappe.confirm(
+                        __('Are you sure you want to suspend {0}?', [frm.doc.franchise_name]),
+                        () => {
+                            frm.set_value('status', 'Suspended');
+                            frm.save();
+                        }
+                    );
+                }, __('Actions'));
+            }
+
+            // Highlight the Actions group button
+            frm.change_custom_button_type(__('Actions'), null, 'primary');
+        }
+
+        // Pattern: custom sidebar widget
+        if (!frm.is_new()) {
+            frm.sidebar.add_user_action(__('View Sales Report')).on('click', () => {
+                frappe.set_route('query-report', 'Franchise Sales Summary', {
+                    franchise_outlet: frm.doc.name,
+                });
+            });
+        }
+    },
+```
+
+### onload: auto-populate from a linked document
+
+`onload` runs once when form data first loads. On a brand-new doc opened with route
+options (e.g. `frappe.new_doc('Franchise Outlet', { company: 'ScoopJoy HQ' })`), the
+route options are auto-applied — but you can fire extra lookups, here pulling the
+currency and country off the chosen Company.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+    onload(frm) {
+        // Pattern: auto-populate fields from linked documents
+        if (frm.is_new() && frappe.route_options) {
+            if (frappe.route_options.company) {
+                frappe.db.get_value('Company', frappe.route_options.company,
+                    ['default_currency', 'country'], (r) => {
+                        if (r) {
+                            frm.set_value('currency', r.default_currency);
+                            frm.set_value('country', r.country);
+                        }
+                    }
+                );
+            }
+        }
+    },
+```
+
+### franchise_type: the dynamic-behavior switch
+
+This single field-change handler is the heart of the recipe. Changing
+`franchise_type` toggles sections and fields, flips fields between mandatory and
+optional, sets a field read-only, swaps a Select field's `options`, seeds
+type-specific defaults on new docs, and rewrites a field's `description`. End with
+`frm.refresh_fields()` so the UI reflects every change.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+    franchise_type(frm) {
+        const type = frm.doc.franchise_type;
+        if (!type) return;
+
+        // Pattern: show/hide sections
+        frm.toggle_display('premium_section',    type === 'Premium');
+        frm.toggle_display('express_section',    type === 'Express');
+
+        // Pattern: show/hide individual fields
+        frm.toggle_display('vip_lounge_area',    type === 'Premium');
+        frm.toggle_display('drive_through',      type !== 'Express');
+        frm.toggle_display('catering_enabled',   type === 'Premium');
+
+        // Pattern: make fields mandatory conditionally
+        frm.toggle_reqd('seating_capacity',      type !== 'Express');
+        frm.toggle_reqd('parking_slots',         type === 'Premium');
+        frm.toggle_reqd('min_order_value',       type === 'Express');
+
+        // Pattern: make fields read-only conditionally
+        frm.toggle_enable('loyalty_program',     type !== 'Express');
+
+        // Pattern: change Select field options dynamically
+        const size_options = {
+            'Premium':  ['', 'Large', 'Flagship', 'Mega'],
+            'Standard': ['', 'Small', 'Medium', 'Large'],
+            'Express':  ['', 'Kiosk', 'Small'],
+        };
+        frm.set_df_property('outlet_size', 'options', size_options[type]);
+
+        // Pattern: set default values based on type
+        const defaults = {
+            'Premium':  { min_staff: 15, target_revenue: 500000 },
+            'Standard': { min_staff: 8,  target_revenue: 250000 },
+            'Express':  { min_staff: 3,  target_revenue: 100000 },
+        };
+        const d = defaults[type];
+        if (frm.is_new()) {
+            frm.set_value('min_staff', d.min_staff);
+            frm.set_value('target_revenue', d.target_revenue);
+        }
+
+        // Pattern: change field description dynamically
+        frm.set_df_property('security_deposit', 'description',
+            type === 'Premium'
+                ? 'Premium outlets require a minimum deposit of INR 5,00,000'
+                : type === 'Standard'
+                    ? 'Standard outlets require a minimum deposit of INR 2,00,000'
+                    : 'Express outlets require a minimum deposit of INR 50,000'
+        );
+
+        frm.refresh_fields();
+    },
+```
+
+### Calculated fields on change
+
+Field-change handlers also feed computed fields. Editing `seating_capacity`
+estimates daily footfall; `monthly_rent` and `staff_salary_budget` both delegate to
+a shared helper that re-sums the monthly fixed costs.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+    seating_capacity(frm) {
+        // Estimate daily footfall from seating capacity
+        if (frm.doc.seating_capacity) {
+            frm.set_value('estimated_daily_footfall',
+                Math.round(frm.doc.seating_capacity * 3.5));
+        }
+    },
+
+    monthly_rent(frm) {
+        recalculate_monthly_costs(frm);
+    },
+
+    staff_salary_budget(frm) {
+        recalculate_monthly_costs(frm);
+    },
+```
+
+### validate: child-row and cross-field checks before save
+
+`validate` runs before save. Here it walks the `menu_items` child table to reject
+duplicate items and non-positive prices, then applies a cross-field rule (Premium
+outlets need at least 40 seats). `frappe.throw` aborts the save with a message.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+    validate(frm) {
+        // Pattern: child table row validation
+        if (frm.doc.menu_items && frm.doc.menu_items.length > 0) {
+            const seen = new Set();
+            for (const row of frm.doc.menu_items) {
+                if (seen.has(row.item_code)) {
+                    frappe.throw(
+                        __('Row {0}: Duplicate item {1}. Remove the duplicate.',
+                            [row.idx, row.item_code])
+                    );
+                }
+                seen.add(row.item_code);
+
+                if (row.selling_price <= 0) {
+                    frappe.throw(
+                        __('Row {0}: Selling price for {1} must be greater than 0.',
+                            [row.idx, row.item_code])
+                    );
+                }
+            }
+        }
+
+        // Cross-field validation
+        if (frm.doc.franchise_type === 'Premium' && (frm.doc.seating_capacity || 0) < 40) {
+            frappe.throw(__('Premium outlets must have at least 40 seats.'));
+        }
+    },
+```
+
+### area_manager: auto-populate from a linked doc
+
+When the area manager Link changes, pull denormalized contact details off the linked
+Employee so they are stored on the outlet for quick reference.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+    area_manager(frm) {
+        if (frm.doc.area_manager) {
+            frappe.db.get_value('Employee', frm.doc.area_manager,
+                ['employee_name', 'cell_phone', 'company_email'], (r) => {
+                    if (r) {
+                        frm.set_value('area_manager_name',  r.employee_name);
+                        frm.set_value('area_manager_phone', r.cell_phone);
+                        frm.set_value('area_manager_email', r.company_email);
+                    }
+                }
+            );
+        }
+    },
+```
+
+### before_save: last-chance modifications
+
+`before_save` is the last chance to mutate the doc before it persists. Here it
+auto-generates an outlet code from a type prefix, a city code, and a random suffix
+when the field is still blank. This closes the `frappe.ui.form.on('Franchise Outlet', { ... })` object.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+    before_save(frm) {
+        // Auto-generate an outlet code if blank
+        if (!frm.doc.outlet_code) {
+            const prefix = {
+                'Premium': 'PRM', 'Standard': 'STD', 'Express': 'EXP'
+            }[frm.doc.franchise_type] || 'OUT';
+            const city_code = (frm.doc.city || 'XX').substring(0, 3).toUpperCase();
+            frm.set_value('outlet_code', `${prefix}-${city_code}-${frappe.utils.get_random(4)}`);
+        }
+    },
+});
+```
+
+### Child-table events: row population and row-level math
+
+The child table gets its own `frappe.ui.form.on('Franchise Menu Item', { ... })`
+handler. Row handlers receive `(frm, cdt, cdn)`; resolve the row with
+`locals[cdt][cdn]` and write to specific cells with
+`frappe.model.set_value(cdt, cdn, fieldname, value)`. Picking an item auto-fills its
+name and rate; changing the selling price recomputes the row margin and the parent
+totals; removing a row also re-totals.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+frappe.ui.form.on('Franchise Menu Item', {
+    item_code(frm, cdt, cdn) {
+        const row = locals[cdt][cdn];
+        if (row.item_code) {
+            // Pattern: auto-populate child row fields from linked doc
+            frappe.db.get_value('Item', row.item_code,
+                ['item_name', 'standard_rate', 'item_group'], (r) => {
+                    if (r) {
+                        frappe.model.set_value(cdt, cdn, 'item_name', r.item_name);
+                        frappe.model.set_value(cdt, cdn, 'standard_rate', r.standard_rate);
+                        frappe.model.set_value(cdt, cdn, 'selling_price', r.standard_rate);
+                        frappe.model.set_value(cdt, cdn, 'item_group', r.item_group);
+                    }
+                }
+            );
+        }
+    },
+
+    selling_price(frm, cdt, cdn) {
+        const row = locals[cdt][cdn];
+        // Pattern: row-level calculation
+        const margin = row.selling_price - (row.standard_rate || 0);
+        frappe.model.set_value(cdt, cdn, 'margin', margin);
+
+        // Recalculate parent totals
+        recalculate_menu_totals(frm);
+    },
+
+    menu_items_remove(frm) {
+        recalculate_menu_totals(frm);
+    },
+});
+```
+
+### Helper functions
+
+The shared calculation helpers live at module scope so multiple events can call
+them.
+
+```javascript title="scoopjoy/scoopjoy/franchise_outlet/franchise_outlet.js"
+function recalculate_monthly_costs(frm) {
+    const rent   = frm.doc.monthly_rent || 0;
+    const salary = frm.doc.staff_salary_budget || 0;
+    const misc   = frm.doc.miscellaneous_costs || 0;
+    frm.set_value('total_monthly_fixed_costs', rent + salary + misc);
+}
+
+function recalculate_menu_totals(frm) {
+    let total_items = 0;
+    let avg_price = 0;
+
+    if (frm.doc.menu_items && frm.doc.menu_items.length > 0) {
+        total_items = frm.doc.menu_items.length;
+        const sum = frm.doc.menu_items.reduce((s, r) => s + (r.selling_price || 0), 0);
+        avg_price = sum / total_items;
+    }
+
+    frm.set_value('total_menu_items', total_items);
+    frm.set_value('avg_menu_price', Math.round(avg_price * 100) / 100);
+}
+```
+
+:::note[Why this works]
+All 15+ patterns live in one form script with clear separation by event.
+`frm.toggle_display` / `frm.toggle_reqd` / `frm.toggle_enable` are the canonical
+Frappe APIs for conditional form behavior. `frm.set_df_property` handles anything the
+toggle shortcuts don't cover (like changing `options` or `description`). Child-table
+events use `frappe.model.set_value(cdt, cdn, ...)` to target specific rows.
+:::
+
+:::caution[Common mistake]
+Using `cur_frm` instead of the `frm` parameter. `cur_frm` is a global that can point
+to the wrong form if multiple forms are open. Always use the `frm` argument passed to
+your event handler.
+:::

@@ -1,0 +1,340 @@
+---
+title: Load Testing with Locust
+description: Verify your franchise ERP handles 50 concurrent POS terminals with a realistic Locust load test.
+sidebar:
+  order: 6
+---
+
+import { LinkCard, FileTree } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Verify your franchise ERP handles 50 concurrent POS terminals.
+
+**Solution:** Simulate realistic traffic with a Locust load test. We will write a load test script that models POS operations, franchise manager dashboards, and back-office reports, then run it headlessly or via the Locust web interface.
+
+<FileTree>
+- load_tests/
+  - locustfile.py Locust load test scenario definition
+  - run_load_test.sh Bash helper script to run the load test
+</FileTree>
+
+## Step 1: Define the Locust file
+
+Create the Locust test file to simulate realistic concurrent users. We define three user profiles: POS operators (`POSTerminalUser`), franchise managers viewing dashboards (`DashboardUser`), and accountants generating reports (`ReportUser`), with appropriate request weights and realistic wait times.
+
+```python title="load_tests/locustfile.py"
+"""
+Locust load test for ScoopJoy franchise ERP.
+
+Run:  locust -f load_tests/locustfile.py --host=https://erp.scoopjoy.com
+Web UI: http://localhost:8089
+"""
+import json
+import random
+from locust import HttpUser, task, between, events
+from locust.exception import StopUser
+
+
+# Test data
+ITEMS = [
+    {"item_code": "MANGO-SORBET-500ML", "rate": 200},
+    {"item_code": "CHOCO-CONE-PACK6", "rate": 350},
+    {"item_code": "VANILLA-TUB-1L", "rate": 450},
+    {"item_code": "BUTTERSCOTCH-CUP", "rate": 80},
+    {"item_code": "STRAWBERRY-STICK", "rate": 60},
+]
+
+POS_PROFILES = ["SJ-BLR-001-POS", "SJ-MUM-001-POS", "SJ-DEL-001-POS"]
+WAREHOUSES = ["Finished Goods - SJ"]
+
+
+class FrappeMixin:
+    """Shared Frappe authentication logic."""
+
+    def frappe_login(self, usr, pwd):
+        """Login and store CSRF token."""
+        response = self.client.post(
+            "/api/method/login",
+            json={"usr": usr, "pwd": pwd},
+            name="/api/method/login",
+        )
+        if response.status_code != 200:
+            raise StopUser(f"Login failed for {usr}")
+
+        # Extract CSRF token from cookies
+        self.csrf_token = response.cookies.get("csrf_token", "")
+        self.headers = {
+            "X-Frappe-CSRF-Token": self.csrf_token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def frappe_call(self, method, args=None, name=None):
+        """Call a whitelisted Frappe method."""
+        return self.client.post(
+            f"/api/method/{method}",
+            json=args or {},
+            headers=self.headers,
+            name=name or f"/api/method/{method}",
+        )
+
+    def frappe_get_doc(self, doctype, name, name_label=None):
+        """Fetch a single document."""
+        return self.client.get(
+            f"/api/resource/{doctype}/{name}",
+            headers=self.headers,
+            name=name_label or f"/api/resource/{doctype}/[name]",
+        )
+
+    def frappe_get_list(self, doctype, filters=None, fields=None, limit=20, name_label=None):
+        """Fetch a list of documents."""
+        params = {
+            "filters": json.dumps(filters or []),
+            "fields": json.dumps(fields or ["name"]),
+            "limit_page_length": limit,
+        }
+        return self.client.get(
+            f"/api/resource/{doctype}",
+            params=params,
+            headers=self.headers,
+            name=name_label or f"/api/resource/{doctype}",
+        )
+
+
+class POSTerminalUser(HttpUser, FrappeMixin):
+    """Simulates a POS terminal operator."""
+
+    wait_time = between(1, 3)  # 1-3 seconds between actions (realistic POS pace)
+    weight = 7  # 70% of simulated users are POS operators
+
+    def on_start(self):
+        """Login as POS user when the simulated user starts."""
+        terminal_id = random.randint(1, 50)
+        self.frappe_login(f"pos-terminal-{terminal_id}@scoopjoy.com", "pos_test_password")
+        self.pos_profile = random.choice(POS_PROFILES)
+        self.warehouse = random.choice(WAREHOUSES)
+
+    @task(5)
+    def create_pos_invoice(self):
+        """Create and submit a POS invoice (most common POS action)."""
+        num_items = random.randint(1, 5)
+        items = []
+        for _ in range(num_items):
+            item = random.choice(ITEMS)
+            items.append({
+                "item_code": item["item_code"],
+                "qty": random.randint(1, 10),
+                "rate": item["rate"],
+                "warehouse": self.warehouse,
+            })
+
+        # Create POS Invoice
+        response = self.client.post(
+            "/api/resource/POS Invoice",
+            json={
+                "doctype": "POS Invoice",
+                "pos_profile": self.pos_profile,
+                "is_pos": 1,
+                "items": items,
+                "payments": [
+                    {
+                        "mode_of_payment": random.choice(["Cash", "UPI", "Card"]),
+                        "amount": sum(i["qty"] * i["rate"] for i in items),
+                    }
+                ],
+            },
+            headers=self.headers,
+            name="/api/resource/POS Invoice [create]",
+        )
+
+        if response.status_code == 200:
+            invoice_name = response.json().get("data", {}).get("name")
+            if invoice_name:
+                # Submit the invoice
+                self.client.put(
+                    f"/api/resource/POS Invoice/{invoice_name}",
+                    json={"docstatus": 1},
+                    headers=self.headers,
+                    name="/api/resource/POS Invoice [submit]",
+                )
+
+    @task(3)
+    def search_items(self):
+        """Search for items by name (common POS action)."""
+        search_terms = ["mango", "chocolate", "vanilla", "butter", "straw"]
+        self.frappe_call(
+            "erpnext.selling.page.point_of_sale.point_of_sale.search_by_term",
+            args={
+                "search_term": random.choice(search_terms),
+                "pos_profile": self.pos_profile,
+            },
+            name="/api/method/pos.search_by_term",
+        )
+
+    @task(1)
+    def get_item_stock(self):
+        """Check item stock levels."""
+        item = random.choice(ITEMS)
+        self.frappe_call(
+            "erpnext.stock.utils.get_stock_balance",
+            args={
+                "item_code": item["item_code"],
+                "warehouse": self.warehouse,
+            },
+            name="/api/method/get_stock_balance",
+        )
+
+
+class DashboardUser(HttpUser, FrappeMixin):
+    """Simulates a franchise manager viewing dashboards."""
+
+    wait_time = between(3, 8)
+    weight = 2  # 20% of simulated users
+
+    def on_start(self):
+        self.frappe_login("manager@scoopjoy.com", "manager_test_password")
+
+    @task(3)
+    def view_outlet_dashboard(self):
+        """Load the outlet dashboard page."""
+        self.frappe_call(
+            "scoopjoy.api.mobile.get_outlet_dashboard",
+            args={"outlet": random.choice(["SJ-BLR-001", "SJ-MUM-001"])},
+            name="/api/method/get_outlet_dashboard",
+        )
+
+    @task(2)
+    def list_recent_invoices(self):
+        """List recent sales invoices."""
+        self.frappe_get_list(
+            "Sales Invoice",
+            filters=[["posting_date", ">=", "2026-03-01"]],
+            fields=["name", "grand_total", "status", "posting_date"],
+            limit=50,
+            name_label="/api/resource/Sales Invoice [list]",
+        )
+
+    @task(1)
+    def view_sales_report(self):
+        """Run a sales analytics report."""
+        self.frappe_call(
+            "frappe.desk.query_report.run",
+            args={
+                "report_name": "ScoopJoy Sales Analytics",
+                "filters": {
+                    "company": "ScoopJoy Foods Pvt Ltd",
+                    "from_date": "2026-03-01",
+                    "to_date": "2026-03-20",
+                },
+            },
+            name="/api/method/query_report.run [sales]",
+        )
+
+
+class ReportUser(HttpUser, FrappeMixin):
+    """Simulates back-office users generating reports."""
+
+    wait_time = between(5, 15)
+    weight = 1  # 10% of simulated users
+
+    def on_start(self):
+        self.frappe_login("accounts@scoopjoy.com", "accounts_test_password")
+
+    @task(2)
+    def profit_loss_report(self):
+        """Generate Profit and Loss report."""
+        self.frappe_call(
+            "frappe.desk.query_report.run",
+            args={
+                "report_name": "Profit and Loss Statement",
+                "filters": {
+                    "company": "ScoopJoy Foods Pvt Ltd",
+                    "from_fiscal_year": "2025-2026",
+                    "to_fiscal_year": "2025-2026",
+                    "periodicity": "Monthly",
+                },
+            },
+            name="/api/method/query_report.run [P&L]",
+        )
+
+    @task(1)
+    def royalty_report(self):
+        """Generate royalty report for all outlets."""
+        self.frappe_call(
+            "frappe.desk.query_report.run",
+            args={
+                "report_name": "ScoopJoy Royalty Summary",
+                "filters": {
+                    "month": "March",
+                    "year": "2026",
+                },
+            },
+            name="/api/method/query_report.run [royalty]",
+        )
+
+
+# === Event hooks for custom metrics ===
+
+@events.request.add_listener
+def on_request(request_type, name, response_time, response_length, exception, **kwargs):
+    """Track Frappe-specific metrics."""
+    if exception:
+        # Log 417 (CSRF failures) separately
+        if hasattr(exception, "response") and exception.response.status_code == 417:
+            events.request.fire(
+                request_type=request_type,
+                name=f"{name} [CSRF_FAIL]",
+                response_time=response_time,
+                response_length=0,
+                exception=None,
+            )
+```
+
+## Step 2: Write the execution script
+
+Create a shell script to run the load test headlessly with pre-configured parameters (e.g., simulating 70 total users with a spawn rate of 5 users per second).
+
+```bash title="load_tests/run_load_test.sh"
+#!/bin/bash
+# Run load test simulating 50 POS terminals + 15 dashboard users + 5 report users
+
+# Headless mode (CI-friendly)
+locust \
+    -f load_tests/locustfile.py \
+    --host=https://staging.scoopjoy.com \
+    --users=70 \
+    --spawn-rate=5 \
+    --run-time=10m \
+    --headless \
+    --csv=load_tests/results/run_$(date +%Y%m%d_%H%M%S) \
+    --html=load_tests/results/report_$(date +%Y%m%d_%H%M%S).html
+
+echo "Results saved to load_tests/results/"
+```
+
+### Performance Targets
+
+| Endpoint | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) | Target RPS |
+|---|---|---|---|---|---|
+| POS Invoice Create | `< 300` | `< 800` | `< 1500` | `< 3000` | 25 |
+| POS Invoice Submit | `< 200` | `< 600` | `< 1200` | `< 2500` | 25 |
+| Item Search | `< 100` | `< 300` | `< 500` | `< 1000` | 50 |
+| Stock Balance | `< 50` | `< 150` | `< 300` | `< 600` | 30 |
+| Dashboard Load | `< 500` | `< 1500` | `< 3000` | `< 5000` | 5 |
+| Report Generation | `< 2000` | `< 5000` | `< 8000` | `< 15000` | 2 |
+| Login | `< 200` | `< 500` | `< 1000` | `< 2000` | 5 |
+
+### Interpreting Results
+
+- **Failure rate > 1%:** Investigate server logs. Common causes: worker exhaustion, Redis memory, DB connection pool.
+- **p95 > 2x p50:** High variance indicates resource contention. Check gunicorn workers and MariaDB `max_connections`.
+- **RPS plateaus while users increase:** You have hit a bottleneck. Profile with `bench doctor` or MariaDB slow query log.
+
+:::note[Why this works]
+The `weight` attribute distributes simulated users realistically — 70% POS operators, 20% managers, and 10% back-office. Locust's event-based architecture can simulate thousands of concurrent users from a single machine. The `FrappeMixin` handles Frappe-specific authentication (CSRF tokens and session cookies) that raw HTTP clients miss.
+:::
+
+:::caution[Common mistake]
+Not warming up the Redis cache before load testing. Run the same flows manually 2–3 times first, otherwise your p50 numbers will be inflated by cold-cache hits. Also, running load tests against a development site with `bench start` (single-threaded) instead of a production setup with gunicorn workers.
+:::

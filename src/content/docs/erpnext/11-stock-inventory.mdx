@@ -1,0 +1,961 @@
+---
+title: Stock & Inventory
+description: Warehouses, items, batches, valuation, and the Stock Ledger Entry system that tracks every unit of inventory in ERPNext.
+sidebar:
+  order: 11
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { Tabs, TabItem, Steps, FileTree } from "@astrojs/starlight/components";
+
+ERPNext tracks every unit of stock through a **Stock Ledger Entry (SLE)** system.
+Every receipt, issue, transfer, or manufacture creates SLE records that maintain a
+running valuation. The **Bin** DocType holds current stock levels per
+item-warehouse combination. In this chapter we set up warehouses for a franchise
+ice cream chain, configure items with variants and batches, and manage the full
+inventory lifecycle.
+
+## Warehouse hierarchy
+
+Warehouses in ERPNext form a tree. A **group warehouse** is a container; **leaf
+warehouses** hold actual stock.
+
+ScoopJoy's structure separates the central kitchen (where production happens) from
+the outlets (where stock is displayed and sold):
+
+<FileTree>
+- ScoopJoy Ice Creams Pvt Ltd Company, implicit root
+  - All Warehouses - SJ (Group)
+    - Central Kitchen - SJ (Group)
+      - Raw Materials Store - SJ
+      - WIP - SJ
+      - Finished Goods - SJ
+    - Outlet 1 - SJ (Group)
+      - Outlet 1 Display Freezer - SJ
+      - Outlet 1 Cold Storage - SJ
+    - Outlet 2 - SJ (Group)
+      - Outlet 2 Display Freezer - SJ
+      - Outlet 2 Cold Storage - SJ
+    - Outlet 3 - SJ (Group)
+      - Outlet 3 Display Freezer - SJ
+      - Outlet 3 Cold Storage - SJ
+    - Scrap Warehouse - SJ
+</FileTree>
+
+You can build that hierarchy in the Desk Tree View, or programmatically — a group
+warehouse first, then its leaves:
+
+```python title="scoopjoy/scoopjoy/setup/warehouses.py"
+# Create a group warehouse
+group_wh = frappe.get_doc({
+    "doctype": "Warehouse",
+    "warehouse_name": "Central Kitchen",
+    "is_group": 1,
+    "parent_warehouse": "All Warehouses - SJ",
+    "company": "ScoopJoy Ice Creams Pvt Ltd"
+})
+group_wh.insert()
+
+# Create child warehouses
+for name in ["Raw Materials Store", "WIP", "Finished Goods"]:
+    wh = frappe.get_doc({
+        "doctype": "Warehouse",
+        "warehouse_name": name,
+        "is_group": 0,
+        "parent_warehouse": "Central Kitchen - SJ",
+        "company": "ScoopJoy Ice Creams Pvt Ltd"
+    })
+    wh.insert()
+```
+
+Each warehouse is linked to a **Stock In Hand** GL account when Perpetual Inventory
+is enabled. You can assign different accounts to different warehouses if needed
+(for example, separate finished goods valuation from raw materials).
+
+:::tip[Pro tip]
+Use the Tree View at **Stock > Warehouse** to visualise and manage your warehouse
+hierarchy.
+:::
+
+## Item master
+
+The Item DocType is central to inventory management. Key fields:
+
+| Field | Purpose |
+|---|---|
+| `item_code` | Unique identifier |
+| `item_name` | Human-readable name |
+| `item_group` | Classification hierarchy |
+| `stock_uom` | Base unit of measure |
+| `has_batch_no` | Enable batch tracking |
+| `has_serial_no` | Enable serial number tracking |
+| `has_variants` | This is a template item |
+| `variant_of` | Points to the template item |
+| `is_stock_item` | Maintains stock (vs. service item) |
+| `valuation_method` | FIFO or Moving Average |
+
+Items are classified into a tree of **Item Groups**. ScoopJoy's groups mirror the
+production flow — raw materials in, finished scoops out:
+
+<FileTree>
+- All Item Groups
+  - Raw Materials
+    - Dairy
+    - Sweeteners
+    - Flavoring
+    - Packaging
+  - Semi-Finished
+    - Ice Cream Base Mix
+  - Finished Goods
+    - Ice Cream Scoops
+    - Ice Cream Tubs
+    - Sundaes
+  - Toppings
+  - Equipment
+</FileTree>
+
+Creating a batch-tracked raw material with a short shelf life:
+
+```python title="scoopjoy/scoopjoy/setup/items.py"
+item = frappe.get_doc({
+    "doctype": "Item",
+    "item_code": "RM-MILK-FULL",
+    "item_name": "Full Cream Milk",
+    "item_group": "Dairy",
+    "stock_uom": "Litre",
+    "is_stock_item": 1,
+    "has_batch_no": 1,
+    "create_new_batch": 1,
+    "batch_number_series": "MILK-.YYYY.-.####",
+    "has_serial_no": 0,
+    "shelf_life_in_days": 5,
+    "valuation_method": "FIFO",
+    "description": "Full cream milk from local dairy farms"
+})
+item.insert()
+```
+
+## Item variants: flavors and sizes
+
+For ice cream products, use **Item Variants** to manage flavor/size combinations
+from a single template — define the attributes once, generate the matrix of
+concrete items.
+
+<Steps>
+
+1. **Define attributes.** Each attribute carries a set of values with short
+   abbreviations used to auto-build variant codes.
+
+   ```python title="scoopjoy/scoopjoy/setup/attributes.py"
+   # Create flavor attribute
+   flavor_attr = frappe.get_doc({
+       "doctype": "Item Attribute",
+       "attribute_name": "Flavor",
+       "item_attribute_values": [
+           {"attribute_value": "Vanilla", "abbr": "VAN"},
+           {"attribute_value": "Chocolate", "abbr": "CHOC"},
+           {"attribute_value": "Strawberry", "abbr": "STR"},
+           {"attribute_value": "Mango", "abbr": "MNG"},
+           {"attribute_value": "Butterscotch", "abbr": "BTR"},
+           {"attribute_value": "Paan", "abbr": "PAAN"}
+       ]
+   })
+   flavor_attr.insert()
+
+   # Create size attribute
+   size_attr = frappe.get_doc({
+       "doctype": "Item Attribute",
+       "attribute_name": "Scoop Size",
+       "item_attribute_values": [
+           {"attribute_value": "Regular", "abbr": "REG"},
+           {"attribute_value": "Large", "abbr": "LRG"},
+           {"attribute_value": "Family Pack", "abbr": "FAM"}
+       ]
+   })
+   size_attr.insert()
+   ```
+
+2. **Create the template item.** Set `has_variants` and list which attributes the
+   template varies on.
+
+   ```python title="scoopjoy/scoopjoy/setup/items.py"
+   template = frappe.get_doc({
+       "doctype": "Item",
+       "item_code": "SCOOP",
+       "item_name": "Ice Cream Scoop",
+       "item_group": "Ice Cream Scoops",
+       "stock_uom": "Nos",
+       "has_variants": 1,
+       "has_batch_no": 1,
+       "create_new_batch": 1,
+       "has_expiry_date": 1,
+       "shelf_life_in_days": 90,
+       "attributes": [
+           {"attribute": "Flavor"},
+           {"attribute": "Scoop Size"}
+       ]
+   })
+   template.insert()
+   ```
+
+3. **Create the concrete variants.** ERPNext's `create_variant` helper builds an
+   Item from the template plus a specific attribute combination.
+
+   ```python title="scoopjoy/scoopjoy/setup/items.py"
+   from erpnext.controllers.item_variant import create_variant
+
+   # Create a specific variant: Vanilla Regular
+   variant = create_variant("SCOOP", {
+       "Flavor": "Vanilla",
+       "Scoop Size": "Regular"
+   })
+   variant.item_code = "SCOOP-VAN-REG"
+   variant.item_name = "Ice Cream Scoop - Vanilla Regular"
+   variant.save()
+
+   # Create another: Chocolate Large
+   variant2 = create_variant("SCOOP", {
+       "Flavor": "Chocolate",
+       "Scoop Size": "Large"
+   })
+   variant2.item_code = "SCOOP-CHOC-LRG"
+   variant2.item_name = "Ice Cream Scoop - Chocolate Large"
+   variant2.save()
+   ```
+
+</Steps>
+
+ERPNext also supports **Manufacturer-based variants** for items where variations
+come from different sources rather than size/color attributes.
+
+:::tip[Pro tip]
+Add barcodes to each variant for quick POS scanning. In the Item form, go to the
+Barcodes section and add EAN-13 or UPC codes per variant.
+:::
+
+## Stock entry types
+
+Stock Entries record all inventory movements outside of purchase/sales. ERPNext has
+these stock entry types:
+
+| Type | Source WH | Target WH | Use Case |
+|---|---|---|---|
+| **Material Receipt** | -- | Yes | Opening stock, direct receipt without PO |
+| **Material Issue** | Yes | -- | Samples, wastage, internal consumption |
+| **Material Transfer** | Yes | Yes | Move stock between warehouses |
+| **Material Transfer for Manufacture** | Yes | WIP | Send raw materials to production |
+| **Manufacture** | WIP | Yes | Receive finished goods from production |
+| **Repack** | Yes | Yes | Change packaging, break bulk |
+| **Send to Subcontractor** | Yes | Subcontractor WH | Send materials to job worker |
+
+A `Material Transfer` moving finished scoops from the central kitchen out to an
+outlet's display freezer — note the per-item `s_warehouse` (source) and
+`t_warehouse` (target), and the `batch_no` for traceability:
+
+```python title="scoopjoy/scoopjoy/stock/transfer.py"
+se = frappe.get_doc({
+    "doctype": "Stock Entry",
+    "stock_entry_type": "Material Transfer",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "posting_date": "2025-07-15",
+    "items": [
+        {
+            "item_code": "SCOOP-VAN-REG",
+            "qty": 50,
+            "uom": "Nos",
+            "s_warehouse": "Finished Goods - SJ",
+            "t_warehouse": "Outlet 1 Display Freezer - SJ",
+            "batch_no": "SCOOP-2025-0042"
+        },
+        {
+            "item_code": "SCOOP-CHOC-LRG",
+            "qty": 30,
+            "uom": "Nos",
+            "s_warehouse": "Finished Goods - SJ",
+            "t_warehouse": "Outlet 1 Display Freezer - SJ",
+            "batch_no": "SCOOP-2025-0043"
+        }
+    ]
+})
+se.insert()
+se.submit()
+```
+
+## Stock reconciliation
+
+When physical stock counts differ from system stock, use **Stock Reconciliation** to
+correct levels. You enter the counted quantity and valuation rate; ERPNext computes
+the delta and posts the adjusting SLEs.
+
+```python title="scoopjoy/scoopjoy/stock/reconcile.py"
+sr = frappe.get_doc({
+    "doctype": "Stock Reconciliation",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "posting_date": "2025-07-31",
+    "posting_time": "18:00:00",
+    "purpose": "Stock Reconciliation",
+    "expense_account": "Stock Adjustment - SJ",
+    "items": [
+        {
+            "item_code": "SCOOP-VAN-REG",
+            "warehouse": "Outlet 1 Display Freezer - SJ",
+            "qty": 23,                    # Physical count
+            "valuation_rate": 85,
+            "batch_no": "SCOOP-2025-0042"
+        },
+        {
+            "item_code": "RM-SUGAR",
+            "warehouse": "Raw Materials Store - SJ",
+            "qty": 42.5,                  # Physical count in Kg
+            "valuation_rate": 42
+        }
+    ]
+})
+sr.insert()
+sr.submit()
+```
+
+ERPNext computes the difference between system qty and the qty you enter, then
+creates appropriate SLE entries to adjust stock. The valuation difference posts to
+the Stock Adjustment expense account.
+
+:::caution[Reconciliation moves money]
+Stock Reconciliation can significantly affect your financial statements (through
+valuation changes). Always reconcile at period-end and review the generated GL
+entries.
+:::
+
+## Batch tracking
+
+Batch tracking is essential for food businesses — you must trace every batch from
+production to sale, track expiry dates, and manage FEFO (First Expiry, First Out)
+picking.
+
+Batches can be auto-created on stock transactions (if `create_new_batch` is enabled
+on the item), or created manually:
+
+```python title="scoopjoy/scoopjoy/stock/batch.py"
+batch = frappe.get_doc({
+    "doctype": "Batch",
+    "batch_id": "VANMIX-20250715-B01",
+    "item": "SCOOP-VAN-REG",
+    "manufacturing_date": "2025-07-15",
+    "expiry_date": "2025-10-13",     # 90-day shelf life
+    # Note: batch_qty is auto-calculated from stock transactions -- do not set manually
+    "reference_doctype": "Stock Entry",
+    "reference_name": "STE-2025-00142"
+})
+batch.insert()
+```
+
+To read the on-hand quantity of one batch in one warehouse, use the built-in
+`get_batch_qty`:
+
+```python title="scoopjoy/scoopjoy/stock/batch.py"
+from erpnext.stock.doctype.batch.batch import get_batch_qty
+
+batch_qty = get_batch_qty(
+    batch_no="VANMIX-20250715-B01",
+    warehouse="Outlet 1 Display Freezer - SJ",
+    item_code="SCOOP-VAN-REG"
+)
+print(f"Batch qty: {batch_qty}")
+```
+
+The Desk report at **Stock > Stock Reports > Batch-Wise Balance History** shows
+current quantity per batch per warehouse, expiry dates, and the age of each batch.
+For an automated expiry sweep, query the Batch DocType directly:
+
+```python title="scoopjoy/scoopjoy/stock/expiry.py"
+from frappe.utils import today, add_days
+
+expiring_batches = frappe.get_all("Batch",
+    filters={
+        "expiry_date": ["between", [today(), add_days(today(), 7)]],
+        "batch_qty": [">", 0]
+    },
+    fields=["batch_id", "item", "expiry_date", "batch_qty"],
+    order_by="expiry_date asc"
+)
+for b in expiring_batches:
+    print(f"EXPIRING: {b.batch_id} ({b.item}) - Expires {b.expiry_date} - Qty: {b.batch_qty}")
+```
+
+:::tip[Pro tip]
+Configure **Notification** rules (Settings > Notification) to send daily emails
+about batches expiring in the next 7 days. For a food business, this is critical to
+minimise waste and ensure customer safety.
+:::
+
+## Serial number tracking
+
+Use serial numbers for high-value equipment rather than food items.
+
+```python title="scoopjoy/scoopjoy/setup/items.py"
+# Equipment item with serial tracking
+item = frappe.get_doc({
+    "doctype": "Item",
+    "item_code": "EQ-FREEZER-UPRIGHT",
+    "item_name": "Upright Display Freezer",
+    "item_group": "Equipment",
+    "stock_uom": "Nos",
+    "is_stock_item": 1,
+    "has_serial_no": 1,
+    "serial_no_series": "FRZ-.YYYY.-.####",
+    "has_batch_no": 0
+})
+item.insert()
+```
+
+When receiving this item via Purchase Receipt, ERPNext auto-generates serial numbers
+(e.g., FRZ-2025-0001, FRZ-2025-0002) and tracks their location across warehouses.
+
+:::note[v16 improvement]
+Serial and batch details are now combined in a single traceability report. You can
+expand item hierarchies and apply filters to identify stock flow and discrepancies
+with less effort.
+:::
+
+## Inventory valuation: FIFO vs Moving Average
+
+ERPNext supports two valuation methods:
+
+| Method | How It Works | Best For |
+|---|---|---|
+| **FIFO** | Oldest stock valued first; each layer has its own rate | Perishables, food (matches physical flow) |
+| **Moving Average** | Single weighted average rate updated on each receipt | Commodities, stable-price items |
+
+The difference shows up the moment prices move between two receipts and you then
+issue stock. Under FIFO, the issue consumes the oldest layer at its original rate;
+under Moving Average, the issue is valued at the blended rate. The same 80-litre
+issue produces a different COGS:
+
+<Tabs>
+  <TabItem label="FIFO">
+
+  ```text
+  Receipt 1: 100 litres @ INR 200/L  -> Stock: 100 @ 200
+  Receipt 2:  50 litres @ INR 220/L  -> Stock: 100 @ 200 + 50 @ 220
+  Issue:      80 litres              -> Issued: 80 @ 200 (oldest first)
+                                      -> Remaining: 20 @ 200 + 50 @ 220
+  COGS for the issue = 80 x 200 = INR 16,000
+  ```
+
+  </TabItem>
+  <TabItem label="Moving Average">
+
+  ```text
+  Receipt 1: 100 litres @ INR 200/L  -> Avg rate: 200
+  Receipt 2:  50 litres @ INR 220/L  -> Avg rate: (100x200 + 50x220) / 150 = 206.67
+  Issue:      80 litres              -> Issued: 80 @ 206.67
+  COGS for the issue = 80 x 206.67 = INR 16,533.60
+  ```
+
+  </TabItem>
+</Tabs>
+
+Set the valuation method per item in the Item master, or set a default at **Stock
+Settings > Default Valuation Method**.
+
+:::tip[Pro tip]
+For a food business, FIFO is almost always the right choice — it matches the
+physical flow (sell oldest stock first) and provides accurate COGS when ingredient
+prices fluctuate.
+:::
+
+## Stock Ledger Entry (SLE) and Bin
+
+Every stock movement creates an SLE record — an append-only audit trail — while the
+Bin holds a fast, current snapshot for each item-warehouse combination.
+
+<Mermaid title="From movement to snapshot" height={300} code={`
+flowchart LR
+  M["Stock movement<br/>receipt · issue · transfer · manufacture"] --> SLE["Stock Ledger Entry<br/>(append-only ledger)"]
+  SLE --> BIN["Bin<br/>(current snapshot per item + warehouse)"]
+  SLE -.->|"if Perpetual Inventory"| GL["GL Entry<br/>(stock value)"]
+`} />
+
+### Stock Ledger Entry
+
+Every stock movement creates an SLE record. Key fields:
+
+```python title="scoopjoy/scoopjoy/stock/inspect.py"
+sle = frappe.get_last_doc("Stock Ledger Entry",
+    filters={
+        "item_code": "SCOOP-VAN-REG",
+        "warehouse": "Outlet 1 Display Freezer - SJ"
+    }
+)
+print(f"Item: {sle.item_code}")
+print(f"Warehouse: {sle.warehouse}")
+print(f"Actual Qty: {sle.actual_qty}")          # Change in this transaction
+print(f"Qty After Transaction: {sle.qty_after_transaction}")  # Running balance
+print(f"Valuation Rate: {sle.valuation_rate}")
+print(f"Stock Value: {sle.stock_value}")
+print(f"Voucher Type: {sle.voucher_type}")       # e.g., Stock Entry, Sales Invoice
+print(f"Voucher No: {sle.voucher_no}")
+print(f"Batch No: {sle.batch_no}")
+```
+
+SLE is an **append-only ledger** — records are never updated, only new ones are
+added. This creates a complete audit trail of every stock movement.
+
+### Bin
+
+The Bin DocType holds the **current snapshot** of stock for each item-warehouse
+combination:
+
+```python title="scoopjoy/scoopjoy/stock/inspect.py"
+bin_data = frappe.get_value("Bin",
+    {"item_code": "SCOOP-VAN-REG", "warehouse": "Outlet 1 Display Freezer - SJ"},
+    ["actual_qty", "planned_qty", "reserved_qty", "ordered_qty", "projected_qty",
+     "valuation_rate", "stock_value"],
+    as_dict=True
+)
+print(f"Actual Qty: {bin_data.actual_qty}")
+print(f"Reserved Qty: {bin_data.reserved_qty}")     # Reserved for sales orders
+print(f"Ordered Qty: {bin_data.ordered_qty}")       # Ordered but not received
+print(f"Projected Qty: {bin_data.projected_qty}")   # actual - reserved + ordered + planned
+print(f"Valuation Rate: {bin_data.valuation_rate}")
+```
+
+| Bin Field | Meaning |
+|---|---|
+| `actual_qty` | Physical stock in warehouse |
+| `planned_qty` | Qty planned for production (from Work Orders) |
+| `reserved_qty` | Qty reserved for Sales Orders |
+| `ordered_qty` | Qty ordered via Purchase Orders (pending receipt) |
+| `projected_qty` | `actual - reserved + ordered + planned` — what you can promise |
+
+## Reorder levels and automatic Material Requests
+
+Configure automatic reordering when stock falls below a threshold:
+
+```python title="scoopjoy/scoopjoy/stock/reorder.py"
+item = frappe.get_doc("Item", "RM-MILK-FULL")
+item.append("reorder_levels", {
+    "warehouse": "Raw Materials Store - SJ",
+    "warehouse_reorder_level": 100,     # Trigger reorder when stock falls below 100L
+    "warehouse_reorder_qty": 500,       # Order 500L each time
+    "material_request_type": "Purchase"  # or "Transfer" or "Manufacture"
+})
+item.save()
+```
+
+Enable auto-creation in **Stock Settings > Auto Material Request**. ERPNext runs a
+scheduled job that checks reorder levels and creates Material Requests
+automatically. The Material Request can then be converted to:
+
+- **Purchase Order** (for bought items)
+- **Work Order** (for manufactured items)
+- **Stock Entry** (for internal transfers)
+
+## Delivery Note and stock reservation
+
+A **Delivery Note** records the dispatch of items to a customer, deducting stock from
+the warehouse.
+
+```python title="scoopjoy/scoopjoy/stock/delivery.py"
+dn = frappe.get_doc({
+    "doctype": "Delivery Note",
+    "customer": "Café Bliss",
+    "posting_date": "2025-07-16",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "items": [
+        {
+            "item_code": "SCOOP-MIX-5L",
+            "item_name": "Vanilla Ice Cream Mix - 5L Tub",
+            "qty": 20,
+            "rate": 450,
+            "warehouse": "Finished Goods - SJ",
+            "batch_no": "VANMIX-20250715-B01"
+        }
+    ]
+})
+dn.insert()
+dn.submit()
+```
+
+In v16, stock can be **reserved** against Sales Orders, preventing overselling. The
+Sales Order itself is created as usual:
+
+```python title="scoopjoy/scoopjoy/stock/reserve.py"
+# Create a Sales Order (stock reservation is a post-submission workflow)
+so = frappe.get_doc({
+    "doctype": "Sales Order",
+    "customer": "Café Bliss",
+    "delivery_date": "2025-07-18",
+    "company": "ScoopJoy Ice Creams Pvt Ltd",
+    "items": [
+        {
+            "item_code": "SCOOP-MIX-5L",
+            "qty": 20,
+            "rate": 450,
+            "warehouse": "Finished Goods - SJ"
+        }
+    ]
+})
+so.insert()
+so.submit()
+```
+
+:::tip[Pro tip]
+Stock Reservation in v16 is a post-submission workflow, not a creation-time field.
+After submitting a Sales Order: (1) enable "Stock Reservation" in Stock Settings,
+(2) open the submitted Sales Order, (3) click **Stock Reservation > Reserve** to
+open the reservation dialog where you select warehouse and quantity. This creates
+separate **Stock Reservation Entry** documents.
+:::
+
+Reserved stock shows up in the Bin's `reserved_qty` field and is excluded from
+available-to-promise calculations.
+
+## Quality inspection on receipt
+
+Configure quality checks for incoming raw materials with a **Quality Inspection
+Template** that lists the parameters to verify:
+
+```python title="scoopjoy/scoopjoy/quality/templates.py"
+qi_template = frappe.get_doc({
+    "doctype": "Quality Inspection Template",
+    "quality_inspection_template_name": "Milk Quality Check",
+    "item_quality_inspection_parameter": [
+        {
+            "specification": "Temperature",
+            "value": "2-4",
+            "min_value": 2,
+            "max_value": 4,
+            "unit_of_measurement": "Celsius"
+        },
+        {
+            "specification": "Fat Content",
+            "value": "3.5-4.5",
+            "min_value": 3.5,
+            "max_value": 4.5,
+            "unit_of_measurement": "Percent"
+        },
+        {
+            "specification": "SNF (Solids Not Fat)",
+            "value": "8.5-9.0",
+            "min_value": 8.5,
+            "max_value": 9.0,
+            "unit_of_measurement": "Percent"
+        }
+    ]
+})
+qi_template.insert()
+```
+
+Link the template to an item and enable **Inspection Required Before Purchase** in
+the Item master. When a Purchase Receipt is created for that item, ERPNext mandates
+a Quality Inspection record before submission.
+
+## Manufacturing stock entries (ice cream production)
+
+Production moves stock through three warehouses: raw materials leave the store, sit
+in WIP while being made, and arrive as finished goods. ERPNext models this with a
+BOM plus two stock entries.
+
+<Mermaid title="Ice cream production flow" height={360} code={`
+flowchart LR
+  RM["Raw Materials Store<br/>milk · cream · sugar · vanilla"] -->|"Material Transfer<br/>for Manufacture"| WIP["WIP - SJ"]
+  WIP -->|"Manufacture entry"| FG["Finished Goods - SJ<br/>100 scoops"]
+  WIP -.->|"scrap"| SCR["Scrap Warehouse - SJ"]
+`} />
+
+<Steps>
+
+1. **Create a Bill of Materials (BOM).** The BOM lists the inputs (and any scrap)
+   needed to make a quantity of the finished item.
+
+   ```python title="scoopjoy/scoopjoy/manufacturing/bom.py"
+   bom = frappe.get_doc({
+       "doctype": "BOM",
+       "item": "SCOOP-VAN-REG",
+       "quantity": 100,                    # Makes 100 scoops
+       "company": "ScoopJoy Ice Creams Pvt Ltd",
+       "is_default": 1,
+       "items": [
+           {
+               "item_code": "RM-MILK-FULL",
+               "qty": 30,                  # 30 litres
+               "uom": "Litre",
+               "rate": 55,
+               "source_warehouse": "Raw Materials Store - SJ"
+           },
+           {
+               "item_code": "RM-CREAM",
+               "qty": 10,                  # 10 litres
+               "uom": "Litre",
+               "rate": 180,
+               "source_warehouse": "Raw Materials Store - SJ"
+           },
+           {
+               "item_code": "RM-SUGAR",
+               "qty": 8,                   # 8 kg
+               "uom": "Kg",
+               "rate": 42,
+               "source_warehouse": "Raw Materials Store - SJ"
+           },
+           {
+               "item_code": "RM-VANILLA-EXTRACT",
+               "qty": 0.5,                 # 500ml
+               "uom": "Litre",
+               "rate": 1200,
+               "source_warehouse": "Raw Materials Store - SJ"
+           }
+       ],
+       "scrap_items": [
+           {
+               "item_code": "RM-WASTE-DAIRY",
+               "qty": 2,
+               "rate": 5,
+               "stock_qty": 2
+           }
+       ]
+   })
+   bom.insert()
+   bom.submit()
+   ```
+
+2. **Material Transfer for Manufacture.** Move the BOM's raw materials into the WIP
+   warehouse. `get_items()` auto-populates the rows from the BOM.
+
+   ```python title="scoopjoy/scoopjoy/manufacturing/produce.py"
+   se_transfer = frappe.get_doc({
+       "doctype": "Stock Entry",
+       "stock_entry_type": "Material Transfer for Manufacture",
+       "company": "ScoopJoy Ice Creams Pvt Ltd",
+       "from_bom": 1,
+       "bom_no": bom.name,
+       "fg_completed_qty": 100,
+       "from_warehouse": "Raw Materials Store - SJ",
+       "to_warehouse": "WIP - SJ"
+   })
+   se_transfer.get_items()    # Auto-populates items from BOM
+   se_transfer.insert()
+   se_transfer.submit()
+   ```
+
+3. **Manufacture entry (receive finished goods).** Consume the WIP raw materials and
+   receive the finished scoops into Finished Goods.
+
+   ```python title="scoopjoy/scoopjoy/manufacturing/produce.py"
+   se_manufacture = frappe.get_doc({
+       "doctype": "Stock Entry",
+       "stock_entry_type": "Manufacture",
+       "company": "ScoopJoy Ice Creams Pvt Ltd",
+       "from_bom": 1,
+       "bom_no": bom.name,
+       "fg_completed_qty": 100,
+       "from_warehouse": "WIP - SJ",
+       "to_warehouse": "Finished Goods - SJ"
+   })
+   se_manufacture.get_items()    # Auto-populates raw materials + finished good
+   se_manufacture.insert()
+   se_manufacture.submit()
+
+   print(f"Manufactured: {se_manufacture.name}")
+   ```
+
+</Steps>
+
+The `get_items()` method reads the BOM and populates raw material rows with
+`s_warehouse` (source) = WIP, the finished goods row with `t_warehouse` (target) =
+Finished Goods, and scrap item rows with `t_warehouse` = Scrap Warehouse (if
+configured).
+
+:::note[v16 improvement]
+Landed costs can now be applied directly to manufacturing stock entries and
+subcontracting jobs, so costs like electricity and freight flow into product cost
+automatically.
+:::
+
+## Stock reports
+
+ERPNext provides comprehensive stock reports:
+
+| Report | Path | Shows |
+|---|---|---|
+| **Stock Balance** | Stock > Stock Balance | Current qty and value per item/warehouse |
+| **Stock Ledger** | Stock > Stock Ledger | All SLE entries with filters |
+| **Stock Projected Qty** | Stock > Stock Projected Qty | Available-to-promise qty |
+| **Warehouse Wise Stock** | Stock > Warehouse Wise Stock Balance | Stock grouped by warehouse |
+| **Batch-Wise Balance** | Stock > Batch-Wise Balance History | Qty per batch with expiry dates |
+| **Stock Ageing** | Stock > Stock Ageing | Age of stock in warehouse |
+| **Item-wise Price** | Stock > Itemwise Price List Rate | Price list vs. valuation rates |
+
+## Fetching real-time stock for a dashboard (API)
+
+Build a real-time stock dashboard using ERPNext's APIs. The pattern is familiar from
+Node.js: a server-side endpoint queries the data, the client calls it and renders.
+
+A whitelisted function reads the Bin snapshots and enriches each with the earliest
+batch expiry — exactly the kind of read-only endpoint you'd expose from an Express
+route:
+
+```python title="scoopjoy/scoopjoy/api.py"
+import frappe
+
+@frappe.whitelist()
+def get_outlet_stock_summary(warehouse=None):
+    """Get stock summary for outlet dashboard."""
+    filters = {
+        "actual_qty": [">", 0]
+    }
+    if warehouse:
+        filters["warehouse"] = warehouse
+
+    bins = frappe.get_all("Bin",
+        filters=filters,
+        fields=[
+            "item_code", "warehouse", "actual_qty",
+            "reserved_qty", "projected_qty",
+            "valuation_rate", "stock_value"
+        ],
+        order_by="item_code"
+    )
+
+    # Enrich with batch expiry info for food items
+    for b in bins:
+        batches = frappe.get_all("Stock Ledger Entry",
+            filters={
+                "item_code": b.item_code,
+                "warehouse": b.warehouse,
+                "actual_qty": [">", 0]
+            },
+            fields=["batch_no"],
+            distinct=True
+        )
+        batch_nos = [x.batch_no for x in batches if x.batch_no]
+        if batch_nos:
+            earliest_expiry = frappe.db.get_value("Batch",
+                {"batch_id": ["in", batch_nos]},
+                "min(expiry_date)"
+            )
+            b["earliest_expiry"] = earliest_expiry
+
+    return bins
+```
+
+On the client, call it with `frappe.call` and render the rows:
+
+```javascript title="scoopjoy/scoopjoy/public/js/stock_dashboard.js"
+// In a custom page or dashboard widget
+frappe.call({
+    method: "scoopjoy.api.get_outlet_stock_summary",
+    args: {
+        warehouse: "Outlet 1 Display Freezer - SJ"
+    },
+    callback: function(r) {
+        if (r.message) {
+            r.message.forEach(function(item) {
+                console.log(
+                    item.item_code,
+                    "Qty:", item.actual_qty,
+                    "Available:", item.projected_qty,
+                    "Expires:", item.earliest_expiry || "N/A"
+                );
+            });
+        }
+    }
+});
+```
+
+For a single item/warehouse lookup, ERPNext ships a built-in utility:
+
+```javascript title="scoopjoy/scoopjoy/public/js/stock_dashboard.js"
+// Get stock for a single item/warehouse
+frappe.call({
+    method: "erpnext.stock.utils.get_stock_balance",
+    args: {
+        item_code: "SCOOP-VAN-REG",
+        warehouse: "Outlet 1 Display Freezer - SJ"
+    },
+    callback: function(r) {
+        console.log("Stock Balance:", r.message);
+    }
+});
+```
+
+The same data is reachable over the auto-generated REST API — query the Bin resource
+directly with filters and field selection:
+
+```bash
+# Get all bins for a warehouse
+curl -s "https://erp.scoopjoy.com/api/resource/Bin?\
+filters=[[\"warehouse\",\"=\",\"Outlet 1 Display Freezer - SJ\"]]&\
+fields=[\"item_code\",\"actual_qty\",\"reserved_qty\",\"projected_qty\"]&\
+limit_page_length=100" \
+  -H "Authorization: token api_key:api_secret" | python -m json.tool
+```
+
+## Summary of v16 stock & inventory improvements
+
+| Feature | Description |
+|---|---|
+| **Stock Reservation** | Reserve inventory against Sales Orders, Work Orders, Production Plans, Subcontracting Orders |
+| **Enhanced MRP** | Smarter planning considering projected inventory, lead times, and future demand |
+| **Master Production Schedule** | Consolidated planner for production and purchase requirements |
+| **Serial & Batch Traceability** | Combined report with forward/backward tracing, hierarchy expansion |
+| **Item/Group-Based Stock Accounting** | Flexible COGS and expense tracking per item group |
+| **Enhanced Picking Lists** | FEFO (First Expiry, First Out) optimised picking |
+| **Landed Cost for Stock Entries** | Apply costs to manufacturing and subcontracting entries |
+| **Periodic Inventory Automation** | Automated journal entries for periodic adjustments |
+| **Multi-Company Warehouse Defaults** | Per-company default manufacturing warehouses |
+| **Performance (Frappe Caffeine)** | Up to 2x faster stock reports and ledger queries |
+| **Phantom BOM Support** | Multi-level Phantom BOMs explode correctly in Production Plans |
+| **WIP Tracking via Job Cards** | Real-time semi-finished goods inventory levels |
+
+## Quick reference: common stock operations
+
+```python title="scoopjoy/scoopjoy/stock/common.py"
+# === Material Receipt (Opening Stock) ===
+se = frappe.get_doc({
+    "doctype": "Stock Entry",
+    "stock_entry_type": "Material Receipt",
+    "items": [{
+        "item_code": "RM-SUGAR",
+        "qty": 100,
+        "t_warehouse": "Raw Materials Store - SJ",
+        "basic_rate": 42
+    }]
+})
+se.insert()
+se.submit()
+
+# === Material Issue (Write-off expired stock) ===
+se = frappe.get_doc({
+    "doctype": "Stock Entry",
+    "stock_entry_type": "Material Issue",
+    "items": [{
+        "item_code": "SCOOP-VAN-REG",
+        "qty": 15,
+        "s_warehouse": "Outlet 1 Display Freezer - SJ",
+        "batch_no": "SCOOP-2025-0039"
+    }]
+})
+se.insert()
+se.submit()
+
+# === Repack (Break a 5L tub into individual scoops) ===
+se = frappe.get_doc({
+    "doctype": "Stock Entry",
+    "stock_entry_type": "Repack",
+    "items": [
+        {
+            "item_code": "SCOOP-MIX-5L",
+            "qty": 1,
+            "s_warehouse": "Finished Goods - SJ"
+        },
+        {
+            "item_code": "SCOOP-VAN-REG",
+            "qty": 25,
+            "t_warehouse": "Finished Goods - SJ",
+            "is_finished_item": 1
+        }
+    ]
+})
+se.insert()
+se.submit()
+```

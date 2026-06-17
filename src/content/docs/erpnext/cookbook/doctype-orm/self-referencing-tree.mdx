@@ -1,0 +1,179 @@
+---
+title: Self-Referencing Tree DocType
+description: Model an unlimited category hierarchy with Frappe's Nested Set model — fast ancestor and descendant queries without recursive joins.
+sidebar:
+  order: 1
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Model a category hierarchy — say Item Groups like
+Dairy → Ice Cream → Premium Ice Cream — with unlimited nesting, and query
+ancestors and descendants cheaply.
+
+**Solution:** Use Frappe's built-in Tree DocType with the Nested Set model. Check
+**Is Tree** on the DocType and inherit from `NestedSet` in the controller; Frappe
+maintains `lft`/`rgt` boundary integers so hierarchy queries become simple range
+comparisons.
+
+## Step 1: DocType JSON definition
+
+The `is_tree` flag plus an `nsm_parent_field` and the hidden `lft`/`rgt`/`old_parent`
+fields are what turn an ordinary DocType into a nested-set tree.
+
+```json title="scoopjoy/scoopjoy/doctype/sj_product_category/sj_product_category.json" {3-5}
+{
+  "name": "SJ Product Category",
+  "module": "ScoopJoy",
+  "is_tree": 1,
+  "nsm_parent_field": "parent_sj_product_category",
+  "naming_rule": "By fieldname",
+  "autoname": "field:category_name",
+  "fields": [
+    { "fieldname": "category_name", "fieldtype": "Data", "label": "Category Name", "reqd": 1, "in_list_view": 1, "unique": 1 },
+    { "fieldname": "parent_sj_product_category", "fieldtype": "Link", "label": "Parent Category", "options": "SJ Product Category", "in_list_view": 1 },
+    { "fieldname": "is_group", "fieldtype": "Check", "label": "Is Group", "default": "0", "in_list_view": 1 },
+    { "fieldname": "old_parent", "fieldtype": "Link", "label": "Old Parent", "options": "SJ Product Category", "hidden": 1 },
+    { "fieldname": "category_code", "fieldtype": "Data", "label": "Category Code", "unique": 1 },
+    { "fieldname": "description", "fieldtype": "Small Text", "label": "Description" },
+    { "fieldname": "lft", "fieldtype": "Int", "label": "Left", "hidden": 1, "search_index": 1 },
+    { "fieldname": "rgt", "fieldtype": "Int", "label": "Right", "hidden": 1, "search_index": 1 }
+  ],
+  "permissions": [
+    { "role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1 }
+  ],
+  "sort_field": "lft",
+  "sort_order": "ASC"
+}
+```
+
+## Step 2: Python controller
+
+Inherit from `NestedSet`. Calling `super().on_update()` lets the base class
+recompute `lft`/`rgt` whenever a node moves; the ancestor/descendant helpers are
+plain `frappe.qb` range queries.
+
+```python title="scoopjoy/scoopjoy/doctype/sj_product_category/sj_product_category.py"
+import frappe
+from frappe import _
+from frappe.utils.nestedset import NestedSet
+
+
+class SJProductCategory(NestedSet):
+    nsm_parent_field = "parent_sj_product_category"
+
+    def validate(self):
+        if self.category_code:
+            self.category_code = self.category_code.upper().strip()
+
+    def on_update(self):
+        super().on_update()
+        self.update_full_path()
+
+    def update_full_path(self):
+        """Compute and cache the full path like 'Dairy > Ice Cream > Premium'."""
+        ancestors = self.get_ancestors()
+        path_parts = [
+            frappe.db.get_value("SJ Product Category", a, "category_name")
+            for a in ancestors
+        ]
+        path_parts.append(self.category_name)
+        full_path = " > ".join(path_parts)
+        frappe.cache.hset("sj_category_path", self.name, full_path)
+
+    def get_ancestors(self):
+        """Ancestor names from root to immediate parent."""
+        SJCat = frappe.qb.DocType("SJ Product Category")
+        return (
+            frappe.qb.from_(SJCat)
+            .select(SJCat.name)
+            .where(SJCat.lft < self.lft)
+            .where(SJCat.rgt > self.rgt)
+            .orderby(SJCat.lft)
+        ).run(pluck="name")
+
+    def get_descendants(self, include_self=False):
+        """All descendant names."""
+        SJCat = frappe.qb.DocType("SJ Product Category")
+        lft_op = SJCat.lft >= self.lft if include_self else SJCat.lft > self.lft
+        rgt_op = SJCat.rgt <= self.rgt if include_self else SJCat.rgt < self.rgt
+        return (
+            frappe.qb.from_(SJCat)
+            .select(SJCat.name)
+            .where(lft_op)
+            .where(rgt_op)
+            .orderby(SJCat.lft)
+        ).run(pluck="name")
+
+
+@frappe.whitelist()
+def get_category_full_path(category):
+    """API: return the cached full path for a category."""
+    cached = frappe.cache.hget("sj_category_path", category)
+    if cached:
+        return cached
+    doc = frappe.get_doc("SJ Product Category", category)
+    doc.update_full_path()
+    return frappe.cache.hget("sj_category_path", category)
+
+
+@frappe.whitelist()
+def move_category(category, new_parent):
+    """API: move a category. NestedSet recomputes lft/rgt on save."""
+    doc = frappe.get_doc("SJ Product Category", category)
+    doc.parent_sj_product_category = new_parent
+    doc.save()
+    return {"status": "ok", "new_parent": new_parent}
+```
+
+## Step 3: Tree view JS
+
+Registering `frappe.treeview_settings` gives the DocType a proper expandable tree
+UI in Desk, with a "Leaf" badge rendered on childless nodes.
+
+```javascript title="scoopjoy/scoopjoy/doctype/sj_product_category/sj_product_category_tree.js"
+frappe.treeview_settings["SJ Product Category"] = {
+    breadcrumb: "ScoopJoy",
+    title: "Product Categories",
+    get_tree_root: false,
+    root_label: "All Categories",
+    get_tree_nodes: "frappe.desk.treeview.get_children",
+    add_tree_node: "frappe.client.insert",
+    filters: [
+        {
+            fieldname: "sj_product_category",
+            fieldtype: "Link",
+            options: "SJ Product Category",
+            label: "Category",
+            get_query: function () {
+                return { filters: [["is_group", "=", 1]] };
+            },
+        },
+    ],
+    fields: [
+        { fieldtype: "Data", fieldname: "category_name", label: "Category Name", reqd: true },
+        { fieldtype: "Check", fieldname: "is_group", label: "Is Group", default: 0 },
+    ],
+    onrender: function (node) {
+        if (node.data && node.data.value && !node.data.expandable) {
+            node.tag_area = $('<span class="badge badge-info ml-2">Leaf</span>');
+            node.$tree_link.append(node.tag_area);
+        }
+    },
+};
+```
+
+:::note[Why this works]
+The Nested Set model stores `lft`/`rgt` integers on each node, so ancestor and
+descendant lookups are a single range comparison (`WHERE lft > X AND rgt < Y`)
+rather than recursive joins. The `NestedSet` base class rebuilds these values on
+every insert, update, or move.
+:::
+
+:::caution[Common mistake]
+Forgetting the `old_parent` field. Frappe's `NestedSet` compares `old_parent`
+against the current parent to detect moves — without it, node reparenting silently
+fails.
+:::

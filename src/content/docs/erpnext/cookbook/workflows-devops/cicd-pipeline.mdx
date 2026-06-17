@@ -1,0 +1,671 @@
+---
+title: Complete CI/CD Pipeline
+description: Gate merges and ship a custom Frappe app with pre-commit, Ruff, GitHub Actions CI/CD, automatic rollback, and a developer Makefile.
+sidebar:
+  order: 7
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard, Aside } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Set up a production-grade CI/CD pipeline for your custom Frappe app —
+one that lints, runs server tests against a real MariaDB + Redis stack, builds a
+Docker image, and ships ScoopJoy to staging and production with a human approval
+gate and automatic rollback.
+
+**Solution:** Wire up six pieces — pre-commit for local hygiene, Ruff for fast
+Python linting/formatting, a GitHub Actions CI workflow that gates merges, a CD
+workflow triggered by version tags, a Makefile for everyday commands, and a
+Dockerfile for the build. The stages chain together like this:
+
+<Mermaid title="ScoopJoy CI/CD pipeline" height={460} code={`
+flowchart LR
+  subgraph CI["CI - on push / PR"]
+    L["Lint and Format (Ruff + Prettier)"]
+    T["Server Tests (MariaDB + Redis)"]
+    TC["Type Check (mypy)"]
+    L --> T
+    L --> TC
+  end
+  subgraph CD["CD - on tag v*"]
+    B["Build and Push Docker Image"]
+    S["Deploy to Staging"]
+    P["Deploy to Production (manual approval)"]
+    R["Rollback on failed health check"]
+    B --> S --> P
+    P -.->|"health check fails"| R
+  end
+  CI --> CD
+`} />
+
+## Step 1: Pre-commit configuration
+
+`pre-commit` runs Ruff, Prettier, and a few safety hooks before each commit, so
+nothing unformatted or secret-laden reaches the repo. Note the JSON check excludes
+`*.json` — Frappe DocType definitions carry trailing commas that a strict checker
+would reject.
+
+```yaml title="scoopjoy/.pre-commit-config.yaml"
+repos:
+  # Ruff: Python linter + formatter (replaces Black, Flake8, isort)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        name: ruff-lint
+        args: [--fix, --exit-non-zero-on-fix]
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff-format
+        types_or: [python, pyi]
+
+  # Prettier: JS/CSS/JSON/HTML formatting
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        types_or: [javascript, css, json, html]
+        exclude: |
+          (?x)^(
+            .*node_modules/.*|
+            .*\.bundle\..*|
+            .*/doctype/.*/.*\.json$
+          )$
+
+  # Standard pre-commit hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+        exclude: \.json$  # Frappe DocType JSONs have trailing commas
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: debug-statements
+
+  # Security: check for secrets
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: [--baseline, .secrets.baseline]
+```
+
+## Step 2: Ruff configuration
+
+A single `pyproject.toml` configures Ruff's linter, formatter, and pytest. The
+per-file ignores and the tab `indent-style` follow Frappe conventions; mutable
+class attributes (`RUF012`) are ignored because DocType controllers use them.
+
+```toml title="scoopjoy/pyproject.toml" {32-33}
+[project]
+name = "scoopjoy"
+version = "1.0.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "S",    # flake8-bandit (security)
+    "T20",  # flake8-print
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # line too long (handled by formatter)
+    "B008",    # do not perform function calls in argument defaults (frappe patterns)
+    "S101",    # assert used (fine in tests)
+    "RUF012",  # mutable class attributes (frappe DocType pattern)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/test_*.py" = ["S101", "T20"]
+"**/tests/**" = ["S101", "T20"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["scoopjoy"]
+known-third-party = ["frappe", "erpnext"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "tab"  # Frappe convention
+
+[tool.pytest.ini_options]
+testpaths = ["scoopjoy/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+```
+
+## Step 3: GitHub Actions CI
+
+The CI workflow runs on every push and PR to `main`/`develop`. The `lint` job is
+the gate: `tests` and `type-check` declare `needs: lint`, so they only run after
+linting passes. The `tests` job spins up real MariaDB and Redis service containers,
+initialises a bench, installs ERPNext + ScoopJoy, and runs `bench run-tests`.
+
+<Aside type="note">
+The `concurrency` group uses the `github.ref` expression with
+`cancel-in-progress: true` so a fresh push cancels the previous in-flight run on
+the same branch — saving runner minutes on rapid pushes.
+</Aside>
+
+```yaml title="scoopjoy/.github/workflows/ci.yml" {13-15,40-67}
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Ruff linter
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: check .
+
+      - name: Run Ruff formatter check
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: format --check .
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check JS/CSS formatting with Prettier
+        run: npx prettier --check "scoopjoy/**/*.{js,css}" --ignore-path .prettierignore
+
+  tests:
+    name: Server Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 30
+
+    services:
+      mariadb:
+        image: mariadb:10.11
+        env:
+          MARIADB_ROOT_PASSWORD: frappe
+          MARIADB_DATABASE: test_frappe
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis-cache:
+        image: redis:7-alpine
+        ports:
+          - 13000:6379
+
+      redis-queue:
+        image: redis:7-alpine
+        ports:
+          - 11000:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: yarn
+
+      - name: Install bench
+        run: pip install frappe-bench
+
+      - name: Initialize bench
+        run: |
+          bench init --skip-redis-config-generation --frappe-branch version-16 ~/frappe-bench
+          cd ~/frappe-bench
+          # Configure MariaDB
+          echo "[mysqld]
+          character-set-client-handshake = FALSE
+          character-set-server = utf8mb4
+          collation-server = utf8mb4_unicode_ci
+
+          [mysql]
+          default-character-set = utf8mb4" > ~/.my.cnf
+
+      - name: Configure bench
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench set-config -g db_host 127.0.0.1
+          bench set-config -g db_port 3306
+          bench set-config -g db_root_password frappe
+          bench set-config -g redis_cache redis://127.0.0.1:13000
+          bench set-config -g redis_queue redis://127.0.0.1:11000
+          bench set-config -g redis_socketio redis://127.0.0.1:11000
+
+      - name: Install ERPNext
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench get-app --branch version-16 erpnext
+          bench new-site --db-root-password frappe --admin-password admin test_site
+          bench --site test_site install-app erpnext
+
+      - name: Install ScoopJoy app
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench get-app $GITHUB_WORKSPACE
+          bench --site test_site install-app scoopjoy
+
+      - name: Run unit tests
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench --site test_site run-tests --app scoopjoy --failfast
+        env:
+          CI: true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: /home/runner/frappe-bench/sites/test_site/test_results/
+
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install mypy frappe-stubs types-requests
+
+      - name: Run mypy
+        run: mypy scoopjoy --ignore-missing-imports --no-strict-optional
+```
+
+## Step 4: GitHub Actions CD
+
+The CD workflow triggers only on tags matching `v*`. It builds and pushes a Docker
+image to GHCR, deploys to staging, then to production behind a GitHub
+`environment: production` — which can require a manual reviewer. The production job
+stashes the current commit hash before deploying, runs a retrying health check, and
+if that fails it checks out the stashed commit and migrates back. Note
+`cancel-in-progress: false` here — you never want a deploy cancelled mid-flight.
+
+<Aside type="note">
+Deploy and rollback are gated by step outcomes: the rollback step uses an `if`
+condition combining `failure()` with the deploy step's outcome, so it only fires
+when the deploy succeeded but the health check did not.
+</Aside>
+
+```yaml title="scoopjoy/.github/workflows/cd.yml" {9-11,55-58,124-134}
+name: CD
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false  # Never cancel deployments
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,prefix=
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /home/frappe/frappe-bench
+            bench get-app --branch ${{ github.ref_name }} scoopjoy || bench get-app scoopjoy ${{ github.server_url }}/${{ github.repository }}
+            cd apps/scoopjoy && git fetch && git checkout ${{ github.ref_name }} && cd ../..
+            bench --site staging.scoopjoy.com migrate
+            bench --site staging.scoopjoy.com clear-cache
+            sudo supervisorctl restart all
+
+      - name: Run smoke tests
+        run: |
+          # Wait for staging to be ready
+          sleep 10
+          # Health check
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://staging.scoopjoy.com/api/method/scoopjoy.scoopjoy.api.health.health_check")
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status $STATUS"
+            exit 1
+          fi
+          echo "Staging health check passed"
+
+      - name: Notify Slack - Staging Deployed
+        if: success()
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "Staging deployed: ${{ github.ref_name }} :rocket:",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Staging Deployed* :white_check_mark:\n*Version:* `${{ github.ref_name }}`\n*Commit:* `${{ github.sha }}`\n*By:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production  # Requires manual approval in GitHub
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create pre-deploy backup
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /home/frappe/frappe-bench
+            bench --site scoopjoy.com backup --with-files
+            echo "Backup completed at $(date)"
+
+      - name: Deploy to production
+        id: deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /home/frappe/frappe-bench
+
+            # Store current commit for rollback
+            cd apps/scoopjoy
+            echo $(git rev-parse HEAD) > /tmp/scoopjoy_rollback_commit
+            git fetch && git checkout ${{ github.ref_name }}
+            cd ../..
+
+            # Run migration
+            bench --site scoopjoy.com migrate
+            bench --site scoopjoy.com clear-cache
+            sudo supervisorctl restart all
+
+      - name: Post-deploy health check
+        id: healthcheck
+        run: |
+          sleep 15
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://scoopjoy.com/api/method/scoopjoy.scoopjoy.api.health.health_check")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed on attempt $i"
+              exit 0
+            fi
+            echo "Health check attempt $i failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after 5 attempts"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure() && steps.deploy.outcome == 'success'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /home/frappe/frappe-bench
+            ROLLBACK_COMMIT=$(cat /tmp/scoopjoy_rollback_commit)
+            cd apps/scoopjoy && git checkout $ROLLBACK_COMMIT && cd ../..
+            bench --site scoopjoy.com migrate
+            bench --site scoopjoy.com clear-cache
+            sudo supervisorctl restart all
+            echo "Rolled back to $ROLLBACK_COMMIT"
+
+      - name: Notify Slack - Production
+        if: always()
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "Production deploy ${{ job.status }}: ${{ github.ref_name }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production Deploy ${{ job.status == 'success' && ':white_check_mark:' || ':x:' }}*\n*Version:* `${{ github.ref_name }}`\n*Status:* ${{ job.status }}\n*By:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+```
+
+## Step 5: Makefile for developer commands
+
+A `Makefile` gives developers a single, discoverable entrypoint for the bench
+commands they run daily — `make test`, `make lint`, `make format`, `make migrate`.
+The `help` target self-documents from the `## ` comments after each rule.
+
+```makefile title="scoopjoy/Makefile"
+.PHONY: help install dev lint format test test-unit test-integration migrate bench-start
+
+BENCH_PATH ?= ~/frappe-bench
+SITE ?= scoopjoy.localhost
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+install: ## Install pre-commit hooks and dependencies
+	pip install pre-commit ruff
+	pre-commit install
+	pre-commit install --hook-type commit-msg
+
+dev: ## Start development bench
+	cd $(BENCH_PATH) && bench start
+
+lint: ## Run linter (Ruff)
+	ruff check .
+	ruff format --check .
+
+format: ## Auto-format code
+	ruff check --fix .
+	ruff format .
+
+test: ## Run all tests
+	cd $(BENCH_PATH) && bench --site $(SITE) run-tests --app scoopjoy
+
+test-unit: ## Run only unit tests
+	cd $(BENCH_PATH) && bench --site $(SITE) run-tests \
+		--app scoopjoy \
+		--module scoopjoy.tests.unit
+
+test-integration: ## Run only integration tests
+	cd $(BENCH_PATH) && bench --site $(SITE) run-tests \
+		--app scoopjoy \
+		--module scoopjoy.tests.integration
+
+migrate: ## Run bench migrate
+	cd $(BENCH_PATH) && bench --site $(SITE) migrate
+
+clear-cache: ## Clear site cache
+	cd $(BENCH_PATH) && bench --site $(SITE) clear-cache
+
+console: ## Open Frappe console
+	cd $(BENCH_PATH) && bench --site $(SITE) console
+
+export-fixtures: ## Export fixtures to app
+	cd $(BENCH_PATH) && bench --site $(SITE) export-fixtures --app scoopjoy
+
+backup: ## Create site backup
+	cd $(BENCH_PATH) && bench --site $(SITE) backup --with-files
+
+build: ## Build JS/CSS assets
+	cd $(BENCH_PATH) && bench build --app scoopjoy
+
+watch: ## Watch and rebuild assets on change
+	cd $(BENCH_PATH) && bench watch --apps scoopjoy
+
+typecheck: ## Run mypy type checker
+	mypy scoopjoy --ignore-missing-imports
+
+safety: ## Check for security vulnerabilities
+	pip-audit
+	ruff check --select S .
+
+release-patch: ## Create a patch release tag
+	@VERSION=$$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"); \
+	IFS='.' read -r major minor patch <<< "$$VERSION"; \
+	NEW="$$major.$$minor.$$((patch+1))"; \
+	sed -i "s/version = \"$$VERSION\"/version = \"$$NEW\"/" pyproject.toml; \
+	git add pyproject.toml && git commit -m "release: v$$NEW" && git tag "v$$NEW"; \
+	echo "Tagged v$$NEW -- push with: git push origin main --tags"
+```
+
+## Step 6: Dockerfile
+
+The image used by the CD build extends the official `frappe/bench` base, copies the
+ScoopJoy source into the bench `apps/` directory, pulls ERPNext, and builds assets.
+
+```dockerfile title="scoopjoy/Dockerfile"
+FROM frappe/bench:latest
+
+ARG APP_BRANCH=main
+
+# Copy app source
+COPY . /home/frappe/frappe-bench/apps/scoopjoy
+
+# Install the app
+RUN cd /home/frappe/frappe-bench \
+    && bench get-app --branch version-16 erpnext \
+    && bench setup requirements --dev \
+    && bench build --app scoopjoy
+
+CMD ["bench", "start"]
+```
+
+:::note[Why this works]
+The CI pipeline gates merges on lint + tests. Ruff replaces Black, Flake8, and
+isort in a single tool with 10-100x faster execution. The CD pipeline uses GitHub
+environments with required reviewers for production, creating a human gate. The
+rollback step stores the current commit hash before deploying, so a failed health
+check triggers an automatic revert.
+:::
+
+:::caution[Common mistake]
+Not running `bench migrate` after deploying code changes. If your release includes
+DocType changes, Custom Fields, or fixtures, skipping migrate means the database
+schema is out of sync with the code. Always include migrate in your deploy script.
+:::

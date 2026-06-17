@@ -1,0 +1,232 @@
+---
+title: Database Indexing Strategy
+description: A systematic path from finding slow queries to adding the right single-column and composite indexes on busy Frappe DocTypes.
+sidebar:
+  order: 6
+---
+
+import { LinkCard, Steps } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Queries on the `Franchise Outlet` and `Sales Invoice` DocTypes are slow
+once ScoopJoy crosses 10,000+ records. You need a systematic approach to identifying
+and adding the right indexes — not just sprinkling them everywhere.
+
+**Solution:** Work the problem end to end — diagnose with the slow query log, confirm
+with `EXPLAIN`, add indexes via the bench CLI or a migration patch, then verify the
+planner actually uses them.
+
+## Step 1: Identify Slow Queries
+
+Turn on MariaDB's slow query log temporarily so you can see which statements blow past
+your latency budget. Here, anything over 500ms gets recorded.
+
+```bash
+# Connect to MariaDB
+bench --site scoopjoy.localhost mariadb
+
+# Enable slow query log (temporary)
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 0.5;  -- queries > 500ms
+SET GLOBAL slow_query_log_file = '/tmp/slow-queries.log';
+
+# After running your app for a while, check the log:
+# bench --site scoopjoy.localhost mariadb -e "SELECT * FROM mysql.slow_log ORDER BY start_time DESC LIMIT 20;"
+```
+
+## Step 2: EXPLAIN a Suspicious Query
+
+Run `EXPLAIN` on a real dashboard query to see how MariaDB plans to execute it. The
+`type` and `rows` columns tell you whether an index is doing any work.
+
+```sql
+-- Check how MariaDB executes a common dashboard query
+EXPLAIN SELECT franchise_outlet, SUM(grand_total), COUNT(*)
+FROM `tabSales Invoice`
+WHERE docstatus = 1
+  AND posting_date BETWEEN '2025-01-01' AND '2025-03-31'
+  AND franchise_outlet IS NOT NULL
+GROUP BY franchise_outlet;
+
+-- Look for:
+-- type: ALL          (full table scan -- BAD)
+-- type: ref or range (index used -- GOOD)
+-- rows: 500000       (scanning many rows -- potentially BAD)
+-- Extra: Using where; Using filesort  (no index for ORDER BY)
+```
+
+## Step 3: Add Indexes Using Bench CLI (Recommended)
+
+The bench command is the preferred route — it creates a Property Setter so the index
+survives migrations and restores. Pass `--column` once per column to build a composite
+index in that order.
+
+```bash
+# Single column index
+bench --site scoopjoy.localhost add-database-index \
+    --doctype "Sales Invoice" \
+    --column franchise_outlet
+
+# Composite index for the common query pattern
+bench --site scoopjoy.localhost add-database-index \
+    --doctype "Sales Invoice" \
+    --column docstatus \
+    --column posting_date \
+    --column franchise_outlet
+```
+
+## Step 4: Add Indexes Programmatically in a Migration Patch
+
+When you want the indexes versioned with your app, add them in a patch. The patch checks
+`information_schema.statistics` first so it is idempotent — safe to re-run on every
+migration.
+
+```python title="scoopjoy/patches/v1_0/add_performance_indexes.py"
+import frappe
+
+
+def execute():
+    """Add custom indexes for franchise reporting performance."""
+
+    # Single-column indexes for frequently filtered fields
+    indexes = [
+        ("Sales Invoice", ["franchise_outlet"]),
+        ("Sales Invoice", ["order_type"]),
+        ("Sales Invoice Item", ["item_code", "parent"]),
+        ("Franchise Outlet", ["region"]),
+        ("Franchise Outlet", ["is_active"]),
+        ("Franchise Outlet", ["franchise_owner"]),
+    ]
+
+    for doctype, columns in indexes:
+        table = f"tab{doctype}"
+        index_name = f"idx_{'_'.join(columns)}"
+
+        # Check if index already exists
+        existing = frappe.db.sql("""
+            SELECT 1 FROM information_schema.statistics
+            WHERE table_schema = DATABASE()
+              AND table_name = %s
+              AND index_name = %s
+            LIMIT 1
+        """, (table, index_name))
+
+        if not existing:
+            col_str = ", ".join([f"`{c}`" for c in columns])
+            frappe.db.sql_ddl(f"ALTER TABLE `{table}` ADD INDEX `{index_name}` ({col_str})")
+            frappe.db.commit()
+            print(f"  Added index {index_name} on {table}({col_str})")
+        else:
+            print(f"  Index {index_name} already exists on {table}")
+
+
+    # Composite index for the most common report query pattern
+    # (docstatus, posting_date, franchise_outlet) covers:
+    #   WHERE docstatus=1 AND posting_date BETWEEN x AND y GROUP BY franchise_outlet
+    composite_table = "tabSales Invoice"
+    composite_name = "idx_docstatus_posting_date_franchise_outlet"
+
+    existing = frappe.db.sql("""
+        SELECT 1 FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+          AND index_name = %s
+        LIMIT 1
+    """, (composite_table, composite_name))
+
+    if not existing:
+        frappe.db.sql_ddl(f"""
+            ALTER TABLE `{composite_table}`
+            ADD INDEX `{composite_name}` (`docstatus`, `posting_date`, `franchise_outlet`)
+        """)
+        frappe.db.commit()
+        print(f"  Added composite index {composite_name}")
+```
+
+Register the patch by appending its dotted path:
+
+```text title="scoopjoy/patches.txt"
+scoopjoy.patches.v1_0.add_performance_indexes
+```
+
+## Step 5: Verify Indexes Are Being Used
+
+Re-run `EXPLAIN` after the index lands. The `type` should drop from `ALL` to `range`,
+and `rows` should shrink dramatically. `SHOW INDEX` and `index_statistics` confirm the
+index exists and is actually being read.
+
+```sql
+-- After adding the composite index, re-run EXPLAIN
+EXPLAIN SELECT franchise_outlet, SUM(grand_total), COUNT(*)
+FROM `tabSales Invoice`
+WHERE docstatus = 1
+  AND posting_date BETWEEN '2025-01-01' AND '2025-03-31'
+GROUP BY franchise_outlet;
+
+-- Expected improvement:
+-- type: range (was: ALL)
+-- key: idx_docstatus_posting_date_franchise_outlet
+-- rows: 15000 (was: 500000)
+
+-- Check all indexes on a table
+SHOW INDEX FROM `tabSales Invoice`;
+
+-- Check index usage statistics
+SELECT
+    index_name,
+    rows_read,
+    rows_requested
+FROM information_schema.index_statistics
+WHERE table_schema = DATABASE()
+  AND table_name = 'tabSales Invoice';
+```
+
+## When NOT to Add Indexes
+
+An index is a write-time cost paid for a read-time gain. The decision guide below
+captures when that trade pays off — and the `frappe.get_list` `COALESCE` gotcha that
+quietly defeats an otherwise good index.
+
+```python title="scoopjoy/scoopjoy/utils/index_guidelines.py"
+# Reference document -- not executable code
+
+"""
+INDEX DECISION GUIDE for ScoopJoy
+
+ADD an index when:
+- Column appears in WHERE clause of frequent queries
+- Column appears in JOIN conditions
+- Column appears in ORDER BY with large result sets
+- Column has HIGH cardinality (many distinct values)
+  e.g., franchise_outlet (100+ values), posting_date (365+ values)
+
+DO NOT add an index when:
+- Column has LOW cardinality (few distinct values)
+  e.g., docstatus (only 0, 1, 2) -- UNLESS part of a composite index
+  e.g., is_active (only 0, 1) -- UNLESS combined with other columns
+- Table has < 1,000 rows (full scan is faster than index lookup)
+- Column is rarely used in WHERE/JOIN/ORDER BY
+- Table has very frequent INSERT/UPDATE (indexes slow writes)
+  e.g., Communication, Activity Log -- high write volume
+- Column is already the first column in an existing composite index
+
+GOTCHA with frappe.get_list and COALESCE:
+  frappe.get_list wraps nullable columns in IFNULL/COALESCE by default.
+  COALESCE(column, '') = 'value' CANNOT use an index on column.
+  Fix: pass ignore_ifnull=True in your get_list call.
+"""
+```
+
+:::note[Why this works]
+MariaDB uses B-tree indexes to narrow down rows before scanning. A composite index on
+`(docstatus, posting_date, franchise_outlet)` satisfies the WHERE clause left-to-right.
+The `bench add-database-index` command creates a Property Setter, ensuring the index
+survives migrations and restores.
+:::
+
+:::caution[Common mistake]
+Adding an index on `docstatus` alone. With only 3 possible values (0, 1, 2), it has
+terrible selectivity. But as the *first column* of a composite index, it works well
+because it immediately eliminates ~60% of rows (drafts and cancelled docs).
+:::

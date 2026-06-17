@@ -1,0 +1,370 @@
+---
+title: Webhook Sender with Retry Logic
+description: Deliver outbound webhooks reliably with exponential backoff, a dead letter queue, and HMAC signatures, triggered from a Sales Invoice submit.
+sidebar:
+  order: 2
+---
+
+import Mermaid from "~/components/Mermaid.astro";
+import { LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
+
+**Problem:** Push real-time order notifications to external systems — the franchise
+HQ dashboard, a delivery partner API — with guaranteed delivery, even when the
+remote endpoint is briefly down.
+
+**Solution:** Build a webhook sender class with exponential backoff retries, a dead
+letter queue, and HMAC signature verification — triggered by Sales Invoice
+submission via `doc_events` hooks. Every attempt is logged in a custom DocType so
+delivery is fully auditable.
+
+The flow: a Sales Invoice submit queues a delivery log and a background job. The
+worker POSTs the payload; on failure it re-enqueues with a growing delay until it
+either succeeds or exhausts its retries and lands in the dead letter queue.
+
+<Mermaid title="Webhook delivery with retry + dead letter" height={460} code={`
+flowchart TB
+  SI["Sales Invoice on_submit"] --> S["WebhookSender.send()"]
+  S --> LOG["Insert Webhook Delivery Log (Queued)"]
+  LOG --> Q["frappe.enqueue → short queue"]
+  Q --> D["deliver_webhook worker"]
+  D --> P["POST payload + HMAC signature"]
+  P -->|"2xx"| OK["status = Success"]
+  P -->|"error / non-2xx"| C{"attempts >= max_retries?"}
+  C -->|"no"| BO["Backoff 1s,2s,4s,8s,16s → re-enqueue"]
+  BO --> D
+  C -->|"yes"| DL["status = Dead Letter + log_error"]
+`} />
+
+## Step 1: Webhook Delivery Log DocType
+
+Create this DocType via the Frappe UI or ship it as fixture JSON. It records the
+target URL, the signed payload, the delivery status, and the retry bookkeeping
+(`attempts`, `max_retries`, `next_retry_at`) so a failed delivery can be resumed or
+inspected later.
+
+```json title="ice_cream_shop/ice_cream_shop/doctype/webhook_delivery_log/webhook_delivery_log.json"
+{
+    "name": "Webhook Delivery Log",
+    "module": "Ice Cream Shop",
+    "doctype": "DocType",
+    "is_submittable": 0,
+    "fields": [
+        {"fieldname": "webhook_url", "fieldtype": "Data", "label": "Webhook URL", "reqd": 1},
+        {"fieldname": "event", "fieldtype": "Data", "label": "Event", "reqd": 1},
+        {"fieldname": "payload", "fieldtype": "Code", "label": "Payload", "options": "JSON"},
+        {"fieldname": "reference_doctype", "fieldtype": "Link", "label": "Reference DocType", "options": "DocType"},
+        {"fieldname": "reference_name", "fieldtype": "Dynamic Link", "label": "Reference Name", "options": "reference_doctype"},
+        {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "Queued\nSuccess\nFailed\nDead Letter", "default": "Queued"},
+        {"fieldname": "attempts", "fieldtype": "Int", "label": "Attempts", "default": 0},
+        {"fieldname": "max_retries", "fieldtype": "Int", "label": "Max Retries", "default": 5},
+        {"fieldname": "last_response_code", "fieldtype": "Int", "label": "Last Response Code"},
+        {"fieldname": "last_response_body", "fieldtype": "Code", "label": "Last Response Body"},
+        {"fieldname": "last_error", "fieldtype": "Code", "label": "Last Error"},
+        {"fieldname": "next_retry_at", "fieldtype": "Datetime", "label": "Next Retry At"},
+        {"fieldname": "signature", "fieldtype": "Data", "label": "HMAC Signature"},
+        {"fieldname": "completed_at", "fieldtype": "Datetime", "label": "Completed At"}
+    ],
+    "permissions": [
+        {"role": "System Manager", "read": 1, "write": 1, "delete": 1}
+    ]
+}
+```
+
+## Step 2: Webhook Sender Class
+
+`send()` builds the signed payload, writes a `Queued` log row, commits it, then
+hands delivery off to a background job — it never makes the HTTP call inline.
+`deliver()` is the worker: it POSTs, and on any failure either re-enqueues with
+exponential backoff or, once `attempts` reaches `max_retries`, marks the row
+`Dead Letter` and records the error.
+
+```python title="ice_cream_shop/utils/webhook_sender.py" {54-61,93-103}
+import frappe
+import requests
+import hashlib
+import hmac
+import json
+import time
+from frappe.utils import now_datetime, add_to_date
+
+
+class WebhookSender:
+    """
+    Sends webhooks with exponential backoff retry and dead letter queue.
+
+    Usage:
+        sender = WebhookSender(
+            url="https://hq.scoopjoy.com/webhooks/orders",
+            secret="my-hmac-secret-key"
+        )
+        sender.send(
+            event="invoice.submitted",
+            payload={"invoice": "ACC-SINV-2025-00042", "total": 450.00},
+            reference_doctype="Sales Invoice",
+            reference_name="ACC-SINV-2025-00042",
+        )
+    """
+
+    MAX_RETRIES = 5
+    BASE_DELAY = 1  # seconds
+    TIMEOUT = 30  # seconds
+
+    def __init__(self, url, secret=None, max_retries=None):
+        self.url = url
+        self.secret = secret or frappe.conf.get("webhook_secret", "")
+        self.max_retries = max_retries or self.MAX_RETRIES
+
+    def _sign_payload(self, payload_bytes):
+        """Create HMAC-SHA256 signature of the payload."""
+        return hmac.new(
+            self.secret.encode("utf-8"),
+            payload_bytes,
+            hashlib.sha256
+        ).hexdigest()
+
+    def send(self, event, payload, reference_doctype=None, reference_name=None):
+        """Queue a webhook delivery as a background job."""
+        payload_json = json.dumps(payload, default=str, sort_keys=True)
+        signature = self._sign_payload(payload_json.encode("utf-8"))
+
+        # Create delivery log
+        log = frappe.get_doc({
+            "doctype": "Webhook Delivery Log",
+            "webhook_url": self.url,
+            "event": event,
+            "payload": payload_json,
+            "reference_doctype": reference_doctype,
+            "reference_name": reference_name,
+            "status": "Queued",
+            "attempts": 0,
+            "max_retries": self.max_retries,
+            "signature": signature,
+        })
+        log.insert(ignore_permissions=True)
+        frappe.db.commit()
+
+        # Enqueue background job for delivery
+        frappe.enqueue(
+            "ice_cream_shop.utils.webhook_sender.deliver_webhook",
+            queue="short",
+            log_name=log.name,
+            url=self.url,
+            secret=self.secret,
+        )
+
+        return log.name
+
+    @staticmethod
+    def deliver(log_name, url, secret):
+        """Actually deliver the webhook. Called as background job."""
+        log = frappe.get_doc("Webhook Delivery Log", log_name)
+
+        payload_bytes = log.payload.encode("utf-8")
+        signature = hmac.new(
+            secret.encode("utf-8"), payload_bytes, hashlib.sha256
+        ).hexdigest()
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-ScoopJoy-Event": log.event,
+            "X-ScoopJoy-Signature": f"sha256={signature}",
+            "X-ScoopJoy-Delivery-Id": log.name,
+            "X-ScoopJoy-Timestamp": str(int(time.time())),
+            "User-Agent": "ScoopJoy-Webhook/1.0",
+        }
+
+        log.attempts += 1
+
+        try:
+            response = requests.post(
+                url, data=payload_bytes, headers=headers, timeout=30
+            )
+
+            log.last_response_code = response.status_code
+            log.last_response_body = response.text[:2000]  # truncate
+
+            if 200 <= response.status_code < 300:
+                log.status = "Success"
+                log.completed_at = now_datetime()
+            else:
+                raise requests.exceptions.HTTPError(
+                    f"HTTP {response.status_code}: {response.text[:500]}"
+                )
+
+        except Exception as e:
+            log.last_error = str(e)[:2000]
+
+            if log.attempts >= log.max_retries:
+                log.status = "Dead Letter"
+                log.completed_at = now_datetime()
+                frappe.log_error(
+                    title=f"Webhook Dead Letter: {log.event}",
+                    message=f"URL: {url}\nAttempts: {log.attempts}\nError: {e}"
+                )
+            else:
+                # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                delay_seconds = (2 ** (log.attempts - 1))
+                log.status = "Queued"
+                log.next_retry_at = add_to_date(
+                    now_datetime(), seconds=delay_seconds
+                )
+                # Re-enqueue with delay
+                frappe.enqueue(
+                    "ice_cream_shop.utils.webhook_sender.deliver_webhook",
+                    queue="short",
+                    log_name=log.name,
+                    url=url,
+                    secret=secret,
+                    enqueue_after_commit=True,
+                    at_front=False,
+                    job_id=f"webhook_retry_{log.name}_{log.attempts}",
+                )
+
+        log.save(ignore_permissions=True)
+        frappe.db.commit()
+
+
+def deliver_webhook(log_name, url, secret):
+    """Top-level function for frappe.enqueue (must be importable by path)."""
+    WebhookSender.deliver(log_name, url, secret)
+```
+
+:::note[Why HMAC?]
+Signing the payload with HMAC-SHA256 and sending it in the `X-ScoopJoy-Signature`
+header lets the receiver recompute the digest with the shared secret and confirm
+the request genuinely came from ScoopJoy's ERP — not a forged POST.
+:::
+
+## Step 3: Hook into Sales Invoice Submit
+
+Bind the sender to the Sales Invoice lifecycle. In Express you'd add this after
+your route handler persisted the order; in Frappe you register a `doc_events`
+hook so the framework calls your function on every submit.
+
+```python title="ice_cream_shop/hooks.py"
+doc_events = {
+    "Sales Invoice": {
+        "on_submit": "ice_cream_shop.events.sales_invoice.on_submit",
+    }
+}
+```
+
+The handler fires one webhook to the HQ dashboard and, when the order needs
+delivery, a second to the delivery partner. Note it only notifies for mobile/POS
+orders, and it calls `sender.send()` (which enqueues) rather than blocking.
+
+```python title="ice_cream_shop/events/sales_invoice.py"
+import frappe
+from ice_cream_shop.utils.webhook_sender import WebhookSender
+
+
+def on_submit(doc, method):
+    """Fire webhooks when a Sales Invoice is submitted."""
+    if doc.custom_order_source != "Mobile App":
+        return  # Only notify for mobile/POS orders
+
+    # Webhook to HQ dashboard
+    hq_url = frappe.db.get_single_value("ScoopJoy Settings", "hq_webhook_url")
+    if hq_url:
+        sender = WebhookSender(url=hq_url)
+        sender.send(
+            event="order.created",
+            payload={
+                "invoice_id": doc.name,
+                "outlet": doc.custom_outlet,
+                "customer": doc.customer,
+                "grand_total": doc.grand_total,
+                "currency": doc.currency,
+                "posting_date": str(doc.posting_date),
+                "items": [
+                    {
+                        "item_code": row.item_code,
+                        "item_name": row.item_name,
+                        "qty": row.qty,
+                        "rate": row.rate,
+                        "amount": row.amount,
+                    }
+                    for row in doc.items
+                ],
+            },
+            reference_doctype="Sales Invoice",
+            reference_name=doc.name,
+        )
+
+    # Webhook to delivery partner
+    delivery_url = frappe.db.get_single_value("ScoopJoy Settings", "delivery_webhook_url")
+    if delivery_url and doc.custom_requires_delivery:
+        sender = WebhookSender(url=delivery_url)
+        sender.send(
+            event="delivery.requested",
+            payload={
+                "order_id": doc.name,
+                "pickup_outlet": doc.custom_outlet,
+                "delivery_address": doc.custom_delivery_address,
+                "total_amount": doc.grand_total,
+                "item_count": len(doc.items),
+            },
+            reference_doctype="Sales Invoice",
+            reference_name=doc.name,
+        )
+```
+
+## Step 4: Scheduled Retry for Stuck Webhooks
+
+The re-enqueue in `deliver()` handles the normal backoff path, but a worker crash
+or restart can leave a row stuck in `Queued` with its `next_retry_at` already
+past. A cron-driven sweep every five minutes picks those up.
+
+```python title="ice_cream_shop/hooks.py"
+scheduler_events = {
+    "cron": {
+        "*/5 * * * *": [
+            "ice_cream_shop.tasks.retry_failed_webhooks"
+        ],
+    }
+}
+```
+
+```python title="ice_cream_shop/tasks.py"
+import frappe
+from frappe.utils import now_datetime
+
+
+def retry_failed_webhooks():
+    """Retry queued webhooks whose next_retry_at has passed."""
+    pending = frappe.get_all(
+        "Webhook Delivery Log",
+        filters={
+            "status": "Queued",
+            "next_retry_at": ["<=", now_datetime()],
+        },
+        fields=["name", "webhook_url"],
+        limit=50,
+    )
+
+    for row in pending:
+        secret = frappe.conf.get("webhook_secret", "")
+        frappe.enqueue(
+            "ice_cream_shop.utils.webhook_sender.deliver_webhook",
+            queue="short",
+            log_name=row["name"],
+            url=row["webhook_url"],
+            secret=secret,
+        )
+```
+
+:::note[Why this works]
+Each delivery attempt is logged in a custom DocType, making it fully auditable.
+Exponential backoff (1s, 2s, 4s, 8s, 16s) prevents hammering a down endpoint. After
+5 failures the webhook moves to `Dead Letter` status, where a System Manager can
+inspect and manually retry. HMAC signatures let the receiver verify that payloads
+genuinely came from ScoopJoy's ERP.
+:::
+
+:::caution[Common mistake]
+Calling `requests.post()` synchronously inside `on_submit`. This blocks the user's
+browser until the external HTTP call completes (or times out). Always use
+`frappe.enqueue()` to push webhook delivery into a background worker.
+:::
