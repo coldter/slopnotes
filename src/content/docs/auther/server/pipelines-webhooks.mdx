@@ -17,12 +17,15 @@ metrics, and the admin UI that ties them together.
 
 ## The pipeline system
 
-Most identity providers force a choice: either accept the built-in behavior, or
-fork the server to change it. Auther's pipeline system is the escape hatch in
-between. Administrators attach custom Lua scripts to 16 auth lifecycle hooks, and
-those scripts run sandboxed at the moment an event fires — so you can geo-block a
-signup, enrich a token with custom claims, or fan out a side effect, all without
-touching the codebase. Scripts are organized as a DAG (directed acyclic graph) and
+**Pipelines let you run your own code at auth events.** Most identity providers
+force a choice: either accept the built-in behavior, or fork the server to change
+it. Auther's pipeline system is the escape hatch in between. Administrators attach
+custom Lua scripts to 16 auth lifecycle hooks, and those scripts run sandboxed at
+the moment an event fires — so you can geo-block a signup, enrich a token with
+custom claims, or fan out a side effect, all without touching the codebase.
+
+Scripts are organized as a **DAG** — a directed acyclic graph, where each node is a
+script and the edges say "this one runs after that one," with no cycles allowed — and
 executed under strict safety limits.
 
 ### Lifecycle hooks
@@ -147,6 +150,32 @@ helpers.metrics.count(name, val)  -- Emit counter metric
 helpers.metrics.gauge(name, val)  -- Emit gauge metric
 ```
 
+To make this concrete, here are two sketches that use the model end to end. The
+first is an **enrichment** hook on `token_build` that adds a custom claim to every
+JWT — the kind of thing you'd otherwise have to fork the server for:
+
+```lua
+-- token_build (Enrichment): tag every token with a plan tier
+local tier = helpers.fetch("https://billing.internal.example/tier").body
+helpers.metrics.count("token.enriched", 1)
+return { claims = { tier = tier } }
+```
+
+The second is a **blocking** hook on `before_signin` that aborts a login. Returning
+`allowed: false` is the *only* thing that stops the flow — anything else (including a
+crash or timeout) lets sign-in proceed, which is the fail-open behavior described
+below:
+
+```lua
+-- before_signin (Blocking): block sign-in when an external check says so
+local banned = helpers.fetch("https://risk.internal.example/check").body
+if helpers.matches(banned, "true") then
+  helpers.metrics.count("auth.signin.blocked", 1)
+  return { allowed = false, reason = "blocked by risk check" }
+end
+return { allowed = true }
+```
+
 ### Pipeline observability
 
 Every pipeline run produces OpenTelemetry-compatible traces (the `pipeline_traces`
@@ -157,10 +186,14 @@ script spent the time on any given execution.
 
 ## The webhook system
 
-Pipelines run logic *inside* Auther. Webhooks are the outbound counterpart: they let
-external applications receive real-time notifications about auth events, so a
-downstream system can react when a user is created, a session is deleted, or an
-OAuth client is registered.
+**Webhooks tell other apps what happened.** Pipelines run logic *inside* Auther;
+webhooks are the outbound counterpart. They let external applications receive
+real-time notifications about auth events, so a downstream system can react when a
+user is created, a session is deleted, or an OAuth client is registered.
+
+A concrete case: your billing service subscribes to `user.created`, and the moment
+someone signs up Auther fires it an HTTP POST so the service can provision an account
+— no polling, no shared database.
 
 ### Architecture
 
@@ -203,7 +236,8 @@ in seven steps:
    record.
 3. For each active endpoint subscribed to this event type, a `pending` delivery
    record is created.
-4. A `WebhookDeliveryJob` is enqueued to Upstash QStash.
+4. A `WebhookDeliveryJob` is enqueued to Upstash QStash — a hosted message queue
+   that holds the job and retries delivery on Auther's behalf.
 5. The QStash worker at `/api/internal/queues/webhook-delivery` receives the job,
    verifies the QStash signature, and calls `deliverWebhook()`.
 6. The delivery service loads the event and endpoint, decrypts the signing secret,
@@ -214,6 +248,14 @@ in seven steps:
 
 Retries are governed by the endpoint's policy: `none` performs zero retries, while
 `standard` allows three retries managed by QStash's exponential backoff.
+
+:::caution[Design your receiver to be idempotent]
+Because deliveries are retried, your endpoint may receive the *same* event more than
+once — for instance if it succeeds but the response is lost in transit. Idempotency
+means handling a duplicate exactly like the original: no double-charged invoice, no
+second welcome email. The `x-webhook-id` header carries the event ID precisely so a
+receiver can dedupe on it.
+:::
 
 ### Webhook signatures
 
@@ -231,7 +273,8 @@ x-webhook-origin: better-auth
 
 ## Metrics and observability
 
-You cannot operate what you cannot see. The metrics system
+**Metrics tell you what the running system is doing.** You cannot operate what you
+cannot see. The metrics system
 (`src/lib/services/metrics-service.ts`) records counters, gauges, and histograms to
 the project's own SQLite database (the `metrics` table), so operational telemetry
 lives alongside the data it describes rather than in a separate observability stack.

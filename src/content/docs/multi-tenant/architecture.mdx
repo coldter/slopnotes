@@ -9,10 +9,20 @@ import Mermaid from "~/components/Mermaid.astro";
 import { Steps } from "@astrojs/starlight/components";
 
 The system is **three Workers plus two static SPAs**, sharing one Postgres via
-Hyperdrive and one Better Auth instance. The boundaries between them aren't
-incidental — they *are* the security model: tenants and operators never share a
-session, never share a worker, and never share a cookie domain. Getting the topology
-right is what makes every later chapter's isolation guarantees hold.
+Hyperdrive (Cloudflare's connection pooler for Postgres) and one Better Auth instance.
+The boundaries between them aren't incidental — they *are* the security model: tenants
+and operators never share a session, never share a worker, and never share a cookie
+domain. Getting the topology right is what makes every later chapter's isolation
+guarantees hold, so it's worth a few minutes up front.
+
+:::note[Cloudflare terms used on this page]
+A few platform-specific words recur below. A *Worker* is a unit of deployed code that
+runs at the edge. A *service binding* lets one Worker call another via typed RPC
+(`env.AUTH.getSession(...)`) instead of an HTTP request — the called Worker needs no
+public URL, so the binding doubles as a private security perimeter. *Hyperdrive* is
+Cloudflare's pooler that keeps warm Postgres connections at the edge. Each is reintroduced
+where it first matters.
+:::
 
 ## Worker topology
 
@@ -50,15 +60,22 @@ gated twice: Cloudflare Access verifies the operator's JWT at the perimeter, the
 table, exposes tenant CRUD and cross-tenant queries, serves `apps/admin-ui`, and runs
 a daily inactivity-sweep cron.
 
-**`apps/app`** and **`apps/admin-ui`** are static-assets workers — no business logic.
-`apps/app` is reachable only through `apps/server`'s `STATIC_ASSETS` binding, with
+**`apps/app`** and **`apps/admin-ui`** are static-assets workers — Cloudflare's
+"Workers Static Assets", which serves a built SPA's files (HTML/JS/CSS) straight from
+the edge with no business logic of its own. `apps/app` is reachable only through
+`apps/server`'s `STATIC_ASSETS` binding, with
 `not_found_handling: "single-page-application"` so client-side routes resolve to
 `index.html`. `apps/admin-ui` is built by Vite and served by `apps/admin`'s `ASSETS`
 binding; it has no separate deployable.
 
 ## Routing rules
 
-The zone is configured once, as a runbook: a proxied fallback origin
+First, a term: a **fallback origin** is the one zone-level hostname that *every* tenant
+custom domain (`app.acme.com`, `dash.bigco.io`, …) quietly lands on once Cloudflare for
+SaaS verifies it. Instead of wiring a route per customer, you point them all at a single
+origin and let one Worker sort out which tenant each request belongs to.
+
+With that in hand, the zone is configured once, as a runbook: a proxied fallback origin
 (`fallback.example.com`) pointed at `apps/server`, a proxied wildcard
 (`*.app.example.com`) at `apps/server`, a published CNAME target
 (`customers.example.com`) that tenants point their custom domains at, the Cloudflare
@@ -77,7 +94,10 @@ The tenant worker matches its three hostnames explicitly:
 
 Custom hostnames like `app.acme.com` need **no** per-tenant route entries — they land
 on the worker through the SaaS zone's fallback origin. The admin worker, by contrast,
-binds as an exact custom domain rather than a route pattern:
+binds with `custom_domain: true` rather than a route pattern. The difference: a `route`
+pattern matches traffic on a hostname the zone already owns, while `custom_domain: true`
+tells Cloudflare to provision and manage the DNS record and certificate for that exact
+hostname — which is what lets a single Access application attach cleanly to it:
 
 ```json title="apps/admin/wrangler — routes"
 "routes": [{ "pattern": "admin.example.com", "custom_domain": true }]

@@ -14,6 +14,13 @@ tables, an append-only audit trigger, and an encrypted-secrets view — and then
 sequences them into a migration order that stays compatible with the running
 single-tenant code at every step.
 
+The guiding rule is **every change is forward-compatible**: new tables are purely
+additive, and new columns are nullable or defaulted, so old code keeps working
+without a backfill. That's what lets the phases deploy independently — a migration
+can land ahead of the worker that uses it without breaking anything. There is
+exactly **one** breaking change in the whole set — dropping the `audit_logs.actor_id`
+foreign key — and it gets its own coordinated rollout, called out below.
+
 Everything follows the project's existing conventions, so new tables look like the
 old ones: Drizzle ORM, `varchar(255)` primary keys, `text` foreign keys for
 compatibility with Better Auth-managed tables, the `createdAt()` / `updatedAt()`
@@ -46,8 +53,15 @@ the new tables.
 ## New tables
 
 Four tables carry the multi-tenant state that doesn't fit into Better Auth's own
-schema: custom hostnames, SSO providers, the tombstone registry for deleted slugs,
-and the operator roster.
+schema:
+
+- **`tenant_custom_hostnames`** — each tenant's custom domain and where it sits in the
+  Cloudflare for SaaS lifecycle.
+- **`sso_providers`** — Better Auth's SSO config per tenant, including the (encrypted)
+  client secret.
+- **`reserved_slugs`** — a tombstone registry so a deleted org's slug can't be
+  immediately reused.
+- **`global_admins`** — the operator roster the admin worker authorizes against.
 
 ### `tenant_custom_hostnames`
 
@@ -245,7 +259,8 @@ polymorphic-actor code that writes `gad_*` actor IDs — see
    `users.id`, `global_admins.id`, or be NULL).
 2. **Add an `organization_id varchar(255)` column** (nullable; enables
    tenant-scoped filtering of audit rows).
-3. **Add an append-only Postgres trigger** that makes the table immutable.
+3. **Add an append-only Postgres trigger** — a `BEFORE UPDATE OR DELETE` trigger that
+   raises an exception, so rows can be inserted but never changed or removed.
 
 </Steps>
 
@@ -287,10 +302,12 @@ ALTER TABLE invitations ALTER COLUMN inviter_id DROP NOT NULL;
 
 ## The `pgcrypto` view for encrypted secrets
 
-SSO client secrets are encrypted at rest, but Better Auth's SSO plugin reads
-provider rows directly from `node_modules` and can't be intercepted. The solution is
-to store ciphertext in the table and expose a decrypting view that Better Auth alone
-reads from:
+SSO client secrets are encrypted at rest using `pgcrypto` — Postgres's built-in
+cryptography extension, which provides symmetric encrypt/decrypt functions inside the
+database. Better Auth's SSO plugin reads provider rows directly from `node_modules`
+and can't be intercepted, so we can't decrypt in application code on its behalf. The
+solution is to store ciphertext in the table and expose a decrypting view that Better
+Auth alone reads from:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -515,10 +532,14 @@ Phase B onward. The consolidations it covers are in
 ## Migration ordering and safety
 
 The schema is forward-compatible with the existing single-tenant code, which is what
-makes a staged rollout safe:
+makes a staged rollout safe. This is the **expand-contract** pattern (also called
+*nullable-first*): you add the new shape in a way that doesn't break the old code
+("expand"), deploy code that uses it, and only later remove anything no longer needed
+("contract"). Here almost everything is expand-only:
 
 - New columns are nullable or defaulted (`enforce_sso` defaults to `false`,
-  `session_version` to `0`; `suspended_*` / `deleted_*` / `branding_*` are nullable).
+  `session_version` to `0`; `suspended_*` / `deleted_*` / `branding_*` are nullable),
+  so a row written by old code is still valid.
 - New tables are purely additive.
 - The `audit_logs.actor_id` FK drop is the **one** breaking change, and it must be
   coordinated with the deploy of the polymorphic-actor code that writes `gad_*` IDs.

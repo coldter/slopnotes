@@ -7,26 +7,35 @@ sidebar:
 
 import Mermaid from "~/components/Mermaid.astro";
 
-Identity is where multi-tenancy is easiest to get subtly wrong: one misconfigured
-cookie domain, one trusted forwarded header, or one default account-linking rule and
-a user in tenant A can act as a user in tenant B. The whole auth surface lives in a
-single worker, `apps/auth`, which runs the only Better Auth instance in the system
-and serves every tenant from it. That one-instance design is what makes the rules
-below tractable: there is exactly one place to get cookies, sessions, and JWT scoping
-right.
+Identity is where multi-tenancy is easiest to get subtly wrong. Misconfigure one
+thing and a user in tenant A can act as a user in tenant B:
 
-The instance is configured to accept an explicit allowlist of app hosts rather than a
-single base URL, so the same worker handles `acme.app.example.com`, sibling tenant
-subdomains, and tenant-owned custom domains like `app.acme.com` without
+- a cookie scoped to the wrong domain,
+- a forwarded header you trusted blindly,
+- a default account-linking rule that merges accounts across orgs.
+
+The whole auth surface lives in a single worker, `apps/auth`, which runs the **only**
+Better Auth instance in the system and serves every tenant from it. That one-instance
+design is what makes the rules below tractable: there is exactly one place to get
+cookies, sessions, and JWT scoping right.
+
+:::tip[Mental model: why one instance can serve every tenant]
+Better Auth normally pins itself to a single base URL. Here it is configured with an
+**allowlist of app hosts** instead — so the same worker answers for
+`acme.app.example.com`, sibling tenant subdomains, and tenant-owned custom domains
+like `app.acme.com`. Each request tells the instance which host it's serving; the
+allowlist just says "yes, that host is one of ours." No per-tenant deployment, no
 reconfiguration.
+:::
 
 ## Part 1 — Better Auth config
 
 The auth worker builds a fresh Better Auth instance per request through a factory,
-`createAuth(db, env, ctx, options)`. The factory receives the already-resolved tenant
-context plus any extra IdP origins a registration attempt needs. Nothing here trusts
-unsanitized forwarded headers — the tenant arrives as a typed parameter, not as a
-header the caller could spoof.
+`createAuth(db, env, ctx, options)`. It receives the already-resolved tenant context
+plus any extra IdP origins a registration attempt needs.
+
+The load-bearing detail: the tenant arrives as a **typed parameter**, not as a header
+the caller could spoof. Nothing in this config trusts an unsanitized forwarded header.
 
 ```ts title="apps/auth/src/lib/auth.ts"
 betterAuth({
@@ -72,18 +81,26 @@ betterAuth({
 
 ### Why `baseURL` is an object, not a string
 
-The object form with `allowedHosts` is what lets one instance serve every tenant.
-Better Auth derives the OIDC callback URL from the inbound request's host at runtime,
-so a per-tenant absolute callback like
-`https://acme.app.example.com/api/auth/sso/callback/{providerId}` resolves correctly
-even though there is only one auth worker behind all of them.
+The object form with `allowedHosts` is what lets one instance serve every tenant. The
+key behavior is **OIDC callback URL derivation**: the address the identity provider
+sends the user back to after login. Better Auth builds it from the inbound request's
+host at runtime rather than from a fixed config value. So a per-tenant absolute
+callback like `https://acme.app.example.com/api/auth/sso/callback/{providerId}`
+resolves correctly even though there is only one auth worker behind all of them.
 
-That runtime host resolution is also the system's sharpest edge. In Better Auth
-v1.6, the dynamic host is read from `x-forwarded-host` first, then `host`,
-then the request URL. So the proxy boundary is load-bearing: before `apps/server`
-calls `AUTH.fetch(...)`, `AUTH.getSession(...)`, or `AUTH.getToken(...)`, it must
-reconstruct the auth-bound request, pin `host` to the already-validated public host,
-and strip or overwrite `x-forwarded-host` and `x-forwarded-proto`.
+That runtime host resolution is also the system's sharpest edge. In Better Auth v1.6,
+the dynamic host is read in this order:
+
+1. `x-forwarded-host`
+2. `host`
+3. the request URL
+
+That ordering makes the proxy boundary load-bearing. Before `apps/server` calls
+`AUTH.fetch(...)`, `AUTH.getSession(...)`, or `AUTH.getToken(...)`, it must:
+
+- reconstruct the auth-bound request,
+- pin `host` to the already-validated public host, and
+- strip or overwrite `x-forwarded-host` and `x-forwarded-proto`.
 
 :::caution[Dynamic `baseURL` trusts proxy headers unless you sanitize them]
 A dynamic `baseURL` will happily believe a forwarded host header. The auth proxy must
@@ -166,8 +183,10 @@ above leans on a few precise facts:
 
 - **No `Domain` attribute** means cookies are host-only by default. The design relies
   on exactly this, which is why `crossSubDomainCookies` stays disabled.
-- **`SameSite` is not the isolation mechanism.** Sibling tenant subdomains under the
-  same registrable domain are same-site to the browser, so `SameSite=Strict` does not
+- **`SameSite` is not the isolation mechanism.** (`SameSite` is the cookie attribute
+  that controls whether a cookie rides along on cross-site requests.) Sibling tenant
+  subdomains under the same registrable domain — its **eTLD+1**, the registrable
+  domain like `acme.com` — are same-site to the browser, so `SameSite=Strict` does not
   block tenant-to-tenant CSRF on its own.
 - Auth and session cookies stay `SameSite=lax` to preserve OAuth/OIDC round-trips and
   Better Auth's state-cookie expectations. Tenant and admin mutations are protected
@@ -233,9 +252,11 @@ below.
 
 ### `ssoCallbackGuardPlugin` — runs *before* token exchange
 
-Rejecting inside `provisionUser` is too late: by the time it runs, the authorization
-code has already been spent at the IdP. To bind a callback to its tenant *before* the
-code is consumed, a custom `before` hook guards the callback path.
+Rejecting inside `provisionUser` is too late. By then the **authorization code
+exchange** has already happened — that's the OIDC step where the auth worker trades
+the one-time code from the IdP for tokens, and the code can only be spent once. To
+bind a callback to its tenant *before* the code is consumed, a custom `before` hook
+guards the callback path.
 
 ```ts title="apps/auth/src/plugins/sso-callback-guard.ts"
 export const ssoCallbackGuardPlugin = (db, tenant: TenantContext) => ({
@@ -322,11 +343,15 @@ sequenceDiagram
   A-->>U: Set-Cookie (host-only to acme.app.example.com)
 `} />
 
-When `enforceSSO` is false, the flow is the ordinary one: `/api/tenancy/current`
-returns `{ enforceSSO: false, ... }`, the UI shows the password form, the client calls
-`authClient.signIn.email({ email, password })`, the enforcement plugin's `before` hook
-is a no-op, and the standard Better Auth email/password path runs — still finishing in
-`session.create.before`, which enforces membership and sets `activeOrganizationId`.
+When `enforceSSO` is false, the flow is the ordinary one:
+
+1. `/api/tenancy/current` returns `{ enforceSSO: false, ... }`.
+2. The UI shows the password form.
+3. The client calls `authClient.signIn.email({ email, password })`.
+4. The enforcement plugin's `before` hook is a no-op.
+5. The standard Better Auth email/password path runs — still finishing in
+   `session.create.before`, which enforces membership and sets
+   `activeOrganizationId`.
 
 The enforcement plugin is defense in depth. Hiding the password form is a convenience;
 the API is the source of truth, and it refuses password sign-in regardless of what the
@@ -339,14 +364,17 @@ Org admins holding the `manage_sso_config` permission register a provider with
 `{ providerId, issuer, clientId, clientSecret, domain }`.
 
 The server handler **overrides `organizationId` from `c.var.tenant.organizationId`**
-and never trusts the body. It normalizes and validates the issuer URL, computes the
-discovery origins Better Auth will need to trust, encrypts `clientSecret` at rest (see
-[SSO client secrets](/multi-tenant/security/#sso-client-secrets)), and calls a
-dedicated auth-worker registration path.
+and never trusts the body. It then:
+
+- normalizes and validates the issuer URL,
+- computes the discovery origins Better Auth will need to trust,
+- encrypts `clientSecret` at rest (see [SSO client secrets](/multi-tenant/security/#sso-client-secrets)), and
+- calls a dedicated auth-worker registration path.
 
 This deliberately is *not* a naive proxy to `/api/auth/sso/register`. Better Auth
 performs OIDC discovery during registration and checks those discovery URLs against
-`trustedOrigins`. The docs also note that `request` is `undefined` during direct
+`trustedOrigins` — the allowlist of origins Better Auth will accept redirects from and
+make requests to. The docs also note that `request` is `undefined` during direct
 `auth.api.*` calls, so registration needs a request-scoped
 `createAuth(..., { extraTrustedOrigins })` path — or an equivalent typed RPC — that
 can inject the validated IdP origins for just that one registration attempt.

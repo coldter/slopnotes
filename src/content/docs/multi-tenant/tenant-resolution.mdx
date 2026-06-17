@@ -7,12 +7,15 @@ sidebar:
 
 import Mermaid from "~/components/Mermaid.astro";
 
-Every request to a tenant worker (`apps/server` or `apps/auth`) has to turn
-`request.host` into an `organizationId` before any business logic runs. This is the
-system's hottest path — it executes on every single API call — so it has to be both
-correct and fast. Getting it wrong leaks data across tenants; getting it slow taxes
-every endpoint. The shape of the solution is a pure classifier, a thin middleware,
-and a two-tier cache.
+Before any business logic runs, every request to a tenant worker (`apps/server` or
+`apps/auth`) has to turn `request.host` into an `organizationId`. This is **the**
+critical path — every single API call goes through it, so two things matter at once:
+
+- **Get it slow** and you've taxed every endpoint in the system.
+- **Get it wrong** and you leak one tenant's data to another.
+
+The shape of the solution is three small pieces: a pure classifier, a thin
+middleware, and a two-tier cache.
 
 ## Hostname shapes
 
@@ -105,12 +108,13 @@ export const tenantMiddleware = createMiddleware<AppEnv>(async (c, next) => {
 handler so that SSO discovery and the session hooks already see the tenant context
 by the time they run.
 
-Two things about the `apex` branch are easy to get wrong. First, it's a real,
-legitimate request: the marketing / find-your-team page on `app.example.com` hits
-`apps/server` with `tenant === null`, not an error. Second, because of that, any
-route that requires a tenant must default-deny when `c.var.tenant === null`. The
-codebase keeps an explicit allowlist of routes that are valid on apex — the login
-picker and the public marketing endpoints — and everything else rejects.
+Two things about the `apex` branch are easy to get wrong:
+
+1. **It's a legitimate request, not an error.** The marketing / find-your-team page on
+   `app.example.com` hits `apps/server` with `tenant === null`.
+2. **So any tenant-scoped route must default-deny when `c.var.tenant === null`.** The
+   codebase keeps an explicit allowlist of routes valid on apex — the login picker and
+   the public marketing endpoints — and everything else rejects.
 
 :::note[One consistent host source]
 The `host` derived from `c.req.url` (via `URL.host`) comes from the same `Host`
@@ -120,20 +124,28 @@ with another derivation, or the classifier and downstream code can disagree.
 
 ## Cache strategy
 
-A Postgres lookup on every API call would be wasteful, so the result is cached. The
-constraint that shapes the design is that this cache is security-sensitive: when a
-tenant is suspended or a slug is renamed, stale entries must clear quickly and
-everywhere. That rules out the obvious single-tier choices.
+A Postgres lookup on every API call would be wasteful, so the result is cached. But
+this cache is security-sensitive: when a tenant is suspended or a slug is renamed,
+stale entries must clear quickly and everywhere. That constraint rules out the obvious
+single-tier choices.
 
-The system uses **two tiers**: Cloudflare's Cache API for the per-colo hot path, and
-KV for cross-colo cache versioning.
+The system uses **two tiers**, each playing to a different strength of Cloudflare's
+edge:
 
-A tempting shortcut is to use KV directly as the lookup cache, but KV's cross-colo
-eventual-consistency window (around 60 seconds) is too long for security-sensitive
-operations like tenant suspension. The Cache API, by contrast, gives sub-millisecond
-reads in-colo with strong same-colo consistency on invalidation — exactly what the
-hot path wants. KV is then used only for a small, infrequently-changing version
-counter that lets the whole fleet invalidate at once.
+- **Cache API** — a per-colo cache (a *colo* is one Cloudflare data center).
+  Sub-millisecond reads in-colo, with strong same-colo consistency on invalidation.
+  This is the fast read path.
+- **KV** — Cloudflare's eventually-consistent global key-value store. It holds one
+  small, rarely-changing version counter.
+
+The mental model: **Cache API answers the lookup fast; KV is the kill switch that
+expires every colo's cache at once.** Fast read, plus one versioned lever for the rare
+broad invalidation.
+
+Why not just use KV as the lookup cache directly? Its cross-colo eventual-consistency
+window (around 60 seconds) is too long for security-sensitive operations like tenant
+suspension — you can't have a suspended tenant still resolving for a minute somewhere.
+The Cache API has no such lag in-colo, which is exactly what the hot path wants.
 
 The cache key embeds that version prefix, which the admin worker bumps on a slug
 rename or a suspension:

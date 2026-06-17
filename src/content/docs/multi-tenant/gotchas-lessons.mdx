@@ -9,12 +9,16 @@ import { LinkCard, Badge } from "@astrojs/starlight/components";
 
 <LinkCard title="← Multi-Tenant overview" href="/multi-tenant/overview/" />
 
-This page is the catalogue of traps found while designing and reviewing the
-multi-tenant build — the mistakes that would have failed at runtime, the security
-holes that would have been exploitable, and the subtle correctness issues that are
-easy to miss — followed by the broader lessons they taught and the questions left for
-a future version. Read it as a checklist when you touch the multi-tenancy surface,
-and as a "here's why we did it that way" companion to the chapters.
+This is a catalogue of traps caught while designing and reviewing the multi-tenant
+build, grouped by how they would have hurt:
+
+- **[Things that would have failed at runtime](#things-that-would-have-failed-at-runtime)** — crashes, silent drops, and 404s from platform or library behavior that contradicts a reasonable first guess.
+- **[Security holes that would have been exploitable](#security-holes-that-would-have-been-exploitable)** — attacks the naive design enabled, and the mitigation that closed each.
+- **[Subtle correctness issues](#subtle-correctness-issues)** — the quiet bugs: wrong behavior, sequential scans, build-order failures.
+
+The tables are for scanning — skim them as a checklist when you touch the multi-tenancy
+surface. Below them, **[Lessons learned](#lessons-learned)** distils the durable
+takeaways, and the **[v2 backlog](#future-work--v2-backlog)** lists what we deferred.
 
 ## Things that would have failed at runtime
 
@@ -90,88 +94,124 @@ wrong behavior, sequential scans, or build-order failures.
 
 ## Lessons learned
 
-The catalogue above produced a handful of durable lessons, grouped by the part of the
-stack they concern.
+If you skip the tables, read this section. Each lesson is one trap above, generalised
+into something you can carry to your own multi-tenant build — the kind of thing you wish
+someone had told you before you wrote the code, not after the incident.
 
 ### About multi-tenancy on Workers
 
-**Cache invalidation is the hardest part.** Queues are the wrong primitive; the design
-landed on RPC fan-out plus KV cache versioning. The asymmetry between workers — the
-admin fans out, but auth has no admin binding — makes it more nuanced than a typical
-pub/sub pattern.
+**Cache invalidation will be the hardest thing you build — design it first, not last.**
+The intuitive answer (a queue everyone subscribes to) is the wrong primitive: Cloudflare
+Queues allow only one consumer, so a fan-out design silently drops messages. What worked
+was RPC fan-out plus KV cache versioning. And the workers aren't symmetric — the admin
+fans out to everyone, but the auth worker has no binding back to admin, so it invalidates
+a different way. If a "cache invalidation" line item looks small on your plan, move it to
+the top.
 
-**Tenant context wants to be a typed RPC parameter, not a header.** HMAC headers drag
-in algorithm choice, replay protection, and downgrade attacks. Service-binding RPC
-eliminates that entire class of problem.
+**Pass tenant context as a typed RPC parameter, never as a header.** The moment tenancy
+rides in an HTTP header you've signed up for algorithm choice, replay protection, and
+downgrade attacks — a whole security surface, for free, that you didn't want. A
+service-binding RPC call with a typed argument makes that entire class of bug
+unrepresentable. Prefer the boring typed call.
 
-**Per-host cookies are necessary but not sufficient.** Sibling tenant subdomains are
-same-site, so the real boundary is host-only cookies plus explicit origin/CSRF
-enforcement on every mutation.
+**Per-host cookies are necessary but not sufficient.** It is tempting to think
+subdomains isolate tenants. They don't: `a.example.com` and `b.example.com` are
+*same-site*, so a strict-`SameSite` cookie does nothing to stop sibling-tenant
+confusion. The real boundary is host-only cookies **plus** an explicit origin/CSRF check
+on every mutation.
 
-**JWT scoping needs all five checks.** `aud` alone, `iss` alone, even both together are
-not enough. The `org` claim with `sessionVersion` is what makes revocation possible.
+**One JWT check is never enough — scope tokens on five axes.** `aud` alone, `iss` alone,
+even both together let a token minted for tenant A validate against tenant B. Per-tenant
+`aud`/`iss` narrows it; the `org` claim pins the tenant; and `sessionVersion` is the part
+people forget — without it you have no way to *revoke*, which is exactly what you need
+the day you suspend a tenant.
 
 ### About Better Auth
 
-**`disableSignUp: true` is the right default for operator-led SaaS.** Self-serve and
-operator-led onboarding do not mix gracefully.
+**For operator-led SaaS, turn self-signup off and mean it.** Self-serve and operator-led
+onboarding don't mix gracefully — leave the default `disableSignUp: false` in place and
+"anyone can sign up" quietly co-exists with your invite-only flow. Set
+`disableSignUp: true` and build the one onboarding path you actually want.
 
-**`accept-invitation` is not a user-creation endpoint.** Bootstrapping users from
-invitations requires custom orchestration.
+**`accept-invitation` assumes the user already exists — it won't create one.** It's
+designed for a signed-in user accepting an org invite, not for bootstrapping a brand-new
+account from an email link. If your invite *is* the account-creation moment, you write
+that orchestration yourself.
 
-**`provisionUser` runs after token exchange.** Tenant-binding checks must run earlier —
-before the IdP code is consumed.
+**Run tenant-binding checks before the IdP code is exchanged, not after.** `provisionUser`
+fires *after* token exchange, which is too late: a response meant for Acme, replayed at
+Globex's callback, has already minted a session. The guard has to sit in front of the
+exchange.
 
-**Account-linking defaults are dangerous.** Always set `accountLinking.enabled` and
-`allowDifferentEmails` explicitly, leave `trustedProviders: []` empty, and approve
-linking explicitly inside `provisionUser`.
+**Treat account-linking defaults as hostile until you've pinned every one.** A
+permissive default (`allowDifferentEmails: true`) lets a tenant-controlled IdP attach a
+*different* email to an existing user — a cross-tenant takeover. Set
+`accountLinking.enabled` and `allowDifferentEmails` explicitly, keep
+`trustedProviders: []` empty, and approve linking by hand inside `provisionUser`.
 
-**The hooks API is a single middleware function** in 2026, not the older
-`{ matcher, handler }` array shape.
+**Re-check the hooks API against the version you're on.** In 2026 a hook is a single
+`createAuthMiddleware(...)` function, not the older `{ matcher, handler }` array. Library
+shapes drift between majors; a tutorial from last year will compile against your types
+and then misbehave.
 
 ### About Cloudflare for SaaS
 
-**Pro/Business plans are sufficient for v1.** Enterprise features (`custom_metadata`,
-`certificate_authority`, wildcard custom certs) are not required.
+**You don't need Enterprise for v1 — but you do need to know which line items are gated.**
+Pro/Business covers the v1 build. `custom_metadata`, `certificate_authority: "google"`,
+and wildcard custom certs are Enterprise-only, and the cruel part is *how* they fail:
+`custom_metadata` is silently dropped, `certificate_authority` throws API error 1459.
+Confirm the plan tier of every feature you lean on before you depend on it.
 
-**TXT pre-verification on your side prevents quota squatting.** HTTP DCV alone would not
-let a competitor squat the cert (they never serve the challenge), but the quota damage
-is real.
+**Verify domain ownership on your side before you ask the CA for a cert.** HTTP DCV alone
+won't let a competitor steal a cert for your customer's domain — they can't serve the
+challenge — but they *can* burn your cert quota by requesting hostnames you'll never
+activate. A TXT pre-verification step on your side closes the squatting window.
 
-**Webhooks exist for SSL and hostname state changes.** v1 uses polling; v2 will add
-webhooks for faster activation notifications.
+**Point the CNAME at a proxied CNAME on your own zone.** Not a worker URL, and not the
+`...cdn.cloudflare.net` form (which is undocumented and wrong). The correct target is a
+proxied record on your zone, e.g. `customers.example.com`.
 
-**The CNAME target is a proxied CNAME on your zone**, not a worker URL or a
-`.cdn.cloudflare.net` form.
+**Webhooks exist for SSL and hostname state — know they're there before you reach for
+polling.** v1 polls every 60 seconds, which is simple and fine; just don't mistake
+polling for the only option when activation latency starts to matter.
 
 ### About Cloudflare Access
 
-**`workers_dev: false` is critical.** Access binds at the hostname level, so the default
-workers.dev URL bypasses it.
+**`workers_dev: false` is one line, and forgetting it un-protects everything.** Access
+binds protection at the *hostname* level, so the default `name.account.workers.dev` URL
+sails right past your Access policy. The auth panel you carefully gated is reachable,
+unauthenticated, on a URL you didn't think about.
 
-**MFA can't be verified in the worker** — there is no `amr` claim in the JWT. Rely on
-the Access policy plus IdP-side enforcement.
+**You can't verify MFA inside the worker — there's no `amr` claim.** Don't try to assert
+"this user did MFA" from the Access JWT; rely on the Access policy and IdP-side
+enforcement instead.
 
-**Service tokens have a different JWT shape** (`type: "app"`, `common_name` set, no
-`email`). Reject them on human-only panels.
+**Reject service tokens on human-only panels.** A service-token JWT has a different shape
+(`type: "app"`, `common_name` set, no `email`); if your admin panel assumes a human, an
+automated token can walk in. Check the shape and refuse it.
 
-**`payload.sub` may not be stable.** Email-fallback is the obvious workaround, but it is
-also the takeover vector; use enrollment tokens for first-login binding instead.
+**`payload.sub` isn't guaranteed stable — and the obvious workaround is a takeover hole.**
+Falling back to email for first-login identity is the natural fix and also the exact
+vector an attacker uses to race-register an operator's email at an IdP. Bind first login
+with an enrollment token instead.
 
 ### About architecture and module boundaries
 
-**Defer architectural deepening at your peril.** `@repo/tenancy` has to land in Phase A,
-not after it — it is already a first-order runtime boundary. The other deep modules can
-wait until Phase C.
+**Land your core runtime boundary early; deferring it is technical debt that compounds.**
+`@repo/tenancy` isn't a "nice refactor for later" — it's a first-order runtime boundary
+every worker depends on, so it has to ship in Phase A. The genuinely deep modules that
+*can* wait should wait (Phase C); the trick is telling the two apart.
 
-**Each new package needs an `AGENTS.md`.** It is a project convention that is easy to
-forget when adding packages.
+**Decide your dependency direction once and enforce it.** `@repo/tenancy` imports schemas
+from `@repo/db`, which makes the reverse import dangerously easy to add by reflex — and
+that creates a cycle. Pick the arrow (`db` never imports `tenancy`) and hold the line.
 
-**Cyclic dependencies between `@repo/tenancy` and `@repo/db` are easy to introduce.**
-Tenancy imports schemas, so `@repo/db` must never import from tenancy.
+**Test deep modules at the boundary, not at every internal helper.** The whole point of a
+deep module is a small interface over a lot of behavior; test that interface and resist
+the urge to pin down every private function — those tests just make refactoring painful.
 
-**Test at the boundary, not inside.** The point of deep modules is testability at the
-small interface; resist the urge to unit-test every internal helper.
+**Honor the project conventions that are easy to forget.** Each new package needs an
+`AGENTS.md`. Small, mechanical, skipped exactly when you're moving fast.
 
 ## Future work / v2 backlog
 

@@ -7,13 +7,17 @@ sidebar:
 
 import { Badge, Steps } from "@astrojs/starlight/components";
 
-Multi-tenancy is mostly a security problem wearing an architecture costume. Every
-decision in the earlier chapters — host-only cookies, per-tenant JWT claims, the
-separate admin worker — exists to keep one tenant's users, sessions, and secrets out
-of another tenant's reach, and to keep operators out of tenant data unless they leave
-an audit trail. This chapter lays out the threat model explicitly: who the attackers
-are, what isolation invariants must always hold, and a concrete mitigation for each
-named attack.
+Multi-tenancy is mostly a security problem wearing an architecture costume. There are
+**two identity domains** — tenant users and operators — and nearly every threat on this
+page reduces to one of two questions: *how could tenant A touch tenant B's data, or how
+could an ordinary user become an operator?* Every decision in the earlier chapters —
+host-only cookies, per-tenant JWT claims, the separate admin worker — exists to make
+both answers "they can't."
+
+This chapter lays out the threat model explicitly: who the attackers are, what
+isolation invariants must always hold, and a concrete mitigation for each named attack.
+Each section states the attack first — how the attacker actually tries it — then the
+defense.
 
 Throughout, each threat carries a status: <Badge text="closed" variant="success" />
 means the design fully addresses it, <Badge text="mitigated" variant="note" /> means
@@ -64,9 +68,12 @@ none of them have been weakened.
 
 ## Cookie isolation
 
-Isolation between tenant subdomains starts at the cookie. The whole model is *per-host
-cookies plus explicit CSRF/origin enforcement*, and it's worth understanding why the
-obvious shortcut — leaning on `SameSite` — doesn't carry the weight.
+**The attack:** a user logged into `acme.app.example.com` visits a malicious tenant at
+`evil.app.example.com`; a script there fires a request that rides Acme's session cookie
+into Acme's API. Isolation between tenant subdomains therefore starts at the cookie. The
+whole model is *per-host cookies plus explicit CSRF/origin enforcement*, and it's worth
+understanding why the obvious shortcut — leaning on `SameSite` — doesn't carry the
+weight.
 
 - The session cookie carries no `Domain` attribute, so the browser scopes it to the
   exact host that set it.
@@ -90,9 +97,11 @@ auth endpoints; the new tenancy and admin routes must do the same.
 
 ## JWT scoping
 
-Cross-tenant token forgery is the central attack in a shared-database SaaS, so every
-JWT is scoped to exactly one host and one org, and every consumer verifies all five
-scoping properties.
+**The attack:** an attacker takes a valid JWT minted for their own tenant and replays
+it against another tenant's host, hoping a consumer will honor it and serve back someone
+else's data. This cross-tenant token forgery is the central attack in a shared-database
+SaaS, so every JWT is scoped to exactly one host and one org, and every consumer
+verifies all five scoping properties.
 
 On the mint side, Better Auth's `jwt` plugin issues per-tenant claims:
 
@@ -129,9 +138,11 @@ assumes they might. The `org` claim ties the JWT to a specific organization, and
 
 ## SSO callback validation before token exchange
 
-When a tenant self-registers its own OIDC provider, the callback URL becomes an
-attack surface. The `ssoCallbackGuardPlugin` runs on `/sign-in/sso/callback/*`
-*before* Better Auth exchanges the authorization code:
+**The attack:** a tenant self-registers its own OIDC provider, then replays its IdP's
+callback response against *another* tenant's callback URL — a confused-deputy trick that
+tries to get Better Auth to mint a session for the wrong tenant. The
+`ssoCallbackGuardPlugin` runs on `/sign-in/sso/callback/*` *before* Better Auth
+exchanges the authorization code:
 
 ```ts
 hooks: {
@@ -284,6 +295,10 @@ As defense in depth, the logger middleware redacts any field named `secret`,
 
 <Badge text="mitigated" variant="note" />
 
+**The attack:** if the worker leaks `CLOUDFLARE_API_TOKEN` (log spill, compromised
+build), an attacker holding it can do whatever it's authorized for — so the question is
+how much damage an account-wide token would allow versus a tightly scoped one.
+
 `CLOUDFLARE_API_TOKEN` is scoped to the SaaS zone only, with three permissions —
 `Zone:Read`, `SSL and Certificates:Edit`, and `Custom Hostnames:Edit` — never
 account-wide. It's stored as a Cloudflare Secret with quarterly rotation in the
@@ -405,6 +420,11 @@ Cross-tenant reads are allowed but tightly controlled:
 
 <Badge text="closed" variant="success" />
 
+**The attack:** the new tenancy and admin mutation routes are *not* Better Auth's own
+endpoints, so they don't automatically inherit its CSRF protection. An attacker who can
+get a logged-in admin to load a hostile page could fire a state-changing request that
+rides the admin's session.
+
 All Better Auth endpoints have built-in CSRF protection (an origin check plus a custom
 header). New admin and tenancy mutation endpoints add the same `Origin` header check —
 the value must equal the configured public hostname. Host-only cookies plus explicit
@@ -415,6 +435,10 @@ hardening only.
 
 <Badge text="mitigated" variant="note" />
 
+**The attack:** an attacker crafts a sign-in link with `callbackURL=https://evil.com`,
+so a successful login bounces the victim to an attacker-controlled site — useful for
+phishing or token theft.
+
 `signIn.sso({ callbackURL })` and similar calls rely on Better Auth's existing
 `trustedOrigins` check, which restricts `callbackURL` to the dynamic per-host set.
 Combined with the host validation in `trustedOrigins` described above, an attacker
@@ -424,8 +448,9 @@ cannot redirect to `https://evil.com`.
 
 <Badge text="accepted" variant="caution" />
 
-This endpoint is publicly accessible — no auth required, because the login page needs
-it. It returns:
+**The attack:** because this endpoint is unauthenticated (the login page needs it), an
+attacker can hammer it across hosts to enumerate which tenants exist and what SSO they
+have configured. It returns:
 
 ```ts
 { organizationId, slug, enforceSSO, providers: [{ providerId, label }], branding }
@@ -492,6 +517,10 @@ Development conveniences are double-gated so they can never leak into production
 
 <Badge text="closed" variant="success" />
 
+**The attack:** an operator (or a DB-credentialed engineer) tampers with `audit_logs`
+to erase evidence of an action they shouldn't have taken — so the control can't live in
+application code alone, since the attacker may have a SQL prompt.
+
 A Postgres trigger blocks UPDATE/DELETE on `audit_logs`, and application code never
 issues UPDATE/DELETE against the table — the trigger is the invariant, not a
 convention. The DB role the workers use holds only `INSERT, SELECT` on `audit_logs`; the
@@ -500,6 +529,10 @@ migration role separately holds the DDL permissions needed to install the trigge
 ## Reserved-slug enforcement at the DB level
 
 <Badge text="closed" variant="success" />
+
+**The attack:** two requests race to claim the same slug at the same instant, both pass
+the application's "is it free?" check, and both try to insert — a TOCTOU window the
+app-level check alone can't close.
 
 A UNIQUE constraint on `organization.slug` and a UNIQUE constraint on
 `reserved_slugs.slug` make slug collisions impossible at the database level. The

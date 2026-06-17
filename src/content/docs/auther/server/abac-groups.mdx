@@ -7,15 +7,19 @@ sidebar:
 
 import { Steps } from "@astrojs/starlight/components";
 
-Relationship tuples decide *who is related to what*, but some access decisions only make sense at the moment of the request: the amount on an invoice, the time of day, whether the actor owns the resource. This chapter covers the layers Auther stacks on top of [ReBAC](/auther/server/rebac/) to capture that context — runtime Lua policies, the ergonomic server-side guard layer, group hierarchies, the sign-up and invite machinery that seeds permissions, the escalation flow for requesting access, and the reusable templates that bundle it all up.
+Relationship tuples decide *who is related to what*, but some access decisions only make sense at the moment of the request: the amount on an invoice, the time of day, whether the actor owns the resource. This chapter covers the layers Auther stacks on top of [ReBAC](/auther/server/rebac/) to capture that context.
+
+The six subsystems below are really one pipeline seen from different angles: **ABAC** adds runtime conditions to a relationship check, the **guard layer** is the ergonomic way application code calls that check, **groups** let one tuple cover many users, **registration contexts** and **invites** seed the initial tuples a new user starts with, **escalation** is how users earn tuples they weren't given, and **templates** bundle common tuple sets so you grant them in one step. The common thread throughout is the access tuple — everything here either creates one, scopes one, or evaluates one.
 
 ## ABAC: attribute-based access control
 
-Pure relationship checks answer yes/no from stored tuples, but they cannot express rules like "admins can only refund invoices under $1,000" or "users can only edit resources they own." Those depend on attributes that are only known at request time. ABAC fills that gap by running a small Lua script against a context object whenever a relationship match needs a second opinion.
+ReBAC answers "is Alice an editor of this invoice?" — a yes/no read of stored relationships. But it cannot express rules like "admins can only refund invoices under $1,000" or "users can only edit resources they own," because those depend on attributes (the invoice amount, who owns it) that are only known at request time. That is the difference between the two models: **ReBAC** decides from *relationships*, **ABAC** decides from *attributes*.
+
+Auther uses ABAC to refine ReBAC rather than replace it. A relationship match still has to exist first; ABAC then runs a small **Lua policy** — a short script written by an operator, not the resource itself — to give that match a second opinion using the live request context.
 
 There are two levels at which a policy can attach, and they compose predictably:
 
-1. **Permission-level policy** lives in the authorization model's permission definition and applies to *every* check for that permission. It is the broad rule.
+1. **Permission-level policy** lives in the authorization model's permission definition and applies to *every* check for that permission. It is the broad rule. Here the `refund` permission requires the `admin` relation *and* a sub-$1,000 amount:
 
    ```json
    {
@@ -27,7 +31,7 @@ There are two levels at which a policy can attach, and they compose predictably:
    }
    ```
 
-2. **Tuple-level condition** is a Lua script attached to one specific access tuple, so it only fires when that exact tuple is the match. A tuple-level condition takes priority over the permission-level policy, letting you carve out a narrower rule for a single grant.
+2. **Tuple-level condition** is a Lua script attached to one specific access tuple, so it only fires when that exact tuple is the match. A tuple-level condition takes priority over the permission-level policy, letting you carve out a narrower rule for a single grant. Here Bob's specific editor grant carries its own condition:
 
    ```sql
    -- Bob can edit invoices, but only while they are in draft status
@@ -81,6 +85,21 @@ if context.user.department == "finance" then return true end
 return context.resource.amount < 500
 ```
 
+To make the flow concrete, trace the refund policy on one request. Alice (an `admin`) tries to refund a $500 invoice. ReBAC confirms she has the `admin` relation, then ABAC builds the context and runs the permission-level Lua:
+
+```lua
+-- context handed to the policy
+context.resource.amount  -- 500
+context.user.role        -- "admin"
+context.action           -- "refund"
+
+-- the policy
+if context.resource.amount < 1000 then return true else return false end
+-- 500 < 1000  ->  returns true  ->  ALLOW
+```
+
+Swap the invoice for a $5,000 one and the same script returns `false` — denied, with both the decision and the context snapshot landing in the audit log described below.
+
 ### Keeping user-authored Lua safe
 
 Because these scripts are written by operators rather than baked into the server, the engine has to treat them as untrusted code on the hot path. The policy engine (`src/lib/auth/policy-engine.ts`) and the pooled runtime (`lua-engine-pool.ts`) enforce hard limits so a slow or oversized script cannot stall a check or exhaust memory:
@@ -127,7 +146,7 @@ Both forms share the same set of guard namespaces: `platform`, `users`, `webhook
 
 ## Groups and hierarchies
 
-Granting permissions one user at a time does not scale, so Auther lets you organize users into groups (the `user_group` table) with memberships recorded in `group_membership`. The important design choice is that **groups are first-class subjects in ReBAC** — a tuple can name a group exactly where it would name a user:
+Granting permissions one user at a time does not scale, so Auther lets you organize users into groups (the `user_group` table) with memberships recorded in `group_membership`. The important design choice is that **groups are first-class subjects in ReBAC** — meaning a tuple can name a group in the exact slot where it would otherwise name a user, with no special-casing. So you grant the group once and add members freely:
 
 ```text
 -- The Engineering group can use client_123
@@ -157,7 +176,7 @@ The payoff is inheritance: if Engineering is a subgroup of Product, and Product 
 
 Most new users should not arrive with zero permissions and wait for an admin. Registration contexts solve the bootstrapping problem by attaching automatic grants to a sign-up flow.
 
-A registration context (the `registration_contexts` table) describes who is signing up and what they should get:
+A registration context (the `registration_contexts` table) describes who is signing up and what they should get. This one auto-grants the `commenter` relation to anyone who signs up through the blog client:
 
 ```json
 {
@@ -223,7 +242,7 @@ When a user submits a request, the service runs a series of gates before decidin
 
 From there an admin either **approves** the request — which creates the granting tuple — or **rejects** it with an optional note.
 
-The per-relation behavior of all of this is configured by the `permission_rules` table:
+The per-relation behavior of all of this is configured by the `permission_rules` table. This rule makes `viewer` self-requestable and auto-approves anyone with an `@example.com` email, while everyone else falls through to admin review:
 
 ```json
 {
