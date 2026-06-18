@@ -1,0 +1,466 @@
+---
+title: "Task API in Litestar"
+description: Rebuild the Module 07 Task CRUD API in Litestar — Controller class, Provide-injected repository, layered DI, a DTO, and lifespan — then diff it against FastAPI.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Litestar — the Same API, Compared" href="/modern-python/08-litestar/" />
+
+## Goal
+
+Build the **exact same** Task CRUD API you built in
+[Module 07 (FastAPI)](/modern-python/07-fastapi/task-api/) — same `Task` shape
+(`id`, `title`, `description`, `done`, `created_at`), same endpoints, same in-memory
+repository behind an interface — but in **Litestar**. The whole point is the diff:
+read this side by side with the FastAPI version and see exactly where a
+`Controller` class, `Provide` injection, layered dependencies, and a DTO change the
+shape of the code (and where they don't).
+
+## What you'll practice
+
+- A `Controller` class that owns `/tasks` and groups every handler as a method
+- `Provide`-injected repository declared **once** on the controller (no `Depends`
+  repetition)
+- **Layered DI**: a clock provided at the app layer, the repo at the controller layer
+- A **DTO** (`return_dto`) to shape the response without hand-writing a second model
+- A `lifespan` context manager to seed and tear down state
+- Typed exceptions (`NotFoundException`) instead of status-code literals
+- Running with both `uv run litestar run` and `uv run uvicorn`
+
+## Requirements
+
+Same contract as Module 07:
+
+| Method | Path | Description | Success |
+|--------|------|-------------|---------|
+| GET | `/tasks` | List all tasks | 200 |
+| GET | `/tasks/{task_id}` | Get one task | 200 / 404 |
+| POST | `/tasks` | Create a task | 201 |
+| PATCH | `/tasks/{task_id}` | Partial update | 200 / 404 |
+| DELETE | `/tasks/{task_id}` | Delete a task | 204 / 404 |
+
+The `Task` model: `id: str` (uuid), `title: str`, `description: str = ""`,
+`done: bool = False`, `created_at: datetime`.
+
+## The worked solution
+
+A small, single-package project. We keep Pydantic for the models (so the diff against
+Module 07 is purely framework-level, not a model rewrite) and let Litestar's DTO layer
+shape the response.
+
+<FileTree>
+- task-api-litestar/
+  - pyproject.toml uv project + deps
+  - src/
+    - app/
+      - \_\_init\_\_.py
+      - models.py Task + Create/Update DTOs (Pydantic)
+      - repository.py in-memory repo behind a Protocol
+      - controllers.py TaskController — the REST surface
+      - app.py Litestar app: DI layers, lifespan, wiring
+  - tests/
+    - test_tasks.py async tests via Litestar's TestClient
+</FileTree>
+
+### pyproject.toml
+
+```toml title="pyproject.toml"
+[project]
+name = "task-api-litestar"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "litestar>=2.13",
+    "uvicorn>=0.34",
+    "pydantic>=2.10",
+]
+
+[dependency-groups]
+dev = ["ruff", "ty", "pytest"]
+
+[tool.uv]
+package = true
+```
+
+Set it up with `uv`:
+
+```bash
+uv init task-api-litestar
+cd task-api-litestar
+uv add litestar uvicorn pydantic
+uv add --dev ruff ty pytest
+```
+
+### models.py — the domain and request models
+
+Same `Task` as the FastAPI exercise. We keep three Pydantic models: the domain `Task`,
+a `CreateTask` body, and an `UpdateTask` body with all-optional fields for `PATCH`.
+Litestar parses the request body into whichever of these you annotate the `data`
+parameter with.
+
+```python title="src/app/models.py"
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from pydantic import BaseModel, Field
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Task(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    title: str
+    description: str = ""
+    done: bool = False
+    created_at: datetime = Field(default_factory=_now)
+
+
+class CreateTask(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str = ""
+
+
+class UpdateTask(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    done: bool | None = None
+```
+
+:::note[Pydantic, not msgspec — on purpose]
+We use Pydantic here so this file is **identical** to the FastAPI version and the diff
+stays purely framework-level. To see Litestar's native fast path, swap `BaseModel` for
+`msgspec.Struct` (drop the `Field` validators or move them to `msgspec.Meta`) — see the
+stretch goals. Litestar treats both as first-class.
+:::
+
+### repository.py — data access behind a Protocol
+
+The repository is **framework-independent** — exactly the same interface you'd use
+under FastAPI. We type the contract as a `Protocol` (Module 02 style) so the controller
+depends on the abstraction, not the in-memory implementation.
+
+```python title="src/app/repository.py"
+from typing import Protocol
+
+from app.models import Task
+
+
+class TaskRepository(Protocol):
+    async def list(self) -> list[Task]: ...
+    async def get(self, task_id: str) -> Task | None: ...
+    async def add(self, task: Task) -> Task: ...
+    async def delete(self, task_id: str) -> bool: ...
+
+
+class InMemoryTaskRepository:
+    def __init__(self) -> None:
+        self._tasks: dict[str, Task] = {}
+
+    async def list(self) -> list[Task]:
+        return sorted(self._tasks.values(), key=lambda t: t.created_at, reverse=True)
+
+    async def get(self, task_id: str) -> Task | None:
+        return self._tasks.get(task_id)
+
+    async def add(self, task: Task) -> Task:
+        self._tasks[task.id] = task
+        return task
+
+    async def delete(self, task_id: str) -> bool:
+        return self._tasks.pop(task_id, None) is not None
+```
+
+### controllers.py — the REST surface
+
+Here's the headline difference from FastAPI. Everything lives on a `TaskController`
+class with `path = "/tasks"`. The repository is declared **once** in
+`dependencies = {"repo": ...}` and every handler receives `repo` by name — no
+`Depends()` on any signature. Not-found cases just `raise NotFoundException`.
+
+The `return_dto` on the list/get handlers is the DTO layer: a `PydanticDTO` that
+shapes the outgoing JSON without us hand-writing a separate `TaskResponse` model.
+
+```python title="src/app/controllers.py" {1-3,15-16,18,30,38,49}
+from litestar import Controller, delete, get, patch, post
+from litestar.dto import DTOConfig
+from litestar.exceptions import NotFoundException
+from litestar.plugins.pydantic import PydanticDTO
+from litestar.status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
+
+from app.models import CreateTask, Task, UpdateTask
+from app.repository import TaskRepository
+
+
+# A read DTO: same fields, but excludes nothing here — shown as the seam where
+# you'd hide internal fields, rename, or expose a subset without a second model.
+class TaskReadDTO(PydanticDTO[Task]):
+    config = DTOConfig(rename_strategy="camel")
+
+
+class TaskController(Controller):
+    path = "/tasks"
+    return_dto = TaskReadDTO                       # applies to every handler's response
+    # Inject the repo ONCE for the whole controller — every method gets `repo` by name.
+    # (The Provide() wrapper is added at the app layer in app.py.)
+
+    @get()
+    async def list_tasks(self, repo: TaskRepository) -> list[Task]:
+        return await repo.list()
+
+    @get("/{task_id:str}")
+    async def get_task(self, task_id: str, repo: TaskRepository) -> Task:
+        task = await repo.get(task_id)
+        if task is None:
+            raise NotFoundException(detail=f"Task {task_id} not found")
+        return task
+
+    @post(status_code=HTTP_201_CREATED)
+    async def create_task(self, data: CreateTask, repo: TaskRepository) -> Task:
+        # `data` is the parsed, validated body — Litestar's body-parameter convention.
+        task = Task(title=data.title, description=data.description)
+        return await repo.add(task)
+
+    @patch("/{task_id:str}")
+    async def update_task(
+        self, task_id: str, data: UpdateTask, repo: TaskRepository
+    ) -> Task:
+        task = await repo.get(task_id)
+        if task is None:
+            raise NotFoundException(detail=f"Task {task_id} not found")
+        updated = task.model_copy(
+            update=data.model_dump(exclude_unset=True)   # only fields the client sent
+        )
+        return await repo.add(updated)
+
+    @delete("/{task_id:str}", status_code=HTTP_204_NO_CONTENT)
+    async def delete_task(self, task_id: str, repo: TaskRepository) -> None:
+        if not await repo.delete(task_id):
+            raise NotFoundException(detail=f"Task {task_id} not found")
+```
+
+A few things worth pointing out against the FastAPI version:
+
+- **`repo` has no `Depends`.** It's injected because `app.py` registers a provider
+  under the key `"repo"` at a layer above this controller. Every handler just lists the
+  name. In FastAPI each of these five handlers would carry
+  `repo: TaskRepository = Depends(get_repo)`.
+- **Path params are typed inline** — `{task_id:str}` — and Litestar validates them
+  before the handler runs.
+- **The body is always `data`.** No `response_model=`; the **return annotation**
+  (`-> Task`, `-> list[Task]`) drives serialization and the OpenAPI schema.
+- **No status-code literals for errors** — `raise NotFoundException(...)` becomes a 404
+  with a structured body, handled centrally.
+- **`exclude_unset=True`** is the partial-update trick: only the fields the client
+  actually sent get applied, so `PATCH {"done": true}` leaves `title` untouched.
+
+### app.py — DI layers, lifespan, and wiring
+
+This file is the Litestar equivalent of FastAPI's `main.py`: it builds the `Litestar`
+app, registers the controller, wires the dependency providers across **layers**, and
+sets up `lifespan`. The repo singleton is created in `lifespan` and provided to the
+controller; a `clock` dependency is provided at the **app layer** to show a second
+layer in action.
+
+```python title="src/app/app.py" {6-8,11-13,17,28-31,34-40}
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from litestar import Litestar
+from litestar.di import Provide
+
+from app.controllers import TaskController
+from app.repository import InMemoryTaskRepository, TaskRepository
+
+
+# --- providers -------------------------------------------------------------
+def provide_clock() -> datetime:
+    """App-layer dependency: available to every route, injected as `clock`."""
+    return datetime.now(timezone.utc)
+
+
+def provide_repo(state_repo: TaskRepository) -> TaskRepository:
+    """Controller-layer dependency: hands the singleton repo to each handler."""
+    return state_repo
+
+
+# --- lifespan: create the repo once, expose it on app.state -----------------
+@asynccontextmanager
+async def lifespan(app: Litestar) -> AsyncGenerator[None, None]:
+    app.state.repo = InMemoryTaskRepository()        # startup
+    yield
+    app.state.repo = None                            # shutdown / cleanup
+
+
+# Pull the singleton off app.state for the controller provider above.
+async def state_repo(state: "State") -> TaskRepository:  # type: ignore[name-defined]
+    return state.repo
+
+
+# --- attach the controller-layer dependency --------------------------------
+TaskController.dependencies = {"repo": Provide(state_repo)}
+
+app = Litestar(
+    route_handlers=[TaskController],
+    lifespan=[lifespan],
+    dependencies={"clock": Provide(provide_clock)},   # app layer — every route
+)
+```
+
+:::note[How the layers stack here]
+`clock` is declared at the **app layer**, so any handler in the whole app could ask
+for it. `repo` is declared at the **controller layer** (`TaskController.dependencies`),
+so only task handlers get it. That's the two-layer story; a `Router` between them would
+be the third, and a per-`@get(dependencies=...)` override the fourth. In FastAPI, all
+of this is per-parameter `Depends` on each handler.
+:::
+
+:::caution[Where the FastAPI↔Litestar diff really lives]
+Look at the four files: `models.py` is **identical** to FastAPI (same Pydantic),
+`repository.py` is **identical** (framework-free). All the real difference is in
+`controllers.py` (class + injected `repo` + typed exceptions) and `app.py` (layered
+`Provide` + `lifespan` shape). That's the lesson — the framework boundary is thin and
+deliberate, and your domain code doesn't move.
+:::
+
+### test_tasks.py — Litestar's TestClient
+
+Litestar ships a `TestClient` (sync) and `AsyncTestClient`, built on the same in-process
+ASGI testing approach FastAPI uses via Starlette. No server, no port — point it at the
+real `app`.
+
+```python title="tests/test_tasks.py"
+from litestar.testing import TestClient
+
+from app.app import app
+
+
+def test_create_and_get() -> None:
+    with TestClient(app=app) as client:
+        resp = client.post("/tasks", json={"title": "Learn Litestar"})
+        assert resp.status_code == 201
+        task = resp.json()
+        assert task["title"] == "Learn Litestar"
+        assert task["done"] is False
+
+        got = client.get(f"/tasks/{task['id']}")
+        assert got.status_code == 200
+        assert got.json()["id"] == task["id"]
+
+
+def test_get_missing_returns_404() -> None:
+    with TestClient(app=app) as client:
+        resp = client.get("/tasks/does-not-exist")
+        assert resp.status_code == 404
+
+
+def test_patch_only_updates_sent_fields() -> None:
+    with TestClient(app=app) as client:
+        created = client.post("/tasks", json={"title": "Original"}).json()
+        patched = client.patch(f"/tasks/{created['id']}", json={"done": True})
+        assert patched.status_code == 200
+        body = patched.json()
+        assert body["done"] is True
+        assert body["title"] == "Original"   # untouched — exclude_unset at work
+
+
+def test_delete_then_404() -> None:
+    with TestClient(app=app) as client:
+        created = client.post("/tasks", json={"title": "Temp"}).json()
+        assert client.delete(f"/tasks/{created['id']}").status_code == 204
+        assert client.get(f"/tasks/{created['id']}").status_code == 404
+```
+
+Using the app inside a `with TestClient(app=app)` block runs `lifespan`, so each test
+gets a freshly-seeded repository — same isolation story as the FastAPI exercise.
+
+## Run it
+
+In-memory storage, so there's **no database to start** — no `docker compose` needed
+(the Postgres version comes in [Module 09](/modern-python/09-database-postgresql/)).
+
+<Steps>
+
+1. Run the dev server (the Litestar CLI auto-discovers `app`):
+
+   ```bash
+   uv run litestar --app app.app:app run --reload
+   ```
+
+   Or with uvicorn directly — identical to how you'd run FastAPI:
+
+   ```bash
+   uv run uvicorn app.app:app --reload
+   ```
+
+2. Create a task:
+
+   ```bash
+   curl -X POST http://localhost:8000/tasks \
+     -H "Content-Type: application/json" \
+     -d '{"title": "Learn Litestar", "description": "Rebuild module 07"}'
+   ```
+
+3. List, fetch, patch, delete (substitute the id from step 2):
+
+   ```bash
+   curl http://localhost:8000/tasks
+   curl http://localhost:8000/tasks/<id>
+   curl -X PATCH http://localhost:8000/tasks/<id> \
+     -H "Content-Type: application/json" -d '{"done": true}'
+   curl -X DELETE http://localhost:8000/tasks/<id> -i
+   ```
+
+4. Open the interactive docs and inspect the route table:
+
+   ```bash
+   # Swagger/ReDoc/Scalar all live under /schema
+   open http://localhost:8000/schema
+   uv run litestar --app app.app:app routes
+   ```
+
+5. Run the tests, lint, and type-check:
+
+   ```bash
+   uv run pytest
+   uv run ruff check .
+   uv run ty check
+   ```
+
+</Steps>
+
+## What changed vs FastAPI
+
+A one-screen recap of the diff against the Module 07 solution:
+
+| | FastAPI (Module 07) | Litestar (this exercise) |
+|--|---------------------|--------------------------|
+| Handlers | free functions on an `APIRouter` | methods on `TaskController` |
+| Repo injection | `repo = Depends(get_repo)` on **every** handler | `dependencies={"repo": Provide(...)}` once |
+| DI layers | per-parameter only | app (`clock`) + controller (`repo`) |
+| Body param | the model-typed parameter | the parameter named `data` |
+| Response shaping | a second `TaskResponse` Pydantic model | `return_dto = TaskReadDTO` |
+| Errors | `raise HTTPException(404, ...)` | `raise NotFoundException(...)` |
+| Lifespan | `lifespan=lifespan` (single CM) | `lifespan=[lifespan]` (list) |
+| Docs | `/docs`, `/redoc` | `/schema` (multi-renderer) |
+| Run | `uvicorn`/`fastapi dev` | `litestar run` or `uvicorn` |
+| `models.py`, `repository.py` | — | **unchanged** |
+
+:::tip[Stretch goals]
+- **Go native-fast**: rewrite `models.py` with `msgspec.Struct` instead of Pydantic
+  and drop `PydanticDTO` for `MsgspecDTO`. Note what you lose (validators) and gain
+  (speed).
+- **Add a Router layer**: wrap the controller in `Router(path="/api/v1", ...)` so the
+  routes become `/api/v1/tasks/...`, giving you the third DI layer.
+- **A guard**: add a `requires_auth` guard to `POST`/`PATCH`/`DELETE` (Bearer header
+  present) and leave the reads public.
+- **Real DTO work**: add an internal `owner_id` field to `Task` and use `DTOConfig(exclude={"owner_id"})`
+  so it never leaks to clients — the DTO use case you can't get cleanly with a single Pydantic model.
+- **Swap storage**: implement a SQLAlchemy-backed `TaskRepository` (the `Protocol` makes
+  this a drop-in) ahead of [Module 09](/modern-python/09-database-postgresql/).
+:::

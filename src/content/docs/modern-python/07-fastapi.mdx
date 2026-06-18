@@ -1,0 +1,920 @@
+---
+title: FastAPI REST APIs
+description: Build async REST APIs with FastAPI — Pydantic-validated requests, Depends() dependency injection, lifespan, and automatic OpenAPI docs, mapped from Express/Nest and Gin.
+sidebar:
+  order: 7
+---
+
+import { Tabs, TabItem, Steps, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+You've spent four modules building the parts: type hints ([02](/modern-python/02-typing/)),
+Pydantic models ([04](/modern-python/04-pydantic/)), and `asyncio` ([05](/modern-python/05-async-concurrency/)).
+**FastAPI** is where they snap together into a web framework. It is the default
+modern Python backend framework in 2026 — async-first, validated by Pydantic,
+and it generates an OpenAPI schema and Swagger UI for free.
+
+If you write Express or Nest in TypeScript, or `net/http`/Gin/Echo in Go, the
+HTTP concepts transfer directly. What's new is how *little* glue you write: the
+type hint on a parameter *is* the parser, the validator, and the OpenAPI schema,
+all at once. A function signature like `def create(body: TaskCreate) -> Task`
+tells FastAPI everything it needs to deserialize the body, reject bad input with
+a 422, serialize the response, and document both.
+
+## The mental model
+
+| Concept | Express / Nest (TS) | Go (Gin / net-http) | FastAPI (Python) |
+|---------|---------------------|---------------------|------------------|
+| Framework | Express / NestJS | Gin / Echo / `net/http` | FastAPI |
+| Runtime model | event loop (single thread) | goroutines | `asyncio` event loop (ASGI) |
+| Server | Node runtime | Go runtime | `uvicorn` (ASGI server) |
+| Route | `app.get("/p", h)` | `r.GET("/p", h)` | `@app.get("/p")` |
+| Router module | `express.Router()` / Nest module | `r.Group("/api")` | `APIRouter()` |
+| Path param | `req.params.id` | `c.Param("id")` | `def f(id: int)` |
+| Query param | `req.query.q` | `c.Query("q")` | `def f(q: str \| None = None)` |
+| Request body | `req.body` (+ Zod) | `c.BindJSON(&s)` | `def f(body: Model)` |
+| Validation | Zod / class-validator | `validator` struct tags | **Pydantic** (built in) |
+| DI | Nest providers / manual | manual wiring / wire | `Depends(...)` |
+| Lifecycle hooks | `onModuleInit` / manual | `defer` in `main` | `lifespan` context manager |
+| Config | `dotenv` / ConfigModule | `envconfig` / Viper | `pydantic-settings` |
+| OpenAPI | `@nestjs/swagger` (opt-in) | swaggo (opt-in) | **automatic** |
+
+### Why FastAPI
+
+- **ASGI + async-first.** Routes are `async def`. The whole stack — server
+  (`uvicorn`), framework, DB drivers (`asyncpg`), HTTP client (`httpx`) — speaks
+  `asyncio`. One process handles thousands of concurrent connections on a single
+  thread, the same shape as Node's event loop. (Sync `def` routes are also
+  supported — FastAPI runs them in a threadpool so they don't block the loop.)
+- **Pydantic-powered validation.** Request bodies, query params, and responses
+  are validated and coerced by the Pydantic v2 models from [module 04](/modern-python/04-pydantic/).
+  Bad input gets a structured `422` automatically — no hand-written guards.
+- **Automatic OpenAPI.** Your type hints generate a live OpenAPI 3.1 schema,
+  served as Swagger UI at `/docs` and ReDoc at `/redoc`. This is the headline
+  feature; Nest and Go need extra annotations to get there.
+- **Dependency injection without a container.** `Depends(...)` wires shared
+  logic (DB sessions, auth, settings) into routes by *function signature* — no
+  decorators-on-classes, no DI container to register, no codegen.
+
+:::note[FastAPI vs Litestar]
+FastAPI is the framework you'll meet first and most often. [Module 08](/modern-python/08-litestar/)
+rebuilds this module's exact API in **Litestar** — a newer async framework with a
+class-based, "controllers + plugins" design that feels closer to Nest. Learn
+FastAPI here; Litestar is the informed comparison.
+:::
+
+## Setup
+
+A FastAPI project is just a `uv` project (see [module 01](/modern-python/01-dev-environment/)).
+No scaffolding tool, no generator.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```bash
+mkdir task-api && cd task-api
+npm init -y
+npm install express
+npm install -D typescript @types/express tsx
+npx tsx watch src/index.ts
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```bash
+mkdir task-api && cd task-api
+go mod init example.com/task-api
+go get github.com/gin-gonic/gin
+go run .
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```bash
+uv init task-api && cd task-api
+uv add fastapi uvicorn
+uv run fastapi dev      # dev server with reload, opens /docs
+```
+
+  </TabItem>
+</Tabs>
+
+`uv add fastapi uvicorn` pulls in FastAPI and the ASGI server. `fastapi dev`
+(shipped with the `fastapi` package) is the modern dev runner — auto-reload, and
+it prints the `/docs` URL on startup. In production you run `uvicorn` directly:
+
+```bash
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000     # production
+uv run fastapi dev app/main.py                              # development (reload)
+```
+
+:::note[ASGI vs WSGI]
+If you've heard of Flask or Django, those grew up on **WSGI** — a synchronous,
+one-request-per-thread interface. FastAPI is built on **ASGI**, the async
+successor, which is why a single `uvicorn` worker can hold thousands of open
+connections (SSE, WebSockets, slow upstreams) without a thread each. That's the
+whole reason FastAPI exists. We won't mention WSGI again.
+:::
+
+## Your first app
+
+A path operation is a function decorated with the HTTP method. Return a `dict`,
+a Pydantic model, or any JSON-serializable value and FastAPI serializes it — no
+`res.json()` call.
+
+```python title="app/main.py"
+from fastapi import FastAPI
+
+app = FastAPI(title="Task API", version="1.0.0")
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+```
+
+The same hello-world in Express and Gin:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import express from "express";
+
+const app = express();
+app.use(express.json());
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+app.listen(8000);
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func main() {
+    r := gin.Default()
+    r.GET("/health", func(c *gin.Context) {
+        c.JSON(200, gin.H{"status": "ok"})
+    })
+    r.Run(":8000")
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}     # serialized to JSON automatically
+```
+
+  </TabItem>
+</Tabs>
+
+### Path and query parameters
+
+Declare them as function parameters with type hints. A parameter named in the
+path (`{task_id}`) is a **path param**; anything else is a **query param**.
+FastAPI parses, coerces, and validates from the URL — `task_id: int` rejects
+`/tasks/abc` with a `422` before your code runs.
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI()
+
+# Path param: /tasks/42  -> task_id == 42 (int, coerced & validated)
+@app.get("/tasks/{task_id}")
+async def get_task(task_id: int) -> dict[str, int]:
+    return {"id": task_id}
+
+# Query params: /tasks?limit=10&done=true
+# done is optional (has a default); limit is coerced to int.
+@app.get("/tasks")
+async def list_tasks(limit: int = 20, done: bool | None = None) -> dict:
+    return {"limit": limit, "done": done}
+```
+
+| | Express | Gin | FastAPI |
+|---|---------|-----|---------|
+| Path | `req.params.id` (string) | `c.Param("id")` (string) | `id: int` (typed + coerced) |
+| Query | `req.query.q` (string\|undefined) | `c.Query("q")` (string) | `q: str \| None = None` |
+| Required? | manual check | manual check | no default ⇒ required, auto-`422` |
+| Coercion | manual `Number(...)` | manual `strconv.Atoi` | from the type hint |
+
+The Python win here: there's no `parseInt`, no `strconv.Atoi`, no "is this query
+string present?" guard. The type hint does coercion *and* validation, and a bad
+value produces a clean `422` with a JSON body pointing at the offending field.
+
+### Request bodies are Pydantic models
+
+This is where [module 04](/modern-python/04-pydantic/) pays off. Type a
+parameter as a Pydantic model and FastAPI reads the JSON body, validates it
+against the model, and hands you a fully-typed instance. Validation failures
+become a `422` automatically.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import { z } from "zod";
+
+const TaskCreate = z.object({
+  title: z.string().min(1).max(200),
+  description: z.string().default(""),
+});
+
+app.post("/tasks", (req, res) => {
+  const parsed = TaskCreate.safeParse(req.body);   // explicit
+  if (!parsed.success) return res.status(422).json(parsed.error);
+  const body = parsed.data;
+  res.status(201).json({ ...body });
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+type TaskCreate struct {
+    Title       string `json:"title" binding:"required,min=1,max=200"`
+    Description string `json:"description"`
+}
+
+func createTask(c *gin.Context) {
+    var body TaskCreate
+    if err := c.ShouldBindJSON(&body); err != nil {  // explicit
+        c.JSON(422, gin.H{"error": err.Error()})
+        return
+    }
+    c.JSON(201, body)
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from pydantic import BaseModel, Field
+from fastapi import FastAPI
+
+app = FastAPI()
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str = ""
+
+@app.post("/tasks", status_code=201)
+async def create_task(body: TaskCreate) -> TaskCreate:
+    return body     # validated already; no safeParse, no ShouldBindJSON
+```
+
+  </TabItem>
+</Tabs>
+
+Notice the asymmetry: in TS and Go you *call* the validator and branch on the
+result. In FastAPI the validation is declarative — it happens before your
+function body, and a failure never reaches your code. The `422` response shape
+is consistent across the whole app (more on that under [Error handling](#error-handling)).
+
+### Response models and status codes
+
+A return type hint of a Pydantic model does double duty: it documents the
+response in OpenAPI *and* filters the output to exactly that model's fields. You
+can also pass `response_model=` explicitly when the return type differs from the
+serialized shape (e.g. stripping a password hash from a DB row).
+
+```python
+from pydantic import BaseModel
+from fastapi import FastAPI, status
+
+app = FastAPI()
+
+class Task(BaseModel):
+    id: int
+    title: str
+
+class TaskWithSecret(BaseModel):
+    id: int
+    title: str
+    internal_note: str
+
+# response_model filters output to Task — internal_note is dropped from the JSON.
+@app.get("/tasks/{task_id}", response_model=Task)
+async def get_task(task_id: int) -> TaskWithSecret:
+    return TaskWithSecret(id=task_id, title="demo", internal_note="hidden")
+
+# status_code sets the default success code; 201 for creates.
+@app.post("/tasks", status_code=status.HTTP_201_CREATED)
+async def create_task(task: Task) -> Task:
+    return task
+```
+
+:::tip[`response_model` is a security boundary, not just docs]
+Because `response_model` *filters* the output, it's the idiomatic way to make
+sure a field you store (a password hash, an internal flag) never leaks into a
+response — even if your handler accidentally returns the full DB object. Declare
+a narrow response model and FastAPI strips everything else. It's the Python
+analogue of a DTO mapping layer, done by the type system.
+:::
+
+### APIRouter for modularization
+
+A flat `app` with every route on it doesn't scale. `APIRouter` is FastAPI's
+`express.Router()` / Gin route group / Nest module: a sub-collection of routes
+with a shared prefix and tags, mounted onto the app with `include_router`.
+
+```python title="app/routes.py"
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+@router.get("")
+async def list_tasks() -> list[dict]:
+    return []
+
+@router.get("/{task_id}")
+async def get_task(task_id: int) -> dict:
+    return {"id": task_id}
+```
+
+```python title="app/main.py"
+from fastapi import FastAPI
+from app.routes import router as tasks_router
+
+app = FastAPI()
+app.include_router(tasks_router)     # mounts /tasks/*
+```
+
+`tags=["tasks"]` groups these endpoints under a "tasks" heading in the Swagger
+UI. The `prefix` is prepended to every route in the router.
+
+## Dependency injection
+
+`Depends(...)` is FastAPI's most distinctive feature, and the one that least
+resembles Express or Go. A **dependency** is a callable (usually a function)
+whose return value is injected into a route. FastAPI runs it before the handler,
+caches it per-request, and — because dependencies can themselves have
+dependencies — resolves a whole graph for you.
+
+The modern style uses `Annotated[T, Depends(fn)]`, which keeps the type hint
+(`T`) and the injection (`Depends(fn)`) on the same parameter so it reads as a
+normal typed argument.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Nest: providers registered in a module, injected by the framework
+@Injectable()
+class TaskService { /* ... */ }
+
+@Controller("tasks")
+class TaskController {
+  constructor(private readonly service: TaskService) {}  // injected
+}
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go: wire dependencies by hand in main, close over them in handlers
+repo := NewTaskRepository()
+svc := NewTaskService(repo)
+r.GET("/tasks", func(c *gin.Context) {
+    c.JSON(200, svc.List())   // svc captured by closure
+})
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from typing import Annotated
+from fastapi import Depends
+
+def get_service() -> TaskService:
+    return TaskService(repo)
+
+# Annotated[T, Depends(...)] — the modern form. `service` is a TaskService.
+@router.get("/tasks")
+async def list_tasks(service: Annotated[TaskService, Depends(get_service)]):
+    return service.list()
+```
+
+  </TabItem>
+</Tabs>
+
+The big difference from Nest is that there's **no container and no
+registration**. A dependency is just a function; you wire it by referencing it
+in `Depends(...)`. The big difference from Go is that the wiring is *declarative
+per route* rather than captured in closures at startup — which is what makes the
+testing override below possible.
+
+### Sub-dependencies
+
+Dependencies can depend on other dependencies, and FastAPI resolves the graph,
+caching each one per request. Here a route needs the "current user," which needs
+a DB session, which needs settings:
+
+```python
+from typing import Annotated
+from fastapi import Depends, Header, HTTPException
+
+def get_settings() -> Settings:
+    return Settings()
+
+def get_repo(settings: Annotated[Settings, Depends(get_settings)]) -> TaskRepository:
+    return TaskRepository(settings.database_url)
+
+def get_current_user(
+    repo: Annotated[TaskRepository, Depends(get_repo)],
+    x_user_id: Annotated[str | None, Header()] = None,
+) -> User:
+    if x_user_id is None:
+        raise HTTPException(status_code=401, detail="missing X-User-Id")
+    return repo.find_user(x_user_id)
+
+@router.get("/me")
+async def me(user: Annotated[User, Depends(get_current_user)]) -> User:
+    return user     # get_settings -> get_repo -> get_current_user, resolved for you
+```
+
+`get_settings` runs once per request even if three dependencies ask for it —
+FastAPI caches by callable within a request. This is the closest thing to Nest's
+provider graph, but assembled on demand from plain functions.
+
+### Yield dependencies: setup and teardown
+
+A dependency that `yield`s runs setup code, hands the yielded value to the route,
+then runs teardown *after* the response is sent. This is the canonical pattern
+for a per-request DB session — acquire on the way in, close on the way out, even
+if the handler raised.
+
+```python
+from typing import Annotated
+from fastapi import Depends
+
+# Preview of the real thing in module 09 — for now, a hand-rolled session.
+async def get_session():
+    session = await pool.acquire()    # setup
+    try:
+        yield session                 # injected into the route
+    finally:
+        await pool.release(session)   # teardown — always runs
+
+@router.get("/tasks")
+async def list_tasks(session: Annotated[Session, Depends(get_session)]):
+    return await session.fetch_all("SELECT * FROM tasks")
+```
+
+| | Express | Go | FastAPI |
+|---|---------|-----|---------|
+| Per-request resource | middleware sets `req.db`, cleanup on `res.finish` | `defer rows.Close()` in handler | `yield` dependency |
+| Teardown on error | error middleware | `defer` | `finally` in the dependency |
+
+:::tip[This is `defer`, scoped to a request]
+A `yield` dependency is the FastAPI equivalent of Go's `defer` or a TS
+`try/finally` — the teardown after `yield` is guaranteed to run once the request
+finishes, including when the handler raises. [Module 09](/modern-python/09-database-postgresql/)
+uses exactly this shape to hand each request a SQLAlchemy `AsyncSession`.
+:::
+
+### Dependency overrides for testing
+
+Because a route names its dependencies by *callable*, tests can swap any of them
+out via `app.dependency_overrides` — replace the real DB session with an
+in-memory fake without touching the route. This is the payoff for declarative DI,
+and it's covered fully in [module 12](/modern-python/12-testing/).
+
+```python
+from app.main import app, get_session
+
+async def fake_session():
+    yield InMemorySession()
+
+app.dependency_overrides[get_session] = fake_session
+# every route that Depends(get_session) now gets the fake; clear the dict to reset.
+```
+
+## Lifespan: startup and shutdown
+
+Most apps need to set up shared resources once at boot (a DB connection pool, a
+Redis client, an `httpx.AsyncClient`) and tear them down at shutdown. The modern
+API is a **`lifespan`** async context manager passed to `FastAPI(...)`: code
+before `yield` runs on startup, code after runs on shutdown.
+
+```python title="app/main.py"
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: open the pool, store it on app.state
+    app.state.pool = await create_pool("postgresql://dev:dev@localhost:5432/app")
+    yield
+    # Shutdown: close it cleanly
+    await app.state.pool.close()
+
+app = FastAPI(lifespan=lifespan)
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Nest: onModuleInit / onApplicationShutdown lifecycle hooks
+@Injectable()
+class DbService implements OnModuleInit, OnApplicationShutdown {
+  async onModuleInit() { this.pool = await createPool(); }
+  async onApplicationShutdown() { await this.pool.end(); }
+}
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func main() {
+    pool := mustCreatePool()
+    defer pool.Close()      // shutdown
+    r := gin.Default()
+    // ... pool captured by handlers
+    r.Run(":8000")
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = await create_pool()   # startup (≈ onModuleInit / mustCreatePool)
+    yield
+    await app.state.pool.close()           # shutdown (≈ onApplicationShutdown / defer)
+
+app = FastAPI(lifespan=lifespan)
+```
+
+  </TabItem>
+</Tabs>
+
+:::caution[Don't use `@app.on_event` anymore]
+You'll see `@app.on_event("startup")` / `@app.on_event("shutdown")` in older
+tutorials. Those are **deprecated**. The `lifespan` context manager is the
+single supported path in 2026 — it's clearer (startup and shutdown live in one
+function, sharing local state) and it's what the docs now teach.
+:::
+
+## Settings via pydantic-settings
+
+Config is a `pydantic-settings` `BaseSettings` model — the same Pydantic you
+already know, reading from environment variables and `.env`. Cover this fully in
+[module 04](/modern-python/04-pydantic/); the FastAPI-specific move is to expose
+it as a cached dependency so routes can `Depends(get_settings)`.
+
+```python title="app/settings.py"
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+    database_url: str = "postgresql+asyncpg://dev:dev@localhost:5432/app"
+    max_tasks: int = 1000
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()     # built once, cached; inject with Depends(get_settings)
+```
+
+`@lru_cache` means the settings object is constructed once for the whole process
+(env vars don't change at runtime), yet it's still a dependency, so tests can
+override it. This replaces `dotenv` + a hand-rolled config object (TS) or
+`envconfig`/Viper (Go) — and it's *validated*: a malformed `MAX_TASKS=abc` fails
+at startup, not at first use.
+
+## Error handling
+
+### HTTPException
+
+Raise `HTTPException` to short-circuit a request with a specific status and JSON
+body. This is the idiomatic "not found" / "forbidden" path.
+
+```python
+from fastapi import HTTPException
+
+@router.get("/tasks/{task_id}")
+async def get_task(task_id: int, repo: RepoDep) -> Task:
+    task = repo.find(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Nest
+if (!task) throw new NotFoundException("task not found");
+// Express
+if (!task) return res.status(404).json({ message: "task not found" });
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+if task == nil {
+    c.JSON(404, gin.H{"error": "task not found"})
+    return
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+if task is None:
+    raise HTTPException(status_code=404, detail="task not found")
+```
+
+  </TabItem>
+</Tabs>
+
+### Custom exception handlers
+
+For domain exceptions you don't want HTTP-shaped at the throw site, register a
+handler that maps an exception type to a response — the equivalent of Nest's
+exception filters or Express's error middleware. Throw a plain domain error deep
+in your service; the handler turns it into JSON at the edge.
+
+```python
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+class TaskNotFound(Exception):
+    def __init__(self, task_id: int):
+        self.task_id = task_id
+
+app = FastAPI()
+
+@app.exception_handler(TaskNotFound)
+async def task_not_found_handler(request: Request, exc: TaskNotFound) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={"error": "not_found", "task_id": exc.task_id},
+    )
+
+# Now a service can `raise TaskNotFound(42)` and it becomes a clean 404.
+```
+
+### The validation error shape
+
+When a request body or param fails Pydantic validation, FastAPI returns a `422`
+with a structured list of errors — every failure, with its location and message,
+not just the first. This consistency is free and is one of the reasons clients
+love FastAPI:
+
+```json
+{
+  "detail": [
+    {
+      "type": "string_too_short",
+      "loc": ["body", "title"],
+      "msg": "String should have at least 1 character",
+      "input": ""
+    }
+  ]
+}
+```
+
+You can override the handler for `RequestValidationError` if you need a different
+shape, but the default is good enough for most APIs and matches the OpenAPI
+schema exactly.
+
+## Middleware and CORS
+
+Middleware wraps every request — the place for cross-cutting concerns like
+request logging or timing. The `@app.middleware("http")` decorator gives you the
+request and a `call_next` to invoke the rest of the chain.
+
+```python
+import time
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+@app.middleware("http")
+async def add_timing(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)      # ≈ next() / next.ServeHTTP
+    response.headers["X-Process-Time"] = f"{time.perf_counter() - start:.4f}"
+    return response
+```
+
+CORS is the one middleware almost every API needs. Use the built-in
+`CORSMiddleware` rather than hand-rolling headers:
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "https://myapp.com"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+```
+
+| | Express | Go (Gin) | FastAPI |
+|---|---------|----------|---------|
+| Generic middleware | `app.use(fn)` | `r.Use(fn)` | `@app.middleware("http")` |
+| CORS | `cors()` package | `cors.Default()` | `CORSMiddleware` |
+| Per-route | route-level middleware | route group middleware | router-level `dependencies=[...]` |
+
+:::note[Dependencies are often better than middleware]
+For request-scoped logic that produces a value (the current user, a DB session),
+prefer a `Depends(...)` over middleware — it's typed, testable via overrides, and
+documented in OpenAPI. Reserve middleware for things that genuinely wrap the
+whole request/response cycle (timing, compression, CORS).
+:::
+
+## Background tasks
+
+`BackgroundTasks` runs work *after* the response is sent — send the email,
+write the audit log — without making the client wait. Add it as a parameter and
+FastAPI injects it.
+
+```python
+from fastapi import BackgroundTasks
+
+def write_audit_log(task_id: int) -> None:
+    ...    # runs after the 201 is already on the wire
+
+@router.post("/tasks", status_code=201)
+async def create_task(body: TaskCreate, bg: BackgroundTasks) -> Task:
+    task = repo.create(body)
+    bg.add_task(write_audit_log, task.id)   # deferred until response is sent
+    return task
+```
+
+:::caution[`BackgroundTasks` is in-process, not a job queue]
+These tasks run in the same process and die if it restarts — fine for "fire a
+notification after responding," wrong for anything that must survive a crash or
+needs retries. For durable work, reach for a real queue: an `asyncio` worker
+fed by Redis or Kafka (modules [10](/modern-python/10-redis-caching/) and
+[11](/modern-python/11-kafka-events/)). Don't put a 30-second job here.
+:::
+
+## Streaming responses and SSE
+
+For data that arrives over time — an LLM token stream, a CSV export, live
+progress — return a `StreamingResponse` wrapping an async generator. This ties
+directly to the async generators from [module 06](/modern-python/06-streams/):
+the generator *is* the response body, yielded chunk by chunk.
+
+```python
+import asyncio
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+async def event_stream():
+    for i in range(10):
+        yield f"data: tick {i}\n\n"     # SSE frame
+        await asyncio.sleep(1)
+
+@app.get("/events")
+async def events() -> StreamingResponse:
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+```
+
+The client receives each frame as it's produced; the connection stays open and
+the event loop is free to serve other requests in between `await`s. That last
+clause is the whole async story — which leads to the one rule you must not break.
+
+## Async route best practices: don't block the loop
+
+The single most common FastAPI performance bug, especially from devs arriving
+from thread-per-request stacks: calling **blocking** code inside an `async def`
+route. There's one event loop. A blocking call (a sync DB driver, `requests`,
+`time.sleep`, a CPU-heavy loop) freezes *every* in-flight request until it
+returns.
+
+```python
+import asyncio, time
+import httpx
+
+# WRONG — blocks the entire event loop for 2 seconds.
+@app.get("/bad")
+async def bad():
+    time.sleep(2)                       # synchronous sleep, blocks the loop
+    return {"ok": True}
+
+# RIGHT — await an async operation; the loop serves others meanwhile.
+@app.get("/good")
+async def good():
+    await asyncio.sleep(2)              # async sleep, yields control
+    async with httpx.AsyncClient() as client:   # async HTTP, not `requests`
+        r = await client.get("https://example.com")
+    return {"status": r.status_code}
+```
+
+:::caution[The async-coloring trap]
+The fix is to use async-native libraries throughout: `httpx` not `requests`,
+`asyncpg`/async SQLAlchemy not a sync driver, `redis.asyncio` not blocking
+`redis`. If you're *stuck* with a blocking library, don't call it directly —
+offload it with `await asyncio.to_thread(blocking_fn, ...)`, which runs it in a
+threadpool so the loop stays free. And remember: a plain `def` route (no `async`)
+is automatically run in a threadpool by FastAPI, so for genuinely sync handlers
+that's the safe default rather than faking `async`.
+:::
+
+## Automatic OpenAPI docs
+
+The selling point, restated because it's that good: FastAPI generates an OpenAPI
+3.1 schema from your type hints and serves two interactive UIs with zero config.
+
+| URL | What it is |
+|-----|------------|
+| `/docs` | Swagger UI — try requests in the browser |
+| `/redoc` | ReDoc — clean, readable reference |
+| `/openapi.json` | the raw schema (feed it to client codegen) |
+
+Enrich the docs with metadata that costs almost nothing:
+
+```python
+from fastapi import FastAPI, APIRouter
+
+app = FastAPI(
+    title="Task API",
+    version="1.0.0",
+    description="A task management service.",
+)
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+@router.post(
+    "",
+    status_code=201,
+    summary="Create a task",
+    response_description="The created task",
+)
+async def create_task(body: TaskCreate) -> Task:
+    """Create a task. The **docstring** becomes the endpoint's long description."""
+    ...
+```
+
+`tags` group endpoints in the UI, `summary` is the short label, and the
+docstring becomes the expanded description. Compared to Nest (`@nestjs/swagger`
+decorators) or Go (swaggo comment annotations), you've already written all of
+this — it's just your type hints and docstrings.
+
+:::tip[Generate clients from `/openapi.json`]
+Because the schema is accurate by construction (it *is* your code), it's safe to
+generate typed clients from it — a TypeScript SDK via `openapi-typescript`, a Go
+client via `oapi-codegen`. Your frontend's types and your backend's types come
+from one source of truth.
+:::
+
+## What's next
+
+This module is the request/response skeleton. The flesh comes later:
+
+- **Real database** — [module 09](/modern-python/09-database-postgresql/) replaces
+  the in-memory repo with async SQLAlchemy + a `yield` session dependency.
+- **Auth** — [module 13](/modern-python/13-security-auth/) adds JWT and OAuth2
+  using FastAPI's security utilities (which are themselves `Depends`).
+- **Testing** — [module 12](/modern-python/12-testing/) tests routes with
+  `httpx`'s `ASGITransport` and dependency overrides.
+- **Litestar** — [module 08](/modern-python/08-litestar/) rebuilds the very same
+  API in the other major async framework.
+
+## Practice
+
+Build the complete Task CRUD API: Pydantic request/response models, an
+`APIRouter`, a `Depends`-injected repository, a `lifespan`, proper status codes,
+and the auto-generated OpenAPI docs. It's the exact API module 08 rebuilds in
+Litestar, so keep the domain clean.
+
+<CardGrid>
+  <LinkCard
+    title="CRUD Task API (FastAPI)"
+    href="/modern-python/07-fastapi/task-api/"
+    description="Build a full async Task CRUD API with Pydantic models, an APIRouter, a Depends-injected in-memory repository, lifespan, validation, and automatic OpenAPI docs."
+  />
+</CardGrid>

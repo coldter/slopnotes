@@ -1,0 +1,505 @@
+---
+title: "JWT Auth API"
+description: Build a FastAPI auth service with argon2 password hashing, pyjwt access and refresh tokens, a get_current_user dependency, and a scope-protected admin route.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Security & Auth"
+  href="/modern-python/13-security-auth/"
+/>
+
+## Goal
+
+Build a small but real FastAPI auth service. Users **register** and **log in**;
+passwords are hashed with **argon2id**; a successful login returns an **access +
+refresh token** pair (`pyjwt`, HS256). A `get_current_user` dependency turns the
+bearer token back into a user on every protected request, and an **RBAC-protected
+admin route** requires an `admin` scope and returns `403` to everyone else.
+
+If you've done auth in Express with `jsonwebtoken` + middleware, or in Go with a
+hand-rolled `http.Handler` wrapper, this is the same idea — except FastAPI's
+`Depends`/`Security` do the wiring, and the security scheme shows up in `/docs` for
+free.
+
+## What you'll practice
+
+- **argon2id** hashing with `argon2-cffi` (`hash`, `verify`, `check_needs_rehash`).
+- **`pyjwt`** encode/decode with pinned `algorithms`, `exp`, and a `type` claim to
+  separate access from refresh tokens.
+- `OAuth2PasswordBearer` + a `get_current_user` dependency, reused via a type alias.
+- `Security(..., scopes=[...])` + `SecurityScopes` for an RBAC admin route.
+- Secrets from `pydantic-settings` with `SecretStr` — nothing hardcoded.
+- Correct `401` (unauthenticated) vs `403` (forbidden) responses.
+
+## Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/auth/register` | Public | Register a user (argon2 hash), get tokens |
+| `POST` | `/auth/login` | Public | Log in (OAuth2 password form), get tokens |
+| `POST` | `/auth/refresh` | Refresh token | Exchange a refresh token for a new pair |
+| `GET` | `/me` | Bearer JWT | The current user |
+| `GET` | `/admin/users` | Bearer JWT + `admin` scope | List all users (RBAC) |
+
+## The worked solution
+
+A single `uv` project. Storage is an in-memory dict so it runs with zero infra; swap
+in async SQLAlchemy from [module 09](/modern-python/09-database-postgresql/) when you're
+ready. The code is split by responsibility — config, security, models, app.
+
+<FileTree>
+- jwt-auth-api/
+  - pyproject.toml uv project + deps
+  - .env JWT secret (gitignored in real life)
+  - src/app/
+    - __init__.py
+    - config.py pydantic-settings + SecretStr
+    - models.py Pydantic request/response + User
+    - security.py argon2, pyjwt, get_current_user, scopes
+    - main.py routes + the in-memory user store
+</FileTree>
+
+### pyproject.toml
+
+Create the project and add the four dependencies:
+
+```bash
+uv init jwt-auth-api && cd jwt-auth-api
+uv add fastapi uvicorn pyjwt argon2-cffi pydantic-settings
+uv add --dev ruff ty
+```
+
+```toml title="pyproject.toml"
+[project]
+name = "jwt-auth-api"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "argon2-cffi>=23.1",
+    "fastapi>=0.115",
+    "pydantic-settings>=2.5",
+    "pyjwt>=2.9",
+    "uvicorn>=0.32",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.7", "ty>=0.0.1"]
+```
+
+### config.py
+
+Secrets live in the environment, validated at startup. `SecretStr` keeps the JWT
+secret out of any log line or stack trace — `str(settings.jwt_secret)` is `'********'`,
+and you only unwrap it with `.get_secret_value()` at the moment you sign.
+
+```python title="src/app/config.py"
+from functools import lru_cache
+
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_")
+
+    jwt_secret: SecretStr
+    jwt_algorithm: str = "HS256"
+    issuer: str = "jwt-auth-api"
+    access_ttl_minutes: int = 15
+    refresh_ttl_days: int = 7
+
+
+@lru_cache
+def get_settings() -> Settings:
+    # Raises at import/startup if APP_JWT_SECRET is missing — fail fast.
+    return Settings()  # ty: ignore[missing-argument]  # populated from env
+```
+
+```bash title=".env"
+APP_JWT_SECRET="change-me-to-a-long-random-string-at-least-32-bytes-please"
+```
+
+:::caution[Don't ship that secret]
+The `.env` value exists so the exercise runs out of the box. In a real service the JWT
+secret comes from a secrets manager or the deploy environment, never from a file in the
+repo. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+:::
+
+### models.py
+
+Plain Pydantic. The request models validate input (a too-short password is a `422`
+before your handler runs — validation is security). `User` is the internal record;
+`UserResponse` is what leaves the service — note it has **no** `password_hash`, so the
+hash can't leak through a response.
+
+```python title="src/app/models.py"
+from pydantic import BaseModel, EmailStr, Field
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    name: str = Field(min_length=1, max_length=100)
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class TokenPair(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    name: str
+    scopes: list[str]
+
+
+class User(BaseModel):
+    id: str
+    email: str
+    name: str
+    password_hash: str
+    scopes: list[str]
+```
+
+### security.py
+
+The crypto and the dependency graph. `hash_password`/`verify_password` wrap argon2id;
+`encode_token` stamps a `type` claim so a refresh token can't be replayed as an access
+token; `decode_token` **pins `algorithms`** (the single most important JWT safety move)
+and validates `iss`/`exp`.
+
+`get_current_user` is the dependency every protected route reuses. It also takes
+`SecurityScopes`, so the *same* function enforces RBAC: routes that demand a scope via
+`Security(get_current_user, scopes=[...])` get a `403` if the token lacks it, while
+plain `Depends(get_current_user)` routes accept any authenticated user.
+
+```python title="src/app/security.py" {18-23,32-41,55-58,71-79}
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
+from uuid import uuid4
+
+import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+from fastapi import Depends, HTTPException, Security, status
+from fastapi.security import OAuth2PasswordBearer, SecurityScopes
+
+from .config import get_settings
+from .models import User
+
+_ph = PasswordHasher()
+settings = get_settings()
+
+# Scope catalogue shows up in the Swagger "Authorize" dialog.
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="auth/login",
+    scopes={
+        "me": "Read your own profile",
+        "admin": "Administer all users",
+    },
+)
+
+
+def hash_password(raw: str) -> str:
+    return _ph.hash(raw)
+
+
+def verify_password(stored_hash: str, raw: str) -> tuple[bool, str | None]:
+    """Returns (ok, new_hash_if_rehash_needed)."""
+    try:
+        _ph.verify(stored_hash, raw)
+    except VerifyMismatchError:
+        return False, None
+    if _ph.check_needs_rehash(stored_hash):
+        return True, _ph.hash(raw)  # upgrade old/weak params transparently
+    return True, None
+
+
+def encode_token(sub: str, scopes: list[str], token_type: str, ttl: timedelta) -> str:
+    now = datetime.now(UTC)
+    payload = {
+        "sub": sub,
+        "scopes": scopes,
+        "type": token_type,
+        "jti": str(uuid4()),
+        "iat": now,
+        "exp": now + ttl,
+        "iss": settings.issuer,
+    }
+    return jwt.encode(payload, settings.jwt_secret.get_secret_value(),
+                      algorithm=settings.jwt_algorithm)
+
+
+def decode_token(token: str) -> dict:
+    return jwt.decode(
+        token,
+        settings.jwt_secret.get_secret_value(),
+        algorithms=[settings.jwt_algorithm],  # PIN it — never trust the token's alg
+        issuer=settings.issuer,
+    )
+
+
+def issue_tokens(user: User) -> dict[str, str]:
+    access = encode_token(user.id, user.scopes, "access",
+                          timedelta(minutes=settings.access_ttl_minutes))
+    refresh = encode_token(user.id, user.scopes, "refresh",
+                           timedelta(days=settings.refresh_ttl_days))
+    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+
+
+# Populated by main.py at import; kept here so the dependency can reach it.
+USERS: dict[str, User] = {}
+
+
+async def get_current_user(
+    security_scopes: SecurityScopes,
+    token: Annotated[str, Depends(oauth2_scheme)],
+) -> User:
+    auth_value = (
+        f'Bearer scope="{security_scopes.scope_str}"'
+        if security_scopes.scopes else "Bearer"
+    )
+    unauthenticated = HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": auth_value},
+    )
+    try:
+        claims = decode_token(token)
+    except jwt.InvalidTokenError:
+        raise unauthenticated
+    if claims.get("type") != "access":  # refresh tokens are not access tokens
+        raise unauthenticated
+    user = USERS.get(claims["sub"])
+    if user is None:
+        raise unauthenticated
+
+    token_scopes = set(claims.get("scopes", []))
+    for required in security_scopes.scopes:
+        if required not in token_scopes:
+            # 403, not 401: authenticated, but not allowed.
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=f"Missing required scope: {required}",
+                headers={"WWW-Authenticate": auth_value},
+            )
+    return user
+
+
+CurrentUser = Annotated[User, Depends(get_current_user)]
+AdminUser = Annotated[User, Security(get_current_user, scopes=["admin"])]
+```
+
+:::note[Why the `type` claim matters]
+Without it, a long-lived refresh token would be a valid access token everywhere —
+defeating the point of short access tokens. Stamping `type` and rejecting the wrong one
+in both `get_current_user` and `/auth/refresh` keeps the two firmly separate. The `jti`
+is the hook you'd use later for a Redis denylist to make logout actually revoke a token.
+:::
+
+### main.py
+
+The routes plus the in-memory store. `register` rejects duplicate emails with `409` and
+hashes before storing — the raw password never persists. `login` uses
+`OAuth2PasswordRequestForm`, FastAPI's built-in dependency for the OAuth2 password flow
+(`username` + `password` form fields), which is what makes the Swagger `Authorize`
+button work. A missing user and a bad password both return the same `401`, so you don't
+leak which emails are registered.
+
+`/me` takes `CurrentUser` (any authenticated user). `/admin/users` takes `AdminUser`,
+which requires the `admin` scope — a normal user calling it gets `403`.
+
+```python title="src/app/main.py" {21-22,45-48,58-60,71-73}
+from typing import Annotated
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+
+from . import security
+from .models import (
+    RefreshRequest,
+    RegisterRequest,
+    TokenPair,
+    User,
+    UserResponse,
+)
+from .security import AdminUser, CurrentUser, decode_token, issue_tokens
+
+app = FastAPI(title="JWT Auth API")
+USERS = security.USERS  # share the one store with the dependency
+
+
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+async def register(body: RegisterRequest) -> TokenPair:
+    if any(u.email == body.email for u in USERS.values()):
+        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered")
+    user = User(
+        id=str(uuid4()),
+        email=body.email,
+        name=body.name,
+        password_hash=security.hash_password(body.password),
+        scopes=["me"],  # admins are seeded below
+    )
+    USERS[user.id] = user
+    return TokenPair(**issue_tokens(user))
+
+
+@app.post("/auth/login")
+async def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]) -> TokenPair:
+    user = next((u for u in USERS.values() if u.email == form.username), None)
+    # Same 401 for "no such user" and "wrong password" — don't leak which.
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "incorrect email or password")
+    ok, new_hash = security.verify_password(user.password_hash, form.password)
+    if not ok:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "incorrect email or password")
+    if new_hash:  # argon2 params upgraded — persist the stronger hash
+        user.password_hash = new_hash
+    return TokenPair(**issue_tokens(user))
+
+
+@app.post("/auth/refresh")
+async def refresh(body: RefreshRequest) -> TokenPair:
+    try:
+        claims = decode_token(body.refresh_token)
+    except Exception:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
+    if claims.get("type") != "refresh":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "wrong token type")
+    user = USERS.get(claims["sub"])
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "unknown user")
+    return TokenPair(**issue_tokens(user))
+
+
+@app.get("/me")
+async def me(user: CurrentUser) -> UserResponse:
+    return UserResponse(id=user.id, email=user.email, name=user.name, scopes=user.scopes)
+
+
+@app.get("/admin/users")
+async def list_users(_: AdminUser) -> list[UserResponse]:
+    return [
+        UserResponse(id=u.id, email=u.email, name=u.name, scopes=u.scopes)
+        for u in USERS.values()
+    ]
+
+
+@app.on_event("startup")
+async def seed_admin() -> None:
+    # Seed an admin so you can exercise the RBAC route.
+    admin = User(
+        id="admin-0",
+        email="admin@example.com",
+        name="Admin",
+        password_hash=security.hash_password("admin-password"),
+        scopes=["me", "admin"],
+    )
+    USERS[admin.id] = admin
+```
+
+:::note[`def` vs `async def` and argon2]
+These handlers are `async def`, and `hash_password` does CPU-and-memory-heavy argon2
+work that blocks the event loop for ~50–100ms. For a learning project at low traffic
+that's fine. Under real load, either make the auth handlers plain `def` (FastAPI runs
+those in a threadpool automatically) or wrap the call in `await asyncio.to_thread(...)`,
+as covered in [module 05](/modern-python/05-async-concurrency/).
+:::
+
+## Run it
+
+<Steps>
+
+1. Start the server (in-memory store, no infra needed):
+
+   ```bash
+   uv run uvicorn app.main:app --reload --app-dir src
+   ```
+
+   Open `http://localhost:8000/docs` — the `Authorize` button and the
+   `me`/`admin` scopes are already wired by `OAuth2PasswordBearer`.
+
+2. Register a user; capture the access token from the response:
+
+   ```bash
+   curl -s -X POST http://localhost:8000/auth/register \
+     -H "Content-Type: application/json" \
+     -d '{"email":"user@example.com","password":"secret123","name":"Test User"}'
+   ```
+
+3. Log in via the OAuth2 password form (form fields, not JSON) and grab the token:
+
+   ```bash
+   ACCESS=$(curl -s -X POST http://localhost:8000/auth/login \
+     -d "username=user@example.com&password=secret123" | jq -r .access_token)
+   ```
+
+4. Call the protected route with the bearer token:
+
+   ```bash
+   curl -s http://localhost:8000/me -H "Authorization: Bearer $ACCESS"
+   ```
+
+5. Prove RBAC works — a normal user hitting the admin route gets `403`:
+
+   ```bash
+   curl -s -o /dev/null -w "%{http_code}\n" \
+     http://localhost:8000/admin/users -H "Authorization: Bearer $ACCESS"   # 403
+   ```
+
+   Now log in as the seeded admin and the same route returns `200`:
+
+   ```bash
+   ADMIN=$(curl -s -X POST http://localhost:8000/auth/login \
+     -d "username=admin@example.com&password=admin-password" | jq -r .access_token)
+   curl -s http://localhost:8000/admin/users -H "Authorization: Bearer $ADMIN"
+   ```
+
+6. Refresh: exchange a refresh token for a brand-new pair:
+
+   ```bash
+   REFRESH=$(curl -s -X POST http://localhost:8000/auth/login \
+     -d "username=user@example.com&password=secret123" | jq -r .refresh_token)
+   curl -s -X POST http://localhost:8000/auth/refresh \
+     -H "Content-Type: application/json" \
+     -d "{\"refresh_token\":\"$REFRESH\"}"
+   ```
+
+7. Lint and type-check before you call it done:
+
+   ```bash
+   uv run ruff check src
+   uv run ty check src
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- **Revocable logout.** Add a `POST /auth/logout` that stores the access token's `jti`
+  in Redis ([module 10](/modern-python/10-redis-caching/)) with a TTL equal to its
+  remaining lifetime, and check that denylist in `get_current_user`. This is the honest
+  fix for "JWTs can't be revoked."
+- **Refresh-token rotation.** Issue a new refresh token on every `/auth/refresh` and
+  invalidate the old `jti` — detect reuse (a stolen refresh token) and revoke the whole
+  family.
+- **Real persistence.** Swap the in-memory dict for async SQLAlchemy
+  ([module 09](/modern-python/09-database-postgresql/)) with a `Depends`-injected session.
+- **Rate-limit `/auth/login`.** Add the Redis sliding-window dependency from
+  [module 10](/modern-python/10-redis-caching/), keyed by IP + submitted username.
+- **Verify an external IdP.** Add a route that accepts an RS256 token from Keycloak and
+  verifies it with `pyjwt`'s `PyJWKClient` against the JWKS endpoint.
+- **Tests.** Drive the whole flow with `httpx`'s `ASGITransport` and `pytest`
+  ([module 12](/modern-python/12-testing/)): 401 without a token, 403 without the scope,
+  the register→login→refresh round trip.
+:::

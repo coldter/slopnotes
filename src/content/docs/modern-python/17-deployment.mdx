@@ -1,0 +1,852 @@
+---
+title: Packaging & Deployment
+description: Ship a modern Python service — uv builds and lockfiles, a uv-based multi-stage Dockerfile, uvicorn in prod, GitHub Actions CI, and Kubernetes manifests.
+sidebar:
+  order: 17
+---
+
+import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+You already ship TypeScript and Go services: a lockfile, a multi-stage Dockerfile,
+a CI workflow, some Kubernetes YAML. The shape of "get this to prod" is the same in
+Python — what changes is the tooling. This module maps each step to its modern
+Python equivalent, all of it built on **`uv`**: `uv build` and `uv.lock` for
+reproducibility, a `uv sync --frozen` multi-stage Docker build that lands a tiny
+image, `uvicorn` for serving, GitHub Actions with `astral-sh/setup-uv`, and K8s
+manifests with health probes wired to FastAPI.
+
+The headline: Python's old packaging reputation — `requirements.txt` that don't
+pin transitive deps, `pip install` that resolves differently on every machine, a
+30-step Dockerfile — is gone. With `uv`, a Python service is as reproducible and as
+easy to containerize as a Go binary, and the images get surprisingly close in size.
+
+## The toolchain map
+
+If you've internalized the npm and Go toolchains, here's the whole Python deploy
+story in one table. Everything is one tool — `uv` — the way Go folds build, deps,
+and run into `go`.
+
+| Concern | npm / Node | Go | Python (uv) |
+|---|---|---|---|
+| Manifest | `package.json` | `go.mod` | `pyproject.toml` |
+| Lockfile | `package-lock.json` | `go.sum` | `uv.lock` |
+| Install (reproducible) | `npm ci` | `go mod download` | `uv sync --frozen` |
+| Build artifact | bundle / `dist/` | static binary | wheel (`uv build`) |
+| Run | `node dist/index.js` | `./server` | `uv run` / `uvicorn` |
+| Publish | `npm publish` | `go install` / proxy | `uv publish` |
+| Pin a tool | `npx` | `go run` | `uvx` |
+
+## Packaging with uv
+
+Before Docker, get the build itself right. There are two distinct things you might
+"package," and uv handles both:
+
+- **A library** you publish to PyPI for others to `uv add` — you care about wheels,
+  sdists, and `uv publish`.
+- **A runnable service** (our FastAPI Task API) that you ship as a container — you
+  care about the *lockfile* and `uv sync`, and you rarely build a wheel at all.
+
+### The lockfile is the contract
+
+`uv.lock` is the heart of reproducibility. It pins every direct *and transitive*
+dependency to an exact version and hash, across every platform, in one
+cross-platform file. This is the piece `requirements.txt` never reliably gave you.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```bash
+# npm: manifest + lockfile, install is reproducible with `ci`
+npm install        # resolves, writes package-lock.json
+npm ci             # installs EXACTLY the lockfile, fails if out of sync
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```bash
+# Go: go.mod + go.sum, the module cache is content-addressed
+go mod tidy        # resolves, updates go.mod + go.sum
+go mod download    # fetches exactly what go.sum pins
+go mod verify      # checksums must match
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```bash
+# uv: pyproject.toml + uv.lock, frozen install is reproducible
+uv add fastapi uvicorn   # resolves, updates pyproject.toml + uv.lock
+uv sync                  # syncs the env to the lockfile (may update lock)
+uv sync --frozen         # installs EXACTLY the lockfile, errors if out of sync
+uv lock --check          # CI gate: fail if the lock is stale
+```
+
+  </TabItem>
+</Tabs>
+
+`uv sync --frozen` is the one you bake into Docker and CI — it's `npm ci` for
+Python. It refuses to touch the lockfile and errors if `pyproject.toml` and
+`uv.lock` have drifted apart, so a build can never silently resolve a different
+dependency tree than the one you tested.
+
+:::tip[Commit the lockfile for apps]
+Commit `uv.lock` for **applications** (services, CLIs) — you want byte-identical
+deploys. For a **library**, the lockfile is for *your* dev environment only;
+downstream consumers resolve against *their* tree, so the lock isn't part of the
+published package. Same rule as `package-lock.json`: commit it for apps, it's
+advisory for libraries.
+:::
+
+### Dependency groups
+
+uv uses PEP 735 dependency groups to separate runtime deps from dev-only ones — the
+equivalent of npm's `dependencies` vs `devDependencies`. The default `dev` group is
+never installed in production.
+
+```toml title="pyproject.toml"
+[project]
+name = "task-api"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic-settings>=2.5",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.9", "ty>=0.0.1", "pytest>=8.3", "pytest-asyncio>=0.24", "httpx>=0.27"]
+
+# Optional: extra groups you opt into explicitly
+[dependency-groups.docs]
+mkdocs = ["mkdocs-material>=9.5"]
+```
+
+```bash
+uv add httpx                 # -> [project.dependencies]
+uv add --dev pytest          # -> [dependency-groups] dev
+uv add --group docs mkdocs   # -> a custom group
+
+uv sync                      # installs runtime + the default `dev` group
+uv sync --no-dev             # PRODUCTION: runtime deps only, no dev tools
+uv sync --group docs         # include an extra group
+```
+
+`uv sync --no-dev --frozen` is exactly what the production Docker stage runs:
+runtime dependencies only, pinned to the lock, no test/lint tooling bloating the
+image. Contrast with `npm ci --production` — same intent, one flag.
+
+### Building a wheel (for libraries)
+
+If you're shipping a *library*, `uv build` produces the two standard distribution
+formats: a **wheel** (`.whl`, the pre-built install format, like a published npm
+tarball) and an **sdist** (`.tar.gz`, the source archive).
+
+```bash
+uv build                 # builds both into dist/
+#   dist/example_app-0.1.0-py3-none-any.whl
+#   dist/example_app-0.1.0.tar.gz
+
+uv build --wheel         # wheel only
+uv publish               # uploads dist/* to PyPI (token via UV_PUBLISH_TOKEN)
+```
+
+For a service you almost never run `uv build` — you don't publish a web app to
+PyPI, you containerize it. The artifact is the *image*, not a wheel.
+
+:::note[`uv export` for legacy interop]
+Some tools (older deploy platforms, security scanners, `pip`-only CI) still want a
+`requirements.txt`. Don't author one by hand — generate it from the lock:
+`uv export --no-dev --format requirements-txt > requirements.txt`. It's a derived
+artifact, like a compiled output, not your source of truth.
+:::
+
+## Dockerizing with uv
+
+The modern Python Dockerfile is a multi-stage `uv sync --frozen` build. The pattern
+mirrors what you do in Node and Go: copy the lockfile first so the dependency layer
+caches independently of your source, install into a venv in a builder stage, then
+copy that venv into a slim runtime image.
+
+### The size story
+
+Python images used to be embarrassing next to Go. With uv and a slim base they're
+not — a FastAPI service lands around 100-150 MB, in the same ballpark as a Node
+service and far from the old multi-hundred-MB `python:3.x` images.
+
+| Concern | Node (TS) | Go | Python (uv + FastAPI) |
+|---|---|---|---|
+| Builder base | `node:22-slim` | `golang:1.23` | `ghcr.io/astral-sh/uv:python3.13-bookworm-slim` |
+| Final base | `node:22-slim` (~190 MB) | `scratch` / distroless (~5-15 MB) | `python:3.13-slim` (~120 MB) / distroless |
+| Final artifact | source + `node_modules` | static binary | `.venv` + source |
+| Layer-cache key | `package*.json` first | `go.mod` + `go.sum` first | `uv.lock` + `pyproject.toml` first |
+| Typical final size | ~190-250 MB | ~10-20 MB | ~100-150 MB |
+| Startup | ~300-500 ms | ~10 ms | ~300-700 ms (import + uvicorn) |
+
+Go still wins on size — there's no runtime to ship, just a static binary into
+`scratch`. Python needs the interpreter, so it lands near Node. The job of the
+Dockerfile is to ship *only* the interpreter, your locked deps, and your code —
+nothing from the build toolchain.
+
+### Cross-language comparison: the Dockerfile
+
+The same multi-stage shape in each ecosystem.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```dockerfile
+FROM node:22-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src/ ./src/
+RUN npm run build
+
+FROM node:22-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=builder /app/dist/ ./dist/
+EXPOSE 8000
+USER node
+CMD ["node", "dist/index.js"]
+# ~200MB
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```dockerfile
+FROM golang:1.23 AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /server ./cmd/server
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=builder /server /server
+EXPOSE 8000
+USER nonroot
+ENTRYPOINT ["/server"]
+# ~12MB
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```dockerfile
+# Stage 1: build the venv with uv
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+WORKDIR /app
+
+# Layer 1: lockfile only -> deps cache independently of source
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-install-project --no-dev
+
+# Layer 2: project source, then install the project itself
+COPY . /app
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# Stage 2: slim runtime, no uv, no build tools
+FROM python:3.13-slim-bookworm
+WORKDIR /app
+RUN groupadd -r app && useradd -r -g app app
+COPY --from=builder --chown=app:app /app /app
+ENV PATH="/app/.venv/bin:$PATH"
+EXPOSE 8000
+USER app
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# ~130MB
+```
+
+  </TabItem>
+</Tabs>
+
+### What each line is buying you
+
+The Python Dockerfile packs a lot into a few lines — here's why each matters:
+
+- **`COPY --from=ghcr.io/astral-sh/uv`** — the official `uv` image ships a static
+  `uv` binary and the Python interpreter. Using it as the builder base means no
+  `pip`, no `python -m venv`, no manual install of uv. (You can also
+  `COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv` into any base if you want to
+  control the Python version yourself.)
+- **`UV_COMPILE_BYTECODE=1`** — pre-compiles `.pyc` files at build time so the
+  container doesn't pay that cost on first request. The container-equivalent of a
+  warm cache.
+- **`UV_LINK_MODE=copy`** — copies packages into the venv instead of hardlinking
+  from the cache mount, avoiding cross-filesystem hardlink warnings in Docker.
+- **`--mount=type=cache,target=/root/.cache/uv`** — a BuildKit cache mount keeps
+  uv's download/wheel cache *between builds* without baking it into a layer. Rebuilds
+  re-resolve nothing they've seen. This is the single biggest build-speed win.
+- **`--no-install-project` on the first sync** — installs only your *dependencies*
+  (the slow part) as a cached layer, deferring your own fast-changing source code to
+  the second sync. Same idea as copying `package.json` before `src/`.
+- **`uv sync --frozen --no-dev`** — exact lockfile, no dev group. Reproducible and
+  lean.
+- **Two stages** — the final image is plain `python:3.13-slim` with *no uv and no
+  build tools*. It carries only the `.venv` (deps), your code, and the interpreter.
+
+The venv lives at `/app/.venv`; putting `/app/.venv/bin` on `PATH` means `uvicorn`
+resolves to the venv's copy with no activation step.
+
+### Distroless for the smallest, hardest image
+
+`python:3.13-slim` is the sane default. To go smaller and shrink the attack surface,
+swap the runtime stage for a **distroless** image — no shell, no package manager,
+nothing but Python and your venv. Harder to debug (no `sh` to exec into), but a
+strong production posture.
+
+```dockerfile title="runtime stage (distroless)"
+FROM gcr.io/distroless/python3-debian12
+WORKDIR /app
+COPY --from=builder /app /app
+ENV PATH="/app/.venv/bin:$PATH" PYTHONPATH="/app"
+EXPOSE 8000
+USER nonroot
+# distroless has no shell, so exec-form CMD only — no "sh -c"
+CMD ["/app/.venv/bin/python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+:::caution[Distroless tradeoffs]
+Distroless images can't run a shell-form `HEALTHCHECK` (`CMD curl ...` needs a
+shell) and you can't `docker exec ... sh` to poke around a misbehaving pod. In
+Kubernetes that's fine — probes hit the app over HTTP, not via a shell — but for
+the everyday build, `slim` is friendlier. Reach for distroless when security review
+asks for it.
+:::
+
+### Non-root, always
+
+Containers run as root by default; that's the most common container security
+finding. Create an unprivileged user and `COPY --chown` so the app's files aren't
+root-owned. The runtime stage above does this with `useradd` + `USER app`.
+
+### .dockerignore
+
+Keep the build context tiny and secrets out of the image. Critically, exclude
+`.venv` — you build a fresh one inside the image; copying the host's (built for your
+laptop's OS/arch) would poison it.
+
+```text title=".dockerignore"
+.git
+.github
+.venv
+__pycache__/
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.ty_cache
+*.md
+!README.md
+docker-compose*.yml
+.env
+.env.*
+.dockerignore
+Dockerfile
+```
+
+## Running in production
+
+In dev you run `uv run fastapi dev` (auto-reload). In prod you run **uvicorn**
+directly — it's the ASGI server FastAPI and Litestar both speak.
+
+### uvicorn workers — the honest 2026 take
+
+The question everyone asks: uvicorn `--workers`, or gunicorn with uvicorn workers?
+
+The honest answer for 2026: **`uvicorn --workers N` directly, and let the platform
+own scaling.** uvicorn's own multi-process manager is mature; the old
+gunicorn+`uvicorn.workers.UvicornWorker` combo existed mainly because uvicorn's
+process management used to be thin, and that gap has closed. In Kubernetes you
+typically run **one uvicorn worker per container** and scale with *replicas* (the
+HPA), not with in-process workers — it gives the scheduler clean, single-purpose
+units and per-pod metrics. Run multiple `--workers` per container only when you're
+deploying to a single fat VM without an orchestrator.
+
+```bash
+# Single worker per container (the K8s default — scale via replicas)
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers
+
+# Multiple workers on one big VM (no orchestrator doing the scaling)
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 --proxy-headers
+```
+
+| Approach | When | Why |
+|---|---|---|
+| `uvicorn --workers N` | a single VM, no orchestrator | one process tree, N CPUs busy |
+| 1 uvicorn worker / container, scale replicas | Kubernetes / ECS / Cloud Run | scheduler owns scaling, clean per-pod metrics |
+| gunicorn + uvicorn worker | legacy setups, gunicorn-specific tuning | mostly historical in 2026 — prefer uvicorn directly |
+
+:::note[The GIL still bounds one process]
+A single uvicorn worker is one process with the GIL. asyncio gives you huge
+concurrency for **I/O-bound** work (DB, HTTP, Redis) on that one process — that's
+the FastAPI sweet spot. For genuinely **CPU-bound** work you still need more
+processes (workers or replicas), exactly as you'd scale Node. Python 3.13's
+free-threaded build is the long-game fix, but for 2026 prod, assume one
+worker = one CPU's worth of Python bytecode.
+:::
+
+### --proxy-headers and graceful shutdown
+
+Behind an ingress or load balancer, pass `--proxy-headers` so uvicorn trusts
+`X-Forwarded-For` / `X-Forwarded-Proto` and your app sees the real client IP and
+scheme. For graceful shutdown, uvicorn handles `SIGTERM` for you: it stops accepting
+new connections and lets in-flight requests drain (up to
+`--timeout-graceful-shutdown`). Your app-level cleanup (closing the DB pool, the
+Redis client) goes in the FastAPI **`lifespan`** — the shutdown half runs on
+`SIGTERM`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// Node: wire SIGTERM yourself
+process.on("SIGTERM", async () => {
+  server.close(async () => {
+    await db.end();
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 30_000);
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go: context cancelled on SIGTERM, then graceful Shutdown
+ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+defer stop()
+<-ctx.Done()
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+srv.Shutdown(shutdownCtx)
+db.Close()
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# FastAPI: uvicorn drains HTTP on SIGTERM; lifespan owns resource cleanup
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = await create_pool()   # startup
+    yield
+    await app.state.pool.close()           # shutdown — runs on SIGTERM
+
+app = FastAPI(lifespan=lifespan)
+```
+
+  </TabItem>
+</Tabs>
+
+### Healthchecks
+
+Give the platform two endpoints to poll. A cheap **liveness** check (is the process
+up?) and a **readiness** check (can it serve — DB reachable, pool ready?). FastAPI
+makes these trivial; they map straight to the K8s `livenessProbe` / `readinessProbe`
+below.
+
+```python title="app/health.py"
+from fastapi import APIRouter, Response, status
+
+router = APIRouter(tags=["meta"])
+
+@router.get("/healthz")          # liveness: process is alive
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+@router.get("/readyz")           # readiness: dependencies are reachable
+async def readyz(response: Response) -> dict[str, str]:
+    try:
+        await check_db()         # e.g. SELECT 1 against the pool
+    except Exception:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "not ready"}
+    return {"status": "ready"}
+```
+
+### 12-factor config with pydantic-settings
+
+Config comes from the environment, validated and typed — never hardcoded, never a
+committed `.env`. You built this in [module 04](/modern-python/04-pydantic/);
+`pydantic-settings` is the Python answer to Go's `envconfig` struct tags, with the
+type safety TS's `process.env` parsing lacks.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```typescript
+// No type safety, no validation, no fail-fast
+const config = {
+  port: parseInt(process.env.PORT ?? "8000"),
+  databaseUrl: process.env.DATABASE_URL ?? "",   // empty if unset!
+  logLevel: process.env.LOG_LEVEL ?? "info",
+};
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+type Config struct {
+    Port        int    `envconfig:"PORT" default:"8000"`
+    DatabaseURL string `envconfig:"DATABASE_URL" required:"true"`
+    LogLevel    string `envconfig:"LOG_LEVEL" default:"info"`
+}
+var cfg Config
+envconfig.MustProcess("", &cfg)   // fails fast if DATABASE_URL missing
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from pydantic import PostgresDsn
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_")
+    port: int = 8000
+    database_url: PostgresDsn          # required: no default -> fails fast at startup
+    log_level: str = "info"
+
+settings = Settings()   # raises ValidationError if APP_DATABASE_URL is missing/invalid
+```
+
+  </TabItem>
+</Tabs>
+
+A field with no default is *required* — the app refuses to boot if it's missing,
+the same fail-fast you get from Go's `required:"true"`. That's exactly the behavior
+you want in a container: a misconfigured pod crashes immediately and loudly instead
+of serving 500s.
+
+:::danger[Never bake secrets into the image]
+No secrets in `pyproject.toml`, in `ENV` lines in the Dockerfile, or in a committed
+`.env`. Inject them at runtime — a K8s `Secret` as env vars (below), or better, an
+External Secrets Operator / cloud secret manager. The `.env` file is a dev
+convenience only; `.dockerignore` and `.gitignore` it.
+:::
+
+## CI/CD with GitHub Actions
+
+The pipeline is the same shape you ship for Node or Go: lint, type-check, and test
+in parallel, then build and push an image. The Python-specific glue is
+`astral-sh/setup-uv`, which installs uv and caches the dependency download keyed on
+`uv.lock`.
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true              # caches ~/.cache/uv keyed on uv.lock
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --frozen             # exact lockfile, includes dev group
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run ty check              # mypy works here too: `uv run mypy .`
+
+      - name: Test
+        run: uv run pytest
+
+  build-and-push:
+    needs: check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=ref,event=branch
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+A few choices worth defending:
+
+- **`setup-uv` with `enable-cache`** caches uv's download cache keyed on `uv.lock`,
+  so unchanged deps are never re-downloaded — the npm/Go-module-cache equivalent.
+- **`uv sync --frozen`** in CI errors if the lockfile is stale, catching a forgotten
+  `uv lock` before it reaches prod. (Add `uv lock --check` as a separate step if you
+  want the failure spelled out explicitly.)
+- **`ruff check` + `ruff format --check`** is *one tool* doing lint and format —
+  replacing the flake8 + black + isort stack. Fast enough that it's never the
+  bottleneck.
+- **`ty check`** is Astral's type checker. It's young (see the caution below); swap
+  `uv run mypy .` if you want the established option — the workflow is identical.
+- **`cache-from/to: type=gha`** reuses Docker layers across runs via the GitHub
+  Actions cache, so the dependency layer only rebuilds when `uv.lock` changes.
+
+:::caution[ty is fast but young]
+`ty` (Astral's type checker, from the Ruff team) is dramatically faster than mypy
+and shares Ruff's polish, but in 2026 it's still pre-1.0 — expect occasional gaps in
+inference on advanced generics. For a greenfield service it's a great default; for a
+large existing codebase with deep typing, **mypy** remains the mature choice and the
+CI step is a one-line swap (`uv run mypy .`). Pick one and pin it; don't run both.
+:::
+
+## Kubernetes
+
+The manifests are the familiar set — `Deployment`, `Service`, `ConfigMap`,
+`Secret`, `HorizontalPodAutoscaler` — and for a FastAPI service they're refreshingly
+boring compared to a JVM app. Python starts fast (no JVM warmup), so the probes
+don't need a generous `startupProbe`, and there's no heap-sizing flag dance.
+
+The key Python-specific decisions: **one uvicorn worker per pod** (scale with
+replicas, not in-process workers), `livenessProbe` → `/healthz`, `readinessProbe` →
+`/readyz`, and resource limits sized for the interpreter plus your working set
+(Python's baseline RSS is higher than Go's, lower than the JVM's).
+
+```yaml title="k8s/deployment.yaml" {31-37,40-46,55-71}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task-api
+  labels:
+    app: task-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: task-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0          # full capacity during rollout
+  template:
+    metadata:
+      labels:
+        app: task-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: app
+          image: ghcr.io/example/task-api:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: APP_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef: { name: task-api-config, key: log-level }
+            - name: APP_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: task-api-secrets, key: database-url }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:          # is the process up? restart if not
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:         # can it serve? pull from rotation if not
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 30
+```
+
+The `Service` gives the pods a stable in-cluster address, and `ConfigMap` / `Secret`
+split non-sensitive config from credentials — both surfaced as env vars that
+`pydantic-settings` reads on boot.
+
+```yaml title="k8s/service.yaml + config"
+apiVersion: v1
+kind: Service
+metadata:
+  name: task-api
+spec:
+  type: ClusterIP
+  selector:
+    app: task-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: task-api-config
+data:
+  log-level: "info"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: task-api-secrets
+type: Opaque
+# base64-encoded EXAMPLE only — real values from a secrets manager
+data:
+  database-url: cG9zdGdyZXNxbDovL2RldjpkZXZAZGI6NTQzMi9hcHA=
+```
+
+The `HorizontalPodAutoscaler` scales replicas on CPU — which for an I/O-bound
+FastAPI service is a decent proxy for "are the workers saturated."
+
+```yaml title="k8s/hpa.yaml"
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: task-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: task-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+:::tip[Sizing memory for Python]
+A FastAPI worker idles around 80-150 MB RSS — higher than a Go binary (~10-30 MB),
+much lower than a JVM (~250-400 MB). Set `requests.memory` near idle RSS and
+`limits.memory` with headroom for your working set (request bodies, connection
+pools, any in-memory caches). Unlike the JVM there's no `MaxRAMPercentage` knob —
+Python doesn't pre-claim a heap — but a process that overruns its `limits.memory`
+still gets OOM-killed, so size with margin.
+:::
+
+## Serverless and edge
+
+Not every service wants a long-running pod. For spiky or low-traffic workloads,
+serverless skips the cluster entirely:
+
+- **AWS Lambda (container image):** package the same uv-built image (Lambda accepts
+  OCI images up to 10 GB) and wrap the ASGI app with **Mangum**, an adapter that
+  translates API Gateway events into ASGI calls. `handler = Mangum(app)` and your
+  existing FastAPI app runs unchanged. Mind cold starts — Python's import time is
+  the cost, so keep the dependency tree lean.
+- **Cloud Run / Container Apps:** run the *exact* `slim` image from above, no
+  adapter needed — they speak plain HTTP and scale to zero. This is the lowest-effort
+  path: the container you already built just works, billed per request.
+- **Edge:** true edge runtimes (Cloudflare Workers, etc.) don't run CPython, so
+  full FastAPI doesn't deploy there. For edge, you're in JS/Wasm territory — keep
+  Python on Lambda/Cloud Run at the regional layer.
+
+The win: one uv-based image, many deploy targets. The same artifact runs in K8s, on
+Cloud Run, or behind Lambda — you choose the runtime per workload, not per rewrite.
+
+## Summary
+
+| Concern | Node (TS) | Go | Python (uv) |
+|---|---|---|---|
+| Reproducible install | `npm ci` | `go mod download` | `uv sync --frozen` |
+| Prod deps only | `npm ci --omit=dev` | (single binary) | `uv sync --no-dev` |
+| Build artifact | bundle | static binary | image (wheel for libs) |
+| Docker builder | `node:slim` | `golang` | `ghcr.io/astral-sh/uv` |
+| Final image | ~200 MB | ~12 MB | ~130 MB (slim) |
+| Serve | `node dist/...` | `./server` | `uvicorn app.main:app` |
+| Scale | replicas / cluster | replicas / cluster | replicas (1 worker/pod) |
+| Config | `process.env` | `envconfig` | `pydantic-settings` |
+| CI deps cache | npm cache | module cache | `setup-uv` cache (uv.lock) |
+| Graceful shutdown | manual SIGTERM | `context` | uvicorn + `lifespan` |
+
+**What to remember:**
+
+- `uv.lock` + `uv sync --frozen` is your reproducibility contract — it's `npm ci`
+  for Python. Commit the lock for apps.
+- The modern Dockerfile is multi-stage with the `ghcr.io/astral-sh/uv` builder,
+  `uv sync --frozen --no-dev`, a BuildKit cache mount, and a slim/distroless runtime
+  with a non-root user. Lockfile first for layer caching.
+- Python images land near Node (~130 MB), well above Go but far below the JVM.
+- Serve with `uvicorn` directly; one worker per container, scale with replicas in
+  K8s. The GIL bounds one process — async is for I/O concurrency, replicas for CPU.
+- `--proxy-headers` behind a proxy; resource cleanup goes in the FastAPI `lifespan`,
+  which runs on `SIGTERM`.
+- CI is `setup-uv` + `ruff check` + `ruff format --check` + `ty check` (or mypy) +
+  `pytest`, then build/push with GHA layer caching.
+- K8s probes hit `/healthz` (liveness) and `/readyz` (readiness); no JVM-style
+  startup probe needed. Config in env via `pydantic-settings`, secrets from a
+  `Secret`, never the image.
+
+## Practice
+
+Take the FastAPI Task API all the way to production: a uv multi-stage image, a
+prod-like Compose stack, a GitHub Actions pipeline, and Kubernetes manifests.
+
+<CardGrid>
+  <LinkCard
+    title="Dockerized App + CI/CD"
+    href="/modern-python/17-deployment/dockerized-app/"
+    description="Containerize the FastAPI Task API with a uv multi-stage Dockerfile, a docker-compose prod-like stack, a lint+type+test+build+push GitHub Actions workflow, and K8s Deployment/Service/probe manifests."
+  />
+</CardGrid>

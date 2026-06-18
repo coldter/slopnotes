@@ -1,0 +1,365 @@
+---
+title: API Cache + Rate Limiter
+description: Build a FastAPI service with a Redis cache-aside layer (TTL + invalidation) on an expensive endpoint and a sliding-window rate-limit dependency, both async.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Redis & Caching"
+  href="/modern-python/10-redis-caching/"
+/>
+
+## Goal
+
+Build a small FastAPI service that demonstrates the two workhorse Redis patterns
+together: **cache-aside** (with a TTL and explicit invalidation) on a deliberately
+slow endpoint, and a **sliding-window rate limiter** as a FastAPI dependency. Both
+are backed by the async `redis.asyncio` client, sharing one connection pool opened
+in the app's lifespan.
+
+By the end you'll watch a 1.5-second endpoint drop to single-digit milliseconds on a
+cache hit, see a write blow the cache away, and get a `429` with a `Retry-After`
+header when you hammer it past the limit.
+
+## What you'll practice
+
+- `redis.asyncio.from_url` + a **connection pool** opened in the FastAPI **lifespan**
+  and shared via a dependency.
+- **Cache-aside**: get → miss → load → `SET ... EX` → return, with `Product`
+  serialized via Pydantic `model_dump_json()`.
+- **Invalidation**: `DELETE` the key on write, after the "DB" mutation.
+- A **sliding-window** rate-limit dependency using an atomic Lua script over a sorted
+  set, returning `429` + `Retry-After`.
+- A `uv` project wired with `ruff` and `ty`.
+
+## Requirements
+
+1. A `GET /reports/{region}` endpoint backed by a slow (simulated 1.5s) computation,
+   cached in Redis with a 30-second TTL.
+2. A `POST /reports/{region}/refresh` endpoint that invalidates the cached report.
+3. A response that reports `cached: true | false` so you can see hits vs misses
+   without reading logs.
+4. A sliding-window rate limiter (5 requests / 10 seconds, keyed by client IP)
+   applied to the report endpoint as a dependency, returning `429` with `Retry-After`
+   when exceeded.
+5. One shared async Redis client, opened and closed in the lifespan.
+
+## The worked solution
+
+A single-package FastAPI app. Everything lives under `app/`: the lifespan + wiring in
+`main.py`, the cache-aside logic in `cache.py`, and the limiter in `ratelimit.py`.
+
+<FileTree>
+- api-caching/
+  - pyproject.toml uv project, deps, ruff + ty config
+  - app/
+    - __init__.py
+    - main.py lifespan, Redis pool, routes
+    - cache.py cache-aside get + invalidate
+    - ratelimit.py sliding-window dependency
+  - docker-compose.yml (optional) just Redis, if not using shared-infra
+</FileTree>
+
+### pyproject.toml
+
+Three runtime deps: `fastapi`, `uvicorn` (the ASGI server), and `redis` with the
+`hiredis` speedup. `ruff` and `ty` go in a dev group.
+
+```toml title="pyproject.toml"
+[project]
+name = "api-caching"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "redis[hiredis]>=5.2",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.8", "ty>=0.0.1"]
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.ty.environment]
+python-version = "3.13"
+```
+
+### app/cache.py
+
+The cache-aside core. `slow_report` is the stand-in for an expensive aggregation
+query — it sleeps 1.5 seconds so the cache win is obvious. `get_report` does the
+classic dance: check Redis, return on hit, otherwise compute, store with a TTL, and
+return. `invalidate_report` deletes the key.
+
+The `Report` model serializes with Pydantic's `model_dump_json()` and validates back
+with `model_validate_json()`, so a malformed cache entry raises instead of returning
+garbage.
+
+```python title="app/cache.py" {30-33,38-44}
+import asyncio
+from datetime import datetime
+
+import redis.asyncio as redis
+from pydantic import BaseModel
+
+REPORT_TTL_SECONDS = 30
+
+
+class Report(BaseModel):
+    region: str
+    total_sales: float
+    generated_at: datetime
+    cached: bool = False
+
+
+async def slow_report(region: str) -> Report:
+    """Stand-in for an expensive query — sleeps to make the cache win visible."""
+    await asyncio.sleep(1.5)
+    return Report(
+        region=region,
+        total_sales=round(len(region) * 1234.56, 2),
+        generated_at=datetime.now(),
+    )
+
+
+async def get_report(r: redis.Redis, region: str) -> Report:
+    key = f"report:{region}"
+
+    cached = await r.get(key)
+    if cached is not None:                       # --- cache HIT ---
+        report = Report.model_validate_json(cached)
+        report.cached = True
+        return report
+
+    report = await slow_report(region)           # --- cache MISS: compute ---
+    await r.set(key, report.model_dump_json(), ex=REPORT_TTL_SECONDS)  # store w/ TTL
+    report.cached = False
+    return report
+
+
+async def invalidate_report(r: redis.Redis, region: str) -> bool:
+    deleted = await r.delete(f"report:{region}")  # next read repopulates
+    return deleted > 0
+```
+
+### app/ratelimit.py
+
+The sliding-window limiter from the module, packaged as a FastAPI dependency factory.
+The Lua script runs atomically: prune old timestamps, count, reject-or-add. The
+`rate_limit(...)` factory returns a dependency you attach to any route; on rejection
+it raises `HTTPException(429)` with a `Retry-After` header computed from when the
+oldest in-window request slides out.
+
+```python title="app/ratelimit.py" {11-25,42-55}
+import time
+import uuid
+
+from fastapi import HTTPException, Request, status
+
+SLIDING_WINDOW_LUA = """
+-- KEYS[1] = zset key
+-- ARGV: now_ms, window_ms, limit, member, ttl_seconds
+local now    = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit  = tonumber(ARGV[3])
+
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+local count = redis.call('ZCARD', KEYS[1])
+if count >= limit then
+  local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+  return {0, oldest[2]}
+end
+redis.call('ZADD', KEYS[1], now, ARGV[4])
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+return {1, 0}
+"""
+
+
+def rate_limit(limit: int, window: int):
+    """Factory -> a FastAPI dependency enforcing `limit` requests per `window` seconds."""
+
+    async def dependency(request: Request) -> None:
+        r = request.app.state.redis
+        client_id = request.client.host if request.client else "unknown"
+        now_ms = int(time.time() * 1000)
+        member = f"{now_ms}-{uuid.uuid4()}"  # unique per request
+
+        allowed, oldest = await r.eval(
+            SLIDING_WINDOW_LUA, 1,
+            f"rate:sliding:{client_id}",
+            now_ms, window * 1000, limit, member, window,
+        )
+
+        if not allowed:
+            # Retry-After = seconds until the oldest in-window request slides out.
+            oldest_ms = int(oldest) if oldest else now_ms
+            retry_after = max(1, (oldest_ms + window * 1000 - now_ms) // 1000)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    return dependency
+```
+
+### app/main.py
+
+The wiring. The lifespan opens one `redis.asyncio` pool, pings it to fail fast, and
+closes it on shutdown. `get_redis` hands the shared client to routes. The report
+route depends on both the Redis client and the rate-limit dependency (5 req / 10 s by
+IP); the refresh route invalidates.
+
+```python title="app/main.py" {10-19,25-27,32,37}
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+import redis.asyncio as redis
+from fastapi import Depends, FastAPI, Request
+
+from app.cache import Report, get_report, invalidate_report
+from app.ratelimit import rate_limit
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    app.state.redis = redis.from_url(
+        "redis://localhost:6379",
+        decode_responses=True,
+        max_connections=20,
+    )
+    await app.state.redis.ping()  # fail fast if Redis is down
+    yield
+    await app.state.redis.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_redis(request: Request) -> redis.Redis:
+    return request.app.state.redis
+
+
+RedisDep = Annotated[redis.Redis, Depends(get_redis)]
+
+
+@app.get("/reports/{region}", dependencies=[Depends(rate_limit(limit=5, window=10))])
+async def read_report(region: str, r: RedisDep) -> Report:
+    return await get_report(r, region)
+
+
+@app.post("/reports/{region}/refresh")
+async def refresh_report(region: str, r: RedisDep) -> dict[str, bool]:
+    return {"invalidated": await invalidate_report(r, region)}
+```
+
+## Run it
+
+You need Redis running first — it comes from the guide's `shared-infra` Docker
+Compose stack.
+
+<Steps>
+
+1. Start Redis from the shared infra:
+
+   ```bash
+   cd shared-infra && docker compose up -d redis
+   ```
+
+   No shared-infra checkout handy? A one-service compose file works too:
+
+   ```bash
+   docker run -d --name redis -p 6379:6379 redis:8
+   ```
+
+2. Scaffold the project and add dependencies:
+
+   ```bash
+   uv init api-caching && cd api-caching
+   uv add fastapi "uvicorn[standard]" "redis[hiredis]"
+   uv add --dev ruff ty
+   ```
+
+3. Add the `app/` package (`__init__.py`, `main.py`, `cache.py`, `ratelimit.py`) from
+   the solution above, then lint and type-check:
+
+   ```bash
+   uv run ruff check .
+   uv run ty check          # mypy works identically if you prefer it
+   ```
+
+4. Run the server:
+
+   ```bash
+   uv run uvicorn app.main:app --reload --port 8000
+   ```
+
+</Steps>
+
+## See the cache hit/miss and the 429
+
+<Steps>
+
+1. First call — a **cache miss**. It takes ~1.5s and returns `"cached": false`:
+
+   ```bash
+   curl -s -w "\n(%{time_total}s)\n" http://localhost:8000/reports/emea
+   # {"region":"emea","total_sales":4938.24,...,"cached":false}
+   # (1.51s)
+   ```
+
+2. Second call — a **cache hit**. Near-instant, `"cached": true`:
+
+   ```bash
+   curl -s -w "\n(%{time_total}s)\n" http://localhost:8000/reports/emea
+   # {"region":"emea",...,"cached":true}
+   # (0.006s)
+   ```
+
+3. Confirm the key and its TTL directly in Redis:
+
+   ```bash
+   docker exec -it redis redis-cli GET "report:emea"
+   docker exec -it redis redis-cli TTL "report:emea"   # counts down from 30
+   ```
+
+4. Invalidate it, then read again — back to a slow miss:
+
+   ```bash
+   curl -s -X POST http://localhost:8000/reports/emea/refresh   # {"invalidated":true}
+   curl -s -w "\n(%{time_total}s)\n" http://localhost:8000/reports/emea  # ~1.5s, cached:false
+   ```
+
+5. Trip the rate limiter — 5 requests are allowed per 10s, the 6th gets `429`:
+
+   ```bash
+   for i in $(seq 1 7); do
+     echo "Request $i:"
+     curl -s -o /dev/null -w "  HTTP %{http_code}  Retry-After: %header{retry-after}\n" \
+       http://localhost:8000/reports/apac
+   done
+   # Requests 1-5: HTTP 200
+   # Requests 6-7: HTTP 429  Retry-After: 10
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- Add **single-flight**: an `asyncio.Lock` per region so that when the cache is cold,
+  ten concurrent requests trigger *one* `slow_report`, not ten (test it with
+  `curl ... &` in a loop and watch the timings).
+- Add **TTL jitter** (`ex=30 + random.randint(0, 5)`) and explain which stampede it
+  prevents.
+- Promote the report into a **cache decorator** (`@cached(r, ttl=30)`) so the route
+  body is a one-liner — see the decorator in the parent module.
+- Emit `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers from the limiter (have
+  the Lua script return the surviving count).
+- Swap the limiter to **token bucket** and compare burst behaviour against the
+  sliding window.
+:::

@@ -1,0 +1,944 @@
+---
+title: API Design & Serialization
+description: REST done right, plus the three API styles in modern Python — FastAPI/OpenAPI, Strawberry GraphQL, and gRPC — mapped from the Express/tRPC and Go tooling you know.
+sidebar:
+  order: 14
+---
+
+import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+[Module 07](/modern-python/07-fastapi/) got a REST API on its feet. This module is
+about doing it *well* — and about the two other API styles you reach for when REST
+stops fitting: **GraphQL** (flexible client-driven queries) and **gRPC** (fast,
+typed, internal service-to-service).
+
+You already know this terrain from another stack. In TypeScript you've designed
+REST with Express + Zod, maybe used tRPC for end-to-end types, Apollo for GraphQL,
+`@grpc/grpc-js` for gRPC. In Go you've hand-written `encoding/json` structs,
+generated OpenAPI from comments with `swaggo`, used `gqlgen` and the first-class
+`grpc-go`. Python's 2026 story is: FastAPI generates OpenAPI for free, **Strawberry**
+does code-first GraphQL from type hints, and `grpcio` gives you async gRPC. The
+mapping is what this module is for.
+
+## The mental model
+
+| Concept | TypeScript | Go | Python (2026) |
+|---|---|---|---|
+| REST framework | Express / Nest | Gin / `net/http` | **FastAPI** |
+| Request validation | Zod / class-validator | struct tags + manual | **Pydantic v2** |
+| OpenAPI spec | `@nestjs/swagger`, tsoa (opt-in) | `swaggo` comments (opt-in) | **automatic** from type hints |
+| GraphQL | Apollo Server, Pothos | `gqlgen` | **Strawberry** (code-first) |
+| gRPC | `@grpc/grpc-js` + `ts-proto` | `grpc-go` (first-class) | **`grpcio`** + `grpcio-tools` |
+| JSON encoder | `JSON.stringify` (V8) | `encoding/json` | **orjson / msgspec** (fast) |
+| Problem details | manual | manual | RFC 9457 (`problem+json`) |
+
+The rest of the module is in four parts: **REST done well**, **OpenAPI**,
+**GraphQL with Strawberry**, **gRPC with grpcio** — then serialization choices and
+an honest decision table.
+
+## Part 1 — REST done well
+
+FastAPI gives you routing and validation. Good API *design* is the layer on top:
+how you model resources, what status codes you return, how you paginate, how errors
+look. None of this is Python-specific knowledge — it's the same REST you've designed
+before — but the FastAPI idioms are worth seeing.
+
+### Resource modeling
+
+Nouns, plural, lowercase, kebab-case for multi-word. Verbs live in the HTTP method,
+not the path.
+
+```text
+GET    /v1/tasks                  list tasks
+POST   /v1/tasks                  create a task
+GET    /v1/tasks/{id}             fetch one
+PUT    /v1/tasks/{id}             full replace
+PATCH  /v1/tasks/{id}             partial update
+DELETE /v1/tasks/{id}             delete
+GET    /v1/tasks/{id}/comments    sub-collection
+GET    /v1/task-templates         multi-word resource (kebab-case)
+
+# Anti-patterns
+GET    /v1/getTask/{id}           verb in path
+POST   /v1/createTask             verb in path
+GET    /v1/task/{id}              singular collection
+```
+
+### Status codes that mean something
+
+| Code | Use it for |
+|---|---|
+| `200 OK` | successful GET/PUT/PATCH with a body |
+| `201 Created` | POST that created a resource (set `Location`) |
+| `202 Accepted` | accepted for async processing, not done yet |
+| `204 No Content` | successful DELETE, or PUT with no body to return |
+| `400 Bad Request` | malformed syntax / unparseable |
+| `401 / 403` | not authenticated / authenticated but not allowed |
+| `404 Not Found` | resource doesn't exist (or you hide existence) |
+| `409 Conflict` | optimistic-lock clash, duplicate unique key |
+| `422 Unprocessable` | well-formed but fails validation (FastAPI's default) |
+| `429 Too Many Requests` | rate limited (add `Retry-After`) |
+
+In FastAPI you set the success code on the decorator; failures are raised:
+
+```python title="app/api/tasks.py"
+from fastapi import APIRouter, HTTPException, Response, status
+
+router = APIRouter(prefix="/v1/tasks", tags=["tasks"])
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_task(body: TaskCreate, response: Response) -> Task:
+    task = await service.create(body)
+    response.headers["Location"] = f"/v1/tasks/{task.id}"
+    return task
+
+@router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_task(task_id: int) -> None:
+    if not await service.delete(task_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "task not found")
+```
+
+:::caution[Don't return 200 for everything]
+A common Express/Node habit is `res.json({ error: ... })` with a `200`. Clients
+(and your own retry logic) key off the status line. A `404` body with a `200`
+status is a bug waiting to happen. FastAPI's `HTTPException` makes the right thing
+easy — use it.
+:::
+
+### Pagination: cursor vs offset
+
+Two strategies, and the choice matters more than people think.
+
+**Offset** (`?limit=20&offset=40`) is simple and lets you jump to "page 5". It
+breaks down on large, mutating datasets: `OFFSET 100000` makes Postgres scan and
+discard 100k rows, and an insert between page loads shifts everything down, so you
+see duplicates or skip rows.
+
+**Cursor** (`?limit=20&cursor=<opaque>`) encodes "where the last page ended"
+(usually `(created_at, id)`). It's `WHERE (created_at, id) < (?, ?)` — index-friendly
+and stable under concurrent writes. The cost: no random page access. It's the right
+default for feeds, infinite scroll, and anything high-volume.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Express: cursor pagination, opaque base64 cursor
+app.get("/v1/tasks", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 20, 100);
+  const cursor = req.query.cursor
+    ? JSON.parse(Buffer.from(String(req.query.cursor), "base64").toString())
+    : null;
+  const rows = await db.tasks(cursor, limit + 1);   // fetch one extra
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit);
+  const next = hasMore
+    ? Buffer.from(JSON.stringify({ createdAt: items.at(-1)!.createdAt, id: items.at(-1)!.id })).toString("base64")
+    : null;
+  res.json({ items, nextCursor: next });
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func listTasks(w http.ResponseWriter, r *http.Request) {
+    limit := clamp(atoi(r.URL.Query().Get("limit"), 20), 1, 100)
+    cursor := decodeCursor(r.URL.Query().Get("cursor")) // may be nil
+    rows := db.Tasks(cursor, limit+1)                   // fetch one extra
+    hasMore := len(rows) > limit
+    items := rows[:min(len(rows), limit)]
+    var next string
+    if hasMore {
+        last := items[len(items)-1]
+        next = encodeCursor(last.CreatedAt, last.ID)
+    }
+    json.NewEncoder(w).Encode(map[string]any{"items": items, "nextCursor": next})
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python title="app/api/pagination.py"
+import base64
+import json
+from typing import Annotated
+from fastapi import APIRouter, Query
+from pydantic import BaseModel
+
+class Page[T](BaseModel):          # PEP 695 generic model
+    items: list[T]
+    next_cursor: str | None = None
+
+def _encode(created_at: str, task_id: int) -> str:
+    raw = json.dumps({"ts": created_at, "id": task_id}).encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+def _decode(cursor: str) -> tuple[str, int]:
+    data = json.loads(base64.urlsafe_b64decode(cursor))
+    return data["ts"], data["id"]
+
+@router.get("")
+async def list_tasks(
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: str | None = None,
+) -> Page[Task]:
+    after = _decode(cursor) if cursor else None
+    rows = await service.page(after, limit + 1)        # fetch one extra
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    nxt = _encode(items[-1].created_at, items[-1].id) if has_more else None
+    return Page(items=items, next_cursor=nxt)
+```
+
+  </TabItem>
+</Tabs>
+
+The "fetch `limit + 1`, slice off the extra" trick is how you know there's a next
+page without a second `COUNT(*)` query — identical across all three stacks.
+
+:::tip[Keep the cursor opaque]
+Base64 a JSON blob and treat it as opaque on the client. If clients start parsing
+it, the encoding becomes a public contract you can't change. The opacity *is* the
+feature.
+:::
+
+### Filtering and sorting
+
+Filters are query params; validate and constrain them. FastAPI turns
+`Annotated[... , Query(...)]` into both the parser and the OpenAPI doc.
+
+```python
+from enum import StrEnum
+
+class TaskStatus(StrEnum):
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+
+@router.get("")
+async def list_tasks(
+    status: TaskStatus | None = None,                      # ?status=open
+    assignee_id: int | None = None,
+    sort: Annotated[str, Query(pattern=r"^-?(created_at|due_date)$")] = "-created_at",
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> Page[Task]:
+    ...
+```
+
+The `-` prefix on `sort` ("`-created_at`" = descending) is a widely-used REST
+convention; the `pattern` whitelist keeps users from sorting on arbitrary columns
+(a SQL-injection-adjacent footgun if you interpolate it).
+
+### Versioning
+
+| Strategy | Example | Verdict |
+|---|---|---|
+| URL path | `/v1/tasks` | **Default.** Visible, cacheable, trivial to route. |
+| Header | `X-API-Version: 1` | Cleaner URLs, harder to test/cache/discover. |
+| Media type | `Accept: application/vnd.app.v1+json` | Purest REST, most friction. Rarely worth it. |
+
+Use URL path versioning unless you have a strong reason not to. In FastAPI it's
+just a router prefix — mount `APIRouter(prefix="/v1")` and `/v2` side by side.
+
+### Error shape: RFC 9457 problem+json
+
+Stop inventing error shapes per endpoint. **RFC 9457** (the 2023 update to RFC 7807)
+standardizes a `application/problem+json` body. Every error looks the same, which
+makes client error handling boring — exactly what you want.
+
+```json
+{
+  "type": "https://api.example.com/errors/task-not-found",
+  "title": "Task not found",
+  "status": 404,
+  "detail": "No task with id 999",
+  "instance": "/v1/tasks/999",
+  "task_id": 999
+}
+```
+
+FastAPI doesn't ship an RFC 9457 helper, but it's a few lines: a Pydantic model plus
+an exception handler that sets the `application/problem+json` content type.
+
+```python title="app/problems.py"
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+class Problem(BaseModel):
+    type: str = "about:blank"
+    title: str
+    status: int
+    detail: str | None = None
+    instance: str | None = None
+
+class ProblemException(Exception):
+    def __init__(self, problem: Problem, **extra: object) -> None:
+        self.problem = problem
+        self.extra = extra          # extension members (e.g. task_id)
+
+def install(app: FastAPI) -> None:
+    @app.exception_handler(ProblemException)
+    async def _handle(request: Request, exc: ProblemException) -> JSONResponse:
+        body = exc.problem.model_dump(exclude_none=True) | exc.extra
+        body["instance"] = str(request.url.path)
+        return JSONResponse(
+            body,
+            status_code=exc.problem.status,
+            media_type="application/problem+json",   # the RFC 9457 content type
+        )
+
+# raise it like:
+raise ProblemException(
+    Problem(type="https://api.example.com/errors/task-not-found",
+            title="Task not found", status=404, detail="No task with id 999"),
+    task_id=999,
+)
+```
+
+:::note[FastAPI's 422 is already structured]
+Validation failures from Pydantic already return a consistent JSON body (a `detail`
+array of per-field errors) with status `422`. RFC 9457 is for *your* domain errors
+— not-found, conflict, business-rule violations — so the whole API speaks one error
+dialect. You can also override the built-in `RequestValidationError` handler to wrap
+422s in problem+json too.
+:::
+
+### Idempotency
+
+`GET`, `PUT`, `DELETE` are idempotent by definition — replaying them is safe.
+`POST` is not, which is a problem when a client retries after a network blip and
+creates two tasks. The fix is an **idempotency key**: the client sends a unique
+`Idempotency-Key` header, you cache the first response against it (in Redis — see
+[module 10](/modern-python/10-redis-caching/)), and replays return the cached result.
+
+```python title="app/idempotency.py"
+from typing import Annotated
+from fastapi import Header
+import redis.asyncio as redis
+
+async def idempotent_create(
+    body: TaskCreate,
+    idempotency_key: Annotated[str | None, Header()] = None,
+    r: redis.Redis = ...,   # injected via Depends
+) -> Task:
+    if idempotency_key:
+        cached = await r.get(f"idem:{idempotency_key}")
+        if cached:
+            return Task.model_validate_json(cached)
+    task = await service.create(body)
+    if idempotency_key:
+        await r.set(f"idem:{idempotency_key}", task.model_dump_json(), ex=86_400)
+    return task
+```
+
+This is exactly how Stripe's API handles retries. Production-grade versions also
+fingerprint the request body so the same key with a *different* body is a `422`.
+
+### ETags and conditional requests
+
+An **ETag** is a version fingerprint for a resource. Return it on `GET`; clients
+send it back as `If-None-Match` (to skip re-downloading unchanged data → `304`) or
+`If-Match` (to do optimistic concurrency on writes → `412` if stale). This is the
+cheap, standards-based way to cut bandwidth and prevent lost updates.
+
+```python
+import hashlib
+from fastapi import Header, Response
+
+@router.get("/{task_id}")
+async def get_task(task_id: int, response: Response,
+                   if_none_match: Annotated[str | None, Header()] = None) -> Task | Response:
+    task = await service.get_or_404(task_id)
+    etag = '"' + hashlib.sha256(task.model_dump_json().encode()).hexdigest()[:16] + '"'
+    if if_none_match == etag:
+        return Response(status_code=304)        # client's copy is current
+    response.headers["ETag"] = etag
+    return task
+```
+
+### Content negotiation and HATEOAS-lite
+
+FastAPI serves JSON by default. Honor the `Accept` header only if you genuinely need
+multiple representations (CSV exports, for instance) — most JSON APIs don't.
+
+**HATEOAS** (embedding hypermedia links in responses) is academically pure and
+almost never used in practice; OpenAPI docs win. The pragmatic middle ground —
+"HATEOAS-lite" — is a `_links` block with the obvious next actions, included only if
+clients will actually follow them:
+
+```json
+{
+  "id": 1, "title": "Ship v2", "status": "open",
+  "_links": {
+    "self":     { "href": "/v1/tasks/1" },
+    "comments": { "href": "/v1/tasks/1/comments" }
+  }
+}
+```
+
+If your clients won't traverse links, skip it — it's pure overhead.
+
+## Part 2 — OpenAPI for free
+
+Here's where Python pulls ahead of the stacks you know. In Express you bolt on
+`@nestjs/swagger` or write the spec by hand; in Go you sprinkle `swaggo` comments and
+run a generator. **FastAPI builds an OpenAPI 3.1 document from your type hints
+automatically** — the function signature *is* the spec.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Nest: opt-in decorators, then generate
+@ApiTags("tasks")
+@Controller("v1/tasks")
+export class TasksController {
+  @ApiOperation({ summary: "Create a task" })
+  @ApiResponse({ status: 201, type: TaskDto })
+  @Post()
+  create(@Body() body: CreateTaskDto): TaskDto { /* ... */ }
+}
+// SwaggerModule.setup("docs", app, document) wires up the UI
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// swaggo: doc comments above the handler, then `swag init`
+// @Summary  Create a task
+// @Tags     tasks
+// @Accept   json
+// @Produce  json
+// @Param    body  body      CreateTask  true  "task"
+// @Success  201   {object}  Task
+// @Router   /v1/tasks [post]
+func CreateTask(c *gin.Context) { /* ... */ }
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python title="app/api/tasks.py"
+# FastAPI: nothing extra — the signature is the spec.
+@router.post(
+    "",
+    status_code=201,
+    summary="Create a task",
+    response_model=Task,
+    responses={409: {"description": "Duplicate title"}},
+)
+async def create_task(body: TaskCreate) -> Task:
+    """Create a task. Markdown in the docstring shows up in /docs."""
+    return await service.create(body)
+```
+
+  </TabItem>
+</Tabs>
+
+Visit `/docs` (Swagger UI) or `/redoc` (ReDoc) and it's all there. The knobs that
+make the generated docs *good*:
+
+- **`tags=[...]`** on the router group endpoints in the sidebar.
+- **`summary=` and the docstring** become the operation title and description
+  (Markdown supported).
+- **`response_model=Task`** controls the *output* schema — crucially, it strips
+  fields not on `Task`, so you never leak a `password_hash` by returning an ORM row
+  directly.
+- **`responses={...}`** documents the non-200 outcomes (your problem+json shapes).
+- **`examples=`** on a field or `Body(examples=...)` pre-fills the "Try it out" form.
+
+```python title="examples on Pydantic models"
+from pydantic import BaseModel, Field
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200, examples=["Ship v2"])
+    priority: Priority = Priority.MEDIUM
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"title": "Ship v2", "priority": "high"}]
+        }
+    }
+```
+
+### Customizing the schema
+
+Set top-level metadata on the app, and reach into `app.openapi()` only when you need
+to (adding a security scheme, say):
+
+```python title="app/main.py"
+app = FastAPI(
+    title="Task API",
+    version="1.0.0",
+    description="Task management API. Auth via Bearer JWT.",
+    openapi_tags=[{"name": "tasks", "description": "Task CRUD"}],
+)
+```
+
+### Generating typed clients
+
+The spec at `/openapi.json` is the payoff: any consumer can codegen a typed client.
+This is the same `openapi-generator` you'd point at a hand-written Go or TS spec —
+except here the spec was free.
+
+```bash
+# Dump the live spec
+curl http://localhost:8000/openapi.json > openapi.json
+
+# Generate a typed TypeScript client (fetch-based)
+npx @openapitools/openapi-generator-cli generate \
+  -i openapi.json -g typescript-fetch -o ./client-ts
+
+# A lighter, very popular TS option built for FastAPI specs:
+npx openapi-typescript openapi.json -o ./client/schema.ts
+```
+
+:::tip[The Python-to-frontend pipeline]
+For a TS frontend talking to a FastAPI backend, `openapi-typescript` +
+`openapi-fetch` gives you fully typed `fetch` calls with zero runtime overhead,
+regenerated from the live spec in CI. It's the closest thing to tRPC's end-to-end
+types when your server is Python, not TypeScript. Wire the regen into a GitHub
+Action so the client can never drift from the server.
+:::
+
+## Part 3 — GraphQL with Strawberry
+
+REST returns fixed shapes; the client takes what it's given and makes multiple
+round-trips for related data. GraphQL inverts that: the client asks for exactly the
+fields it wants, across relationships, in one request.
+
+```graphql
+query {
+  task(id: 1) {
+    title
+    status
+    assignee { name }
+    comments { text author { name } }
+  }
+}
+```
+
+**Strawberry** is the modern, type-hints-based, **code-first** GraphQL library for
+Python. You define types with `@strawberry.type` on dataclass-like classes and
+Python annotations; Strawberry derives the SDL schema from them. This is the inverse
+of the schema-first `.graphql`-file workflow you'd use with Apollo or `gqlgen`.
+
+| | TypeScript | Go | Python |
+|---|---|---|---|
+| Library | Apollo Server, Pothos | `gqlgen` | **Strawberry** |
+| Style | schema-first or code-first | schema-first (codegen) | **code-first** (type hints) |
+| Schema source of truth | `.graphql` SDL or resolvers | `.graphql` SDL | your Python types |
+| N+1 fix | `dataloader` package | `dataloaden` codegen | `strawberry.dataloader` |
+| Async resolvers | yes | yes (goroutines) | yes (`async def`) |
+
+```bash
+uv add strawberry-graphql
+```
+
+### Types, queries, mutations
+
+A Strawberry type is a class decorated with `@strawberry.type`; its annotated
+attributes become GraphQL fields, mapping over directly: `str` → `String!`,
+`str | None` → nullable `String`, `list[Comment]` → `[Comment!]!`.
+
+```python title="app/graphql/schema.py"
+import strawberry
+
+@strawberry.enum
+class TaskStatus:
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+
+@strawberry.type
+class User:
+    id: int
+    name: str
+
+@strawberry.type
+class Task:
+    id: int
+    title: str
+    status: TaskStatus
+    assignee_id: int | None
+
+@strawberry.input               # an input type, for mutation args
+class CreateTaskInput:
+    title: str
+    assignee_id: int | None = None
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def task(self, id: int) -> Task | None:
+        return await service.get(id)
+
+    @strawberry.field
+    async def tasks(self, status: TaskStatus | None = None, limit: int = 20) -> list[Task]:
+        return await service.list(status, limit)
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    async def create_task(self, input: CreateTaskInput) -> Task:
+        return await service.create(input)
+
+schema = strawberry.Schema(query=Query, mutation=Mutation)
+```
+
+Resolvers are just methods — `async def` ones are awaited, so they slot straight into
+the `asyncpg`/SQLAlchemy async stack from [module 09](/modern-python/09-database-postgresql/).
+Compare the shape to what you'd write elsewhere:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Apollo: SDL string + a resolver map (schema-first)
+const typeDefs = `#graphql
+  type Task { id: Int!  title: String!  assignee: User }
+  type Query { task(id: Int!): Task }
+`;
+const resolvers = {
+  Query: { task: (_p, { id }) => service.get(id) },
+  Task:  { assignee: (t) => userLoader.load(t.assigneeId) },
+};
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// gqlgen: write schema.graphql, generate, fill in resolver structs
+func (r *queryResolver) Task(ctx context.Context, id int) (*model.Task, error) {
+    return r.svc.Get(ctx, id)
+}
+func (r *taskResolver) Assignee(ctx context.Context, t *model.Task) (*model.User, error) {
+    return userLoader(ctx).Load(t.AssigneeID)
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# Strawberry: the Python type IS the schema (code-first)
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def task(self, id: int) -> Task | None:
+        return await service.get(id)
+```
+
+  </TabItem>
+</Tabs>
+
+### The N+1 problem and DataLoader
+
+GraphQL's killer feature is also its killer footgun. Resolve `assignee` on a list of
+50 tasks and the naive resolver fires 50 separate user queries — the **N+1 problem**.
+A `DataLoader` fixes it by *collecting* every key requested in one tick of the event
+loop and dispatching a single batched query, then handing each caller back its slice.
+The batch function's contract is strict: return a list the **same length and order**
+as the input keys.
+
+```python title="app/graphql/loaders.py"
+import strawberry
+from strawberry.dataloader import DataLoader
+
+async def load_users(keys: list[int]) -> list[User | None]:
+    rows = await service.users_by_ids(keys)        # ONE query for all keys
+    by_id = {u.id: u for u in rows}
+    return [by_id.get(k) for k in keys]            # same order as keys
+
+@strawberry.type
+class Task:
+    id: int
+    title: str
+    assignee_id: int | None
+
+    @strawberry.field
+    async def assignee(self, info: strawberry.Info) -> User | None:
+        if self.assignee_id is None:
+            return None
+        return await info.context["user_loader"].load(self.assignee_id)
+```
+
+The loader lives on the per-request context so its cache doesn't leak across requests:
+
+```python title="app/graphql/app.py"
+from strawberry.fastapi import GraphQLRouter
+
+async def get_context() -> dict[str, object]:
+    return {"user_loader": DataLoader(load_fn=load_users)}
+
+graphql_app = GraphQLRouter(schema, context_getter=get_context)
+```
+
+:::caution[The DataLoader must be per-request]
+Create a fresh `DataLoader` per request (in `context_getter`), never a module-level
+singleton. A DataLoader caches results for its lifetime — a shared one would serve
+one user stale data from another request. This is the single most common Strawberry
+mistake.
+:::
+
+### Mounting on FastAPI
+
+`GraphQLRouter` is just an `APIRouter`, so GraphQL and REST live on the same app —
+REST at `/v1/...` with its OpenAPI docs, GraphQL at `/graphql` with GraphiQL. That
+two-styles-on-one-app setup is exactly the sub-project below.
+
+```python title="app/main.py"
+from fastapi import FastAPI
+from app.graphql.app import graphql_app
+from app.api import tasks
+
+app = FastAPI(title="Task API")
+app.include_router(tasks.router)          # REST + auto OpenAPI at /docs
+app.include_router(graphql_app, prefix="/graphql")   # GraphQL + GraphiQL
+```
+
+### GraphQL vs REST — the honest take
+
+GraphQL is not a REST upgrade; it's a different tool with a different cost curve.
+
+- **Reach for GraphQL** when many heterogeneous clients (web, iOS, Android) need
+  different slices of a rich, interconnected graph — the classic BFF / mobile case.
+  Clients stop waiting on you to add `?include=comments` params.
+- **Stay on REST** for public APIs, simple CRUD, and anything where HTTP caching,
+  CDNs, and "curl just works" matter. GraphQL's single POST endpoint throws away
+  HTTP caching, and you inherit N+1 risk, query-depth/complexity limits, and a
+  heavier client.
+
+Most shops that adopt GraphQL keep REST for the public edge and use GraphQL as an
+internal BFF layer. Both can sit on one FastAPI app.
+
+## Part 4 — gRPC with grpcio
+
+For **internal service-to-service** calls, JSON-over-HTTP/1.1 is wasteful: text
+parsing, no schema enforcement, head-of-line blocking. **gRPC** uses Protocol Buffers
+(a compact binary format with a strict schema) over HTTP/2 with multiplexed streams.
+You define the contract in a `.proto` file and generate typed stubs for every
+language — so your Python service and a Go service share one source of truth.
+
+This is the area where Go has a real head start: gRPC is practically first-class
+there. Python's `grpcio` is mature and fully async, but codegen is clunkier (more on
+that below).
+
+```bash
+uv add grpcio
+uv add --dev grpcio-tools          # the protoc compiler + plugins
+```
+
+### The .proto contract
+
+```protobuf title="proto/tasks.proto"
+syntax = "proto3";
+package tasks.v1;
+
+service TaskService {
+  rpc GetTask    (GetTaskRequest)    returns (Task);
+  rpc ListTasks  (ListTasksRequest)  returns (ListTasksResponse);
+  rpc CreateTask (CreateTaskRequest) returns (Task);
+  rpc WatchTasks (WatchTasksRequest) returns (stream TaskEvent);  // server streaming
+}
+
+message Task {
+  int64  id     = 1;
+  string title  = 2;
+  Status status = 3;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;   // proto3 enums MUST have a 0 default
+  STATUS_OPEN        = 1;
+  STATUS_DONE        = 2;
+}
+
+message GetTaskRequest    { int64 id = 1; }
+message CreateTaskRequest { string title = 1; }
+message ListTasksRequest  { int32 page_size = 1; string page_token = 2; }
+message ListTasksResponse { repeated Task tasks = 1; string next_page_token = 2; }
+message WatchTasksRequest { int64 user_id = 1; }
+message TaskEvent         { string kind = 1; Task task = 2; }
+```
+
+### Generating stubs
+
+```bash
+uv run python -m grpc_tools.protoc \
+  -I proto \
+  --python_out=app/gen \
+  --grpc_python_out=app/gen \
+  --pyi_out=app/gen \
+  proto/tasks.proto
+```
+
+This emits `tasks_pb2.py` (messages), `tasks_pb2_grpc.py` (service stubs), and
+`tasks_pb2.pyi` (type stubs so `ty`/`mypy` and your editor understand the generated
+code).
+
+:::caution[grpcio codegen is the rough edge]
+Two honest gotchas Go/TS devs hit. First, generated imports are *absolute* — the
+common `ModuleNotFoundError: No module named 'tasks_pb2'` comes from the generated
+`tasks_pb2_grpc.py` importing `tasks_pb2` as a top-level module; you fix it with a
+`-I` layout that matches your package, or a post-process step. Second, the generated
+classes aren't `dataclass`/Pydantic-friendly. Many teams reach for **`buf`** (to lint
+and manage protos) and alternatives like **`grpclib`** (a pure-async gRPC impl) or
+**`connecpy`** (a Python ConnectRPC server that also speaks plain HTTP/JSON, handy for
+browser clients). Plain `grpcio` is the safe default; know the ecosystem exists.
+:::
+
+### Async server and client
+
+`grpcio` has a native asyncio API under `grpc.aio` — no threadpool, real coroutines.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// @grpc/grpc-js: callback-style handlers
+const server = new grpc.Server();
+server.addService(TaskService, {
+  getTask: (call, cb) => cb(null, { id: call.request.id, title: "..." }),
+});
+server.bindAsync("0.0.0.0:50051", grpc.ServerCredentials.createInsecure(), () =>
+  server.start());
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// grpc-go: implement the generated interface, register, serve
+type server struct{ pb.UnimplementedTaskServiceServer }
+
+func (s *server) GetTask(ctx context.Context, r *pb.GetTaskRequest) (*pb.Task, error) {
+    return &pb.Task{Id: r.Id, Title: "..."}, nil
+}
+func main() {
+    lis, _ := net.Listen("tcp", ":50051")
+    s := grpc.NewServer()
+    pb.RegisterTaskServiceServer(s, &server{})
+    s.Serve(lis)
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python title="app/grpc_server.py"
+import asyncio
+import grpc
+from app.gen import tasks_pb2, tasks_pb2_grpc
+
+class TaskServicer(tasks_pb2_grpc.TaskServiceServicer):
+    async def GetTask(self, request: tasks_pb2.GetTaskRequest, context) -> tasks_pb2.Task:
+        task = await service.get(request.id)
+        if task is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "task not found")
+        return tasks_pb2.Task(id=task.id, title=task.title)
+
+    async def WatchTasks(self, request, context):       # server streaming
+        async for event in service.watch(request.user_id):
+            yield tasks_pb2.TaskEvent(kind=event.kind, task=event.task)
+
+async def serve() -> None:
+    server = grpc.aio.server()
+    tasks_pb2_grpc.add_TaskServiceServicer_to_server(TaskServicer(), server)
+    server.add_insecure_port("[::]:50051")
+    await server.start()
+    await server.wait_for_termination()
+
+asyncio.run(serve())
+```
+
+  </TabItem>
+</Tabs>
+
+The async client mirrors it — note `async with` for the channel and `async for` to
+consume a server stream:
+
+```python title="app/grpc_client.py"
+import grpc
+from app.gen import tasks_pb2, tasks_pb2_grpc
+
+async def main() -> None:
+    async with grpc.aio.insecure_channel("localhost:50051") as channel:
+        stub = tasks_pb2_grpc.TaskServiceStub(channel)
+        task = await stub.GetTask(tasks_pb2.GetTaskRequest(id=1))
+        print(task.title)
+        async for event in stub.WatchTasks(tasks_pb2.WatchTasksRequest(user_id=1)):
+            print(event.kind, event.task.title)
+```
+
+### When gRPC
+
+gRPC shines for **internal, high-throughput, polyglot service-to-service** traffic:
+binary payloads, a strict shared schema, bidirectional streaming, and deadlines/
+cancellation built into the protocol. It's a poor fit for public/browser-facing APIs
+(no native browser support without `grpc-web` or Connect, not human-curlable, no HTTP
+caching). Rule of thumb: **gRPC behind the wall, REST/GraphQL at the edge.**
+
+## Serialization choices
+
+The default `json` module is correct but slow, and FastAPI's default response
+encoding goes through Pydantic. For hot paths you have faster options:
+
+| Library | What it is | Use it when |
+|---|---|---|
+| **Pydantic v2** | validation + (de)serialization, Rust core | the default — you want validation *and* schema generation |
+| **orjson** | fastest JSON encoder, C-backed | drop-in speed for JSON responses; serializes `datetime`/`UUID`/dataclasses natively |
+| **msgspec** | ultra-fast schema-based ser/de + validation | hot paths where Pydantic validation overhead shows up; supports JSON *and* MessagePack |
+| stdlib `json` | always available | scripts, config, when speed doesn't matter |
+
+`orjson` is the easy win — FastAPI ships an `ORJSONResponse` you set as the default
+response class:
+
+```python
+from fastapi import FastAPI
+from fastapi.responses import ORJSONResponse
+
+app = FastAPI(default_response_class=ORJSONResponse)
+```
+
+`msgspec` is the choice when profiling shows Pydantic validation as the bottleneck on
+a very hot endpoint — it's dramatically faster but gives up Pydantic's richer
+validator ecosystem. (Litestar, [module 08](/modern-python/08-litestar/), uses msgspec
+natively.) For most APIs: Pydantic for validation, `ORJSONResponse` for the wire.
+Don't micro-optimize serialization before you've profiled.
+
+## Choosing a style: REST vs GraphQL vs gRPC
+
+| Factor | REST | GraphQL | gRPC |
+|---|---|---|---|
+| **Wire format** | JSON / HTTP/1.1 | JSON / HTTP/1.1 (POST) | Protobuf / HTTP/2 |
+| **Schema** | OpenAPI (auto in FastAPI) | GraphQL SDL (from Strawberry types) | `.proto` (required) |
+| **Python lib** | FastAPI | Strawberry | grpcio |
+| **Over-fetching** | common | solved (client picks fields) | n/a (typed messages) |
+| **N+1 risk** | n/a | high — needs DataLoader | n/a |
+| **HTTP caching** | easy, native | hard (single POST) | n/a |
+| **Streaming** | SSE / WebSocket | subscriptions | first-class (4 modes) |
+| **Browser-native** | yes | yes (client lib) | no (needs grpc-web/Connect) |
+| **Best for** | public APIs, CRUD | mobile/SPA BFF, rich graphs | internal microservices |
+
+A common production shape: **REST** (auto-OpenAPI) for the public edge, **GraphQL**
+as the BFF for web/mobile, **gRPC** between internal services. All three can coexist —
+FastAPI + Strawberry on the same process, gRPC as a separate listener.
+
+## Practice
+
+Build both styles — GraphQL and auto-OpenAPI REST — on one FastAPI app, over the
+familiar Task domain, with a DataLoader to dodge N+1.
+
+<CardGrid>
+  <LinkCard
+    title="GraphQL API + OpenAPI"
+    href="/modern-python/14-api-design/graphql-api/"
+    description="Mount a Strawberry GraphQL API (queries, a mutation, a DataLoader) next to an auto-documented REST side on one FastAPI app — and see both styles, two ways."
+  />
+</CardGrid>

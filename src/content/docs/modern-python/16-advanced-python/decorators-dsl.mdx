@@ -1,0 +1,472 @@
+---
+title: Build a Decorator Toolkit / mini-DSL
+description: Build a reusable retry/timed decorator toolkit, a context manager, and a descriptor-based validated field, composed into a small fluent, type-checked client API.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Advanced Python" href="/modern-python/16-advanced-python/" />
+
+## Goal
+
+Build a small, reusable toolkit out of the four metaprogramming tools from the
+module — a parametrized `@retry(times=, backoff=)` decorator, a `@timed` decorator,
+a context manager, and a descriptor-based validated field — and then **compose**
+them into a tiny fluent client API. The payoff is seeing how the building blocks
+that frameworks are made of fit together in one file you wrote yourself.
+
+The finished toolkit lets you write this:
+
+```python
+from toolkit import retry, timed, span, Bounded
+
+class ApiClient:
+    timeout = Bounded(min=0.1, max=30.0)     # descriptor-validated field
+    retries = Bounded(min=0, max=10)
+
+    def __init__(self, timeout: float = 5.0, retries: int = 3) -> None:
+        self.timeout = timeout               # validated through the descriptor
+        self.retries = retries
+
+    @timed
+    @retry(times=3, backoff=0.05, exceptions=(ConnectionError,))
+    def fetch(self, url: str) -> dict[str, object]:
+        with span("http.get"):               # context manager times the block
+            return _flaky_get(url)
+```
+
+If you've written an Express middleware stack, a Go `http.RoundTripper` wrapper, or
+a NestJS interceptor, this is the same instinct — cross-cutting behavior factored
+out of the function body — expressed with Python's decorator/descriptor/context-
+manager machinery.
+
+## What you'll practice
+
+- A **parametrized decorator factory** (`@retry(...)`) with `functools.wraps` and
+  PEP 695 `[**P, R]` typing so the wrapped signature survives.
+- A simple **`@timed`** decorator that works on any function.
+- A **`@contextmanager`** generator (`span`) for timing/instrumenting a block.
+- A reusable **descriptor** (`Bounded`) with `__set_name__`, `__get__`, `__set__`.
+- **Composing** them — stacking decorators, using the descriptor and context
+  manager together in one class.
+
+## Requirements
+
+1. `retry(times, backoff, exceptions)` — retries on the listed exceptions with
+   exponential backoff; re-raises the last exception when attempts run out.
+2. `timed` — logs elapsed wall-clock time; preserves the function's metadata.
+3. `span(label)` — a context manager that times a block and records it.
+4. `Bounded(min, max)` — a descriptor that validates `min <= value <= max` on
+   assignment, reused across multiple fields.
+5. A `ApiClient`-style class composing all four, with a demo `main`.
+6. Tests proving retry count, backoff, metadata preservation, and validation.
+
+## The worked solution
+
+A single `uv` project. The toolkit lives in one module; a demo and a test file
+exercise it.
+
+<FileTree>
+- decorators-dsl/
+  - pyproject.toml uv project + ruff/ty config
+  - src/
+    - toolkit/
+      - __init__.py re-exports the public API
+      - **decorators.py** retry + timed
+      - **context.py** the span context manager
+      - **descriptors.py** the Bounded descriptor
+      - client.py the composed ApiClient demo
+  - tests/
+    - test_toolkit.py behavior tests
+</FileTree>
+
+### pyproject.toml
+
+A plain `uv` library project targeting Python 3.13+. The only runtime dependency is
+`structlog` for structured timing output; `pytest` is a dev dependency.
+
+```toml title="pyproject.toml"
+[project]
+name = "decorators-dsl"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = ["structlog>=24.4"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ty>=0.0.1"]
+
+[build-system]
+requires = ["uv_build>=0.8"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]   # pyflakes, pycodestyle, isort, pyupgrade, bugbear
+```
+
+Create it and add deps with `uv` — no `pip`, no manual virtualenv:
+
+```bash
+uv init --lib decorators-dsl
+cd decorators-dsl
+uv add structlog
+uv add --dev pytest ty
+```
+
+### decorators.py — the retry factory and timed
+
+`retry` is the three-layer factory from the module: `retry(...)` captures config and
+returns `decorator`; `decorator(fn)` returns `wrapper`; `wrapper` runs the retry
+loop. PEP 695 `[**P, R]` keeps the wrapped signature exact for `ty`/`mypy`, and
+`functools.wraps` keeps `__name__`/`__doc__`/`__wrapped__`.
+
+```python title="src/toolkit/decorators.py" {12-15,18-32,46-58}
+from __future__ import annotations
+
+import functools
+import time
+from collections.abc import Callable
+
+import structlog
+
+log = structlog.get_logger()
+
+
+def retry[**P, R](
+    times: int = 3,
+    backoff: float = 0.1,
+    exceptions: tuple[type[Exception], ...] = (Exception,),
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Retry `fn` on the given exceptions with exponential backoff."""
+
+    def decorator(fn: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(fn)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            last_exc: Exception | None = None
+            for attempt in range(times):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as exc:
+                    last_exc = exc
+                    delay = backoff * (2**attempt)
+                    log.warning(
+                        "retry",
+                        fn=fn.__name__,
+                        attempt=attempt + 1,
+                        of=times,
+                        error=str(exc),
+                    )
+                    if attempt < times - 1:
+                        time.sleep(delay)
+            assert last_exc is not None
+            raise last_exc
+
+        return wrapper
+
+    return decorator
+
+
+def timed[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    """Log the wall-clock time a function takes. Metadata-preserving."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            log.info("timed", fn=fn.__name__, ms=round(elapsed_ms, 2))
+
+    return wrapper
+```
+
+:::note[Why the `finally`]
+`timed` logs in a `finally` so the timing is recorded even when the wrapped function
+raises — you want to know that the slow call was the one that blew up. The same
+applies to `span` below.
+:::
+
+### context.py — the span context manager
+
+`span` is the generator form of a context manager. Everything before `yield` is
+setup, the `yield`ed value is what `as` binds, and the `finally` is teardown. It
+times the block and yields a small mutable record you can read afterward.
+
+```python title="src/toolkit/context.py" {12-13,18-26}
+from __future__ import annotations
+
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+
+import structlog
+
+log = structlog.get_logger()
+
+
+@dataclass
+class Span:
+    label: str
+    elapsed_ms: float = field(default=0.0)
+
+
+@contextmanager
+def span(label: str) -> Iterator[Span]:
+    """Time a block of code. `with span("x") as s: ...; s.elapsed_ms` is set."""
+    record = Span(label=label)
+    start = time.perf_counter()
+    try:
+        yield record                       # the `with span(...) as record` value
+    finally:
+        record.elapsed_ms = (time.perf_counter() - start) * 1000
+        log.info("span", label=label, ms=round(record.elapsed_ms, 2))
+```
+
+### descriptors.py — the Bounded validated field
+
+`Bounded` is a reusable data descriptor. `__set_name__` captures the attribute's own
+name at class-creation time, so one descriptor instance per field stores its value
+in a private slot without you repeating the name. `__set__` validates on every
+assignment; `__get__` returns the descriptor itself when accessed on the class.
+
+```python title="src/toolkit/descriptors.py" {16-18,20-24,26-29}
+from __future__ import annotations
+
+from typing import Any, overload
+
+
+class Bounded:
+    """Reusable descriptor enforcing min <= value <= max on assignment."""
+
+    def __init__(self, *, min: float, max: float) -> None:
+        if min > max:
+            raise ValueError("min must be <= max")
+        self.min = min
+        self.max = max
+        self.private = ""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        # Called once at class-body evaluation; `name` is the attribute name.
+        self.private = f"_{name}"
+
+    @overload
+    def __get__(self, obj: None, objtype: type | None = None) -> Bounded: ...
+    @overload
+    def __get__(self, obj: object, objtype: type | None = None) -> float: ...
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:                    # accessed on the class itself
+            return self
+        return getattr(obj, self.private)
+
+    def __set__(self, obj: Any, value: float) -> None:
+        if not (self.min <= value <= self.max):
+            raise ValueError(
+                f"{self.private[1:]} must be in [{self.min}, {self.max}], got {value}"
+            )
+        setattr(obj, self.private, value)
+```
+
+:::tip[Why the `@overload` pair]
+`__get__` returns two different types depending on whether it's accessed on the
+class (`Server.timeout` → the descriptor) or an instance (`server.timeout` → a
+`float`). The `@overload` stubs tell `ty`/`mypy` exactly that, so the field reads as
+a plain `float` everywhere you actually use it.
+:::
+
+### `__init__.py` — the public API
+
+Re-export the toolkit so callers write `from toolkit import retry, timed, span,
+Bounded`.
+
+```python title="src/toolkit/__init__.py"
+from toolkit.context import Span, span
+from toolkit.decorators import retry, timed
+from toolkit.descriptors import Bounded
+
+__all__ = ["Bounded", "Span", "retry", "span", "timed"]
+```
+
+### client.py — composing the toolkit
+
+`ApiClient` uses all four pieces at once: two `Bounded` descriptor fields, a method
+stacked with `@timed` over `@retry(...)`, and a `span` inside the method body. The
+`_flaky_get` helper fails the first two times to exercise retry/backoff.
+
+```python title="src/toolkit/client.py" {6-7,15-21}
+from __future__ import annotations
+
+from toolkit import Bounded, retry, span, timed
+
+_attempts = {"n": 0}
+
+
+def _flaky_get(url: str) -> dict[str, object]:
+    """Simulate a flaky endpoint: fails twice, then succeeds."""
+    _attempts["n"] += 1
+    if _attempts["n"] < 3:
+        raise ConnectionError(f"transient failure #{_attempts['n']}")
+    return {"url": url, "status": 200, "attempt": _attempts["n"]}
+
+
+class ApiClient:
+    timeout = Bounded(min=0.1, max=30.0)   # descriptor-validated fields
+    retries = Bounded(min=0, max=10)
+
+    def __init__(self, timeout: float = 5.0, retries: int = 3) -> None:
+        self.timeout = timeout             # validated via Bounded.__set__
+        self.retries = retries
+
+    @timed                                 # 2nd: times the whole retry loop
+    @retry(times=3, backoff=0.02, exceptions=(ConnectionError,))  # 1st
+    def fetch(self, url: str) -> dict[str, object]:
+        with span("http.get") as s:        # times just this block
+            result = _flaky_get(url)
+        result["block_ms"] = round(s.elapsed_ms, 2)
+        return result
+
+
+def main() -> None:
+    client = ApiClient(timeout=5.0, retries=3)
+    print("fetch result:", client.fetch("https://example.com/api"))
+
+    try:
+        client.timeout = 99.0              # out of bounds → ValueError
+    except ValueError as exc:
+        print("rejected:", exc)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+When you run this, `fetch` fails twice (you'll see two `retry` warnings), succeeds
+on the third attempt, the `span` logs the inner block time, and `timed` logs the
+total. Then the out-of-bounds `timeout` assignment is rejected by the descriptor.
+
+### tests/test_toolkit.py
+
+The tests are the spec. They assert the retry count and eventual success, that
+`timed` preserves `__name__`/`__doc__`, that `span` records elapsed time, and that
+`Bounded` accepts valid values and rejects out-of-range ones.
+
+```python title="tests/test_toolkit.py" {6-17,27-31,40-49}
+from __future__ import annotations
+
+import pytest
+
+from toolkit import Bounded, retry, span, timed
+
+
+def test_retry_succeeds_after_failures() -> None:
+    calls = {"n": 0}
+
+    @retry(times=3, backoff=0.0, exceptions=(ValueError,))
+    def flaky() -> str:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ValueError("boom")
+        return "ok"
+
+    assert flaky() == "ok"
+    assert calls["n"] == 3                 # failed twice, succeeded on the third
+
+
+def test_retry_reraises_after_exhausting() -> None:
+    @retry(times=2, backoff=0.0, exceptions=(ValueError,))
+    def always_fails() -> None:
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError, match="nope"):
+        always_fails()
+
+
+def test_timed_preserves_metadata() -> None:
+    @timed
+    def add(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
+
+    assert add.__name__ == "add"           # functools.wraps did its job
+    assert add.__doc__ == "Add two numbers."
+    assert add(2, 3) == 5
+
+
+def test_span_records_elapsed() -> None:
+    with span("work") as s:
+        sum(range(1000))
+    assert s.elapsed_ms >= 0.0
+
+
+def test_bounded_validates() -> None:
+    class Server:
+        port = Bounded(min=1, max=65535)
+
+    s = Server()
+    s.port = 8080
+    assert s.port == 8080                  # reads back as a plain int
+
+    with pytest.raises(ValueError, match=r"port must be in \[1, 65535\]"):
+        s.port = 99999
+```
+
+## Run it
+
+<Steps>
+
+1. Scaffold the project and add dependencies (no `pip`, no manual venv):
+
+   ```bash
+   uv init --lib decorators-dsl
+   cd decorators-dsl
+   uv add structlog
+   uv add --dev pytest ty
+   ```
+
+   Then drop in the files above under `src/toolkit/` and `tests/`.
+
+2. Run the demo — watch the retries, the span, and the descriptor rejection:
+
+   ```bash
+   uv run python -m toolkit.client
+   ```
+
+3. Run the tests (retry counts, metadata, span timing, validation):
+
+   ```bash
+   uv run pytest -q
+   ```
+
+4. Lint, format, and type-check with the Astral toolchain:
+
+   ```bash
+   uvx ruff format .
+   uvx ruff check .
+   uv run ty check        # mypy works the same way if you prefer it
+   ```
+
+</Steps>
+
+The most instructive test is `test_retry_succeeds_after_failures`: it proves the
+factory's three layers fire correctly — config captured once, wrapper invoked per
+call, loop retrying until the third attempt lands.
+
+:::tip[Stretch goals]
+- Make `retry` and `timed` work on **`async def`** too: branch on
+  `inspect.iscoroutinefunction(fn)` and provide an `async def wrapper` that `await`s
+  the call (`asyncio.sleep` instead of `time.sleep` for backoff).
+- Add a `jitter` option to `retry` (randomize the backoff to avoid thundering herds)
+  and a `max_delay` cap.
+- Turn `Bounded` into a typed generic descriptor and add a `Pattern` descriptor that
+  validates strings against a regex — reuse `__set_name__`.
+- Make `ApiClient.fetch` use the instance's own `self.retries` / `self.timeout`
+  instead of hard-coded `retry(times=3)` — a class-method decorator that reads
+  config from `self` at call time.
+- Add a `@cached(ttl=...)` decorator backed by a dict with per-entry expiry, then
+  compose it under `@retry` and confirm the cache only stores successes.
+:::

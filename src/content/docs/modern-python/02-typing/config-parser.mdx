@@ -1,0 +1,439 @@
+---
+title: Typed Config Parser
+description: Parse config from env or a dict into a typed dataclass tree using stdlib only — a Protocol-based source, Literal fields, generics, and exhaustive match.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Modern Typing"
+  href="/modern-python/02-typing/"
+/>
+
+## Goal
+
+Build a configuration loader that reads from a **pluggable source** (a plain
+dict, or the process environment) and returns a **fully typed** `AppConfig` —
+nested dataclasses, `Literal`-constrained fields, the works. When the input is
+wrong, it collects *every* problem into a list of structured errors instead of
+throwing on the first one, and reports them with an exhaustive `match`.
+
+The constraint that makes this exercise sharp: **stdlib + `typing` only.** No
+Pydantic (that's module 04 — and you'll appreciate how much it does for you after
+hand-rolling this). Everything here is `dataclasses`, `Protocol`, `Literal`,
+`Enum`, PEP 695 generics, and `match`.
+
+A TS dev would reach for `zod`; a Go dev would write `(Config, error)` and a pile
+of `if err != nil`. Here you'll model the result so the type system forces the
+caller to handle both success and the error list.
+
+## What you'll practice
+
+- **`Protocol`** for a pluggable config source (env, dict, anything shaped right)
+- **`dataclass`** trees for typed, nested config
+- **`Literal`** + **`StrEnum`** for constrained fields with exhaustive `match`
+- **PEP 695 generics** (`def f[T](...)`) for reusable typed parsing helpers
+- **`match`/`case`** with guards and `assert_never` for exhaustive error handling
+- Accumulating errors instead of failing fast
+- Running `uv run` and `uv run ty check`
+
+## Requirements
+
+<Steps>
+
+1. **Define a `ConfigSource` Protocol.** It exposes one method, `get(key) -> str
+   | None`. Provide two implementations: a `DictSource` wrapping a `dict`, and an
+   `EnvSource` reading `os.environ`. Code that loads config depends only on the
+   Protocol — never on a concrete source.
+
+2. **Model the config as a dataclass tree.** A `ServerConfig`, a
+   `DatabaseConfig`, and a top-level `AppConfig` holding both plus a
+   `Literal`/`StrEnum` log level.
+
+3. **Parse with typed, generic helpers.** A single generic `require` that takes a
+   parser function `str -> T` and accumulates an error if the key is missing or
+   the value doesn't parse.
+
+4. **Accumulate errors; return a typed result.** Loading returns either an
+   `Ok(config)` or an `Err(errors)`. The caller dispatches with an exhaustive
+   `match`, and each error variant is displayed via a `match` with `assert_never`
+   so adding a variant is a compile-time-style error.
+
+</Steps>
+
+## The worked solution
+
+A single-module `uv` project — one file does the whole job, zero runtime
+dependencies.
+
+<FileTree>
+- config-parser/
+  - pyproject.toml
+  - src/
+    - config_parser/
+      - **\_\_init\_\_.py** the whole solution
+</FileTree>
+
+### pyproject.toml
+
+Created by `uv init --package`. No runtime deps — stdlib only — so the
+dependency list is empty. `ty` (and optionally `ruff`) come in as dev tools.
+
+```toml title="pyproject.toml"
+[project]
+name = "config-parser"
+version = "0.1.0"
+description = "Typed config parser — stdlib only"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+config-parser = "config_parser:main"
+
+[build-system]
+requires = ["uv_build>=0.7"]
+build-backend = "uv_build"
+
+[tool.ty.rules]
+# be strict — this exercise is about types earning their keep
+```
+
+### The source Protocol — pluggable, structural
+
+The loader should not care *where* values come from. A `Protocol` expresses
+"anything with a `get(key) -> str | None`" — exactly a Go/TS interface. Neither
+`DictSource` nor `EnvSource` declares that it implements `ConfigSource`; they
+just have the right shape, and `ty` verifies it where they're used.
+
+```python title="src/config_parser/__init__.py"
+import os
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Protocol, assert_never
+
+
+# --- The pluggable source (structural typing) ---
+
+class ConfigSource(Protocol):
+    def get(self, key: str) -> str | None: ...
+
+
+class DictSource:
+    """Reads from an in-memory dict — does NOT inherit ConfigSource."""
+
+    def __init__(self, data: dict[str, str]) -> None:
+        self._data = data
+
+    def get(self, key: str) -> str | None:
+        return self._data.get(key)
+
+
+class EnvSource:
+    """Reads from the process environment."""
+
+    def get(self, key: str) -> str | None:
+        return os.environ.get(key)
+```
+
+### The typed config tree and the log-level enum
+
+Plain `dataclass`es give you `__init__`, `__repr__`, and `__eq__` for free —
+exactly what you want for config. `LogLevel` is a `StrEnum`, so members *are*
+strings (they serialize and compare cleanly) and a `match` over them can be made
+exhaustive.
+
+```python title="src/config_parser/__init__.py"
+# --- The typed config tree ---
+
+class LogLevel(StrEnum):
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    url: str
+    pool_size: int
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    name: str
+    debug: bool
+    log_level: LogLevel
+    server: ServerConfig
+    database: DatabaseConfig
+```
+
+### The error model and result type
+
+`ConfigError` is a closed union (a base plus a fixed set of frozen subclasses) —
+the Python idiom for a sealed/discriminated type. `Result` is a small generic
+envelope: `Ok[T]` carries a value, `Err` carries the error list. Because `Err`
+holds no value it's typed `Result[Never]` — it fits *any* `Result[T]`, the same
+trick as Kotlin's `ParseResult<Nothing>` or a TS `{ ok: false }` variant.
+
+```python title="src/config_parser/__init__.py"
+from typing import Never
+
+# --- Structured errors (a closed union) ---
+
+@dataclass(frozen=True)
+class MissingKey:
+    key: str
+
+
+@dataclass(frozen=True)
+class InvalidValue:
+    key: str
+    value: str
+    expected: str
+
+
+type ConfigError = MissingKey | InvalidValue
+
+
+# --- A tiny generic Result envelope ---
+
+@dataclass(frozen=True)
+class Ok[T]:
+    value: T
+
+
+@dataclass(frozen=True)
+class Err:
+    errors: list[ConfigError]
+
+
+type Result[T] = Ok[T] | Err
+```
+
+### Generic parsing helpers
+
+`parse_int` / `parse_bool` / `parse_log_level` each turn a raw string into a
+typed value or `None`. `require` is the reusable, **generic** core: give it a key
+and a `str -> T | None` parser, and it appends the right error (missing vs
+invalid) and returns `None` on failure, or the parsed `T` on success. One helper,
+fully typed, works for every field type.
+
+```python title="src/config_parser/__init__.py"
+from collections.abc import Callable
+
+# --- Field parsers: str -> T | None ---
+
+def parse_str(raw: str) -> str | None:
+    return raw
+
+
+def parse_int(raw: str) -> int | None:
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def parse_bool(raw: str) -> bool | None:
+    match raw.strip().lower():
+        case "true" | "1" | "yes":
+            return True
+        case "false" | "0" | "no":
+            return False
+        case _:
+            return None
+
+
+def parse_log_level(raw: str) -> LogLevel | None:
+    try:
+        return LogLevel(raw.strip().lower())
+    except ValueError:
+        return None
+
+
+# --- The generic require helper (PEP 695) ---
+
+def require[T](
+    source: ConfigSource,
+    key: str,
+    parse: Callable[[str], T | None],
+    expected: str,
+    errors: list[ConfigError],
+) -> T | None:
+    raw = source.get(key)
+    if raw is None:
+        errors.append(MissingKey(key))
+        return None
+    parsed = parse(raw)
+    if parsed is None:
+        errors.append(InvalidValue(key, raw, expected))
+        return None
+    return parsed
+```
+
+### Loading the config
+
+`load_config` accepts *any* `ConfigSource` (Protocol-typed parameter), pulls each
+field through `require`, accumulates errors, and returns a typed `Result`. If
+anything failed we return `Err`; otherwise every value is non-`None`, so we build
+the dataclass tree.
+
+```python title="src/config_parser/__init__.py" {2,21}
+def load_config(source: ConfigSource) -> Result[AppConfig]:
+    errors: list[ConfigError] = []
+
+    host = require(source, "SERVER_HOST", parse_str, "string", errors)
+    port = require(source, "SERVER_PORT", parse_int, "integer", errors)
+    db_url = require(source, "DATABASE_URL", parse_str, "string", errors)
+    pool = require(source, "DATABASE_POOL_SIZE", parse_int, "integer", errors)
+    name = require(source, "APP_NAME", parse_str, "string", errors)
+    debug = require(source, "APP_DEBUG", parse_bool, "bool (true/false)", errors)
+    level = require(source, "LOG_LEVEL", parse_log_level, "log level", errors)
+
+    if errors:
+        return Err(errors)
+
+    # Past the guard, every value is non-None. assert narrows the type for ty.
+    assert host is not None and port is not None
+    assert db_url is not None and pool is not None
+    assert name is not None and debug is not None and level is not None
+
+    return Ok(
+        AppConfig(
+            name=name,
+            debug=debug,
+            log_level=level,
+            server=ServerConfig(host=host, port=port),
+            database=DatabaseConfig(url=db_url, pool_size=pool),
+        )
+    )
+```
+
+:::note[Why `assert` and not `!`-style force-unwrap?]
+After `if errors: return Err(...)`, you and I know every value is non-`None` —
+but `ty` still sees `str | None`. `assert x is not None` is the idiomatic way to
+*narrow* the type for the checker (it also fails loudly at runtime if your logic
+is ever wrong). The stretch goals show how to restructure so the narrowing is
+automatic and the asserts disappear.
+:::
+
+### Displaying errors with an exhaustive match
+
+`describe_error` matches each `ConfigError` variant and binds its fields in one
+step. The `case _: assert_never(error)` line is the payoff: because `ConfigError`
+is a closed union, if you add a third error variant and forget to handle it here,
+`ty` flags this `match` — the union can't reach `assert_never` unless it's truly
+`Never`.
+
+```python title="src/config_parser/__init__.py" {8}
+def describe_error(error: ConfigError) -> str:
+    match error:
+        case MissingKey(key=key):
+            return f"missing required key: {key}"
+        case InvalidValue(key=key, value=value, expected=expected):
+            return f"invalid value for {key!r}: {value!r} (expected {expected})"
+        case _:
+            assert_never(error)   # add a variant to ConfigError -> ty errors here
+```
+
+### main — dispatch the result
+
+`main` loads a deliberately-broken dict source and pattern-matches the result.
+The `match result` is exhaustive: `Result` is `Ok[T] | Err`, so handling both is
+all there is — you cannot forget the error branch.
+
+```python title="src/config_parser/__init__.py"
+def main() -> None:
+    # One good, one bad (non-int port, unknown log level), one missing (APP_NAME).
+    raw = {
+        "SERVER_HOST": "0.0.0.0",
+        "SERVER_PORT": "not-a-number",
+        "DATABASE_URL": "postgresql://dev:dev@localhost:5432/app",
+        "DATABASE_POOL_SIZE": "10",
+        "APP_DEBUG": "true",
+        "LOG_LEVEL": "verbose",
+    }
+    source: ConfigSource = DictSource(raw)
+
+    match load_config(source):
+        case Ok(value=config):
+            print("loaded config:")
+            print(f"  {config}")
+        case Err(errors=errors):
+            print(f"config invalid ({len(errors)} problem(s)):")
+            for err in errors:
+                print(f"  - {describe_error(err)}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Swap `DictSource(raw)` for `EnvSource()` and the exact same `load_config` reads
+your real environment — that's the Protocol paying off: the loader never knew or
+cared which source it got.
+
+## Run it
+
+<Steps>
+
+1. Scaffold the project (creates `pyproject.toml` and `src/config_parser/`):
+
+   ```bash
+   uv init --package config-parser
+   cd config-parser
+   ```
+
+2. Drop the solution into `src/config_parser/__init__.py`, then run it. `uv`
+   creates the venv and wires up the package on first run — no activate step:
+
+   ```bash
+   uv run config-parser
+   ```
+
+   You should see the accumulated errors (note it reports *all three*, not just
+   the first):
+
+   ```text
+   config invalid (3 problem(s)):
+     - invalid value for 'SERVER_PORT': 'not-a-number' (expected integer)
+     - missing required key: APP_NAME
+     - invalid value for 'LOG_LEVEL': 'verbose' (expected log level)
+   ```
+
+3. Typecheck it — this is the real point of the exercise:
+
+   ```bash
+   uv run ty check
+   ```
+
+   It should pass clean. Now prove the safety net works: delete the
+   `case InvalidValue(...)` branch in `describe_error` and run `uv run ty check`
+   again — `ty` flags the `assert_never` because the union is no longer fully
+   handled.
+
+</Steps>
+
+:::tip[Stretch goals]
+- **Retire the asserts.** Restructure so `load_config` builds each sub-config as
+  its own `Result[ServerConfig]` / `Result[DatabaseConfig]` and combines them.
+  When each piece is either fully present or an `Err`, the success path has no
+  `None`s to narrow — the asserts vanish.
+- **Add a prefixed source.** Write a `PrefixedSource` that wraps another
+  `ConfigSource` and prepends `"MYAPP_"` to every key. It only needs a `get`
+  method — it's structurally a `ConfigSource` for free, no inheritance.
+- **Range validation.** Add an `OutOfRange` variant to `ConfigError` (e.g. port
+  must be 1–65535). Watch `ty` flag every `match` that doesn't handle it — then
+  fix them. That's exhaustiveness doing your refactoring TODO list for you.
+- **Layered config.** Take a `list[ConfigSource]` and resolve each key from the
+  first source that has it (env overrides file overrides defaults) — a tiny,
+  fully-typed precedence chain.
+:::

@@ -1,0 +1,900 @@
+---
+title: Advanced Python
+description: Decorators, context managers, descriptors, dunder protocols, metaclasses, the GIL and free-threading, and performance — the features that make Python read like Python.
+sidebar:
+  order: 16
+---
+
+import { Tabs, TabItem, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+This is where Python stops looking like "TypeScript with colons" and starts
+showing what makes it uniquely Python. Decorators, context managers, descriptors,
+and the dunder protocols are the machinery that frameworks you already use —
+FastAPI, Pydantic, SQLAlchemy, pytest — are built out of. Learn them and the magic
+stops being magic: you see the plain objects underneath. We finish with the two
+things every TS/Go dev asks about on day one — the GIL and "is Python slow?" —
+answered honestly, with the 2026 free-threaded build in the picture.
+
+## Decorators
+
+A decorator is a function that takes a function and returns a function. That's the
+whole idea. The `@` syntax is sugar — `@d` above `def f` just means `f = d(f)`.
+TypeScript has decorators too (now Stage 3, used heavily by NestJS/TypeORM), but
+they decorate *classes and members* and mutate via metadata. Go has nothing like
+them — you wrap explicitly with higher-order functions. Python decorators sit in
+between: ordinary callables, applied with sugar, working on functions *and*
+classes.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// TS decorators are class-centric and run at definition time.
+// They decorate classes, methods, fields, accessors — not free functions.
+function logged<T, A extends unknown[], R>(
+  target: (this: T, ...args: A) => R,
+  ctx: ClassMethodDecoratorContext,
+) {
+  return function (this: T, ...args: A): R {
+    console.log(`calling ${String(ctx.name)}`);
+    return target.call(this, ...args);
+  };
+}
+
+class Service {
+  @logged
+  fetch(id: number) {
+    return { id };
+  }
+}
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go has no decorators. You wrap explicitly with a higher-order function
+// and pass the wrapped value around yourself.
+func Logged[A any, R any](name string, fn func(A) R) func(A) R {
+    return func(a A) R {
+        log.Printf("calling %s", name)
+        return fn(a)
+    }
+}
+
+fetch := Logged("fetch", func(id int) map[string]int {
+    return map[string]int{"id": id}
+})
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# A decorator is just a function f -> f. @logged means fetch = logged(fetch).
+import functools
+from collections.abc import Callable
+
+def logged[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        print(f"calling {fn.__name__}")
+        return fn(*args, **kwargs)
+    return wrapper
+
+class Service:
+    @logged
+    def fetch(self, id: int) -> dict[str, int]:
+        return {"id": id}
+```
+
+  </TabItem>
+</Tabs>
+
+### Always use `functools.wraps`
+
+Without `@functools.wraps(fn)`, the wrapper *replaces* the original — its
+`__name__`, `__doc__`, `__qualname__`, type hints, and signature all become the
+wrapper's. That breaks introspection, `help()`, framework dispatch (FastAPI reads
+your signature to build the OpenAPI schema), and debuggers.
+
+```python
+import functools
+from collections.abc import Callable
+
+def bad(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return wrapper          # wrapper.__name__ == "wrapper" — metadata lost
+
+def good[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    @functools.wraps(fn)    # copies __name__, __doc__, __wrapped__, annotations
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        return fn(*args, **kwargs)
+    return wrapper
+```
+
+:::caution[The mutable-state gotcha TS devs hit]
+A decorator runs **once**, at function-definition time (import time), not per call.
+State you create *outside* `wrapper` (a counter, a cache, a lock) is shared across
+all calls. State *inside* `wrapper` is per-call. Frameworks rely on the once-at-
+import behavior — that's how `@app.get("/users")` registers the route the moment
+the module is imported.
+:::
+
+### `PEP 695` typing for decorators
+
+Use the new `[**P, R]` syntax (Python 3.12+) so the decorator is transparent to
+type checkers — `ty` and `mypy` will keep the wrapped function's exact signature.
+`P` is a `ParamSpec` (captures `*args, **kwargs` precisely), `R` the return type.
+
+```python
+import functools
+from collections.abc import Callable
+
+def timed[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        import time
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            elapsed = (time.perf_counter() - start) * 1000
+            print(f"{fn.__name__} took {elapsed:.2f}ms")
+    return wrapper
+```
+
+### Decorators with arguments: the factory pattern
+
+`@retry(times=3)` has one more layer than `@logged`. `retry(times=3)` is *called*
+first and must **return a decorator**, which is then applied. Three nested
+functions: configure → decorate → wrap.
+
+```python
+import functools
+import time
+from collections.abc import Callable
+
+def retry[**P, R](
+    times: int = 3,
+    backoff: float = 0.1,
+    exceptions: tuple[type[Exception], ...] = (Exception,),
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    # Layer 1: capture the config, return the real decorator.
+    def decorator(fn: Callable[P, R]) -> Callable[P, R]:
+        # Layer 2: the actual decorator — takes fn, returns wrapper.
+        @functools.wraps(fn)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            # Layer 3: runs on every call.
+            last_exc: Exception | None = None
+            for attempt in range(times):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as exc:
+                    last_exc = exc
+                    if attempt < times - 1:
+                        time.sleep(backoff * (2**attempt))  # exponential
+            assert last_exc is not None
+            raise last_exc
+        return wrapper
+    return decorator
+
+@retry(times=5, backoff=0.2, exceptions=(ConnectionError,))
+def fetch_user(user_id: int) -> dict[str, int]:
+    ...
+```
+
+:::tip[The two-shapes problem]
+`@retry` and `@retry()` are different: bare `@retry` passes the function as `times`.
+If you want a decorator usable *both* with and without parens, give the first
+parameter a sentinel default and branch — but honestly, just always require parens
+(`@retry()`). Consistency beats cleverness, and it's what most libraries do.
+:::
+
+### Stacking decorators
+
+Decorators apply **bottom-up** (nearest the function first), like function
+composition `f(g(h(x)))`. The order is load-bearing.
+
+```python
+@timed          # 3rd: wraps the retrying version → times the whole retry loop
+@retry(times=3) # 2nd: wraps the cached version → retries cache misses
+@functools.cache  # 1st: wraps fetch_user → caches results
+def fetch_user(user_id: int) -> dict[str, int]:
+    ...
+
+# Equivalent to:
+# fetch_user = timed(retry(times=3)(functools.cache(fetch_user)))
+```
+
+### Real-world: caching, auth, and the stdlib decorators
+
+`functools` ships the decorators you'll reach for daily. `@cache` is an unbounded
+memoizer; `@lru_cache(maxsize=N)` bounds it. Use them on pure functions.
+
+```python
+import functools
+
+@functools.cache                 # memoize forever — pure functions only
+def fib(n: int) -> int:
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+@functools.lru_cache(maxsize=1024)  # bounded LRU cache
+def lookup_country(ip: str) -> str:
+    ...
+
+fib.cache_info()    # CacheInfo(hits=..., misses=..., maxsize=None, currsize=...)
+fib.cache_clear()   # wipe it
+```
+
+A real-world auth decorator for a sync handler — note it inspects the call and can
+short-circuit by raising before the wrapped function ever runs:
+
+```python
+import functools
+from collections.abc import Callable
+
+class Forbidden(Exception): ...
+
+def requires_role[**P, R](
+    role: str,
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def decorator(fn: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(fn)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            user = kwargs.get("user")
+            if user is None or role not in getattr(user, "roles", ()):
+                raise Forbidden(f"requires role {role!r}")
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@requires_role("admin")
+def delete_account(account_id: int, *, user: object) -> None:
+    ...
+```
+
+:::note[Decorating async functions]
+A decorator wrapping an `async def` must itself be `async` and `await` the call —
+`return await fn(*args, **kwargs)` inside an `async def wrapper`. A sync wrapper
+around a coroutine function silently returns the *coroutine object* without running
+it. If you need one decorator for both, branch on
+`inspect.iscoroutinefunction(fn)` and define two wrappers.
+:::
+
+### Class decorators
+
+A decorator can take a *class* and return one — `@dataclass` is the canonical
+example. It's how Python adds behavior to a whole type at definition time, the
+nearest analog to TS's class decorators.
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)   # generates __init__, __repr__, __eq__, __hash__
+class Point:
+    x: float
+    y: float
+
+def singleton[T](cls: type[T]) -> type[T]:
+    """Class decorator: always return the same instance."""
+    instance: dict[type[T], T] = {}
+    @functools.wraps(cls, updated=())
+    def get_instance(*args: object, **kwargs: object) -> T:
+        if cls not in instance:
+            instance[cls] = cls(*args, **kwargs)
+        return instance[cls]
+    return get_instance  # type: ignore[return-value]
+```
+
+## Context managers
+
+A context manager guarantees setup/teardown around a block — open/close, acquire/
+release, begin/commit-or-rollback. It is Python's `try/finally`, made reusable and
+named. This is the role Go fills with `defer` and the one TС39's `using` declaration
+(TypeScript 5.2+, `Symbol.dispose`) is racing to catch up to.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// TS 5.2+ `using` — explicit resource management via Symbol.dispose.
+class Db implements Disposable {
+  constructor() { console.log("open"); }
+  [Symbol.dispose]() { console.log("close"); }
+  query(sql: string) { /* ... */ }
+}
+
+function run() {
+  using db = new Db();   // disposed at end of scope, even on throw
+  db.query("SELECT 1");
+} // -> "close" here
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go uses defer — runs on function exit, LIFO order.
+func run() error {
+    db, err := Open()
+    if err != nil {
+        return err
+    }
+    defer db.Close()      // guaranteed to run when run() returns
+
+    return db.Query("SELECT 1")
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# Python uses `with`. __exit__ runs on block exit, even on exception.
+with open("data.txt") as f:        # f.__enter__() returns the file
+    data = f.read()
+# f.__exit__(...) closed the file here — even if read() raised
+
+# Multiple managers in one with (PEP 617 parenthesized form):
+with (
+    open("in.txt") as src,
+    open("out.txt", "w") as dst,
+):
+    dst.write(src.read())
+```
+
+  </TabItem>
+</Tabs>
+
+| Mechanism | TypeScript | Go | Python |
+|---|---|---|---|
+| Scope-based cleanup | `using` + `Symbol.dispose` | `defer` (function scope) | `with` + `__exit__` (block scope) |
+| Async cleanup | `await using` | — (no async defer) | `async with` + `__aexit__` |
+| Suppress error in cleanup | manual try/catch | recover in deferred fn | `__exit__` returns `True` |
+| Dynamic / N resources | nested `using` | multiple `defer` | `contextlib.ExitStack` |
+
+### Writing one: the class protocol
+
+A context manager is any object with `__enter__` and `__exit__`. `__enter__`'s
+return value is bound by `as`. `__exit__` receives the exception (or three `None`s
+on clean exit) and returns truthy to **suppress** it.
+
+```python
+import time
+from types import TracebackType
+from typing import Self
+
+class Timer:
+    def __enter__(self) -> Self:
+        self.start = time.perf_counter()
+        return self                       # bound to `as t`
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        self.elapsed = time.perf_counter() - self.start
+        print(f"block took {self.elapsed * 1000:.2f}ms")
+        return False                      # don't suppress exceptions
+
+with Timer() as t:
+    time.sleep(0.05)
+```
+
+### The easy way: `@contextmanager`
+
+For most cases, write a generator and decorate it. Everything before `yield` is
+`__enter__`; the `yield`ed value is bound by `as`; everything after (best in a
+`finally`) is `__exit__`. This is the idiomatic way to write 90% of context
+managers.
+
+```python
+from contextlib import contextmanager
+from collections.abc import Iterator
+
+@contextmanager
+def transaction(conn) -> Iterator[Connection]:
+    tx = conn.begin()
+    try:
+        yield conn           # the `with ... as conn` value
+        tx.commit()          # runs only if the block didn't raise
+    except Exception:
+        tx.rollback()        # runs on any exception in the block
+        raise
+    finally:
+        tx.close()           # always runs
+
+with transaction(conn) as c:
+    c.execute("INSERT ...")  # commit on success, rollback on raise
+```
+
+### `ExitStack` — dynamic and N-of-them resources
+
+When the number of resources isn't known until runtime, `ExitStack` lets you
+`enter_context` in a loop and unwinds them all (LIFO) at the end. This is the
+clean answer to "I have a list of files / connections to manage."
+
+```python
+from contextlib import ExitStack
+
+def merge(paths: list[str], out: str) -> None:
+    with ExitStack() as stack:
+        files = [stack.enter_context(open(p)) for p in paths]
+        with open(out, "w") as dst:
+            for f in files:
+                dst.write(f.read())
+    # every file in `files` is closed here, in reverse order
+```
+
+### `suppress` and `closing`
+
+Two small `contextlib` helpers that replace boilerplate `try/except` and
+`try/finally`:
+
+```python
+from contextlib import suppress, closing
+
+# suppress: ignore specific exceptions in the block (cleaner than try/except/pass)
+with suppress(FileNotFoundError):
+    os.remove("maybe-missing.tmp")
+
+# closing: call .close() on exit for objects that aren't context managers
+with closing(urlopen("https://example.com")) as page:
+    data = page.read()
+```
+
+### Async context managers
+
+`async with` calls `__aenter__`/`__aexit__` — essential for async DB sessions,
+HTTP clients, and connection pools (you saw these in the async, database, and Redis
+modules). The generator form is `@asynccontextmanager`.
+
+```python
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+
+@asynccontextmanager
+async def lifespan(app) -> AsyncIterator[None]:
+    pool = await create_pool(DSN)        # startup
+    app.state.pool = pool
+    try:
+        yield                            # app runs here
+    finally:
+        await pool.close()               # shutdown
+
+# This is exactly FastAPI's lifespan handler — now you see the protocol underneath.
+async with httpx.AsyncClient() as client:
+    resp = await client.get("https://example.com")
+```
+
+## Descriptors
+
+Descriptors are Python's "delegate" — the analog to Kotlin's `by`. A descriptor is
+an object that defines `__get__`/`__set__`/`__delete__` and is assigned as a
+*class attribute*; it then intercepts attribute access on instances. This is the
+machinery behind `@property`, `classmethod`, `staticmethod`, bound methods, and
+every ORM/Pydantic field. Once you see it, the "magic" disappears.
+
+| Concern | TypeScript | Go | Python |
+|---|---|---|---|
+| Lazy/computed read | `get x()` accessor | method `cfg.X()` | `@property` or `__get__` |
+| Reusable read/write logic across fields | mixin / decorator | embedded struct | a descriptor class |
+| Validation on assignment | `set x(v)` per field | manual in setter method | one descriptor, reused on N fields |
+| Knowing the attribute's own name | manual | manual | `__set_name__` hands it to you |
+
+### `@property` *is* a descriptor
+
+You've used `@property` — it's just a descriptor instance the language ships. It
+intercepts reads (and optionally writes) of one attribute.
+
+```python
+class Circle:
+    def __init__(self, radius: float) -> None:
+        self._radius = radius
+
+    @property
+    def area(self) -> float:           # read intercepted by property.__get__
+        return 3.14159 * self._radius**2
+
+    @property
+    def radius(self) -> float:
+        return self._radius
+
+    @radius.setter
+    def radius(self, value: float) -> None:  # write intercepted by property.__set__
+        if value < 0:
+            raise ValueError("radius must be non-negative")
+        self._radius = value
+```
+
+### A reusable validated-attribute descriptor
+
+The win over `@property` is **reuse**: write the validation once, apply it to many
+fields. `__set_name__` (Python 3.6+) is the key — the interpreter calls it at class
+creation with the attribute's own name, so the descriptor knows where to stash its
+value without you repeating the name.
+
+```python
+from typing import Any
+
+class Bounded:
+    """A reusable descriptor enforcing min <= value <= max."""
+
+    def __init__(self, *, min: float, max: float) -> None:
+        self.min = min
+        self.max = max
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        # Called once at class-body evaluation. `name` is the attribute name.
+        self.private = f"_{name}"
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> float:
+        if obj is None:                  # accessed on the class, not an instance
+            return self  # type: ignore[return-value]
+        return getattr(obj, self.private)
+
+    def __set__(self, obj: Any, value: float) -> None:
+        if not (self.min <= value <= self.max):
+            raise ValueError(f"must be in [{self.min}, {self.max}], got {value}")
+        setattr(obj, self.private, value)
+
+class Server:
+    port = Bounded(min=1, max=65535)     # one descriptor instance, class-level
+    workers = Bounded(min=1, max=256)    # reuse — no duplicated validation
+
+    def __init__(self, port: int, workers: int) -> None:
+        self.port = port                 # goes through Bounded.__set__ → validated
+        self.workers = workers
+
+Server(port=8080, workers=4)
+Server(port=99999, workers=4)            # ValueError: must be in [1, 65535]
+```
+
+:::note[Data vs non-data descriptors]
+A descriptor with `__set__` (or `__delete__`) is a **data descriptor** and takes
+priority over an instance's `__dict__`. One with only `__get__` is a **non-data
+descriptor** (like a plain method) and is shadowed by instance attributes. This
+precedence is why `obj.method` finds the class's method but `obj.x = 5` can shadow a
+non-data descriptor. It's also why methods are descriptors at all — a function's
+`__get__` is what binds `self`.
+:::
+
+## Dunder methods and protocols
+
+"Dunder" (double-underscore) methods let your objects plug into Python's syntax and
+built-ins: `len(x)` calls `__len__`, `x[k]` calls `__getitem__`, `x()` calls
+`__call__`, `for i in x` calls `__iter__`. This is structural typing at the syntax
+level — implement the protocol and your object *is* iterable/callable/indexable.
+
+```python
+from collections.abc import Iterator
+
+class Deck:
+    def __init__(self) -> None:
+        self._cards = [(r, s) for s in "♠♥♦♣" for r in range(2, 15)]
+
+    def __len__(self) -> int:                 # len(deck)
+        return len(self._cards)
+
+    def __getitem__(self, i: int) -> tuple[int, str]:  # deck[0], deck[1:3], iteration
+        return self._cards[i]
+
+    def __iter__(self) -> Iterator[tuple[int, str]]:   # for card in deck
+        return iter(self._cards)
+
+    def __contains__(self, card: tuple[int, str]) -> bool:  # card in deck
+        return card in self._cards
+```
+
+### `__call__` — objects that behave like functions
+
+Implement `__call__` and instances become callable. This is how you build
+stateful "functions" and configurable callables — exactly what `functools.partial`
+and many decorators-as-classes do.
+
+```python
+class RateLimiter:
+    def __init__(self, per_second: int) -> None:
+        self.per_second = per_second
+        self.tokens = per_second
+
+    def __call__(self, fn):              # instance used as a decorator!
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if self.tokens <= 0:
+                raise RuntimeError("rate limited")
+            self.tokens -= 1
+            return fn(*args, **kwargs)
+        return wrapper
+
+limit = RateLimiter(per_second=10)
+
+@limit                                    # @<callable-instance>
+def send_email(to: str) -> None: ...
+```
+
+### `__getattr__` — dynamic attributes
+
+`__getattr__` is called only when normal lookup *fails* — the hook for proxies,
+lazy loaders, and config objects. (`__getattribute__` intercepts *every* access and
+is a footgun; reach for `__getattr__`.)
+
+```python
+class Config:
+    def __init__(self, data: dict[str, object]) -> None:
+        self._data = data
+
+    def __getattr__(self, name: str) -> object:
+        try:
+            return self._data[name]      # cfg.database_url -> self._data["database_url"]
+        except KeyError:
+            raise AttributeError(name) from None
+```
+
+### `__init_subclass__` — the metaclass you usually want instead
+
+When you want "run code whenever someone subclasses me" — plugin registration,
+validation of subclasses, auto-registration — `__init_subclass__` (3.6+) does it
+without a metaclass. Frameworks use it for clean plugin systems.
+
+```python
+class Plugin:
+    registry: dict[str, type["Plugin"]] = {}
+
+    def __init_subclass__(cls, *, name: str, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        Plugin.registry[name] = cls       # auto-register every subclass
+
+class JsonExporter(Plugin, name="json"): ...
+class CsvExporter(Plugin, name="csv"): ...
+
+Plugin.registry  # {"json": JsonExporter, "csv": CsvExporter}
+```
+
+### `__slots__` recap
+
+`__slots__` replaces the per-instance `__dict__` with a fixed array of fields —
+less memory, faster attribute access, and it forbids typo'd attributes. Worth it
+for objects you create by the millions. (`@dataclass(slots=True)` does this for
+you.)
+
+```python
+class Point:
+    __slots__ = ("x", "y")               # no __dict__; ~40% less memory per instance
+    def __init__(self, x: float, y: float) -> None:
+        self.x = x
+        self.y = y
+
+p = Point(1.0, 2.0)
+p.z = 3.0                                # AttributeError — typo caught, not silently set
+```
+
+## Metaclasses
+
+A metaclass is "the class of a class." `type` is the default metaclass: `type(int)`
+is `type`. A custom metaclass overrides `__new__`/`__init__` to customize class
+*creation* — the most powerful and least-needed feature in the language.
+
+```python
+class RegistryMeta(type):
+    registry: dict[str, type] = {}
+
+    def __new__(mcs, name, bases, namespace, **kwargs):
+        cls = super().__new__(mcs, name, bases, namespace)
+        if bases:                        # skip the base class itself
+            RegistryMeta.registry[name] = cls
+        return cls
+
+class Model(metaclass=RegistryMeta): ...
+class User(Model): ...                   # auto-registered via the metaclass
+```
+
+:::caution[Honest take: you almost never need a metaclass]
+In 2026, reach for `__init_subclass__` (subclass hooks), `__set_name__`
+(descriptors that know their name), class decorators (transform a class), or
+`typing.Protocol` (structural typing) *first* — they cover the cases people used to
+write metaclasses for, with far less mystery. Metaclasses are how the machinery of
+older ORMs (Django models) and some frameworks works under the hood, and it's worth
+recognizing one when you read framework source. But writing your own is a strong
+signal to step back: "metaclasses are deeper magic than 99% of users should ever
+worry about" (Tim Peters). Pydantic v2 moved most of its model machinery into a
+compiled core precisely to keep this off your plate.
+:::
+
+## The GIL and free-threading
+
+This is the question every TS and Go dev asks. The **GIL (Global Interpreter
+Lock)** is a mutex inside CPython that lets only **one thread execute Python
+bytecode at a time**. Threads still exist and still preempt each other, but they
+take turns on the interpreter — so Python threads give you concurrency, not
+CPU parallelism.
+
+| | TypeScript/Node | Go | Python (CPython) |
+|---|---|---|---|
+| Threads run Python/JS in parallel? | No (one thread) | **Yes** (goroutines on N OS threads) | No (GIL) — until free-threaded build |
+| IO concurrency | event loop | goroutines + netpoller | `asyncio` / threads |
+| CPU parallelism | worker threads / cluster | goroutines (free) | `multiprocessing` / free-threaded build |
+| Shared-memory data races | rare (one thread) | **common** (need mutex/channels) | rare under GIL; possible under free-threading |
+
+### Why the GIL matters (and when it doesn't)
+
+The GIL only bites **CPU-bound, pure-Python** work. For **IO-bound** work — waiting
+on a socket, disk, or DB — the thread releases the GIL while it waits, so threads
+(and `asyncio`) overlap IO just fine. C extensions (NumPy, orjson, asyncpg's parser)
+release the GIL during heavy native work too.
+
+```python
+# CPU-bound: GIL serializes this. Threads give NO speedup; processes do.
+def crunch(n: int) -> int:
+    return sum(i * i for i in range(n))
+
+# IO-bound: threads (or asyncio) overlap the waiting fine — GIL released during IO.
+def fetch(url: str) -> bytes:
+    return urlopen(url).read()
+```
+
+### Free-threading: Python 3.13+ (`3.13t` / `3.14t`)
+
+Python 3.13 shipped an official **free-threaded build** (PEP 703) — a separate
+interpreter (`python3.13t`, install with `uv python install 3.14t`) that **removes
+the GIL**, so threads run Python bytecode in true parallel, finally. In 3.14 it's
+officially supported (no longer experimental), though some C extensions still need
+rebuilding for it and single-threaded code carries a small overhead.
+
+```bash
+# Install and run a free-threaded interpreter with uv
+uv python install 3.14t           # the "t" = free-threaded (no GIL)
+uv run --python 3.14t script.py
+
+# Check at runtime
+python -c "import sys; print(sys._is_gil_enabled())"   # False on a 3.xt build
+```
+
+:::caution[Free-threading is real, but read the fine print]
+The free-threaded build does what Go has always done: threads run Python in
+parallel. But (1) some C extensions must be rebuilt/marked compatible — check yours;
+(2) you now have **real data races**, the thing the GIL accidentally protected you
+from — you need locks/queues like a Go dev does; (3) single-threaded throughput has
+a small penalty. For most 2026 backends, async-for-IO + processes-for-CPU is still
+the safe default, and free-threading is the option to evaluate for CPU-parallel
+workloads in one process.
+:::
+
+### The decision table
+
+This is the whole chapter in one table. Pick by workload:
+
+| Workload | Use | Why |
+|---|---|---|
+| **IO-bound** (HTTP, DB, files, queues) | `asyncio` | One thread overlaps thousands of waits; no GIL contention |
+| IO-bound, sync libraries only | `concurrent.futures.ThreadPoolExecutor` | GIL released during IO; threads are cheap |
+| **CPU-bound** (parsing, math, crypto) | `concurrent.futures.ProcessPoolExecutor` / `multiprocessing` | Separate processes = separate GILs = real cores |
+| CPU-bound, want shared memory | free-threaded build (`3.14t`) + threads | True parallelism in one process — mind the data races |
+| CPU-bound, numeric | NumPy / Polars / a Rust ext | Releases the GIL in native code anyway |
+
+```python
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+# CPU-bound → processes (one GIL each, real parallelism)
+with ProcessPoolExecutor() as pool:
+    results = list(pool.map(crunch, [10_000_000] * 8))
+
+# IO-bound with a sync library → threads (GIL released while waiting)
+with ThreadPoolExecutor(max_workers=32) as pool:
+    pages = list(pool.map(fetch, urls))
+```
+
+:::tip[Honest comparison to goroutines]
+A goroutine is cheap, parallel by default, and the scheduler is built in — Go makes
+concurrency *and* parallelism the easy path. Python makes you choose your tool:
+`asyncio` for IO (great, but "colored" functions), processes for CPU (real
+parallelism, but serialization + memory cost), threads for IO with sync libs. The
+free-threaded build narrows the gap for CPU work, but Go's "just spawn a goroutine"
+ergonomics remain ahead. The flip side: under the GIL you rarely fight the data
+races that goroutines expose you to.
+:::
+
+## Performance
+
+Python is "slow" the way a delivery truck is slow — it's the wrong question for
+most backends, where you're IO-bound on the DB and network. Optimize only what you
+measure. The cardinal rule TS/Go devs already know applies double here: **profile
+first.**
+
+### Profiling: `cProfile` and `py-spy`
+
+```bash
+# Deterministic profiler in the stdlib — good for "which function dominates?"
+python -m cProfile -s cumtime -m app.worker
+
+# py-spy: sampling profiler, attaches to a RUNNING process, zero code changes.
+# The 2026 go-to for profiling a live server without restarting it.
+uvx py-spy top --pid 12345           # live top-like view
+uvx py-spy record -o profile.svg --pid 12345   # flamegraph
+```
+
+### The cheap wins, in order
+
+```python
+import functools
+
+# 1. Cache pure work. Free, huge wins on repeated calls.
+@functools.cache
+def parse_rule(text: str) -> Rule: ...
+
+# 2. __slots__ for high-cardinality objects — less memory, faster access.
+class Event:
+    __slots__ = ("ts", "kind", "payload")
+
+# 3. orjson instead of stdlib json — a Rust-backed serializer, multiples faster.
+import orjson
+body = orjson.dumps({"id": 1})       # bytes, fast; FastAPI's ORJSONResponse uses it
+
+# 4. Pick the right data structure: set/dict membership is O(1) vs list O(n);
+#    use collections.deque for queues, not list.pop(0).
+seen = set(ids)                      # `x in seen` is O(1)
+```
+
+### When to reach for native code
+
+When you've profiled and a pure-Python hot loop genuinely dominates, drop to native:
+
+| Tool | Use it for |
+|---|---|
+| **orjson / msgspec** | JSON (de)serialization — drop-in, instant win |
+| **NumPy / Polars** | vectorized numeric / dataframe work — releases the GIL |
+| **PyO3 (Rust)** | write a hot module in Rust, import it as Python — the 2026 favorite |
+| **Cython / mypyc** | compile annotated Python to C — Pydantic v2 and Black use this |
+
+:::tip[The most important performance rule]
+"Fast enough" is a real and correct engineering answer. A FastAPI endpoint that
+spends 8ms in Python and 40ms waiting on Postgres will not get faster by rewriting
+the 8ms in Rust — fix the query, add an index, or cache in Redis. Reach for native
+code only after a profiler points at a Python hot loop that actually matters.
+:::
+
+## Summary
+
+| Feature | TypeScript | Go | Python |
+|---|---|---|---|
+| Decorators | Stage-3, class/member, metadata | higher-order funcs (explicit) | `@d` = `f = d(f)`, funcs + classes |
+| Scope cleanup | `using` / `Symbol.dispose` | `defer` | `with` + `__enter__`/`__exit__` |
+| Async cleanup | `await using` | — | `async with` + `__aexit__` |
+| Reusable attribute logic | accessors / decorators | embedded structs | descriptors (`__get__`/`__set__`) |
+| Operator/syntax hooks | `Symbol.iterator`, etc. | interfaces (`Stringer`) | dunder methods |
+| Subclass hook | — | — | `__init_subclass__` (over metaclass) |
+| CPU parallelism | worker threads | goroutines | processes / free-threaded build |
+
+**What to remember:**
+
+- A decorator is `f = d(f)`; always `functools.wraps`; parametrized decorators are
+  factories (configure → decorate → wrap); use `[**P, R]` typing.
+- Context managers are reusable `try/finally`; write them as `@contextmanager`
+  generators; `ExitStack` for N resources; `async with` for async resources.
+- Descriptors are Python's delegation — `@property`, methods, and ORM fields are all
+  descriptors. `__set_name__` gives a reusable validated field.
+- Prefer `__init_subclass__` / descriptors / class decorators / `Protocol` over
+  metaclasses — you rarely need a metaclass.
+- The GIL serializes CPU-bound Python; IO-bound code overlaps fine. 3.13+ ships a
+  free-threaded build that removes it. Decide by workload: IO→async, CPU→processes
+  or free-threaded.
+- Profile before optimizing. Cache, `__slots__`, orjson, and the right data
+  structure are the cheap wins; "fast enough" is a valid answer.
+
+## Practice
+
+Put these together into one small, fluent toolkit — a parametrized retry decorator,
+a timing decorator, a context manager, and a descriptor-based validated field,
+composed into a tiny DSL.
+
+<CardGrid>
+  <LinkCard
+    title="Build a Decorator Toolkit / mini-DSL"
+    href="/modern-python/16-advanced-python/decorators-dsl/"
+    description="Build a reusable @retry / @timed toolkit, a context manager, and a descriptor-based validated field — then compose them into a fluent, type-checked client API."
+  />
+</CardGrid>

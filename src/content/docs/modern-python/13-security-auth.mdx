@@ -1,0 +1,906 @@
+---
+title: Security & Auth
+description: Auth for FastAPI — argon2 password hashing, pyjwt access/refresh tokens, OAuth2PasswordBearer and Security dependencies, OIDC with JWKS, and RBAC scopes.
+sidebar:
+  order: 13
+---
+
+import { Tabs, TabItem, Steps, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Every backend you've built has needed auth. In Express you bolted on Passport.js
+middleware; in Go you hand-rolled a `func(http.Handler) http.Handler` wrapper that
+parsed the `Authorization` header. FastAPI takes a third route: **auth is just
+dependency injection**. The same `Depends()` you used for a database session
+([module 09](/modern-python/09-database-postgresql/)) is how you require a logged-in
+user, check a scope, or validate a token from an external identity provider.
+
+That's the big idea of this module. There's no separate "security framework" to
+learn — `OAuth2PasswordBearer`, `Security`, and `HTTPBearer` are dependencies that
+extract a token, and `get_current_user` is a dependency that turns that token into a
+user. Routes declare what they need in their signature; FastAPI wires it and returns
+the right `401`/`403` automatically.
+
+We'll cover password hashing with **argon2**, JWTs with **`pyjwt`** (access + refresh),
+the dependency-based current-user pattern, OAuth2/OIDC against an external provider,
+RBAC via scopes, and the cross-cutting essentials — CORS, secrets via
+`pydantic-settings`, rate-limiting auth endpoints, timing-safe comparison, and the
+pitfalls TS/Go devs hit.
+
+## The mental model: middleware vs dependencies
+
+Express and Go assemble auth as per-route middleware you wire by hand. FastAPI
+expresses the same flow as a dependency graph — and because dependencies can depend on
+other dependencies, "extract token → decode JWT → load user → check scope" is just a
+chain.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Express: middleware functions, wired per route
+import jwt from "jsonwebtoken";
+
+function authenticate(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith("Bearer ")) return res.status(401).end();
+  try {
+    req.user = jwt.verify(header.slice(7), process.env.JWT_SECRET!);
+    next();
+  } catch {
+    res.status(401).end();
+  }
+}
+
+app.get("/me", authenticate, (req, res) => res.json(req.user));
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go: hand-rolled middleware, explicit control
+func authenticate(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        raw := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+        token, err := jwt.Parse(raw, func(t *jwt.Token) (any, error) {
+            return []byte(os.Getenv("JWT_SECRET")), nil
+        })
+        if err != nil || !token.Valid {
+            http.Error(w, "Unauthorized", http.StatusUnauthorized)
+            return
+        }
+        ctx := context.WithValue(r.Context(), userKey, token.Claims)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+mux.Handle("/me", authenticate(meHandler))
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# FastAPI: auth is a dependency. Declare it in the signature.
+from typing import Annotated
+from fastapi import Depends, FastAPI
+
+app = FastAPI()
+
+# oauth2_scheme extracts the Bearer token; get_current_user decodes + loads.
+# Both are defined once (below) and reused everywhere by type.
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+@app.get("/me")
+async def me(user: CurrentUser) -> User:
+    return user  # only runs if the dependency resolved a user; else 401
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+| Aspect | Express | Go | FastAPI |
+|--------|---------|-----|---------|
+| Auth model | middleware functions | middleware functions | **dependencies** (`Depends`/`Security`) |
+| Wiring | per route, imperative | per route, imperative | declarative in the signature |
+| Token extraction | read header by hand | read header by hand | `OAuth2PasswordBearer` / `HTTPBearer` |
+| "Current user" | mutate `req.user` | `context.WithValue` | a dependency that returns the user |
+| 401 vs 403 | you write `res.status(...)` | you write `http.Error(...)` | raise `HTTPException`; FastAPI maps it |
+| Composability | call middleware inside middleware | wrap handlers | dependencies depend on dependencies |
+| OpenAPI integration | manual | manual | **automatic** (security schemes in `/docs`) |
+
+The payoff: the security scheme shows up in the auto-generated OpenAPI docs, the
+`Authorize` button appears in Swagger UI, and a route's auth requirements are visible
+in its signature instead of buried in a middleware stack.
+
+## Password hashing: argon2, not bcrypt-by-default
+
+Rule zero: **never store passwords reversibly, and never hash them with a
+general-purpose digest.** If you reach for `hashlib.md5` or `hashlib.sha256` on a
+password, stop — those are fast by design, which is exactly what an attacker with your
+database dump wants. You need a *slow*, salted, memory-hard function.
+
+In 2026 the default is **argon2id** (the password-hashing competition winner) via
+**`argon2-cffi`**. You'll still see **bcrypt** in older Python code (often through
+`passlib`); it's fine, but `passlib` is effectively unmaintained, and `argon2-cffi`
+gives you a cleaner API and a stronger algorithm. Use argon2.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import argon2 from "argon2";
+
+const hash = await argon2.hash("correct horse battery staple");
+const ok = await argon2.verify(hash, "correct horse battery staple");
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+import "github.com/alexedwards/argon2id"
+
+hash, _ := argon2id.CreateHash("correct horse battery staple", argon2id.DefaultParams)
+ok, _ := argon2id.ComparePasswordAndHash("correct horse battery staple", hash)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+
+ph = PasswordHasher()  # sane argon2id defaults (time, memory, parallelism)
+
+def hash_password(raw: str) -> str:
+    return ph.hash(raw)  # self-describing string: $argon2id$v=19$m=...,t=...,p=...$salt$hash
+
+def verify_password(stored_hash: str, raw: str) -> bool:
+    try:
+        ph.verify(stored_hash, raw)  # raises on mismatch — not a bool return
+        return True
+    except VerifyMismatchError:
+        return False
+```
+
+  </TabItem>
+</Tabs>
+
+The argon2 hash string is **self-describing**: it embeds the algorithm, version, and
+parameters alongside the salt and digest. That's what makes seamless upgrades possible
+— when you raise the cost factor next year, you don't need a migration. Check on each
+successful login whether the stored hash used weaker parameters and silently re-hash:
+
+```python
+def verify_and_maybe_rehash(user: User, raw: str) -> bool:
+    try:
+        ph.verify(user.password_hash, raw)
+    except VerifyMismatchError:
+        return False
+    # Same password, but the stored hash used old/weak parameters? Upgrade it.
+    if ph.check_needs_rehash(user.password_hash):
+        user.password_hash = ph.hash(raw)  # persist this
+    return True
+```
+
+:::caution[Hashing blocks the event loop]
+argon2 is *deliberately* CPU-and-memory-expensive — a single hash can take 50–100ms.
+On FastAPI's single-threaded event loop that stalls every other request (the
+blocking-call trap from [module 05](/modern-python/05-async-concurrency/)). In a `def`
+(non-`async`) route, FastAPI already runs the handler in a threadpool, so a plain
+`ph.hash(...)` is fine. In an `async def` route, push it off the loop:
+
+```python
+import asyncio
+hashed = await asyncio.to_thread(ph.hash, raw)
+```
+:::
+
+:::note[Compare strings the timing-safe way]
+When you compare *non-hashed* secrets — an API key, a CSRF token, an HMAC — never use
+`==`. A naive comparison returns early on the first mismatching byte, leaking length
+and content through timing. Use `hmac.compare_digest(a, b)`, which always scans the
+full length. argon2's `verify` and `pyjwt`'s signature check already do this
+internally; this matters for secrets you compare yourself.
+:::
+
+## JWTs with pyjwt
+
+A JWT is a signed, base64url-encoded JSON blob: `header.payload.signature`. The server
+signs it on login; the client sends it back; the server verifies the signature and
+reads the claims. **Signed, not encrypted** — anyone can read the payload, so never put
+secrets in it. The library is **`pyjwt`** (the alternative, **`joserfc`**, is worth
+knowing if you need full JOSE/JWE; for plain JWT, `pyjwt` is the standard).
+
+### Encode and decode
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import jwt from "jsonwebtoken";
+
+const token = jwt.sign({ sub: userId, scopes }, SECRET, {
+  algorithm: "HS256",
+  expiresIn: "15m",
+});
+
+const claims = jwt.verify(token, SECRET); // throws on bad sig / expiry
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+claims := jwt.MapClaims{
+    "sub": userID,
+    "exp": time.Now().Add(15 * time.Minute).Unix(),
+}
+token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+signed, _ := token.SignedString([]byte(secret))
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from datetime import datetime, timedelta, UTC
+import jwt  # the pyjwt package imports as `jwt`
+
+SECRET = settings.jwt_secret  # from pydantic-settings, never hardcoded
+
+def encode_token(sub: str, scopes: list[str]) -> str:
+    now = datetime.now(UTC)
+    payload = {
+        "sub": sub,
+        "scopes": scopes,
+        "iat": now,
+        "exp": now + timedelta(minutes=15),
+        "iss": "example-app",
+        "aud": "example-app-clients",
+    }
+    return jwt.encode(payload, SECRET, algorithm="HS256")
+
+def decode_token(token: str) -> dict:
+    # Verifies signature AND validates exp/iss/aud. Raises on any failure.
+    return jwt.decode(
+        token,
+        SECRET,
+        algorithms=["HS256"],          # pin the algorithm — see the warning below
+        issuer="example-app",
+        audience="example-app-clients",
+    )
+```
+
+  </TabItem>
+</Tabs>
+
+`jwt.decode` raises specific exceptions you'll want to catch and map to clean errors:
+`ExpiredSignatureError`, `InvalidAudienceError`, `InvalidIssuerError`, and the catch-all
+`InvalidTokenError`.
+
+:::caution[The `alg` confusion attack — always pin `algorithms`]
+The single most-exploited JWT mistake: trusting the `alg` field *inside the token*. An
+attacker flips a server's RS256 token to `alg: "none"` (no signature) or to HS256
+(signing with the public key as the HMAC secret). **`pyjwt` requires you to pass
+`algorithms=[...]` to `decode`** precisely so you state what you accept, not the token.
+Never pass the list dynamically from the token header. Pin it.
+:::
+
+### Claims that matter
+
+| Claim | Meaning | Why you care |
+|-------|---------|--------------|
+| `sub` | subject — the user id | who the token is about |
+| `exp` | expiry (unix seconds) | short-lived tokens limit blast radius |
+| `iat` | issued-at | audit / "issued before password change" checks |
+| `iss` | issuer | reject tokens minted elsewhere |
+| `aud` | audience | reject tokens meant for a different service |
+| `jti` | unique token id | the hook for revocation lists |
+| `scopes` / `roles` | custom | RBAC (see below) |
+
+### HS256 vs RS256
+
+| | HS256 (symmetric) | RS256 (asymmetric) |
+|--|-------------------|--------------------|
+| Key | one shared secret | private key signs, public key verifies |
+| Who can mint | anyone with the secret | only the holder of the private key |
+| Best for | a single service signing its own tokens | an IdP minting tokens many services verify |
+| Verifier needs | the secret (a liability if leaked) | only the public key (safe to distribute) |
+| Key distribution | out of band | published as a **JWKS** endpoint |
+
+Rule of thumb: **HS256** when one service both issues and verifies (the JWT Auth API
+sub-project). **RS256** (or ES256) when an identity provider issues tokens that other
+services verify — which is exactly the OAuth2/OIDC case below.
+
+### Access + refresh tokens
+
+A single long-lived token is a liability: if it leaks, the attacker has access until it
+expires, and you can't easily revoke it. The standard pattern splits responsibilities:
+
+- **Access token** — short-lived (5–15 min), sent on every request, holds the claims.
+- **Refresh token** — long-lived (days/weeks), sent *only* to a `/refresh` endpoint,
+  exchanged for a fresh access token.
+
+```python
+def issue_tokens(user: User) -> dict[str, str]:
+    now = datetime.now(UTC)
+    access = jwt.encode(
+        {"sub": user.id, "scopes": user.scopes, "type": "access",
+         "iat": now, "exp": now + timedelta(minutes=15)},
+        SECRET, algorithm="HS256",
+    )
+    refresh = jwt.encode(
+        {"sub": user.id, "type": "refresh", "jti": str(uuid4()),
+         "iat": now, "exp": now + timedelta(days=7)},
+        SECRET, algorithm="HS256",
+    )
+    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+
+
+@app.post("/auth/refresh")
+async def refresh(body: RefreshRequest, users: UserRepoDep) -> TokenPair:
+    try:
+        claims = decode_token(body.refresh_token)
+    except jwt.InvalidTokenError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
+    if claims.get("type") != "refresh":  # don't accept an access token here
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "wrong token type")
+    user = await users.get(claims["sub"])
+    return issue_tokens(user)
+```
+
+:::caution[Honest take: JWTs are not as great as they look]
+JWTs sell themselves as "stateless auth," and that's exactly their weakness:
+
+- **You can't revoke a stateless token.** Logout, "sign out everywhere," or banning a
+  user does *nothing* to tokens already issued — they're valid until `exp`. The only
+  fixes reintroduce state: a short access-token lifetime plus refresh rotation, or a
+  server-side denylist of `jti`s (often in Redis), at which point you're half-way back
+  to sessions.
+- **Where do you store them in a browser?** `localStorage` is readable by any XSS;
+  `httpOnly` cookies are safer but reintroduce CSRF concerns.
+- **They get fat.** Stuffing roles/permissions into the token means stale data and big
+  headers.
+
+If your clients are first-party web apps, an opaque **session id in an httpOnly cookie**
+backed by Redis is often simpler and *more* secure — revocation is a `DEL`. Reach for
+JWTs when you have multiple services or third-party APIs that must verify tokens without
+calling back to an auth server. Don't cargo-cult them.
+:::
+
+## FastAPI security: dependencies, not middleware
+
+### Extracting the token: `OAuth2PasswordBearer`
+
+`OAuth2PasswordBearer` is a dependency that pulls the `Bearer` token out of the
+`Authorization` header (and tells OpenAPI which URL issues tokens, so Swagger UI's
+`Authorize` button works). It returns the raw token string — you decode it yourself.
+
+```python title="app/security.py"
+from typing import Annotated
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+import jwt
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+
+
+async def get_current_user(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    users: UserRepoDep,
+) -> User:
+    credentials_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        claims = decode_token(token)
+    except jwt.InvalidTokenError:
+        raise credentials_exc
+    if claims.get("type") != "access":
+        raise credentials_exc
+    user = await users.get(claims["sub"])
+    if user is None or user.disabled:
+        raise credentials_exc
+    return user
+
+
+# Reusable type alias — annotate any route param with this to require a user.
+CurrentUser = Annotated[User, Depends(get_current_user)]
+```
+
+Now any route that wants the logged-in user just asks for one:
+
+```python
+@router.get("/me")
+async def read_me(user: CurrentUser) -> UserResponse:
+    return UserResponse.model_validate(user)
+```
+
+The dependency chain — `oauth2_scheme` → `get_current_user` → `UserRepoDep` — resolves
+top-down before the route body runs. If any link raises `HTTPException`, the body never
+executes and the client gets the status you raised.
+
+### `Depends` vs `Security`, and `HTTPBearer`
+
+| Utility | Use it when |
+|---------|-------------|
+| `OAuth2PasswordBearer` | you issue tokens from a `/login` endpoint (password flow); want the Swagger `Authorize` flow |
+| `HTTPBearer` | you just want "read a `Bearer` token", no OAuth2 password-flow UI |
+| `Depends(...)` | wraps any dependency, including your `get_current_user` |
+| `Security(...)` | like `Depends`, **plus** it declares OAuth2 **scopes** for a route (RBAC) |
+
+`HTTPBearer` is the leaner option when tokens come from elsewhere (e.g. an external IdP)
+and you don't want the password-flow UI:
+
+```python
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+bearer = HTTPBearer()
+
+async def current_user_from_bearer(
+    creds: Annotated[HTTPAuthorizationCredentials, Depends(bearer)],
+) -> User:
+    token = creds.credentials  # the part after "Bearer "
+    ...
+```
+
+### Returning 401 vs 403 correctly
+
+This trips up TS/Go devs because the names are misleading:
+
+- **`401 Unauthorized`** actually means *unauthenticated* — "I don't know who you are."
+  Missing/expired/invalid token. Include a `WWW-Authenticate: Bearer` header.
+- **`403 Forbidden`** means *authenticated but not allowed* — "I know who you are, you
+  just can't do this." A logged-in user hitting an admin route.
+
+FastAPI's security utilities raise `401` when the token is missing; your scope checks
+raise `403`. Don't return `403` for a missing token (leaks endpoint existence to
+unauthenticated clients) or `401` for a permission failure (tells the client to
+re-authenticate, which won't help).
+
+## OAuth2 / OIDC: verifying an external provider's tokens
+
+So far your service mints its own HS256 tokens. The other big pattern: an external
+**identity provider** (Keycloak, Auth0, Entra ID, Google) handles login via the
+**authorization-code flow**, and your API is a **resource server** that only *verifies*
+the tokens the IdP issued. You never see the password; you verify an RS256 JWT against
+the provider's public keys.
+
+```text
+Browser ──(1) click "Log in"──▶ Frontend
+Frontend ─(2) redirect /authorize (client_id, redirect_uri, scope, PKCE)──▶ IdP
+User ────(3) login + consent at IdP─────────────────────────────────────▶ IdP
+IdP ─────(4) redirect back with ?code=...────────────────────────────────▶ Frontend
+Frontend ─(5) POST /token (code + PKCE verifier)─────────────────────────▶ IdP
+IdP ─────(6) { access_token (RS256 JWT), id_token, refresh_token }───────▶ Frontend
+Frontend ─(7) GET /api/resource  Authorization: Bearer <access_token>────▶ Your API
+Your API ─(8) fetch JWKS (cached), verify RS256 signature, check iss/aud─▶ (local)
+Your API ─(9) 200 protected resource─────────────────────────────────────▶ Frontend
+```
+
+### The resource-server side: verify with JWKS
+
+The IdP publishes its public keys at a **JWKS** (JSON Web Key Set) URL, discoverable
+from `/.well-known/openid-configuration`. `pyjwt` has a `PyJWKClient` that fetches and
+caches them, picks the right key by the token's `kid` header, and hands you a key to
+verify with:
+
+```python title="app/oidc.py"
+import jwt
+from jwt import PyJWKClient
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+OIDC_ISSUER = settings.oidc_issuer          # e.g. https://keycloak.example.com/realms/app
+OIDC_AUDIENCE = settings.oidc_audience      # your client/audience id
+
+# PyJWKClient caches keys in-process and refreshes on cache miss.
+_jwks = PyJWKClient(f"{OIDC_ISSUER}/protocol/openid-connect/certs")
+bearer = HTTPBearer()
+
+
+async def verify_oidc_token(
+    creds: Annotated[HTTPAuthorizationCredentials, Depends(bearer)],
+) -> dict:
+    token = creds.credentials
+    try:
+        signing_key = _jwks.get_signing_key_from_jwt(token)  # picks key by `kid`
+        return jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],          # IdPs sign asymmetrically
+            audience=OIDC_AUDIENCE,
+            issuer=OIDC_ISSUER,
+        )
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
+```
+
+You verify entirely offline after the first JWKS fetch — no callback to the IdP per
+request. That's the whole point of asymmetric tokens.
+
+### The client side: `authlib`
+
+If your own service initiates the login (a server-rendered app, not a SPA), **`authlib`**
+handles the authorization-code dance — redirect, callback, token exchange, PKCE:
+
+```python title="app/auth_client.py"
+from authlib.integrations.starlette_client import OAuth
+
+oauth = OAuth()
+oauth.register(
+    name="keycloak",
+    server_metadata_url=f"{OIDC_ISSUER}/.well-known/openid-configuration",
+    client_id=settings.oidc_client_id,
+    client_secret=settings.oidc_client_secret,
+    client_kwargs={"scope": "openid profile email"},
+)
+
+@app.get("/login")
+async def login(request: Request):
+    redirect_uri = request.url_for("callback")
+    return await oauth.keycloak.authorize_redirect(request, redirect_uri)
+
+@app.get("/callback")
+async def callback(request: Request):
+    token = await oauth.keycloak.authorize_access_token(request)  # does the /token exchange
+    userinfo = token["userinfo"]  # parsed id_token claims
+    ...  # create your own session or app token
+```
+
+:::tip[Don't roll your own provider]
+For first-party login you *can* issue your own tokens (the sub-project does). But the
+moment you need "log in with Google," SSO, MFA, or social login, run a managed IdP
+(Keycloak self-hosted, or Auth0/Entra hosted) and make your API a resource server. Auth
+is a place where reinventing primitives — password reset flows, account lockout, MFA — is
+how breaches happen.
+:::
+
+## RBAC: roles and scopes
+
+Authentication answers "who are you"; **authorization** answers "what may you do." The
+mental model: a user has a set of **scopes** (or roles — same idea, finer vs coarser
+grained), a token carries them, and a dependency checks the route's required scopes
+against the token's.
+
+FastAPI builds this in via `Security(...)` + `SecurityScopes`. The scopes you declare on
+a route show up in OpenAPI, and the framework collects the union of required scopes down
+the dependency tree.
+
+```python title="app/security.py"
+from fastapi import Depends, HTTPException, Security, status
+from fastapi.security import OAuth2PasswordBearer, SecurityScopes
+
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="auth/login",
+    scopes={
+        "tasks:read": "Read tasks",
+        "tasks:write": "Create and edit tasks",
+        "admin": "Administer the system",
+    },
+)
+
+
+async def get_current_user(
+    security_scopes: SecurityScopes,
+    token: Annotated[str, Depends(oauth2_scheme)],
+    users: UserRepoDep,
+) -> User:
+    authenticate_value = (
+        f'Bearer scope="{security_scopes.scope_str}"'
+        if security_scopes.scopes else "Bearer"
+    )
+    try:
+        claims = decode_token(token)
+    except jwt.InvalidTokenError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token",
+                            headers={"WWW-Authenticate": authenticate_value})
+    token_scopes = set(claims.get("scopes", []))
+    user = await users.get(claims["sub"])
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "unknown user")
+
+    # 403, not 401: the user IS authenticated, just lacks the scope.
+    for required in security_scopes.scopes:
+        if required not in token_scopes:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=f"missing required scope: {required}",
+                headers={"WWW-Authenticate": authenticate_value},
+            )
+    return user
+```
+
+Declare requirements per route with `Security(...)` and its `scopes=`:
+
+```python
+# Any authenticated user — no scopes required:
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+@router.get("/me")
+async def me(user: CurrentUser) -> UserResponse: ...
+
+# Requires the "tasks:write" scope:
+@router.post("/tasks")
+async def create_task(
+    body: TaskCreate,
+    user: Annotated[User, Security(get_current_user, scopes=["tasks:write"])],
+) -> Task: ...
+
+# Requires "admin":
+@router.delete("/admin/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    admin: Annotated[User, Security(get_current_user, scopes=["admin"])],
+) -> None: ...
+```
+
+Compare the per-route role guard across stacks — same intent, different ergonomics:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Express: a middleware factory you wire per route
+const requireScope = (scope: string) =>
+  (req: Request, res: Response, next: NextFunction) =>
+    req.user.scopes.includes(scope) ? next() : res.status(403).end();
+
+app.post("/tasks", authenticate, requireScope("tasks:write"), createTask);
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Go: a middleware factory you wrap the handler with
+func requireScope(scope string) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            claims := r.Context().Value(userKey).(Claims)
+            if !slices.Contains(claims.Scopes, scope) {
+                http.Error(w, "Forbidden", http.StatusForbidden)
+                return
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+
+mux.Handle("POST /tasks", authenticate(requireScope("tasks:write")(createTask)))
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# FastAPI: declare the scope in the signature; the dependency enforces it.
+@router.post("/tasks")
+async def create_task(
+    body: TaskCreate,
+    user: Annotated[User, Security(get_current_user, scopes=["tasks:write"])],
+) -> Task:
+    ...
+```
+
+  </TabItem>
+</Tabs>
+
+:::note[Roles vs scopes vs ABAC]
+**Roles** are coarse buckets (`admin`, `editor`). **Scopes** are fine-grained verbs on
+resources (`tasks:write`) — better for APIs because they compose. When even scopes aren't
+enough — "can edit *only their own* tasks" — you need **attribute-based** checks inside
+the handler (compare `task.owner_id == user.id`), because that depends on the *data*, not
+just the token. A reasonable mental model: scopes gate the route; ownership checks gate
+the row.
+:::
+
+## CORS
+
+A browser will not let JS on `https://app.example.com` read a response from
+`https://api.example.com` unless the API opts in with CORS headers. CORS is a
+**browser** policy — it does nothing for server-to-server or `curl` — and it is **not**
+authentication. Configure it explicitly; never reflect `*` with credentials.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import cors from "cors";
+app.use(cors({
+  origin: ["https://app.example.com"],
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true,
+}));
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func cors(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Access-Control-Allow-Origin", "https://app.example.com")
+        w.Header().Set("Access-Control-Allow-Credentials", "true")
+        if r.Method == http.MethodOptions { w.WriteHeader(http.StatusOK); return }
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,   # explicit list from config, NOT ["*"]
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+```
+
+  </TabItem>
+</Tabs>
+
+:::caution[`allow_origins=["*"]` and `allow_credentials=True` is a footgun]
+The two are mutually exclusive by spec — browsers reject a wildcard origin when
+credentials are sent, and Starlette won't echo the origin. More importantly, a wildcard
+on a credentialed API is a vulnerability. List your real origins.
+:::
+
+## Cross-cutting essentials
+
+### Secrets via pydantic-settings — never hardcode
+
+The JWT secret, OIDC client secret, and DB password all come from the environment via
+**`pydantic-settings`** ([module 04](/modern-python/04-pydantic/)). Hardcoding a secret
+or committing it to git is the single most common real-world leak.
+
+```python title="app/config.py"
+from functools import lru_cache
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_")
+
+    jwt_secret: SecretStr          # SecretStr keeps it out of repr/logs
+    jwt_algorithm: str = "HS256"
+    access_token_ttl_minutes: int = 15
+    refresh_token_ttl_days: int = 7
+    cors_origins: list[str] = ["http://localhost:3000"]
+    oidc_issuer: str | None = None
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()  # raises at startup if a required secret is missing — fail fast
+```
+
+`SecretStr` is the key move: `str(settings.jwt_secret)` is `'**********'`, so it can't
+leak into a log line or stack trace by accident. Call `.get_secret_value()` only at the
+point you actually sign a token.
+
+### Rate-limit the auth endpoints
+
+Login and refresh are credential-stuffing and brute-force targets. Rate-limit them with
+the Redis sliding-window dependency from
+[module 10](/modern-python/10-redis-caching/) — keyed by IP (and ideally by submitted
+username) so one attacker can't grind through passwords:
+
+```python
+@router.post(
+    "/login",
+    dependencies=[Depends(rate_limit(limit=5, window=60))],  # 5/min from module 10
+)
+async def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]) -> TokenPair:
+    ...
+```
+
+### Input validation is security
+
+Validation isn't just UX — it's your first line of defense, and in FastAPI it's free.
+A Pydantic model on the request body ([module 04](/modern-python/04-pydantic/)) rejects
+malformed input with a `422` before your handler runs, shrinking the attack surface
+(oversized payloads, unexpected types, injection vectors in unvalidated fields).
+
+### SQL injection: parameterize, always
+
+Never build SQL by string-formatting user input. SQLAlchemy and asyncpg
+([module 09](/modern-python/09-database-postgresql/)) parameterize for you when you pass
+bind parameters — the danger is only when you defeat them with f-strings:
+
+```python
+# NEVER — f-string interpolation is an injection hole:
+await conn.execute(f"SELECT * FROM users WHERE email = '{email}'")
+
+# Always — bound parameters; the driver escapes/separates data from SQL:
+await conn.execute(text("SELECT * FROM users WHERE email = :email"), {"email": email})
+# asyncpg: await conn.fetch("SELECT * FROM users WHERE email = $1", email)
+```
+
+### Don't log secrets
+
+Tokens, passwords, and secrets must never reach your logs. With `structlog`
+([module 15](/modern-python/15-observability/)), add a processor that redacts known
+sensitive keys, and rely on `SecretStr` so config values self-redact. Audit what your
+exception handlers serialize — a 500 that echoes the request body can dump a password
+into your log aggregator.
+
+## Security checklist
+
+```text
+Authentication
+  [ ] Passwords hashed with argon2id (argon2-cffi), never md5/sha
+  [ ] check_needs_rehash on login to upgrade old hashes
+  [ ] Hashing offloaded from the event loop (def route or asyncio.to_thread)
+  [ ] Access tokens short-lived (5-15 min); refresh tokens separate + rotated
+  [ ] jwt.decode pins algorithms=[...]; iss/aud/exp validated
+  [ ] Login/refresh return 401 indistinguishably (don't leak which emails exist)
+
+Authorization
+  [ ] 401 for unauthenticated, 403 for authenticated-but-forbidden
+  [ ] Scopes declared with Security(...); ownership checked in the handler
+  [ ] Default-deny: protected routes require a user explicitly
+
+Transport & headers
+  [ ] HTTPS enforced in prod
+  [ ] CORS lists explicit origins (never * with credentials)
+
+Secrets & input
+  [ ] Secrets via pydantic-settings + SecretStr; never hardcoded or logged
+  [ ] SQL uses bound parameters, never f-strings
+  [ ] Request bodies validated by Pydantic
+  [ ] Auth endpoints rate-limited
+  [ ] hmac.compare_digest for any manual secret comparison
+```
+
+## Summary
+
+| Concern | Express / Node | Go | FastAPI (Python) |
+|---------|----------------|-----|------------------|
+| Password hash | `argon2` | `argon2id` | **`argon2-cffi`** |
+| JWT | `jsonwebtoken` | `golang-jwt` | **`pyjwt`** (or `joserfc`) |
+| Token extraction | read header | read header | `OAuth2PasswordBearer` / `HTTPBearer` |
+| Current user | `req.user` | `context.Value` | `Depends(get_current_user)` |
+| RBAC | middleware factory | middleware factory | `Security(..., scopes=[...])` |
+| OIDC verify | `express-oauth2-jwt-bearer` | `coreos/go-oidc` | `pyjwt` + `PyJWKClient` |
+| OAuth2 client | `passport-oauth2` | `golang.org/x/oauth2` | `authlib` |
+| CORS | `cors` package | manual headers | `CORSMiddleware` |
+| Config / secrets | `dotenv` | `envconfig` | `pydantic-settings` + `SecretStr` |
+
+**Key takeaways:**
+
+- Auth in FastAPI is **dependency injection**, not middleware — `get_current_user` is a
+  dependency, scopes ride on `Security(...)`, and `/docs` documents it all for free.
+- Hash with **argon2id**; never md5/sha for passwords; offload hashing off the loop.
+- **Pin `algorithms`** on every `jwt.decode`. HS256 to sign your own tokens, RS256 + JWKS
+  to verify an IdP's.
+- Be honest about JWTs: stateless means **unrevocable**. Short access tokens + refresh
+  rotation, or sessions for first-party web apps.
+- `401` = unauthenticated, `403` = forbidden. Get the codes right.
+
+## Practice
+
+Put it together: a FastAPI auth service with argon2 hashing, access + refresh tokens, a
+`get_current_user` dependency, and an RBAC-protected admin route — all on `uv`.
+
+<CardGrid>
+  <LinkCard
+    title="JWT Auth API"
+    href="/modern-python/13-security-auth/jwt-auth-api/"
+    description="Build a FastAPI service with register/login (argon2), pyjwt access+refresh tokens, a get_current_user dependency, and a scope-protected admin route. Worked solution on uv with a full curl flow."
+  />
+</CardGrid>

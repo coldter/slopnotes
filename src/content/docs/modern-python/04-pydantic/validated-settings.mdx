@@ -1,0 +1,354 @@
+---
+title: Validated Settings & Models
+description: Build a typed pydantic-settings config from env/.env plus request/response models with custom validators and a discriminated union, then watch ValidationErrors fire.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard, Tabs, TabItem } from "@astrojs/starlight/components";
+
+<LinkCard title="← Pydantic & Typed Data Validation" href="/modern-python/04-pydantic/" />
+
+## Goal
+
+Build a tiny but realistic validation layer for a notification service: a typed
+**`Settings`** object loaded from the environment and a `.env` file, plus a set
+of **request/response models** that exercise `Field` constraints, a
+`@field_validator`, a `@model_validator`, an `Annotated` reusable validator, a
+`@computed_field`, and a **discriminated union** of channel payloads. Then you'll
+run it and watch Pydantic raise structured `ValidationError`s on bad input —
+proof the boundary is actually enforced, not just annotated.
+
+## What you'll practice
+
+- A `BaseSettings` config with `env_prefix`, `.env` loading, nested settings, and
+  `Field` constraints — the 12-factor pattern.
+- Request models with `Field(...)` constraints, an `Annotated` reusable
+  validator, a `@field_validator` (transform + reject), and a cross-field
+  `@model_validator(mode="after")`.
+- A discriminated union (`Field(discriminator=...)`) over email/SMS/push payloads.
+- A response model with a `@computed_field`.
+- Reading a `ValidationError` and turning it into a clean dict with `.errors()`.
+
+## Requirements
+
+A single `uv` project. The full solution is below; build it yourself first, then
+compare.
+
+<Steps>
+
+1. `Settings(BaseSettings)` reading `APP_`-prefixed env vars and `.env`, with a
+   nested `RedisSettings`, a required `database_url`, a constrained `port`, and a
+   `default_sender` email validated by an `Annotated` type.
+2. A discriminated union `NotificationPayload = EmailPayload | SmsPayload | PushPayload`
+   keyed on a `channel` literal.
+3. A `SendRequest` model combining constraints, a `@field_validator`, a
+   `@model_validator`, and the union.
+4. A `SendResponse` model with a `@computed_field`.
+5. A `main.py` that loads settings and runs both valid and invalid inputs,
+   printing the parsed models and the structured errors.
+
+</Steps>
+
+## The worked solution
+
+A flat, single-package `uv` project. The whole validation layer is three small
+modules.
+
+<FileTree>
+- validated-settings/
+  - pyproject.toml created by `uv init`, deps added with `uv add`
+  - .env local config (gitignored in real projects)
+  - src/
+    - app/
+      - \_\_init\_\_.py
+      - settings.py BaseSettings config
+      - models.py request/response models + discriminated union
+      - main.py demo: valid + invalid runs
+</FileTree>
+
+### Project setup
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```bash
+uv init validated-settings
+cd validated-settings
+uv add "pydantic[email]" pydantic-settings
+uv add --dev ruff ty
+```
+
+  </TabItem>
+</Tabs>
+
+`pydantic[email]` pulls in `email-validator` so the `EmailStr` type works.
+`pydantic-settings` is a separate package from `pydantic` in v2 — it was split
+out of the core, so you add it explicitly.
+
+### Settings: typed config from env + .env
+
+`Settings` loads `APP_`-prefixed variables, falls back to `.env`, and binds the
+nested `redis` block with the `__` delimiter (`APP_REDIS__PORT`). `database_url`
+has no default, so a missing value is a startup error — exactly what you want for
+config you can't run without.
+
+```python title="src/app/settings.py"
+from typing import Annotated
+
+from pydantic import AfterValidator, BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _looks_like_email(v: str) -> str:
+    if "@" not in v or v.startswith("@") or v.endswith("@"):
+        raise ValueError("must look like an email address")
+    return v.lower()
+
+
+# A reusable, composable validated type — the rule travels with the type.
+SenderEmail = Annotated[str, AfterValidator(_looks_like_email)]
+
+
+class RedisSettings(BaseModel):
+    host: str = "localhost"
+    port: int = Field(default=6379, ge=1, le=65535)
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="APP_",
+        env_nested_delimiter="__",   # APP_REDIS__PORT -> redis.port
+        extra="ignore",
+    )
+
+    database_url: str                          # required: no default
+    port: int = Field(default=8000, ge=1, le=65535)
+    debug: bool = False                         # "true"/"1"/"yes" -> True
+    default_sender: SenderEmail = "noreply@example.com"
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+```
+
+### Models: constraints, validators, discriminated union
+
+The three channel payloads share a `channel` literal that acts as the
+discriminator. `SendRequest` ties it together with field constraints, a
+normalizing `@field_validator`, and a cross-field `@model_validator` that rejects
+scheduling a send in the past. `SendResponse` derives `delivered` with a
+`@computed_field`.
+
+```python title="src/app/models.py"
+from datetime import datetime, timezone
+from typing import Annotated, Literal
+from uuid import UUID, uuid4
+
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    EmailStr,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
+
+
+def _strip(v: object) -> object:
+    return v.strip() if isinstance(v, str) else v
+
+
+NonEmptyStr = Annotated[str, BeforeValidator(_strip), Field(min_length=1, max_length=280)]
+
+
+# --- Discriminated union over the delivery channel -------------------------
+class EmailPayload(BaseModel):
+    channel: Literal["email"]
+    to: EmailStr
+    subject: str = Field(..., min_length=1, max_length=120)
+    body: NonEmptyStr
+
+
+class SmsPayload(BaseModel):
+    channel: Literal["sms"]
+    to: str = Field(..., pattern=r"^\+[1-9]\d{6,14}$")  # E.164
+    body: NonEmptyStr
+
+
+class PushPayload(BaseModel):
+    channel: Literal["push"]
+    device_token: str = Field(..., min_length=10)
+    body: NonEmptyStr
+
+
+NotificationPayload = Annotated[
+    EmailPayload | SmsPayload | PushPayload,
+    Field(discriminator="channel"),
+]
+
+
+# --- Request / response models ---------------------------------------------
+class SendRequest(BaseModel):
+    request_id: UUID = Field(default_factory=uuid4)
+    priority: int = Field(default=5, ge=1, le=10)
+    send_after: datetime | None = None
+    payload: NotificationPayload
+
+    @field_validator("send_after")
+    @classmethod
+    def must_be_aware(cls, v: datetime | None) -> datetime | None:
+        # normalize naive datetimes to UTC so comparisons are well-defined
+        if v is not None and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
+    @model_validator(mode="after")
+    def not_in_past(self) -> "SendRequest":
+        if self.send_after is not None and self.send_after < datetime.now(timezone.utc):
+            raise ValueError("send_after must not be in the past")
+        return self
+
+
+class SendResponse(BaseModel):
+    request_id: UUID
+    channel: str
+    status: Literal["queued", "sent", "failed"]
+
+    @computed_field  # serialized in model_dump(), not an input field
+    @property
+    def delivered(self) -> bool:
+        return self.status == "sent"
+```
+
+### The demo: valid and invalid runs
+
+`main.py` loads settings, sends one valid request per channel, then feeds three
+deliberately broken inputs and prints the structured errors via
+`ValidationError.errors()`.
+
+```python title="src/app/main.py"
+from pydantic import ValidationError
+
+from app.models import SendRequest, SendResponse
+from app.settings import Settings
+
+
+def show_errors(label: str, exc: ValidationError) -> None:
+    print(f"\n[INVALID] {label} -> {exc.error_count()} error(s):")
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err["loc"])
+        print(f"  - {loc}: {err['msg']}  (type={err['type']})")
+
+
+def main() -> None:
+    settings = Settings()
+    print("=== Settings ===")
+    print(settings.model_dump())
+    print(f"redis -> {settings.redis.host}:{settings.redis.port}")
+
+    print("\n=== Valid requests ===")
+    email = SendRequest.model_validate(
+        {"payload": {"channel": "email", "to": "a@b.com",
+                     "subject": "Hi", "body": "  hello  "}}
+    )
+    print("email body (stripped):", repr(email.payload.body))
+
+    sms = SendRequest.model_validate(
+        {"priority": 1, "payload": {"channel": "sms", "to": "+14155550123", "body": "pong"}}
+    )
+    print("sms ok, priority:", sms.priority)
+
+    resp = SendResponse(request_id=email.request_id, channel="email", status="sent")
+    print("response:", resp.model_dump())  # note computed `delivered` field
+
+    print("\n=== Invalid requests ===")
+    try:
+        SendRequest.model_validate(
+            {"priority": 99, "payload": {"channel": "email", "to": "not-an-email",
+                                         "subject": "", "body": ""}}
+        )
+    except ValidationError as exc:
+        show_errors("bad email + priority + empty fields", exc)
+
+    try:
+        SendRequest.model_validate({"payload": {"channel": "carrier-pigeon", "body": "x"}})
+    except ValidationError as exc:
+        show_errors("unknown channel (discriminator)", exc)
+
+    try:
+        SendRequest.model_validate(
+            {"send_after": "2000-01-01T00:00:00Z",
+             "payload": {"channel": "sms", "to": "+14155550123", "body": "late"}}
+        )
+    except ValidationError as exc:
+        show_errors("send_after in the past (model validator)", exc)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Create a `.env` so `database_url` resolves (it has no default):
+
+```bash title=".env"
+APP_DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/app
+APP_DEBUG=true
+APP_REDIS__PORT=6380
+```
+
+## Run it
+
+<Steps>
+
+1. Sync dependencies (creates the venv and installs everything):
+
+   ```bash
+   uv sync
+   ```
+
+2. Run the demo. `uv run` adds `src/` to the path via the project config; if you
+   used a flat layout, run from the project root:
+
+   ```bash
+   uv run python -m app.main
+   ```
+
+   You'll see settings load (note `redis.port` is `6380` from
+   `APP_REDIS__PORT`, and `debug` coerced to `True`), the valid requests parse
+   (the email body is stripped to `'hello'`), the response includes the computed
+   `delivered` field, and three structured error blocks like:
+
+   ```text
+   [INVALID] bad email + priority + empty fields -> 3 error(s):
+     - priority: Input should be less than or equal to 10  (type=less_than_equal)
+     - payload.email.to: value is not a valid email address...  (type=value_error)
+     - payload.email.subject: String should have at least 1 character  (type=string_too_short)
+   ```
+
+3. Confirm the unset-required-config failure mode — comment out
+   `APP_DATABASE_URL` in `.env` (or run without it) and rerun: `Settings()`
+   raises a `ValidationError` for the missing `database_url` at startup, before
+   any business logic runs.
+
+4. Lint and type-check (every project in this guide uses both):
+
+   ```bash
+   uv run ruff check .
+   uv run ty check
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- Add a `@computed_field` `is_urgent` to `SendRequest` (`priority <= 2`) and
+  assert it serializes in `model_dump()`.
+- Add `model_config = ConfigDict(extra="forbid")` to the payload models and watch
+  an unexpected key (e.g. `{"channel": "sms", "to": "...", "body": "x", "foo": 1}`)
+  become a `ValidationError` instead of being silently dropped.
+- Replace the hand-rolled `_looks_like_email` with `EmailStr` in `settings.py`
+  and compare the error messages.
+- Add a `from_env_strict` constructor that calls `Settings.model_validate(...)`
+  with `strict=True` and feel which env strings stop coercing.
+- Feed the discriminated union a JSON string with `SendRequest.model_validate_json`
+  instead of a dict, and confirm it's the same result with one fewer parse step.
+:::

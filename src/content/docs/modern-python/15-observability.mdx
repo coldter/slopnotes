@@ -1,0 +1,786 @@
+---
+title: Observability
+description: Structured logging with structlog, Prometheus metrics, and OpenTelemetry tracing for Python services — mapped from the pino/zap and prom-client tooling you already use.
+sidebar:
+  order: 15
+---
+
+import { Tabs, TabItem, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+A service you can't see into is a service you can't operate. Observability rests on
+three pillars: **logs** (what happened), **metrics** (how much, how often, how
+fast), and **traces** (where time went across services). Python in 2026 has a
+clean, vendor-neutral story for all three: **structlog** for structured logging,
+the **Prometheus client** for metrics, and **OpenTelemetry** for tracing — and
+the OTel SDK can carry your metrics too.
+
+If you're reaching for `print()` to debug a running service, stop. `print` writes
+unstructured text to stdout with no level, no timestamp, no context, and no way to
+filter or correlate it. We'll name it once here as the thing structured logging
+replaces, then never again.
+
+## The three pillars at a glance
+
+| Concept | TypeScript | Go | Python |
+|---------|-----------|-----|--------|
+| Structured logging | pino | `slog` / zap / zerolog | **structlog** |
+| Stdlib logging | `console` | `log` | `logging` (structlog wraps it) |
+| Log context | `AsyncLocalStorage` | `context.Context` | **`contextvars`** + bound loggers |
+| Metrics client | prom-client | `client_golang` | **`prometheus-client`** |
+| Metrics endpoint | custom `/metrics` | `promhttp.Handler()` | `make_asgi_app()` mounted on FastAPI |
+| Tracing | `@opentelemetry/sdk-node` | `go.opentelemetry.io/otel` | **`opentelemetry-sdk`** |
+| Auto-instrumentation | `@opentelemetry/auto-instrumentations-node` | manual mostly | `opentelemetry-instrumentation-*` |
+| Health checks | custom route | custom route | custom FastAPI route |
+| Error tracking | Sentry SDK | Sentry SDK | `sentry-sdk` |
+| Profiler | `0x` / clinic | pprof | **py-spy** (no code changes) |
+
+### What you'll install
+
+The whole module's dependency set, added to a `uv` project:
+
+```bash
+uv add structlog prometheus-client \
+  opentelemetry-distro opentelemetry-exporter-otlp \
+  opentelemetry-instrumentation-fastapi \
+  opentelemetry-instrumentation-httpx \
+  opentelemetry-instrumentation-sqlalchemy
+```
+
+:::note[The "one SDK, many backends" pitch]
+OpenTelemetry is to telemetry what SLF4J is to JVM logging or what `database/sql`
+is to Go DB drivers — a vendor-neutral API. You instrument once against the OTel
+SDK and export OTLP to *any* backend: Jaeger, Tempo, Honeycomb, Datadog, Grafana
+Cloud. Swap the collector config, never your application code. That's the whole
+reason to prefer OTel over a vendor's proprietary tracer.
+:::
+
+## Pillar 1 — Structured logging with structlog
+
+### Why not raw `logging`
+
+The stdlib `logging` module works and is everywhere, but its default output is a
+human-formatted string. Structured logging means every line is a JSON object with
+typed fields you can filter, aggregate, and correlate in Loki, ELK, or Datadog —
+no fragile regex parsing. `structlog` is the modern Python way to get there. It's
+the equivalent of choosing **pino** over `console.log` in Node, or leaning on
+**`slog`**'s structured handler in Go.
+
+```text
+# print/logging default (a string a regex has to claw fields out of)
+2026-06-19 10:23:45 INFO user created id=123 name=Alice
+
+# structlog JSON (machine-parseable, every field typed and queryable)
+{"event": "user created", "user_id": 123, "name": "Alice", "level": "info", "timestamp": "2026-06-19T10:23:45.123Z"}
+```
+
+### The same "log an event with fields" three ways
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import pino from "pino";
+
+const logger = pino();
+
+logger.info({ userId: 123, name: "Alice" }, "user created");
+logger.error({ err }, "failed to connect");
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+import "log/slog"
+
+logger := slog.Default()
+
+logger.Info("user created", "userId", 123, "name", "Alice")
+logger.Error("failed to connect", "err", err)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+import structlog
+
+log = structlog.get_logger()
+
+log.info("user created", user_id=123, name="Alice")
+log.error("failed to connect", err=str(err))
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+- structlog's first positional arg is the `event` (the message); everything else is
+  `**kwargs` that become structured fields — exactly like pino's object or `slog`'s
+  key/value varargs.
+- `structlog.get_logger()` returns a *lazy* logger. It does almost no work until you
+  actually emit, so you can call it at module top level.
+- Field values are kept as native types (`user_id=123` stays an `int` in the JSON),
+  not stringified into the message.
+
+### Configuring structlog (JSON for prod, pretty for dev)
+
+structlog is a *pipeline of processors*. Each log call flows through the chain: add
+a timestamp, add the level, merge in context, then render. Configure it once at
+startup.
+
+```python title="app/logging_config.py"
+import logging
+import sys
+
+import structlog
+
+
+def configure_logging(*, json_logs: bool, level: str = "INFO") -> None:
+    # Shared processors run for every event.
+    shared: list = [
+        structlog.contextvars.merge_contextvars,   # pull in request-scoped context
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,       # render exc_info into a string
+    ]
+
+    # The final renderer: JSON in prod, colorized key=value in dev.
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if json_logs
+        else structlog.dev.ConsoleRenderer()
+    )
+
+    structlog.configure(
+        processors=[*shared, renderer],
+        wrapper_class=structlog.make_filtering_bound_logger(
+            logging.getLevelNamesMapping()[level]
+        ),
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+```
+
+:::tip[Dev ergonomics for free]
+`ConsoleRenderer` gives you the pretty, colorized, aligned `key=value` output that
+makes `pino-pretty` so nice in Node — but it's built in. Flip `json_logs=True` in
+production (driven by an env var via pydantic-settings) and you emit one JSON object
+per line. Same code path, two renderers.
+:::
+
+### Log levels
+
+structlog respects the stdlib level names you already know:
+
+| Level | When | Example |
+|-------|------|---------|
+| `debug` | Developer detail, off in prod | `log.debug("cache lookup", key=k)` |
+| `info` | Normal operations | `log.info("server started", port=8000)` |
+| `warning` | Unexpected but handled | `log.warning("retrying", attempt=n)` |
+| `error` | An operation failed | `log.error("db write failed", err=str(e))` |
+| `exception` | An error *with* the current traceback | `log.exception("unhandled")` |
+
+`make_filtering_bound_logger(INFO)` drops anything below `INFO` *before* the
+processor chain runs — so a disabled `log.debug(...)` costs almost nothing, the
+same way pino's level gate or `slog`'s `Enabled()` check works.
+
+### Context binding: the killer feature
+
+This is where structured logging earns its keep. **Bind** fields to a logger once,
+and every subsequent line carries them — no threading a logger object through every
+function call. There are two ways to bind.
+
+**1. Bound loggers** — explicit, returns a new logger with extra fields baked in:
+
+```python
+log = structlog.get_logger()
+request_log = log.bind(request_id="abc-123", path="/api/tasks")
+
+request_log.info("handling request")     # includes request_id + path
+request_log.info("db query done", rows=4) # also includes request_id + path
+```
+
+**2. `contextvars`** — implicit, ambient context for the whole async task, the
+direct analogue of Node's `AsyncLocalStorage` and Go's `context.Context`. This is
+what you want for request-scoped data like a correlation ID:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const als = new AsyncLocalStorage<{ requestId: string }>();
+
+als.run({ requestId: id }, () => {
+  // every logger.child() in here can read requestId
+  handle();
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+ctx := context.WithValue(r.Context(), "requestId", id)
+// pass ctx down; logger derives fields from it
+logger := slog.With("requestId", id)
+handle(ctx, logger)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+import structlog
+
+# At the start of a request (e.g. in middleware):
+structlog.contextvars.clear_contextvars()
+structlog.contextvars.bind_contextvars(request_id="abc-123", path="/api/tasks")
+
+# Anywhere downstream — no logger passing, no ctx argument:
+log = structlog.get_logger()
+log.info("deep in the call stack")   # automatically includes request_id + path
+```
+
+  </TabItem>
+</Tabs>
+
+`contextvars` are async-safe: each `asyncio` task gets its own copy, so two
+concurrent requests never leak each other's context. The
+`merge_contextvars` processor (first in our pipeline above) is what pulls these
+bound values into every event.
+
+### Request-scoped context with FastAPI middleware
+
+The standard pattern: a middleware that mints (or reads) a correlation ID, binds it
+to `contextvars`, and tags the response. Every log line within that request — yours
+*and* the framework's — then carries the ID.
+
+```python title="app/middleware.py"
+import uuid
+
+import structlog
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+
+class RequestContextMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope["headers"])
+        # Honor an inbound correlation ID (from a gateway / upstream service),
+        # otherwise generate one. lowercase header names in ASGI.
+        incoming = headers.get(b"x-request-id")
+        request_id = incoming.decode() if incoming else str(uuid.uuid4())
+
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(
+            request_id=request_id,
+            method=scope["method"],
+            path=scope["path"],
+        )
+
+        async def send_with_request_id(message) -> None:
+            if message["type"] == "http.response.start":
+                message.setdefault("headers", []).append(
+                    (b"x-request-id", request_id.encode())
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
+```
+
+:::note[Correlation IDs cross service boundaries]
+The `X-Request-Id` header is the thread that stitches a single user action across
+your whole fleet. Honor it inbound, propagate it outbound (set it on every `httpx`
+request), and a support ticket's request ID lets you `grep` one ID across every
+service's logs. When you add tracing below, the OTel `trace_id` plays the same role
+at a deeper level — and you'll inject *that* into your logs too.
+:::
+
+### Routing stdlib `logging` through structlog
+
+Your dependencies (uvicorn, SQLAlchemy, httpx) log via stdlib `logging`, not
+structlog. To get *one* consistent JSON stream, route stdlib records through
+structlog's renderer with `ProcessorFormatter`:
+
+```python title="app/logging_config.py (continued)"
+def configure_stdlib_bridge(*, json_logs: bool) -> None:
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if json_logs
+        else structlog.dev.ConsoleRenderer()
+    )
+    formatter = structlog.stdlib.ProcessorFormatter(
+        processor=renderer,
+        foreign_pre_chain=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+        ],
+    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+
+    # Let uvicorn's loggers propagate to root instead of double-printing.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).handlers = []
+        logging.getLogger(name).propagate = True
+```
+
+Now uvicorn's access logs and your `log.info(...)` calls land in the same JSON
+stream, both carrying the bound `request_id`.
+
+## Pillar 2 — Metrics with Prometheus
+
+### The model
+
+Prometheus is **pull-based**: your app exposes a `/metrics` text endpoint, and a
+Prometheus server scrapes it on a timer. This is the inverse of push-based systems
+like StatsD. The `prometheus-client` library is the direct sibling of Node's
+**prom-client** and Go's **`client_golang`** — same metric types, same exposition
+format.
+
+### Metric types
+
+| Type | Goes | Use for |
+|------|------|---------|
+| **Counter** | up only (resets on restart) | total requests, errors, items processed |
+| **Gauge** | up and down | in-flight requests, queue depth, connection pool size |
+| **Histogram** | buckets + sum + count | request latency, payload sizes (gives you percentiles) |
+| **Summary** | client-side quantiles | latency when you can't aggregate across instances (prefer Histogram) |
+
+### Declaring metrics, three ways
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import { Counter, Histogram } from "prom-client";
+
+const requests = new Counter({
+  name: "http_requests_total",
+  help: "Total HTTP requests",
+  labelNames: ["method", "path", "status"],
+});
+
+const latency = new Histogram({
+  name: "http_request_duration_seconds",
+  help: "Request latency",
+  labelNames: ["method", "path"],
+});
+
+requests.inc({ method: "GET", path: "/api/tasks", status: "200" });
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+var requests = promauto.NewCounterVec(prometheus.CounterOpts{
+    Name: "http_requests_total",
+    Help: "Total HTTP requests",
+}, []string{"method", "path", "status"})
+
+var latency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+    Name: "http_request_duration_seconds",
+    Help: "Request latency",
+}, []string{"method", "path"})
+
+requests.WithLabelValues("GET", "/api/tasks", "200").Inc()
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from prometheus_client import Counter, Histogram
+
+REQUESTS = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    labelnames=["method", "path", "status"],
+)
+
+LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "Request latency in seconds",
+    labelnames=["method", "path"],
+    # Buckets in seconds — tune to your SLO.
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
+REQUESTS.labels(method="GET", path="/api/tasks", status="200").inc()
+```
+
+  </TabItem>
+</Tabs>
+
+**Key differences:**
+
+- Declare metrics as **module-level singletons**. The default registry is a global,
+  and re-declaring the same metric name raises `Duplicated timeseries` — so define
+  once, import everywhere. (This bites people who declare metrics inside a function.)
+- `.labels(...)` returns the specific child series, then you `.inc()` / `.observe()`
+  on it — same shape as Go's `.WithLabelValues(...)`.
+- Histogram buckets are *fixed at declaration* and chosen by you. There's no
+  auto-bucketing; pick buckets that straddle your latency SLO.
+
+### The `/metrics` endpoint on FastAPI
+
+`prometheus-client` ships an ASGI app you mount directly — no hand-written route:
+
+```python title="app/metrics.py"
+import time
+
+from prometheus_client import make_asgi_app
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from app.metrics_defs import LATENCY, REQUESTS, IN_PROGRESS
+
+# Mounted in main.py:  app.mount("/metrics", metrics_app)
+metrics_app = make_asgi_app()
+
+
+class PrometheusMiddleware:
+    """Records a counter + latency histogram for every HTTP request."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope["method"]
+        # Use the route template, NOT the raw path — see the cardinality caution.
+        path = scope.get("path", "unknown")
+        status_holder = {"code": 500}
+
+        async def send_wrapper(message) -> None:
+            if message["type"] == "http.response.start":
+                status_holder["code"] = message["status"]
+            await send(message)
+
+        IN_PROGRESS.inc()
+        start = time.perf_counter()
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            elapsed = time.perf_counter() - start
+            IN_PROGRESS.dec()
+            LATENCY.labels(method=method, path=path).observe(elapsed)
+            REQUESTS.labels(
+                method=method, path=path, status=str(status_holder["code"])
+            ).inc()
+```
+
+### RED and USE: what to actually measure
+
+Two methodologies keep you from drowning in metrics:
+
+| Method | For | The three signals |
+|--------|-----|-------------------|
+| **RED** | request-driven services (your API) | **R**ate, **E**rrors, **D**uration |
+| **USE** | resources (CPU, pool, queue) | **U**tilization, **S**aturation, **E**rrors |
+
+The middleware above gives you RED for free: rate (`http_requests_total`), errors
+(filter by `status=~"5.."`), duration (the histogram). For USE, a gauge on your DB
+pool's in-use connections and your Kafka consumer lag covers the resources that
+actually fall over.
+
+### Cardinality: the one pitfall that bites everyone
+
+Every unique combination of label values is a **separate time series** Prometheus
+must store and index. Put a high-cardinality value in a label and you get a
+"cardinality explosion" — millions of series, an OOM'd Prometheus, and a surprise
+bill.
+
+```python
+# CATASTROPHE: user_id and raw path are unbounded.
+REQUESTS.labels(method="GET", path=f"/users/{user_id}", status="200").inc()
+#                                          ^^^^^^^ a new series per user, forever
+
+# GOOD: use the route TEMPLATE, keep labels low-cardinality.
+REQUESTS.labels(method="GET", path="/users/{id}", status="200").inc()
+```
+
+:::caution[Honest take: labels are not log fields]
+The mental trap for people coming from structured logging is treating metric labels
+like log fields. They are not. A log field can be a user ID, a request ID, a full
+URL — logs are written once and indexed cheaply. A metric label multiplies your
+storage by its cardinality *forever*. Rule of thumb: **never** put user IDs, request
+IDs, emails, raw paths, or timestamps in a label. Keep each label's distinct values
+in the low tens. When you want per-user detail, that's what logs and traces are for.
+:::
+
+## Pillar 3 — Tracing with OpenTelemetry
+
+### Concepts
+
+A **trace** is the end-to-end journey of one request. Each unit of work is a
+**span** (an HTTP handler, a DB query, an outbound call). Spans nest into a tree;
+they all share one **trace ID**, and each links to its parent via **span ID**.
+Context **propagation** carries the trace ID across process boundaries (via the
+`traceparent` header) so a request through three services is one connected trace.
+
+| Term | Meaning |
+|------|---------|
+| Trace | The whole request journey across services |
+| Span | One timed unit of work within a trace |
+| Trace ID | Shared by every span in one trace |
+| Span ID | Identifies a single span |
+| Context propagation | Passing trace context across service calls (`traceparent` header) |
+| Exporter | Ships spans to a backend (OTLP → collector → Jaeger/Tempo) |
+| Sampler | Decides which traces to keep (cost control) |
+
+### Auto-instrumentation: the fast path
+
+This is the big win over manual JVM/Go tracing. The `opentelemetry-instrumentation-*`
+packages monkey-patch your libraries to emit spans with **zero application code
+changes**. Wire FastAPI, httpx, and SQLAlchemy in one place:
+
+```python title="app/tracing.py"
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+def configure_tracing(app, *, service_name: str, otlp_endpoint: str) -> None:
+    resource = Resource.create({"service.name": service_name})
+    provider = TracerProvider(resource=resource)
+    # Batch + export over OTLP gRPC to the collector (default :4317).
+    provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint))
+    )
+    trace.set_tracer_provider(provider)
+
+    # One call each — these patch the libraries to emit spans automatically.
+    FastAPIInstrumentor.instrument_app(app)
+    HTTPXClientInstrumentor().instrument()
+    SQLAlchemyInstrumentor().instrument(enable_commenter=True)
+```
+
+That alone gives you a span per HTTP request, a child span per outbound `httpx`
+call (with the `traceparent` header propagated automatically), and a child span per
+SQL query — connected into one trace.
+
+:::tip[Zero-code via opentelemetry-distro]
+You can skip even `tracing.py`. `uv add opentelemetry-distro` plus
+`uv run opentelemetry-bootstrap -a install` auto-detects your installed libraries,
+and you launch with `opentelemetry-instrument uv run uvicorn app.main:app`,
+configured entirely by env vars (`OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`).
+The in-code approach above is worth knowing because you'll want manual spans for
+business logic anyway.
+:::
+
+### Manual spans for business logic
+
+Auto-instrumentation covers the framework; you add spans for the operations *you*
+care about — same as `tracer.startSpan()` in Node or `tracer.Start(ctx, ...)` in Go.
+
+```python title="app/service.py"
+from opentelemetry import trace
+
+tracer = trace.get_tracer(__name__)
+
+
+async def process_order(order_id: str) -> Order:
+    with tracer.start_as_current_span("process_order") as span:
+        span.set_attribute("order.id", order_id)
+        try:
+            await validate(order_id)        # auto-spanned DB/HTTP calls nest here
+            await charge(order_id)
+            span.set_attribute("order.status", "completed")
+            return Order(order_id, status="completed")
+        except PaymentError as exc:
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+            raise
+```
+
+The `with` block handles `start`/`end` for you (no `finally: span.end()` like the
+JVM), and `start_as_current_span` makes it the parent for any spans created inside —
+including the auto-instrumented ones.
+
+### Trace/log correlation
+
+The payoff of running all three pillars: stitch a `trace_id` into every log line so
+"this error log" links straight to "this trace." Add a structlog processor that
+reads the active span:
+
+```python title="app/logging_config.py (processor)"
+from opentelemetry import trace
+
+
+def add_trace_context(logger, method_name, event_dict):
+    span = trace.get_current_span()
+    ctx = span.get_span_context()
+    if ctx.is_valid:
+        event_dict["trace_id"] = format(ctx.trace_id, "032x")
+        event_dict["span_id"] = format(ctx.span_id, "016x")
+    return event_dict
+```
+
+Drop `add_trace_context` into your processor chain and every log emitted inside a
+span carries `trace_id`. Now a log search in Loki links to the exact trace in
+Jaeger — logs, metrics, and traces all joined by IDs.
+
+## Health checks and graceful shutdown
+
+### `/healthz` vs `/readyz`
+
+Kubernetes distinguishes two probes, and conflating them causes restart loops:
+
+| Probe | Question | Endpoint | Failure means |
+|-------|----------|----------|---------------|
+| **Liveness** | "Is the process wedged?" | `/healthz` | Kill and restart the pod |
+| **Readiness** | "Can it serve traffic *now*?" | `/readyz` | Pull it from the load balancer (don't restart) |
+
+`/healthz` should be **cheap and dependency-free** — it answers "is the event loop
+alive?" `/readyz` checks the things you need to serve a request (DB, Redis) and
+returns `503` when they're down, so traffic drains without a kill.
+
+```python title="app/health.py"
+from fastapi import APIRouter, Response, status
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+router = APIRouter(tags=["health"])
+
+
+@router.get("/healthz")
+async def healthz() -> dict[str, str]:
+    # Liveness: no dependencies. If the loop runs, we're alive.
+    return {"status": "ok"}
+
+
+@router.get("/readyz")
+async def readyz(response: Response, engine: AsyncEngine) -> dict[str, object]:
+    checks: dict[str, str] = {}
+    ready = True
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        checks["postgres"] = "ok"
+    except Exception as exc:  # noqa: BLE001 — readiness must never raise
+        checks["postgres"] = f"down: {exc}"
+        ready = False
+
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"ready": ready, "checks": checks}
+```
+
+### Graceful shutdown
+
+On `SIGTERM`, you want in-flight requests to finish, the trace exporter to flush its
+buffer, and pools to close — *then* exit. uvicorn handles connection draining; you
+own resource cleanup via FastAPI's `lifespan`:
+
+```python title="app/main.py (lifespan)"
+from contextlib import asynccontextmanager
+
+from opentelemetry import trace
+
+
+@asynccontextmanager
+async def lifespan(app):
+    engine = create_engine(...)
+    app.state.engine = engine
+    yield
+    # Shutdown: flush pending spans, then close pools.
+    await engine.dispose()
+    trace.get_tracer_provider().shutdown()  # forces BatchSpanProcessor to flush
+```
+
+:::caution[Flush your exporter or lose your last traces]
+`BatchSpanProcessor` buffers spans and exports in batches. If the process exits
+without `shutdown()`, the final batch — often the spans for the error you're chasing
+— never leaves the process. Always flush on shutdown. Same gotcha as not calling
+`sdk.shutdown()` in Node's OTel SDK.
+:::
+
+## Profiling and error tracking
+
+**Profiling — py-spy.** When a service is slow or pinning a CPU in production,
+`py-spy` is the pprof of Python: a *sampling* profiler that attaches to a running
+process by PID with **no code changes and no restart**. `py-spy dump --pid 1234`
+prints every thread's stack right now; `py-spy top --pid 1234` gives a live
+`top`-style view; `py-spy record -o flame.svg --pid 1234` produces a flamegraph.
+Because it reads memory from outside the process, it adds near-zero overhead — safe
+to run against prod.
+
+**Error tracking — Sentry.** Metrics tell you the error *rate*; Sentry tells you the
+error. `sentry-sdk` captures unhandled exceptions with full stack traces, local
+variables, request context, and release/version — and its FastAPI integration wires
+in with a single `sentry_sdk.init(dsn=..., traces_sample_rate=0.1)`. It also reads
+the OTel trace context, so a Sentry issue links back to the trace. Same role as
+`@sentry/node` or `sentry-go`.
+
+## What to instrument first (honest take)
+
+You can't instrument everything on day one, and you shouldn't try. Priority order
+for a new service:
+
+1. **Structured JSON logs with a request ID.** Highest value, lowest effort. The
+   moment you can `grep` one correlation ID across a request, debugging changes.
+2. **RED metrics on HTTP** — the request counter + latency histogram from the
+   middleware above. That's your "is it up, is it fast, is it erroring" dashboard.
+3. **Health endpoints** — `/healthz` and `/readyz`, because K8s needs them to route
+   traffic sanely.
+4. **Tracing, auto-instrumented.** Turn it on; you don't need manual spans yet. The
+   framework + DB + HTTP spans alone explain most "why is this endpoint slow."
+5. **Manual spans and custom business metrics** — last, and only where a real
+   question demands them. Don't pre-instrument code nobody is asking about.
+
+The discipline that matters most isn't adding telemetry — it's **cardinality and
+cost**. Sampled traces (1–10% in prod), low-cardinality metric labels, and logs at
+`INFO` (not `DEBUG`) in production keep your observability bill smaller than your
+compute bill. Telemetry you can't afford to keep is telemetry you don't have.
+
+## Summary
+
+| Concern | TypeScript | Go | Python |
+|---------|-----------|-----|--------|
+| Structured logging | pino | `slog` / zap | **structlog** (JSON renderer) |
+| Log context | `AsyncLocalStorage` | `context.Context` | `contextvars` + `bind_contextvars` |
+| Metrics | prom-client | `client_golang` | **`prometheus-client`** |
+| `/metrics` | custom route | `promhttp.Handler()` | `make_asgi_app()` mount |
+| Tracing | `@opentelemetry/sdk-node` | `go.opentelemetry.io/otel` | **`opentelemetry-sdk`** + `-instrumentation-*` |
+| Auto-instrument | auto-instrumentations-node | mostly manual | `opentelemetry-instrument` (zero code) |
+| Trace/log link | inject `trace_id` | inject `trace_id` | structlog processor reads active span |
+| Profiling | clinic / 0x | pprof | **py-spy** (no restart) |
+| Error tracking | `@sentry/node` | `sentry-go` | `sentry-sdk` |
+
+## Practice
+
+Wire all three pillars into one FastAPI service — structured logs with a request
+ID, a Prometheus `/metrics` endpoint, OpenTelemetry traces exported to a collector,
+and health probes — then watch a request flow through every pillar at once.
+
+<CardGrid>
+  <LinkCard
+    title="Observability Stack"
+    href="/modern-python/15-observability/observability-stack/"
+    description="Instrument a FastAPI service with structlog JSON logging + request-id middleware, a Prometheus request counter and latency histogram, and auto-instrumented OpenTelemetry tracing exported via OTLP — with an OTel Collector + Prometheus docker-compose stack."
+  />
+</CardGrid>

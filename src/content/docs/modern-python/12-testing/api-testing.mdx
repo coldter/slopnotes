@@ -1,0 +1,510 @@
+---
+title: Testing a Service
+description: Build a layered pytest suite for the FastAPI Task API — unit and parametrized tests, async httpx AsyncClient tests, one Hypothesis property, and a Testcontainers Postgres integration test.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard title="← Testing" href="/modern-python/12-testing/" />
+
+## Goal
+
+Write a complete, layered test suite for the FastAPI **Task API** from
+[module 07](/modern-python/07-fastapi/) — exercising every level of the pyramid:
+
+- **unit tests** of the repository/logic with no I/O,
+- **parametrized** validation tests (Go-style table tests),
+- **async API tests** driving the app in-process with `httpx.AsyncClient` +
+  `ASGITransport`,
+- **one Hypothesis property** proving a round-trip invariant,
+- **one Testcontainers-backed Postgres** integration test against a real database.
+
+If you've paired Jest unit tests with a supertest e2e suite in Node, or table
+tests plus `httptest` in Go, this is the same instinct — pytest fixtures do the
+wiring.
+
+## What you'll practice
+
+<Steps>
+
+1. **Fixtures & DI** — a `repo` fixture, an async `client` fixture, a
+   session-scoped Postgres container.
+2. **Unit tests** — `InMemoryTaskRepository` logic at memory speed.
+3. **Parametrization** — `@pytest.mark.parametrize` over title-validation cases.
+4. **Async API tests** — `httpx.AsyncClient` over `ASGITransport`, no live server.
+5. **Hypothesis** — a JSON round-trip property on the `Task` model.
+6. **Testcontainers** — a real Postgres CRUD test, marked `integration`.
+
+</Steps>
+
+## Requirements
+
+- **Docker** running locally (only the integration test needs it).
+- **Python 3.13+** and **uv**.
+
+The system under test is a slim version of the module 07 Task API: a Pydantic
+`Task` model, a repository protocol with an in-memory implementation, and a FastAPI
+app exposing CRUD over `/tasks`.
+
+## The worked solution
+
+A single `uv` project. Production code under `src/app/`, tests under `tests/`.
+
+<FileTree>
+- api-testing/
+  - pyproject.toml deps + pytest/coverage config
+  - src/
+    - app/
+      - __init__.py
+      - models.py Pydantic Task model
+      - repository.py protocol + in-memory + Postgres impls
+      - main.py FastAPI app + routes
+  - tests/
+    - conftest.py shared fixtures (repo, client, postgres)
+    - unit/
+      - test_repository.py in-memory repo logic
+      - test_validation.py parametrized validation
+      - test_properties.py Hypothesis round-trip
+    - integration/
+      - test_api.py async API tests (AsyncClient)
+      - test_postgres.py Testcontainers Postgres CRUD
+</FileTree>
+
+### Project setup
+
+```bash
+uv init api-testing && cd api-testing
+uv add fastapi httpx asyncpg
+uv add --dev pytest pytest-asyncio hypothesis testcontainers
+```
+
+```toml title="pyproject.toml"
+[project]
+name = "api-testing"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "asyncpg>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.122",
+    "testcontainers>=4.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+markers = ["integration: needs Docker (Testcontainers)"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+```
+
+### The application under test
+
+The model is a Pydantic v2 `Task`. Validation lives in the field constraints — a
+blank or over-long title fails at construction time.
+
+```python title="src/app/models.py"
+from pydantic import BaseModel, Field
+
+
+class Task(BaseModel):
+    id: int
+    title: str = Field(min_length=1, max_length=200)
+    done: bool = False
+
+
+class CreateTask(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+```
+
+The repository is a `Protocol` (structural typing — Python's interface) with two
+implementations: a synchronous in-memory one for unit tests, and an async
+asyncpg-backed one for the integration test.
+
+```python title="src/app/repository.py"
+from typing import Protocol
+
+import asyncpg
+
+from app.models import Task
+
+
+class TaskRepository(Protocol):
+    def add(self, title: str) -> Task: ...
+    def get(self, task_id: int) -> Task | None: ...
+    def list(self) -> list[Task]: ...
+    def set_done(self, task_id: int, done: bool) -> Task | None: ...
+
+
+class InMemoryTaskRepository:
+    def __init__(self) -> None:
+        self._tasks: dict[int, Task] = {}
+        self._next_id = 1
+
+    def add(self, title: str) -> Task:
+        task = Task(id=self._next_id, title=title.strip())
+        self._tasks[task.id] = task
+        self._next_id += 1
+        return task
+
+    def get(self, task_id: int) -> Task | None:
+        return self._tasks.get(task_id)
+
+    def list(self) -> list[Task]:
+        return list(self._tasks.values())
+
+    def set_done(self, task_id: int, done: bool) -> Task | None:
+        task = self._tasks.get(task_id)
+        if task is None:
+            return None
+        updated = task.model_copy(update={"done": done})
+        self._tasks[task_id] = updated
+        return updated
+
+
+class PostgresTaskRepository:
+    """Async repo used only by the Testcontainers integration test."""
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    @staticmethod
+    async def create_schema(pool: asyncpg.Pool) -> None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id    SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    done  BOOLEAN NOT NULL DEFAULT FALSE
+                )
+                """
+            )
+
+    async def add(self, title: str) -> Task:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO tasks (title) VALUES ($1) RETURNING id, title, done",
+                title.strip(),
+            )
+        return Task(**dict(row))
+
+    async def get(self, task_id: int) -> Task | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, title, done FROM tasks WHERE id = $1", task_id
+            )
+        return Task(**dict(row)) if row else None
+```
+
+The FastAPI app wires the in-memory repo via dependency injection, so a test can
+override it. The route maps a missing task to `404` and a validation error to the
+automatic `422`.
+
+```python title="src/app/main.py"
+from fastapi import Depends, FastAPI, HTTPException
+
+from app.models import CreateTask, Task
+from app.repository import InMemoryTaskRepository, TaskRepository
+
+app = FastAPI()
+_repo = InMemoryTaskRepository()
+
+
+def get_repo() -> TaskRepository:
+    return _repo
+
+
+@app.post("/tasks", status_code=201)
+def create_task(body: CreateTask, repo: TaskRepository = Depends(get_repo)) -> Task:
+    return repo.add(body.title)
+
+
+@app.get("/tasks")
+def list_tasks(repo: TaskRepository = Depends(get_repo)) -> list[Task]:
+    return repo.list()
+
+
+@app.get("/tasks/{task_id}")
+def get_task(task_id: int, repo: TaskRepository = Depends(get_repo)) -> Task:
+    task = repo.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+```
+
+### Shared fixtures: conftest.py
+
+`conftest.py` holds every shared fixture. The `client` fixture wraps the app in an
+`ASGITransport` so tests hit the real ASGI stack with no socket. `override_repo`
+swaps in a fresh in-memory repo per test via FastAPI's `dependency_overrides`, so
+API tests start from a clean slate and never leak state between cases.
+
+```python title="tests/conftest.py"
+import httpx
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport
+
+from app.main import app, get_repo
+from app.repository import InMemoryTaskRepository
+
+
+@pytest.fixture
+def repo() -> InMemoryTaskRepository:
+    return InMemoryTaskRepository()
+
+
+@pytest.fixture(autouse=True)
+def override_repo(repo: InMemoryTaskRepository):
+    # Every API test gets a fresh repo; cleared automatically afterwards.
+    app.dependency_overrides[get_repo] = lambda: repo
+    yield
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def client():
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as c:
+        yield c
+```
+
+### Unit tests: repository logic
+
+Fast, no I/O — just the in-memory repo. Request the `repo` fixture and assert on
+behavior.
+
+```python title="tests/unit/test_repository.py"
+from app.repository import InMemoryTaskRepository
+
+
+def test_add_assigns_incrementing_ids(repo: InMemoryTaskRepository):
+    first = repo.add("one")
+    second = repo.add("two")
+    assert (first.id, second.id) == (1, 2)
+
+
+def test_add_trims_whitespace(repo: InMemoryTaskRepository):
+    task = repo.add("  spaced  ")
+    assert task.title == "spaced"
+
+
+def test_get_missing_returns_none(repo: InMemoryTaskRepository):
+    assert repo.get(999) is None
+
+
+def test_set_done_updates_in_place(repo: InMemoryTaskRepository):
+    task = repo.add("finish me")
+    updated = repo.set_done(task.id, done=True)
+    assert updated is not None
+    assert updated.done is True
+    assert repo.get(task.id).done is True
+```
+
+### Parametrized validation tests
+
+Table-driven: one body, many rows, each reported separately. The Pydantic model
+raises `ValidationError` for blank/over-long titles.
+
+```python title="tests/unit/test_validation.py"
+import pytest
+from pydantic import ValidationError
+
+from app.models import CreateTask
+
+
+@pytest.mark.parametrize(
+    ("title", "valid"),
+    [
+        pytest.param("write tests", True, id="normal"),
+        pytest.param("x", True, id="single-char"),
+        pytest.param("a" * 200, True, id="max-length"),
+        pytest.param("", False, id="empty"),
+        pytest.param("a" * 201, False, id="too-long"),
+    ],
+)
+def test_title_validation(title: str, valid: bool):
+    if valid:
+        assert CreateTask(title=title).title == title
+    else:
+        with pytest.raises(ValidationError):
+            CreateTask(title=title)
+```
+
+### Async API tests
+
+Drive the app through the `client` fixture — real routing, real serialization, real
+status codes, no running server.
+
+```python title="tests/integration/test_api.py"
+async def test_create_and_get(client):
+    resp = await client.post("/tasks", json={"title": "write tests"})
+    assert resp.status_code == 201
+    task = resp.json()
+    assert task["title"] == "write tests"
+    assert task["done"] is False
+
+    got = await client.get(f"/tasks/{task['id']}")
+    assert got.status_code == 200
+    assert got.json() == task
+
+
+async def test_get_missing_returns_404(client):
+    resp = await client.get("/tasks/999")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "task not found"
+
+
+async def test_empty_title_returns_422(client):
+    resp = await client.post("/tasks", json={"title": ""})
+    assert resp.status_code == 422
+
+
+async def test_list_reflects_creates(client):
+    await client.post("/tasks", json={"title": "one"})
+    await client.post("/tasks", json={"title": "two"})
+    resp = await client.get("/tasks")
+    titles = [t["title"] for t in resp.json()]
+    assert titles == ["one", "two"]
+```
+
+### A Hypothesis property test
+
+The invariant: a `Task` survives a JSON round-trip unchanged. Hypothesis generates
+hundreds of `Task`s — including titles full of unicode, whitespace, and edge-length
+strings you'd never write by hand — and shrinks any failure to a minimal example.
+
+```python title="tests/unit/test_properties.py"
+from hypothesis import given, strategies as st
+
+from app.models import Task
+
+
+@given(
+    st.builds(
+        Task,
+        id=st.integers(min_value=1),
+        title=st.text(min_size=1, max_size=200),
+        done=st.booleans(),
+    )
+)
+def test_task_json_roundtrip(task: Task):
+    restored = Task.model_validate_json(task.model_dump_json())
+    assert restored == task
+```
+
+### A Testcontainers Postgres integration test
+
+The real thing: a Postgres 17 container, the async `PostgresTaskRepository`, real
+SQL. The container is **session-scoped** (started once for the whole run) and the
+test is marked `integration` so it can be deselected on the inner loop.
+
+```python title="tests/integration/test_postgres.py"
+import asyncpg
+import pytest
+import pytest_asyncio
+from testcontainers.postgres import PostgresContainer
+
+from app.repository import PostgresTaskRepository
+
+
+@pytest.fixture(scope="session")
+def postgres():
+    with PostgresContainer("postgres:17") as pg:
+        yield pg
+
+
+@pytest_asyncio.fixture
+async def pg_repo(postgres):
+    # testcontainers returns a sync (psycopg) URL; asyncpg wants a plain DSN.
+    dsn = postgres.get_connection_url().replace(
+        "postgresql+psycopg2://", "postgresql://"
+    )
+    pool = await asyncpg.create_pool(dsn)
+    await PostgresTaskRepository.create_schema(pool)
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE tasks RESTART IDENTITY")
+    yield PostgresTaskRepository(pool)
+    await pool.close()
+
+
+@pytest.mark.integration
+async def test_add_and_get_against_real_postgres(pg_repo: PostgresTaskRepository):
+    created = await pg_repo.add("  persisted task  ")
+    assert created.id >= 1
+    assert created.title == "persisted task"   # proves the trim survives SQL
+
+    fetched = await pg_repo.get(created.id)
+    assert fetched == created
+
+    assert await pg_repo.get(9999) is None
+```
+
+:::note[Why one real-DB test earns its keep]
+The in-memory unit tests never touch SQL — so they can't catch a malformed
+`INSERT`, a column-name typo, or a trim that gets lost on the round-trip to
+Postgres. This single Testcontainers test does, against the exact engine
+production uses. That's the line from the [Testing](/modern-python/12-testing/)
+module in practice: mock what you don't own, spin up what you do.
+:::
+
+## Run it
+
+<Steps>
+
+1. Run the fast suite (no Docker) — this is your inner loop:
+
+   ```bash
+   uv run pytest -m "not integration"
+   ```
+
+2. Run a single file or test while iterating:
+
+   ```bash
+   uv run pytest tests/unit/test_repository.py
+   uv run pytest tests/integration/test_api.py::test_create_and_get
+   ```
+
+3. Run everything, including the Testcontainers Postgres test (Docker must be up):
+
+   ```bash
+   docker info        # confirm the daemon is running
+   uv run pytest
+   ```
+
+4. Run with coverage and see the uncovered lines:
+
+   ```bash
+   uv run pytest --cov=app --cov-report=term-missing
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- Add `PUT /tasks/{id}/done` to the app and a `set_done` test at both the
+  API layer and the Postgres layer.
+- Add a `RuleBasedStateMachine` (Hypothesis stateful test) that drives random
+  `add`/`set_done`/`get` sequences against the in-memory repo and asserts the IDs
+  stay unique.
+- Make the in-memory and Postgres repos pass the **same** test by parametrizing a
+  fixture over both implementations (`@pytest.fixture(params=[...])`).
+- Add a `function`-scoped transaction-rollback fixture so each Postgres test runs
+  in a transaction that's rolled back — keeping tests isolated without `TRUNCATE`.
+- Wire `--cov=app --cov-fail-under=85` into a GitHub Actions job that runs
+  `uv run pytest`.
+:::

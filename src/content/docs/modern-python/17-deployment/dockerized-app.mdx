@@ -1,0 +1,581 @@
+---
+title: "Dockerized App + CI/CD"
+description: Make the FastAPI Task API production-deployable — a uv multi-stage Dockerfile, .dockerignore, a prod-like docker-compose, a GitHub Actions pipeline, and K8s manifests.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Packaging & Deployment"
+  href="/modern-python/17-deployment/"
+/>
+
+## Goal
+
+Take the FastAPI Task API from [module 07](/modern-python/07-fastapi/task-api/)
+and make it production-deployable, end to end: a uv-based multi-stage Dockerfile
+that lands a ~130 MB image, a `.dockerignore`, a `docker-compose.yml` that runs the
+*built* image (not the dev server) against Postgres, a GitHub Actions workflow that
+lints, type-checks, tests, builds, and pushes the image, and a set of Kubernetes
+manifests with health probes wired to the app.
+
+If you've Dockerized a Node or Go service, the multi-stage shape is the same idea:
+a fat builder stage that installs the whole toolchain, and a slim runtime stage that
+copies out only the artifact. The Python twist is that "the artifact" is a `.venv`
+built by `uv sync --frozen`, and the runtime image carries the interpreter but no
+uv and no build tools.
+
+## What you'll practice
+
+- A multi-stage `Dockerfile` with the `ghcr.io/astral-sh/uv` builder and BuildKit
+  cache mounts.
+- Lockfile-first layer caching: `uv sync --frozen --no-dev` as its own cached layer.
+- A slim, non-root runtime image running `uvicorn`.
+- A `.dockerignore` that keeps the context lean and `.venv` out.
+- A `docker-compose.yml` that runs the production image against Postgres with a
+  health-gated `depends_on`.
+- A GitHub Actions pipeline using `astral-sh/setup-uv` (lint + type + test + build +
+  push).
+- Kubernetes `Deployment` / `Service` / `ConfigMap` / `Secret` with
+  liveness/readiness probes.
+
+## Requirements
+
+1. Multi-stage `Dockerfile` building a `.venv` with `uv sync --frozen --no-dev`,
+   final image non-root and `uvicorn`-served.
+2. `.dockerignore` excluding `.venv`, caches, and secrets.
+3. `docker-compose.yml` running the built image + Postgres, app waits for DB health.
+4. `/healthz` (liveness) and `/readyz` (readiness) endpoints on the app.
+5. A GitHub Actions workflow: `ruff check`, `ruff format --check`, `ty check`,
+   `pytest`, then build + push to GHCR.
+6. K8s manifests: `Deployment` (with probes), `Service`, `ConfigMap`, `Secret`.
+
+## The worked solution
+
+We start from the module 07 Task API and add the deployment layer around it. The
+app gains a tiny `health.py` and a `settings.py` (pydantic-settings); everything
+else is the deploy scaffolding.
+
+<FileTree>
+- task-api/
+  - pyproject.toml uv project + deps (fastapi, uvicorn, pydantic-settings)
+  - uv.lock the reproducibility contract (committed)
+  - **Dockerfile** multi-stage uv build
+  - **.dockerignore** keep the context lean
+  - **docker-compose.yml** prod-like: built image + Postgres
+  - app/
+    - __init__.py
+    - main.py FastAPI app, lifespan, router wiring
+    - models.py Pydantic models (from module 07)
+    - repository.py in-memory repo (from module 07)
+    - routes.py the CRUD APIRouter (from module 07)
+    - settings.py pydantic-settings config
+    - health.py /healthz + /readyz probes
+  - .github/
+    - workflows/
+      - **ci.yml** lint + type + test + build + push
+  - k8s/
+    - **deployment.yaml** Deployment + probes
+    - service.yaml ClusterIP Service
+    - config.yaml ConfigMap + Secret template
+</FileTree>
+
+### The app additions
+
+The CRUD code (`models.py`, `repository.py`, `routes.py`) is exactly what you built
+in module 07. Two small files make it production-shaped.
+
+`settings.py` reads config from the environment, typed and validated — a missing
+required value crashes the process at boot instead of serving errors later.
+
+```python title="app/settings.py"
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_")
+
+    log_level: str = "info"
+    # In module 09 this becomes a required PostgresDsn; in-memory for now.
+    database_url: str = "memory://"
+
+
+settings = Settings()
+```
+
+`health.py` gives the platform two endpoints — a cheap liveness check and a
+readiness check that would verify the DB in module 09. They map straight to the K8s
+probes.
+
+```python title="app/health.py"
+from fastapi import APIRouter
+
+router = APIRouter(tags=["meta"])
+
+
+@router.get("/healthz")
+async def healthz() -> dict[str, str]:
+    """Liveness: the process is up and the event loop is responsive."""
+    return {"status": "ok"}
+
+
+@router.get("/readyz")
+async def readyz() -> dict[str, str]:
+    """Readiness: dependencies are reachable. (Add a DB ping in module 09.)"""
+    return {"status": "ready"}
+```
+
+`main.py` mounts the health router alongside the tasks router. The `lifespan` is
+where a real DB pool would open at startup and close on `SIGTERM`.
+
+```python title="app/main.py" {15-16}
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+from app.health import router as health_router
+from app.repository import InMemoryTaskRepository
+from app.routes import router as tasks_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.repository = InMemoryTaskRepository()
+    yield
+    # Shutdown runs on SIGTERM — close the DB pool / Redis client here (module 09+).
+
+
+app = FastAPI(title="Task API", version="1.0.0", lifespan=lifespan)
+app.include_router(tasks_router)
+app.include_router(health_router)
+```
+
+### pyproject.toml
+
+`uvicorn[standard]` pulls in the production extras (`uvloop`, `httptools`). The dev
+group holds tooling that never reaches the image.
+
+```toml title="pyproject.toml"
+[project]
+name = "task-api"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic-settings>=2.5",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.9", "ty>=0.0.1", "pytest>=8.3", "pytest-asyncio>=0.24", "httpx>=0.27"]
+```
+
+### The Dockerfile
+
+The production default: a `uv` builder stage that installs deps and the project into
+a `.venv`, and a slim runtime stage that copies only that venv and the source. No
+uv, no build tools in the final image.
+
+```dockerfile title="Dockerfile" {2,3,9-13,16-18,22,27,31,35}
+# --- Stage 1: build the venv with uv ---
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+WORKDIR /app
+
+# Layer 1: dependencies only (lockfile-driven, caches independently of source).
+# Bind-mount the lock + manifest so they don't bust later layers when source changes.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-install-project --no-dev
+
+# Layer 2: project source, then install the project itself into the venv.
+COPY . /app
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# --- Stage 2: slim runtime, no uv, no build tools ---
+FROM python:3.13-slim-bookworm
+WORKDIR /app
+
+# Non-root user — root-by-default is the #1 container security finding.
+RUN groupadd -r app && useradd -r -g app app
+
+# Copy the built venv + source from the builder, owned by the app user.
+COPY --from=builder --chown=app:app /app /app
+
+# Put the venv on PATH so `uvicorn` resolves to it without activation.
+ENV PATH="/app/.venv/bin:$PATH"
+
+EXPOSE 8000
+USER app
+
+# slim has a shell, so a shell-form HEALTHCHECK works (Compose / docker run use it).
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"
+
+# One worker per container — scale with replicas, not in-process workers.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+```
+
+The four ideas doing the heavy lifting:
+
+- **`ghcr.io/astral-sh/uv:python3.13-...` builder** ships uv *and* the interpreter,
+  so there's no `pip`, no manual venv, no installing uv.
+- **`--mount=type=cache,target=/root/.cache/uv`** keeps uv's download/wheel cache
+  *between builds* without baking it into a layer — rebuilds re-download nothing.
+- **Split sync (`--no-install-project` first)** installs the slow dependency layer
+  separately from your fast-changing source, so a code-only change reuses the cached
+  dep layer. This is `COPY package.json` before `COPY src/`, the uv way.
+- **Two stages** — the runtime image is plain `python:3.13-slim` carrying only the
+  `.venv` and your code, run by a non-root `app` user.
+
+:::caution[Copy `uv.lock`, never the host `.venv`]
+The `.dockerignore` excludes `.venv`. That's deliberate: the host venv is built for
+your laptop's OS/arch, and copying it into a Linux image produces a broken
+environment with subtly wrong native wheels. The image builds a *fresh* venv inside
+the builder from `uv.lock`. Copy the lockfile, build the venv in-image.
+:::
+
+### .dockerignore
+
+```text title=".dockerignore"
+.git
+.github
+.venv
+__pycache__/
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.ty_cache
+.mypy_cache
+k8s/
+*.md
+!README.md
+docker-compose*.yml
+.env
+.env.*
+.dockerignore
+Dockerfile
+```
+
+### docker-compose.yml — prod-like local run
+
+This Compose file runs the *built image* (not `fastapi dev`) so local matches
+production. It wires Postgres in for module 09's DB swap and gates the app on the
+database being **healthy**, not merely started.
+
+```yaml title="docker-compose.yml" {4-6,11-14,16-18,28-32}
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: task-api:local
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_LOG_LEVEL=info
+      - APP_DATABASE_URL=postgresql+asyncpg://dev:dev@db:5432/app
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d app"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+```
+
+The Postgres credentials match the guide's [shared-infra
+convention](/modern-python/01-dev-environment/) (`dev`/`dev`/`app` on 5432), so the
+same DSN works across every module.
+
+### GitHub Actions — lint, type, test, build, push
+
+One workflow, two jobs. `check` runs on every push and PR; `build-and-push` runs
+only on `main` and needs `check` to pass. `astral-sh/setup-uv` installs uv and
+caches the dependency download keyed on `uv.lock`.
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run ty check          # or: uv run mypy .
+
+      - name: Test
+        run: uv run pytest
+
+  build-and-push:
+    needs: check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=ref,event=branch
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+:::note[`uv sync --frozen` is also a lockfile gate]
+Because `--frozen` errors when `pyproject.toml` and `uv.lock` have drifted, the
+install step doubles as a "did you forget to `uv lock`?" check. Add an explicit
+`uv lock --check` step if you want that failure spelled out by name.
+:::
+
+### Kubernetes manifests
+
+A FastAPI service in K8s is refreshingly plain — Python starts fast, so no
+JVM-style `startupProbe`, no heap-sizing flags. One uvicorn worker per pod; scale
+with replicas.
+
+```yaml title="k8s/deployment.yaml" {21-23,30-36,38-46}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task-api
+  labels:
+    app: task-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: task-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: task-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: app
+          image: ghcr.io/example/task-api:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: APP_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef: { name: task-api-config, key: log-level }
+            - name: APP_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: task-api-secrets, key: database-url }
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 30
+```
+
+```yaml title="k8s/service.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  name: task-api
+spec:
+  type: ClusterIP
+  selector:
+    app: task-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+```yaml title="k8s/config.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: task-api-config
+data:
+  log-level: "info"
+---
+# Template only — base64 here is encoding, NOT encryption.
+# Real values: kubectl create secret generic task-api-secrets \
+#   --from-literal=database-url="postgresql+asyncpg://dev:dev@db:5432/app"
+# Better: External Secrets Operator / cloud secret manager.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: task-api-secrets
+type: Opaque
+data:
+  database-url: cG9zdGdyZXNxbCthc3luY3BnOi8vZGV2OmRldkBkYjo1NDMyL2FwcA==
+```
+
+:::danger[The committed Secret is a template]
+The base64 value above is a throwaway example — base64 is encoding, not encryption,
+so anyone with read access decodes it instantly. Never commit real credentials.
+Create the Secret with `kubectl create secret` or sync it from a real vault.
+:::
+
+## Run it
+
+<Steps>
+
+1. Generate the lockfile (commit `uv.lock` afterward) and verify locally:
+
+   ```bash
+   uv sync
+   uv run uvicorn app.main:app --port 8000 --proxy-headers
+   ```
+
+2. Build the production image and run it standalone:
+
+   ```bash
+   docker build -t task-api:local .
+   docker run -p 8000:8000 task-api:local
+   ```
+
+3. Or bring up the prod-like stack (built image + Postgres, app waits for DB
+   health):
+
+   ```bash
+   docker compose up --build
+   ```
+
+4. Exercise the running container:
+
+   ```bash
+   curl http://localhost:8000/healthz
+   curl http://localhost:8000/readyz
+
+   curl -X POST http://localhost:8000/tasks \
+     -H "Content-Type: application/json" \
+     -d '{"title": "Ship it", "description": "Dockerize the API"}'
+
+   curl http://localhost:8000/tasks
+   ```
+
+5. Confirm the image is lean and non-root:
+
+   ```bash
+   docker image ls task-api:local           # ~130MB
+   docker run --rm task-api:local whoami     # -> app  (not root)
+   ```
+
+6. Apply the manifests to a cluster and watch the rollout:
+
+   ```bash
+   kubectl create namespace task-api
+   kubectl apply -f k8s/ -n task-api
+   kubectl rollout status deployment/task-api -n task-api
+   kubectl port-forward svc/task-api 8000:80 -n task-api
+   ```
+
+</Steps>
+
+### Lint and type-check
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check          # mypy works here too: uv run mypy .
+```
+
+## Stretch goals
+
+:::tip[Stretch goals]
+- Swap the runtime base for `gcr.io/distroless/python3-debian12` and adjust the
+  `CMD` to exec-form `python -m uvicorn` (distroless has no shell). Compare image
+  sizes.
+- Add a `release.yml` workflow triggered on `v*` tags that stamps the version,
+  pushes a semver-tagged image, and runs `kubectl set image` against a `production`
+  environment with a required-reviewer gate.
+- Wire `/readyz` to actually ping Postgres (`SELECT 1` through the pool) once you do
+  [module 09](/modern-python/09-database-postgresql/) — return `503` when the DB is
+  unreachable so K8s pulls the pod from rotation.
+- Add a `HorizontalPodAutoscaler` (min 2, max 10, target 70% CPU) and load-test the
+  service to watch it scale.
+- Pin the base images by digest (`@sha256:...`) and add a `trivy` or `docker scout`
+  scan step to the CI workflow that fails on high-severity CVEs.
+- Build a multi-arch image (`linux/amd64,linux/arm64`) with
+  `docker/build-push-action`'s `platforms:` so it runs on both Graviton and x86
+  nodes.
+:::

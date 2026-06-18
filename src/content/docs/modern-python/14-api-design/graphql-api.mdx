@@ -1,0 +1,373 @@
+---
+title: GraphQL API + OpenAPI
+description: Build a Strawberry GraphQL API with a DataLoader next to auto-generated OpenAPI REST docs, all on one FastAPI app, over the Task domain.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← API Design & Serialization"
+  href="/modern-python/14-api-design/"
+/>
+
+## Goal
+
+Run **two API styles on one app**. A single FastAPI process serves:
+
+- a **REST** side at `/v1/tasks` with **OpenAPI/Swagger UI generated for free** at
+  `/docs`, and
+- a **GraphQL** side at `/graphql` (with GraphiQL) built **code-first with
+  Strawberry** — queries, a mutation, and a `DataLoader` that batches a nested lookup
+  to dodge the N+1 problem.
+
+By the end you'll have felt both contracts against the same Task domain: the
+fixed-shape, cacheable REST resource, and the client-shaped GraphQL graph.
+
+## What you'll practice
+
+- Defining GraphQL types **code-first** from Python type hints (`@strawberry.type`),
+  the inverse of the schema-first `.graphql` workflow in Apollo / `gqlgen`.
+- Writing async query and mutation resolvers.
+- Killing the N+1 problem with a per-request `strawberry.dataloader.DataLoader`.
+- Mounting Strawberry's `GraphQLRouter` on FastAPI alongside REST routes whose
+  OpenAPI schema comes from nothing but type hints.
+
+## Requirements
+
+- A `uv` project with `fastapi`, `uvicorn`, `strawberry-graphql`.
+- REST: `GET /v1/tasks`, `GET /v1/tasks/{id}`, served with auto OpenAPI at `/docs`.
+- GraphQL at `/graphql`: a `tasks` query, a `task(id)` query, a `createTask` mutation,
+  and an `assignee` field on `Task` resolved through a `DataLoader`.
+- An in-memory store so the focus stays on the API surface, not a database.
+
+## The worked solution
+
+One small `uv` project. The REST router and the GraphQL schema share the same
+service layer, so you can compare the two styles fetching identical data.
+
+<FileTree>
+- graphql-api/
+  - pyproject.toml uv deps + project config
+  - app/
+    - __init__.py
+    - main.py FastAPI app, mounts REST + GraphQL
+    - service.py in-memory task & user stores
+    - rest.py REST router (auto OpenAPI)
+    - **graphql_api.py** Strawberry types, resolvers, DataLoader
+</FileTree>
+
+### pyproject.toml
+
+```toml title="pyproject.toml"
+[project]
+name = "graphql-api"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "strawberry-graphql>=0.250",
+]
+
+[dependency-groups]
+dev = ["ruff", "ty"]
+```
+
+You'd create this with:
+
+```bash
+uv init graphql-api && cd graphql-api
+uv add fastapi uvicorn strawberry-graphql
+uv add --dev ruff ty
+```
+
+### service.py — the shared domain
+
+Deliberately boring: dict-backed stores so the lesson is the API, not persistence.
+The key detail is `users_by_ids` — a *batch* lookup that the DataLoader will call
+once per request instead of once per task.
+
+```python title="app/service.py"
+from dataclasses import dataclass
+
+
+@dataclass
+class Task:
+    id: int
+    title: str
+    status: str
+    assignee_id: int | None
+
+
+@dataclass
+class User:
+    id: int
+    name: str
+
+
+_USERS: dict[int, User] = {
+    1: User(1, "Alice"),
+    2: User(2, "Bob"),
+}
+
+_TASKS: dict[int, Task] = {
+    1: Task(1, "Ship v2", "open", 1),
+    2: Task(2, "Write docs", "open", 2),
+    3: Task(3, "Triage bugs", "done", 1),
+}
+_next_id = 4
+
+
+def list_tasks(status: str | None = None, limit: int = 20) -> list[Task]:
+    rows = [t for t in _TASKS.values() if status is None or t.status == status]
+    return rows[:limit]
+
+
+def get_task(task_id: int) -> Task | None:
+    return _TASKS.get(task_id)
+
+
+def create_task(title: str, assignee_id: int | None) -> Task:
+    global _next_id
+    task = Task(_next_id, title, "open", assignee_id)
+    _TASKS[_next_id] = task
+    _next_id += 1
+    return task
+
+
+def users_by_ids(ids: list[int]) -> list[User]:
+    """Batch lookup — one call resolves many user keys. The DataLoader uses this."""
+    return [_USERS[i] for i in ids if i in _USERS]
+```
+
+### rest.py — the REST side (free OpenAPI)
+
+A plain `APIRouter`. The Pydantic response models and type hints are *all* FastAPI
+needs to generate the OpenAPI 3.1 schema and the Swagger UI — no annotations, no spec
+file. `response_model` doubles as an output filter.
+
+```python title="app/rest.py"
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app import service
+
+router = APIRouter(prefix="/v1/tasks", tags=["tasks"])
+
+
+class TaskOut(BaseModel):
+    id: int
+    title: str
+    status: str
+    assignee_id: int | None
+
+
+@router.get("", summary="List tasks")
+async def list_tasks(status: str | None = None, limit: int = 20) -> list[TaskOut]:
+    """List tasks, optionally filtered by status. Auto-documented at /docs."""
+    return [TaskOut(**vars(t)) for t in service.list_tasks(status, limit)]
+
+
+@router.get("/{task_id}", summary="Get a task by ID")
+async def get_task(task_id: int) -> TaskOut:
+    task = service.get_task(task_id)
+    if task is None:
+        raise HTTPException(404, "task not found")
+    return TaskOut(**vars(task))
+```
+
+### graphql_api.py — the Strawberry side
+
+Code-first: each `@strawberry.type` class *is* a GraphQL type, derived from the
+annotations. The `assignee` field on `Task` is a resolver that defers to a
+`DataLoader`, so requesting `assignee` across a list of tasks fires **one** batched
+user lookup, not one per task.
+
+```python title="app/graphql_api.py"
+import strawberry
+from strawberry.dataloader import DataLoader
+from strawberry.fastapi import GraphQLRouter
+
+from app import service
+
+
+# --- DataLoader batch function: one call resolves many keys, in key order ---
+async def load_users(keys: list[int]) -> list["User | None"]:
+    rows = service.users_by_ids(keys)            # the single batched lookup
+    by_id = {u.id: User(id=u.id, name=u.name) for u in rows}
+    return [by_id.get(k) for k in keys]          # MUST match length + order of keys
+
+
+@strawberry.type
+class User:
+    id: int
+    name: str
+
+
+@strawberry.type
+class Task:
+    id: int
+    title: str
+    status: str
+    assignee_id: int | None
+
+    @strawberry.field
+    async def assignee(self, info: strawberry.Info) -> User | None:
+        if self.assignee_id is None:
+            return None
+        # batched + cached for the lifetime of this request
+        return await info.context["user_loader"].load(self.assignee_id)
+
+
+@strawberry.input
+class CreateTaskInput:
+    title: str
+    assignee_id: int | None = None
+
+
+def _to_gql(t: service.Task) -> Task:
+    return Task(id=t.id, title=t.title, status=t.status, assignee_id=t.assignee_id)
+
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def tasks(self, status: str | None = None, limit: int = 20) -> list[Task]:
+        return [_to_gql(t) for t in service.list_tasks(status, limit)]
+
+    @strawberry.field
+    async def task(self, id: int) -> Task | None:
+        t = service.get_task(id)
+        return _to_gql(t) if t else None
+
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    async def create_task(self, input: CreateTaskInput) -> Task:
+        return _to_gql(service.create_task(input.title, input.assignee_id))
+
+
+schema = strawberry.Schema(query=Query, mutation=Mutation)
+
+
+# Fresh DataLoader per request — never a module-level singleton (it caches).
+async def get_context() -> dict[str, object]:
+    return {"user_loader": DataLoader(load_fn=load_users)}
+
+
+graphql_router: GraphQLRouter = GraphQLRouter(schema, context_getter=get_context)
+```
+
+:::caution[Per-request DataLoader, always]
+`get_context` builds a new `DataLoader` for every request. A DataLoader caches by key
+for its whole lifetime, so a shared module-level instance would serve one user data
+cached during another user's request. This is the most common Strawberry footgun —
+keep the loader on the per-request context.
+:::
+
+### main.py — both styles, one app
+
+`GraphQLRouter` is an `APIRouter`, so REST and GraphQL just `include_router` onto the
+same `FastAPI()`. REST gets `/docs`; GraphQL gets GraphiQL at `/graphql`.
+
+```python title="app/main.py"
+from fastapi import FastAPI
+
+from app.graphql_api import graphql_router
+from app.rest import router as rest_router
+
+app = FastAPI(
+    title="Task API",
+    version="1.0.0",
+    description="One app, two styles: REST (auto OpenAPI) + GraphQL (Strawberry).",
+)
+
+app.include_router(rest_router)                       # REST + OpenAPI at /docs
+app.include_router(graphql_router, prefix="/graphql") # GraphQL + GraphiQL
+
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {"rest_docs": "/docs", "graphql": "/graphql"}
+```
+
+## Run it
+
+<Steps>
+
+1. Install and start the dev server:
+
+   ```bash
+   uv run fastapi dev app/main.py
+   ```
+
+2. Open the REST docs — Swagger UI, generated entirely from the type hints:
+
+   ```text
+   http://localhost:8000/docs
+   ```
+
+3. Open GraphiQL and run a query that exercises the DataLoader (note `assignee` on
+   every task resolves through a single batched lookup):
+
+   ```text
+   http://localhost:8000/graphql
+   ```
+
+   ```graphql
+   {
+     tasks(status: "open") {
+       id
+       title
+       status
+       assignee { id name }
+     }
+   }
+   ```
+
+4. Run the mutation (GraphQL enums/inputs are unquoted; here `assigneeId` is a plain
+   int):
+
+   ```graphql
+   mutation {
+     createTask(input: { title: "Review PR", assigneeId: 2 }) {
+       id
+       title
+       assignee { name }
+     }
+   }
+   ```
+
+5. Hit the same data over REST to feel the contrast — fixed shape, no field picking:
+
+   ```bash
+   curl http://localhost:8000/v1/tasks/1
+   curl "http://localhost:8000/v1/tasks?status=open&limit=10"
+   ```
+
+6. Lint and type-check:
+
+   ```bash
+   uv run ruff check .
+   uv run ty check .          # mypy works here too, if you prefer the mature option
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- Add a `comments` field on `Task` with a *second* DataLoader keyed `task_id ->
+  list[Comment]`, and confirm a query for many tasks' comments still batches into one
+  lookup.
+- Add RFC 9457 `application/problem+json` error responses to the REST side (see the
+  parent module) and document the `404` shape with `responses={404: {...}}`.
+- Wire the in-memory store to async SQLAlchemy / `asyncpg` from
+  [module 09](/modern-python/09-database-postgresql/) and watch the DataLoader collapse
+  N queries into one `WHERE id = ANY($1)`.
+- Export `/openapi.json` and generate a typed TypeScript client with
+  `openapi-typescript`; regenerate it in CI so it can't drift from the server.
+- Add a `subscription` to Strawberry (an `async def` generator) that streams task
+  status changes, and compare it to gRPC server streaming from the parent module.
+:::

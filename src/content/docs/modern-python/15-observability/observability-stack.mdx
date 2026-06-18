@@ -1,0 +1,563 @@
+---
+title: Observability Stack
+description: Wire a FastAPI service with structlog JSON logging + request-id middleware, a Prometheus /metrics endpoint, and auto-instrumented OpenTelemetry tracing exported over OTLP.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← Observability"
+  href="/modern-python/15-observability/"
+/>
+
+## Goal
+
+Take a tiny FastAPI service and make it *fully observable* across all three
+pillars at once: emit structured JSON logs where every line carries a request ID,
+expose a Prometheus `/metrics` endpoint with a request counter and a latency
+histogram, and auto-instrument OpenTelemetry tracing exported over OTLP to a
+collector. Add `/healthz` and `/readyz` probes. Then run an OTel Collector +
+Prometheus stack with Docker Compose and watch a single request light up all three
+pillars, joined by the same `trace_id`.
+
+If you've wired `pino` + `prom-client` + `@opentelemetry/sdk-node` in Node, or
+`zerolog` + `promhttp` + the OTel Go SDK, this is the same three pillars — but
+structlog's `contextvars` and OTel's one-call auto-instrumentation make the wiring
+notably lighter than the Go path.
+
+## What you'll practice
+
+- Configuring **structlog** once: ISO timestamps, JSON renderer, and a processor
+  that injects the active OTel `trace_id` into every log line.
+- A **request-ID middleware** that binds `request_id` to `contextvars` and echoes
+  it back in the `X-Request-Id` response header.
+- A **Prometheus middleware** recording `http_requests_total` (Counter) and
+  `http_request_duration_seconds` (Histogram), exposed via `make_asgi_app()`.
+- **OpenTelemetry** auto-instrumentation for FastAPI and httpx, exporting spans
+  over OTLP gRPC to a collector.
+- `/healthz` (liveness, dependency-free) and `/readyz` (readiness) endpoints.
+- Running an **OTel Collector + Prometheus** stack with `docker compose`.
+
+## Requirements
+
+- One `GET /work` endpoint that does a little work (a manual span + an outbound
+  `httpx` call) so there's something to trace and time.
+- Every log line is JSON and includes `request_id`; logs emitted inside a request
+  also include `trace_id`.
+- `/metrics` returns Prometheus exposition format with the request counter and
+  latency histogram.
+- Traces export to the collector over OTLP (`:4317`).
+- Graceful shutdown flushes the span exporter.
+
+## The worked solution
+
+A small `uv` project. The observability lives in four focused modules —
+`logging_config.py`, `metrics.py`, `tracing.py`, and the middleware in `main.py` —
+so each pillar is isolated and easy to reason about.
+
+<FileTree>
+- observability-stack/
+  - pyproject.toml uv project + deps
+  - docker-compose.yml OTel Collector + Prometheus
+  - otel-collector.yaml receivers/exporters config
+  - prometheus.yml scrape config
+  - app/
+    - __init__.py
+    - settings.py pydantic-settings (env-driven config)
+    - **logging_config.py** structlog JSON + trace_id processor
+    - **metrics.py** Counter + Histogram + Prometheus middleware
+    - **tracing.py** OTel SDK + auto-instrumentation
+    - health.py /healthz + /readyz
+    - main.py app wiring, request-id middleware, lifespan
+</FileTree>
+
+### pyproject.toml
+
+Create the project and add the dependencies in one go:
+
+```bash
+uv init observability-stack && cd observability-stack
+uv add fastapi uvicorn structlog prometheus-client httpx \
+  pydantic-settings \
+  opentelemetry-distro opentelemetry-exporter-otlp \
+  opentelemetry-instrumentation-fastapi \
+  opentelemetry-instrumentation-httpx
+```
+
+```toml title="pyproject.toml"
+[project]
+name = "observability-stack"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "structlog>=24.4",
+    "prometheus-client>=0.21",
+    "httpx>=0.28",
+    "pydantic-settings>=2.7",
+    "opentelemetry-distro>=0.50b0",
+    "opentelemetry-exporter-otlp>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "opentelemetry-instrumentation-httpx>=0.50b0",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.9", "ty>=0.0.1a1"]
+```
+
+### settings.py
+
+Config comes from the environment via `pydantic-settings` — `json_logs` flips the
+renderer, and the OTLP endpoint points at the collector.
+
+```python title="app/settings.py"
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="APP_")
+
+    service_name: str = "observability-stack"
+    json_logs: bool = True
+    log_level: str = "INFO"
+    otlp_endpoint: str = "http://localhost:4317"
+
+
+settings = Settings()
+```
+
+### logging_config.py
+
+structlog is configured once. The custom `add_trace_context` processor reads the
+active span and injects `trace_id`/`span_id` — this is what links a log line to its
+trace. The `merge_contextvars` processor pulls in the `request_id` bound by the
+middleware.
+
+```python title="app/logging_config.py" {7-14,22,30}
+import logging
+
+import structlog
+from opentelemetry import trace
+
+
+def add_trace_context(logger, method_name, event_dict):
+    """Inject the active OTel trace/span IDs so logs link to traces."""
+    span = trace.get_current_span()
+    ctx = span.get_span_context()
+    if ctx.is_valid:
+        event_dict["trace_id"] = format(ctx.trace_id, "032x")
+        event_dict["span_id"] = format(ctx.span_id, "016x")
+    return event_dict
+
+
+def configure_logging(*, json_logs: bool, level: str) -> None:
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if json_logs
+        else structlog.dev.ConsoleRenderer()
+    )
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,   # request_id, path, ...
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.format_exc_info,
+            add_trace_context,                          # trace_id, span_id
+            renderer,
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(
+            logging.getLevelNamesMapping()[level]
+        ),
+        cache_logger_on_first_use=True,
+    )
+```
+
+### metrics.py
+
+Module-level metric singletons (re-declaring a name raises `Duplicated timeseries`)
+plus the middleware that records them. `make_asgi_app()` is the `/metrics` handler.
+
+```python title="app/metrics.py" {5-10,12-17,30,38-43}
+import time
+
+from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+REQUESTS = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    labelnames=["method", "path", "status"],
+)
+LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "Request latency in seconds",
+    labelnames=["method", "path"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+IN_PROGRESS = Gauge("http_requests_in_progress", "In-flight HTTP requests")
+
+metrics_app = make_asgi_app()
+
+
+class PrometheusMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope["method"]
+        # Prefer the matched route template to keep label cardinality bounded.
+        route = scope.get("route")
+        path = getattr(route, "path", scope["path"])
+        status = {"code": 500}
+
+        async def send_wrapper(message) -> None:
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+            await send(message)
+
+        IN_PROGRESS.inc()
+        start = time.perf_counter()
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            IN_PROGRESS.dec()
+            LATENCY.labels(method=method, path=path).observe(
+                time.perf_counter() - start
+            )
+            REQUESTS.labels(
+                method=method, path=path, status=str(status["code"])
+            ).inc()
+```
+
+:::note[Why a histogram, not a summary]
+`http_request_duration_seconds` is a Histogram so Prometheus can compute quantiles
+*server-side across all instances* with `histogram_quantile(0.95, ...)`. A Summary
+computes quantiles client-side per process and can't be aggregated across replicas —
+useless once you scale past one pod. Default to histograms.
+:::
+
+### tracing.py
+
+One function wires the SDK and patches FastAPI + httpx. After this, every request
+is a span and every outbound `httpx` call is a child span with `traceparent`
+propagated automatically.
+
+```python title="app/tracing.py" {14-18,20-22}
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+def configure_tracing(app, *, service_name: str, otlp_endpoint: str) -> None:
+    provider = TracerProvider(
+        resource=Resource.create({"service.name": service_name})
+    )
+    provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint))
+    )
+    trace.set_tracer_provider(provider)
+
+    FastAPIInstrumentor.instrument_app(app)
+    HTTPXClientInstrumentor().instrument()
+```
+
+### health.py
+
+Liveness is dependency-free; readiness would check real dependencies (here it's a
+stub that always passes — swap in a DB `SELECT 1` in a real service).
+
+```python title="app/health.py"
+from fastapi import APIRouter, Response, status
+
+router = APIRouter(tags=["health"])
+
+
+@router.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/readyz")
+async def readyz(response: Response) -> dict[str, object]:
+    checks = {"self": "ok"}  # real services check Postgres/Redis here
+    ready = all(v == "ok" for v in checks.values())
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"ready": ready, "checks": checks}
+```
+
+### main.py
+
+The wiring point: configure logging and tracing, add both middlewares, mount
+`/metrics`, register health routes, and flush the span exporter on shutdown. The
+request-ID middleware binds `request_id` to `contextvars` so every downstream log
+line carries it.
+
+```python title="app/main.py" {17-21,24-43,46,49-50,58}
+import uuid
+from contextlib import asynccontextmanager
+
+import httpx
+import structlog
+from fastapi import FastAPI
+from opentelemetry import trace
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from app.health import router as health_router
+from app.logging_config import configure_logging
+from app.metrics import PrometheusMiddleware, metrics_app
+from app.settings import settings
+from app.tracing import configure_tracing
+
+log = structlog.get_logger()
+tracer = trace.get_tracer(__name__)
+
+
+class RequestContextMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope["headers"])
+        incoming = headers.get(b"x-request-id")
+        request_id = incoming.decode() if incoming else str(uuid.uuid4())
+
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(
+            request_id=request_id,
+            method=scope["method"],
+            path=scope["path"],
+        )
+
+        async def send_wrapper(message) -> None:
+            if message["type"] == "http.response.start":
+                message.setdefault("headers", []).append(
+                    (b"x-request-id", request_id.encode())
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("starting up", service=settings.service_name)
+    yield
+    # Flush buffered spans before exit, then we're done.
+    trace.get_tracer_provider().shutdown()
+    log.info("shut down cleanly")
+
+
+configure_logging(json_logs=settings.json_logs, level=settings.log_level)
+
+app = FastAPI(title="observability-stack", lifespan=lifespan)
+# Order matters: request context is bound first (outermost), metrics inside it.
+app.add_middleware(PrometheusMiddleware)
+app.add_middleware(RequestContextMiddleware)
+app.include_router(health_router)
+app.mount("/metrics", metrics_app)
+
+configure_tracing(
+    app, service_name=settings.service_name, otlp_endpoint=settings.otlp_endpoint
+)
+
+
+@app.get("/work")
+async def do_work() -> dict[str, object]:
+    log.info("work requested")  # carries request_id AND trace_id
+    with tracer.start_as_current_span("fetch-upstream") as span:
+        span.set_attribute("upstream", "example.com")
+        async with httpx.AsyncClient() as client:
+            resp = await client.get("https://example.com")  # auto-spanned child
+    log.info("work done", upstream_status=resp.status_code)
+    return {"upstream_status": resp.status_code}
+```
+
+:::caution[Middleware order is execution order]
+Starlette runs the *last* `add_middleware` call as the outermost layer. We add
+`RequestContextMiddleware` after `PrometheusMiddleware` so context binding happens
+first — meaning the metrics layer (and everything inside) already sees the bound
+`request_id`. Add them in the wrong order and your earliest log lines miss the ID.
+:::
+
+### docker-compose.yml
+
+Two services: the OTel Collector (receives OTLP, forwards traces) and Prometheus
+(scrapes the app's `/metrics`). The app runs on your host via `uv run`.
+
+```yaml title="docker-compose.yml"
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC (the app exports here)
+      - "4318:4318"   # OTLP HTTP
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach the host-run app on Linux
+```
+
+```yaml title="otel-collector.yaml"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+
+exporters:
+  # Print traces to the collector log so you can see them with `docker compose logs`.
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+```
+
+```yaml title="prometheus.yml"
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "observability-stack"
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+```
+
+:::tip[Swap the debug exporter for Jaeger]
+The collector's `debug` exporter just logs spans — handy for a first run. To *see*
+traces in a UI, add a Jaeger service (`jaegertracing/all-in-one`, UI on `:16686`,
+OTLP enabled) and point the collector's traces pipeline at it with an `otlp/jaeger`
+exporter. The app's code doesn't change at all — that's the "one SDK, many backends"
+promise in action.
+:::
+
+## Run it
+
+<Steps>
+
+1. Start the telemetry backends (OTel Collector + Prometheus). Requires Docker with
+   the Compose plugin:
+
+   ```bash
+   docker compose up -d
+   ```
+
+2. Run the service:
+
+   ```bash
+   uv run uvicorn app.main:app --port 8000
+   ```
+
+3. Open the UIs and endpoints:
+
+   | URL | What |
+   |---|---|
+   | `http://localhost:8000/work` | The instrumented endpoint |
+   | `http://localhost:8000/healthz` | Liveness probe |
+   | `http://localhost:8000/readyz` | Readiness probe |
+   | `http://localhost:8000/metrics` | Prometheus exposition format |
+   | `http://localhost:9090` | Prometheus UI |
+
+</Steps>
+
+## Test it
+
+<Steps>
+
+1. Hit the endpoint a few times to generate logs, metrics, and traces:
+
+   ```bash
+   curl -i http://localhost:8000/work
+   ```
+
+   The response carries an `X-Request-Id` header, and the service's stdout shows JSON
+   log lines with matching `request_id` *and* `trace_id` fields:
+
+   ```json
+   {"method": "GET", "path": "/work", "request_id": "a1b2...", "trace_id": "9f3c...", "event": "work requested", "level": "info", "timestamp": "2026-06-19T10:23:45.001Z"}
+   ```
+
+2. Confirm the metrics are exposed:
+
+   ```bash
+   curl -s http://localhost:8000/metrics | grep http_request
+   ```
+
+   You'll see `http_requests_total{...}` and the
+   `http_request_duration_seconds_bucket{...}` series.
+
+3. See the exported traces in the collector log:
+
+   ```bash
+   docker compose logs otel-collector | grep -A2 "fetch-upstream"
+   ```
+
+4. In the Prometheus UI (`http://localhost:9090`), run these queries:
+
+   ```text
+   # Request rate (requests/sec)
+   rate(http_requests_total[1m])
+
+   # 95th percentile latency
+   histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+
+   # Error rate (5xx share of all requests)
+   sum(rate(http_requests_total{status=~"5.."}[5m]))
+     / sum(rate(http_requests_total[5m]))
+
+   # In-flight requests right now
+   http_requests_in_progress
+   ```
+
+</Steps>
+
+:::tip[Stretch goals]
+- Add **SQLAlchemy auto-instrumentation** (`opentelemetry-instrumentation-sqlalchemy`)
+  and a real `/readyz` check that runs `SELECT 1` against the shared-infra Postgres
+  (`postgresql+asyncpg://dev:dev@localhost:5432/app`). Watch a query span nest inside
+  the request span.
+- Add a **Jaeger** service to the compose stack and point the collector at it, then
+  click through a `/work` trace in the Jaeger UI and confirm the `trace_id` matches
+  your log line.
+- Add a **custom business Counter** (e.g. `work_jobs_processed_total` tagged by
+  outcome) and graph it next to the HTTP RED metrics.
+- Switch logging off JSON in dev: set `APP_JSON_LOGS=false` and confirm structlog's
+  `ConsoleRenderer` gives you colorized, aligned output — same code, prettier dev UX.
+- Run **`opentelemetry-instrument uv run uvicorn app.main:app`** instead of calling
+  `configure_tracing` in code, configuring everything via `OTEL_*` env vars — the
+  zero-code auto-instrumentation path.
+:::

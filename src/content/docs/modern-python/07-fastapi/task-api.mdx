@@ -1,0 +1,431 @@
+---
+title: "CRUD Task API (FastAPI)"
+description: Build a complete async Task CRUD API with FastAPI — Pydantic models, an APIRouter, a Depends-injected repository, lifespan, validation, and automatic OpenAPI.
+sidebar:
+  order: 1
+---
+
+import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
+
+<LinkCard
+  title="← FastAPI REST APIs"
+  href="/modern-python/07-fastapi/"
+/>
+
+## Goal
+
+Build a complete REST API for task management with FastAPI — full CRUD, Pydantic
+request/response models, an `APIRouter`, a `Depends`-injected repository, a
+`lifespan` for startup/shutdown, validation, proper status codes, and the
+automatic OpenAPI docs. Storage is an in-memory repository; the real database
+arrives in [module 09](/modern-python/09-database-postgresql/).
+
+The domain is deliberately small and clean — `Task: id, title, description,
+done, created_at` — because [module 08](/modern-python/08-litestar/) rebuilds
+this *exact same API* in Litestar so you can compare the two frameworks side by
+side. Keep the models reusable.
+
+## What you'll practice
+
+- Pydantic v2 models for create / update / response, with `Field` constraints.
+- An `APIRouter` mounted on the app with a prefix and tags.
+- A repository behind a `Protocol`, injected with `Annotated[T, Depends(...)]`.
+- A `lifespan` context manager that owns the repository's lifecycle.
+- `HTTPException` for 404s and proper status codes (`201`, `204`).
+- Reading `/docs` to exercise the API with zero extra code.
+
+## Requirements
+
+- Full CRUD: create, read (one + list), update, delete.
+- Input validation via Pydantic (`title` required, 1–200 chars).
+- Partial updates: `PATCH` where omitted fields are left unchanged.
+- `404` for missing tasks, `201` on create, `204` on delete.
+- In-memory storage behind an injected repository — no DB.
+- Automatic OpenAPI at `/docs`.
+
+### API endpoints
+
+| Method | Path | Description | Success |
+|--------|------|-------------|---------|
+| `GET` | `/tasks` | List all tasks (optional `?done=` filter) | `200` |
+| `GET` | `/tasks/{id}` | Get a task by id | `200` / `404` |
+| `POST` | `/tasks` | Create a task | `201` |
+| `PATCH` | `/tasks/{id}` | Update provided fields | `200` / `404` |
+| `DELETE` | `/tasks/{id}` | Delete a task | `204` / `404` |
+
+## The worked solution
+
+A small `uv` project. The code is split by responsibility — models, repository,
+routes, app — the same shape you'd grow into a real service.
+
+<FileTree>
+- task-api/
+  - pyproject.toml uv project + deps
+  - app/
+    - __init__.py
+    - models.py Pydantic request/response models
+    - repository.py in-memory repo behind a Protocol
+    - routes.py APIRouter with the CRUD endpoints
+    - main.py FastAPI app, lifespan, router wiring
+</FileTree>
+
+The request flows down through the layers and the response bubbles back up:
+
+```text
+HTTP client ──JSON──▶ routes.py (APIRouter)
+                         │  Depends(get_repository)
+                         ▼
+                     repository.py (in-memory)
+                         │
+                         ▼
+                     models.py (Task / TaskCreate / TaskUpdate)
+   routes ──TaskRead JSON──▶ client     (HTTPException ──▶ 404 JSON)
+```
+
+### Create the project
+
+<Steps>
+
+1. Scaffold and add dependencies:
+
+   ```bash
+   uv init task-api && cd task-api
+   uv add fastapi uvicorn
+   uv add --dev ruff ty
+   mkdir app && touch app/__init__.py
+   ```
+
+2. Write the four files below into `app/`.
+
+</Steps>
+
+### app/models.py — the data models
+
+Three models for three jobs: `TaskCreate` (the POST body — `title` required),
+`TaskUpdate` (the PATCH body — every field optional, `None` means "leave it"),
+and `TaskRead` (the response shape). `Task` is the internal stored record. Note
+`done` defaults to `False` and `created_at` defaults to now, so creating a task
+needs only a title.
+
+```python title="app/models.py"
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str = ""
+
+
+class TaskUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    done: bool | None = None
+
+
+class TaskRead(BaseModel):
+    id: int
+    title: str
+    description: str
+    done: bool
+    created_at: datetime
+
+
+class Task(BaseModel):
+    """The stored record. Same fields as TaskRead, owned by the repository."""
+    id: int
+    title: str
+    description: str
+    done: bool = False
+    created_at: datetime = Field(default_factory=_now)
+```
+
+:::note[Why a separate `TaskRead`?]
+`Task` is what the repository stores; `TaskRead` is the wire contract. Today they
+have identical fields, so this looks redundant — but when [module 09](/modern-python/09-database-postgresql/)
+turns `Task` into a SQLAlchemy row with extra internal columns, `TaskRead` keeps
+the public response stable. Declaring `response_model=TaskRead` on the routes
+also *filters* the output to exactly these fields, so nothing internal leaks.
+:::
+
+### app/repository.py — in-memory data access
+
+The repository is defined as a `Protocol` (structural interface — see [module 02](/modern-python/02-typing/))
+so the routes depend on a *shape*, not a concrete class. The in-memory
+implementation is a `dict` plus an autoincrementing id. `get` returns `Task |
+None`; the route decides what a `None` means (a `404`).
+
+```python title="app/repository.py"
+from typing import Protocol
+from app.models import Task, TaskCreate, TaskUpdate
+
+
+class TaskRepository(Protocol):
+    def list(self, done: bool | None = None) -> list[Task]: ...
+    def get(self, task_id: int) -> Task | None: ...
+    def create(self, data: TaskCreate) -> Task: ...
+    def update(self, task_id: int, data: TaskUpdate) -> Task | None: ...
+    def delete(self, task_id: int) -> bool: ...
+
+
+class InMemoryTaskRepository:
+    """A dict-backed repo. Swapped for SQLAlchemy in module 09."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[int, Task] = {}
+        self._next_id = 1
+
+    def list(self, done: bool | None = None) -> list[Task]:
+        tasks = list(self._tasks.values())
+        if done is not None:
+            tasks = [t for t in tasks if t.done == done]
+        return sorted(tasks, key=lambda t: t.created_at, reverse=True)
+
+    def get(self, task_id: int) -> Task | None:
+        return self._tasks.get(task_id)
+
+    def create(self, data: TaskCreate) -> Task:
+        task = Task(id=self._next_id, title=data.title, description=data.description)
+        self._tasks[task.id] = task
+        self._next_id += 1
+        return task
+
+    def update(self, task_id: int, data: TaskUpdate) -> Task | None:
+        task = self._tasks.get(task_id)
+        if task is None:
+            return None
+        # exclude_unset: only fields the client actually sent are applied.
+        patch = data.model_dump(exclude_unset=True)
+        updated = task.model_copy(update=patch)
+        self._tasks[task_id] = updated
+        return updated
+
+    def delete(self, task_id: int) -> bool:
+        return self._tasks.pop(task_id, None) is not None
+```
+
+:::tip[`exclude_unset` is the partial-update trick]
+`data.model_dump(exclude_unset=True)` returns only the fields the client
+*actually sent* in the JSON — not the ones that defaulted to `None`. That's the
+difference between "set `description` to null" and "don't touch `description`."
+`model_copy(update=...)` then applies just those fields to the stored task. This
+is the immutable partial-update pattern, in two lines.
+:::
+
+### app/routes.py — the APIRouter
+
+The router holds every endpoint under the `/tasks` prefix with the `tasks` tag.
+The repository comes in through `Depends(get_repository)`, written as
+`Annotated[TaskRepository, Depends(get_repository)]` and aliased to `RepoDep` so
+each route reads cleanly. Missing tasks raise `HTTPException(404)`; the handlers
+never touch status codes for the happy path (those are declared on the
+decorator).
+
+```python title="app/routes.py"
+from typing import Annotated
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from app.models import TaskCreate, TaskRead, TaskUpdate
+from app.repository import TaskRepository
+
+
+def get_repository(request) -> TaskRepository:
+    # The single repository instance lives on app.state (created in lifespan).
+    return request.app.state.repository
+
+
+RepoDep = Annotated[TaskRepository, Depends(get_repository)]
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+@router.get("", response_model=list[TaskRead], summary="List tasks")
+async def list_tasks(repo: RepoDep, done: bool | None = None) -> list:
+    return repo.list(done=done)
+
+
+@router.get("/{task_id}", response_model=TaskRead, summary="Get a task")
+async def get_task(task_id: int, repo: RepoDep):
+    task = repo.get(task_id)
+    if task is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="task not found")
+    return task
+
+
+@router.post(
+    "",
+    response_model=TaskRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a task",
+)
+async def create_task(data: TaskCreate, repo: RepoDep):
+    return repo.create(data)
+
+
+@router.patch("/{task_id}", response_model=TaskRead, summary="Update a task")
+async def update_task(task_id: int, data: TaskUpdate, repo: RepoDep):
+    task = repo.update(task_id, data)
+    if task is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="task not found")
+    return task
+
+
+@router.delete(
+    "/{task_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a task",
+)
+async def delete_task(task_id: int, repo: RepoDep) -> None:
+    if not repo.delete(task_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="task not found")
+    # No return -> 204 No Content
+```
+
+:::note[Injecting a shared instance via `app.state`]
+`get_repository` reads the one repository instance off `request.app.state`, where
+the `lifespan` put it at startup. This keeps a single shared repo for the process
+(so data persists across requests) while still being a `Depends` — which means
+tests can override `get_repository` to inject a fresh fake. That override pattern
+is the focus of [module 12](/modern-python/12-testing/).
+:::
+
+### app/main.py — the app, lifespan, and wiring
+
+`lifespan` creates the repository at startup and stashes it on `app.state`, then
+yields; teardown (after `yield`) is where you'd close a DB pool in module 09.
+`include_router` mounts the CRUD routes. The `FastAPI(...)` metadata flows
+straight into `/docs`.
+
+```python title="app/main.py"
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+from app.repository import InMemoryTaskRepository
+from app.routes import router as tasks_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: one repository for the process lifetime.
+    app.state.repository = InMemoryTaskRepository()
+    yield
+    # Shutdown: nothing to clean up for in-memory; module 09 closes the pool here.
+
+
+app = FastAPI(
+    title="Task API",
+    version="1.0.0",
+    description="A small CRUD task service built with FastAPI.",
+    lifespan=lifespan,
+)
+
+app.include_router(tasks_router)
+
+
+@app.get("/health", tags=["meta"])
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+```
+
+### pyproject.toml
+
+`uv add` manages this for you; the dependency block ends up looking like:
+
+```toml title="pyproject.toml"
+[project]
+name = "task-api"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.9", "ty>=0.0.1"]
+```
+
+## Run it
+
+No infrastructure to start — storage is in-memory.
+
+<Steps>
+
+1. Start the dev server (auto-reload, prints the docs URL):
+
+   ```bash
+   uv run fastapi dev app/main.py
+   ```
+
+   For a production-style run instead: `uv run uvicorn app.main:app --port 8000`.
+
+2. Open the interactive docs in a browser:
+
+   ```text
+   http://127.0.0.1:8000/docs
+   ```
+
+3. Create a task:
+
+   ```bash
+   curl -X POST http://127.0.0.1:8000/tasks \
+     -H "Content-Type: application/json" \
+     -d '{"title": "Learn FastAPI", "description": "Finish module 07"}'
+   # 201 -> {"id":1,"title":"Learn FastAPI","description":"Finish module 07","done":false,"created_at":"..."}
+   ```
+
+4. List, filter, and fetch:
+
+   ```bash
+   curl http://127.0.0.1:8000/tasks
+   curl "http://127.0.0.1:8000/tasks?done=false"
+   curl http://127.0.0.1:8000/tasks/1
+   ```
+
+5. Partial update (mark it done — title and description untouched), then delete:
+
+   ```bash
+   curl -X PATCH http://127.0.0.1:8000/tasks/1 \
+     -H "Content-Type: application/json" \
+     -d '{"done": true}'
+
+   curl -i -X DELETE http://127.0.0.1:8000/tasks/1     # 204 No Content
+   ```
+
+6. See validation in action — an empty title is rejected with a structured `422`:
+
+   ```bash
+   curl -i -X POST http://127.0.0.1:8000/tasks \
+     -H "Content-Type: application/json" \
+     -d '{"title": ""}'
+   # 422 -> {"detail":[{"type":"string_too_short","loc":["body","title"],...}]}
+   ```
+
+</Steps>
+
+### Lint and type-check
+
+```bash
+uv run ruff check .
+uv run ruff format .
+uv run ty check        # mypy works here too if you prefer the mature option
+```
+
+## Stretch goals
+
+:::tip[Stretch goals]
+- Add a custom exception handler that maps a domain `TaskNotFound` exception to a
+  `404` body, then raise that from the repository instead of returning `None`.
+- Add pagination to `GET /tasks` with `?limit=` and `?offset=` query params.
+- Add a `PUT /tasks/{id}` for full replacement and contrast it with the `PATCH`
+  partial update.
+- Add a `BackgroundTasks` parameter to create, and log an "audit" line after the
+  `201` is sent.
+- Override `get_repository` with a fresh `InMemoryTaskRepository` in a test using
+  `app.dependency_overrides`, then hit the API with `httpx` — a preview of
+  [module 12](/modern-python/12-testing/).
+:::

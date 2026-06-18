@@ -1,0 +1,714 @@
+---
+title: Pydantic & Typed Data Validation
+description: Validate data at the boundary with Pydantic v2 — models, Field constraints, custom validators, discriminated unions, and pydantic-settings for 12-factor config.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Steps, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Type hints are checked by `ty` and `mypy` at edit time — but they vanish at
+runtime. A function annotated `def handle(body: Order)` will happily receive a
+`dict` with a string where an `int` should be, a missing field, or `null` where
+you promised a value. The annotation is a comment as far as the interpreter is
+concerned. The instant data crosses a boundary you don't control — an HTTP body,
+a config file, a row from an external service, a message off Kafka — the type
+system has already left the building.
+
+**Pydantic v2** is how modern Python closes that gap. You declare a model once,
+and Pydantic *parses, validates, and coerces* incoming data against it at
+runtime, raising a structured error if it doesn't fit. If you've reached for
+**zod** in TypeScript or stacked **`validator` struct tags** on a Go struct,
+this is the same job — Python just makes the model declaration and the type hint
+the same object.
+
+## The mental model: dataclasses validate nothing
+
+Module 03 used `@dataclass` for plain data. Dataclasses are great, but be clear
+on what they do and don't do: a dataclass generates `__init__`, `__repr__`, and
+`__eq__` from annotations — and then ignores the annotations entirely at
+runtime. Nothing is checked.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class User:
+    id: int
+    email: str
+
+# All of these "work" — no error, garbage stored:
+User(id="not-a-number", email=123)       # types are lies
+User(id=1, email="a@b.com", extra="oops")  # TypeError, but only because of arity
+```
+
+A dataclass is a typed *struct*. Pydantic's `BaseModel` is a typed *schema*: same
+declaration, but the boundary is enforced.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// zod: schema and inferred type are separate things you keep in sync
+import { z } from "zod";
+
+const User = z.object({
+  id: z.number().int(),
+  email: z.string().email(),
+});
+type User = z.infer<typeof User>;  // { id: number; email: string }
+
+const user = User.parse(jsonFromRequest); // throws ZodError on bad input
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// struct tags + go-playground/validator: type is the struct, rules are strings
+import "github.com/go-playground/validator/v10"
+
+type User struct {
+    ID    int    `json:"id" validate:"required"`
+    Email string `json:"email" validate:"required,email"`
+}
+
+var u User
+json.Unmarshal(body, &u)                 // decode (no rule checking yet)
+err := validator.New().Struct(u)         // THEN validate, as a separate step
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# Pydantic: the class IS the schema AND the type. One declaration.
+from pydantic import BaseModel, EmailStr
+
+class User(BaseModel):
+    id: int
+    email: EmailStr
+
+user = User.model_validate(json_from_request)  # parses + validates + coerces
+# ty/mypy also see `user.id: int` — same object does double duty
+```
+
+  </TabItem>
+</Tabs>
+
+The key difference from Go: there's no decode-then-validate two-step and no
+string mini-language for rules. The annotations *are* the rules, and parsing and
+validation are the same call. The key difference from zod: the schema is a real
+Python class, so it's also the static type — no `z.infer` round-trip to keep in
+sync.
+
+| Concept | TS (zod) | Go (struct + validator) | Python (Pydantic v2) |
+|---|---|---|---|
+| Declare schema | `z.object({...})` | `struct { ... }` | `class X(BaseModel)` |
+| Static type | `z.infer<typeof S>` | the struct itself | the class itself |
+| Parse + validate | `S.parse(x)` | `Unmarshal` then `validator.Struct` | `X.model_validate(x)` |
+| Constraints | `.int().min(1)` | `validate:"gte=1"` tags | `Field(ge=1)` / `Annotated` |
+| Error type | `ZodError` (issues[]) | `validator.ValidationErrors` | `ValidationError` (errors()) |
+| Serialize out | `S.parse(x)` round-trip | `json.Marshal` | `x.model_dump()` |
+| No-validation struct | `interface`/`type` | plain `struct` | `@dataclass` |
+
+:::note[Why this matters more in Python]
+TypeScript and Go are compiled with a type checker in the loop; a lot of bad
+data is caught before runtime. Python ships the source and trusts annotations
+that nobody enforces. Pydantic is the runtime backstop that compiled languages
+get partly for free — which is exactly why it became the backbone of FastAPI,
+pydantic-settings, and most modern Python config.
+:::
+
+## Defining models
+
+A `BaseModel` is a class whose annotated attributes become validated fields.
+Defaults work like Python defaults; a field with no default is required.
+
+```python
+from pydantic import BaseModel
+
+class Task(BaseModel):
+    title: str                    # required
+    done: bool = False            # optional, defaults to False
+    priority: int = 3             # optional
+    notes: str | None = None      # optional AND nullable (None allowed)
+
+Task(title="Write module")                  # done=False, priority=3, notes=None
+Task(title="Ship it", done=True, priority=1)
+Task()                                       # ValidationError: title is required
+```
+
+:::caution[`X | None` vs optional are different things]
+TS/Go devs trip on this constantly. In Pydantic, **required** means "must be
+supplied"; **nullable** (`str | None`) means "may be `None`". They're
+independent:
+
+- `notes: str | None` — *required*, but you may pass `None`.
+- `notes: str = "..."` — *optional* (has a default), never `None`.
+- `notes: str | None = None` — optional AND nullable. This is the usual "truly
+  optional field" you want.
+
+`str | None` alone does **not** make a field optional, unlike a `?:` field in a
+TS interface. You need the `= None` default too.
+:::
+
+### `Field(...)` — constraints, metadata, aliases
+
+`Field()` attaches validation rules and metadata to a field. It's the zod
+`.min().max().regex()` chain and the Go `validate:"..."` tag, but as keyword
+arguments.
+
+```python
+from pydantic import BaseModel, Field
+
+class CreateUser(BaseModel):
+    # ... is "required, no default" (explicit). Same as no default at all.
+    username: str = Field(..., min_length=3, max_length=32, pattern=r"^[a-z0-9_]+$")
+    age: int = Field(..., ge=0, le=150)            # 0 <= age <= 150
+    score: float = Field(default=0.0, ge=0, le=1)  # 0.0 <= score <= 1.0
+    tags: list[str] = Field(default_factory=list)  # mutable default — see note
+    # alias: accept "emailAddress" from JSON, expose as `.email` in Python
+    email: str = Field(..., alias="emailAddress", description="primary contact")
+```
+
+| Constraint | Applies to | zod | Go validator |
+|---|---|---|---|
+| `gt` / `ge` / `lt` / `le` | numbers | `.gt()/.gte()/.lt()/.lte()` | `gt`/`gte`/`lt`/`lte` |
+| `min_length` / `max_length` | str, list, etc. | `.min()/.max()` | `min`/`max` |
+| `pattern` | str | `.regex()` | `regexp` (custom) |
+| `multiple_of` | numbers | `.multipleOf()` | — |
+| `default_factory` | any | — (`.default()` for values) | — |
+| `alias` | the wire name | `.transform`/key rename | `json:"name"` tag |
+| `description` | OpenAPI/schema docs | `.describe()` | — |
+
+:::tip[Mutable default args — the Python footgun, solved]
+Never write `tags: list[str] = []`. In Python a default value is evaluated
+**once**, so every instance would share the *same* list (a classic Python bug
+that bites TS/Go devs who expect a fresh value each call). Pydantic flags bare
+mutable defaults; use `Field(default_factory=list)` to get a fresh container per
+instance. We cover this footgun in depth in
+[Data Structures & FP](/modern-python/03-data-structures-fp/).
+:::
+
+### Nested models and collections
+
+Models compose. A field typed as another `BaseModel` is validated recursively; a
+`list[Model]` validates every element.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+const Address = z.object({ city: z.string(), zip: z.string() });
+const Order = z.object({
+  id: z.string().uuid(),
+  shipTo: Address,
+  lines: z.array(z.object({ sku: z.string(), qty: z.number().int().positive() })),
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+type Address struct {
+    City string `validate:"required"`
+    Zip  string `validate:"required"`
+}
+type Line struct {
+    SKU string `validate:"required"`
+    Qty int    `validate:"gt=0"`
+}
+type Order struct {
+    ID     string    `validate:"required,uuid4"`
+    ShipTo Address   `validate:"required"`         // `dive` needed for slices
+    Lines  []Line    `validate:"required,dive"`
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from uuid import UUID
+from pydantic import BaseModel, Field
+
+class Address(BaseModel):
+    city: str
+    zip: str
+
+class Line(BaseModel):
+    sku: str
+    qty: int = Field(..., gt=0)
+
+class Order(BaseModel):
+    id: UUID                       # validates + coerces a UUID string
+    ship_to: Address               # validated recursively
+    lines: list[Line]              # every element validated, no `dive` needed
+```
+
+  </TabItem>
+</Tabs>
+
+Note Pydantic ships rich types out of the box — `UUID`, `datetime`, `date`,
+`Decimal`, `Path`, `IPv4Address`, `EmailStr` (needs `pydantic[email]`), `HttpUrl`
+— each with parsing and validation. A JSON `"2026-06-19T10:00:00Z"` becomes a
+real `datetime`, not a string you re-parse downstream.
+
+### Unions and discriminated unions
+
+A plain union (`A | B`) makes Pydantic try each member in order — correct but
+potentially slow and ambiguous. When variants share a literal "tag" field, use a
+**discriminated union** with `Field(discriminator=...)`: Pydantic reads the tag
+and routes to exactly one model. This is the direct analogue of a TS
+discriminated union and far cleaner than Go's type-switch-on-interface.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+const Event = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("created"), id: z.string() }),
+  z.object({ kind: z.literal("deleted"), id: z.string(), reason: z.string() }),
+]);
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// No native sum type: decode "kind", then switch and re-decode into the variant.
+type envelope struct{ Kind string `json:"kind"` }
+var e envelope
+json.Unmarshal(body, &e)
+switch e.Kind {
+case "created": /* unmarshal into Created */
+case "deleted": /* unmarshal into Deleted */
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class Created(BaseModel):
+    kind: Literal["created"]       # the discriminator tag
+    id: str
+
+class Deleted(BaseModel):
+    kind: Literal["deleted"]
+    id: str
+    reason: str
+
+class Envelope(BaseModel):
+    event: Created | Deleted = Field(discriminator="kind")
+
+Envelope.model_validate({"event": {"kind": "deleted", "id": "1", "reason": "spam"}})
+# -> routes straight to Deleted; a bad `kind` gives one clear error, not N
+```
+
+  </TabItem>
+</Tabs>
+
+This pairs naturally with the typed-error and `match`/`case` patterns from
+[Modern Typing](/modern-python/02-typing/) — a validated discriminated union is
+exactly what you want to `match` over.
+
+## Validation, coercion, and serialization
+
+### The five methods you'll actually use
+
+Pydantic v2 renamed everything onto a consistent `model_*` surface (the v1
+`.parse_obj()`/`.dict()`/`.json()` names are gone — name them once so you
+recognize them in old code, then forget them).
+
+| Method | Direction | Input/Output | zod analogue |
+|---|---|---|---|
+| `Model(**kwargs)` | in | from keyword args | `S.parse({...})` |
+| `Model.model_validate(obj)` | in | from a `dict`/object | `S.parse(obj)` |
+| `Model.model_validate_json(s)` | in | from a JSON **string** (fastest) | `S.parse(JSON.parse(s))` |
+| `m.model_dump()` | out | to a `dict` | `S.parse` round-trip |
+| `m.model_dump_json()` | out | to a JSON **string** | `JSON.stringify` |
+
+`model_validate_json` is not just `json.loads` + `model_validate` — it validates
+*while* parsing in Rust, skipping an intermediate Python `dict`. Prefer it when
+your input is bytes/str off the wire.
+
+```python
+user = User.model_validate_json('{"id": "42", "email": "a@b.com"}')
+user.id                            # 42  (int — coerced from the JSON string!)
+
+user.model_dump()                  # {'id': 42, 'email': 'a@b.com'}
+user.model_dump(exclude={"email"}) # {'id': 42}
+user.model_dump(by_alias=True)     # uses field aliases on the way out
+user.model_dump_json(indent=2)     # pretty JSON string
+```
+
+### Lax (default) vs strict coercion
+
+By default Pydantic is **lax**: it coerces sensible cross-type inputs — the
+string `"42"` becomes `int` `42`, `"true"` becomes `True`, a JSON number for a
+`Decimal` field is accepted. This is what you want at an HTTP boundary where
+everything arrives as strings. It is *not* Go's `Unmarshal`, which would reject a
+string into an `int` field.
+
+When you want zod-style "no surprises" parsing, opt into **strict** mode:
+
+```python
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
+
+class Strict(BaseModel):
+    model_config = ConfigDict(strict=True)   # whole-model strict
+    n: int                                    # now "42" (str) is REJECTED
+
+class Mixed(BaseModel):
+    n: StrictInt                              # per-field strict
+    s: str                                    # still lax
+
+# one-off strict on an otherwise-lax model:
+Mixed.model_validate({"n": 1, "s": "x"}, strict=True)
+```
+
+| Input | Lax (default) | Strict |
+|---|---|---|
+| `"42"` → `int` | `42` | error |
+| `42` → `str` | error | error |
+| `1` → `bool` | `True` | error |
+| `"2026-06-19"` → `date` | parsed | parsed (strings are the date wire format) |
+
+### `model_config = ConfigDict(...)`
+
+Model-wide behavior lives in a `model_config` class attribute. The four you'll
+reach for:
+
+```python
+from pydantic import BaseModel, ConfigDict
+
+class Account(BaseModel):
+    model_config = ConfigDict(
+        frozen=True,             # immutable + hashable (like a frozen dataclass)
+        extra="forbid",          # reject unknown keys (default is "ignore")
+        populate_by_name=True,   # accept BOTH the alias and the field name
+        str_strip_whitespace=True,
+    )
+    user_name: str
+```
+
+- `extra="forbid"` is the one most teams turn on globally — silently dropping
+  unknown fields hides typos and contract drift. zod's `.strict()` is the same
+  idea; Go's decoder needs `DisallowUnknownFields()`.
+- `frozen=True` gives you an immutable, hashable model — Python's answer to a Go
+  value struct or a frozen `@dataclass`.
+- `populate_by_name=True` lets a field with an `alias` be populated by *either*
+  name, which matters when the same model is used for both an external API and
+  internal code.
+
+## Custom validators
+
+Constraints cover the common cases; custom logic uses decorators. There are two
+axes: **field** vs **model** level, and **before** (raw input) vs **after**
+(typed value) the core validation runs.
+
+### `@field_validator`
+
+Runs for one (or several) named fields. By default it runs *after* coercion, so
+you receive the already-typed value.
+
+```python
+from pydantic import BaseModel, field_validator
+
+class Signup(BaseModel):
+    username: str
+    password: str
+
+    @field_validator("username")
+    @classmethod
+    def lowercase_username(cls, v: str) -> str:
+        return v.strip().lower()        # transform: normalize
+
+    @field_validator("password")
+    @classmethod
+    def strong_enough(cls, v: str) -> str:
+        if len(v) < 12 or v.isalpha():
+            raise ValueError("password must be 12+ chars and not all letters")
+        return v                        # validate: raise ValueError to reject
+```
+
+Raise a plain `ValueError` (or `AssertionError`) to signal a validation failure;
+Pydantic wraps it into the structured `ValidationError`. You do **not** raise
+`ValidationError` yourself.
+
+### `@model_validator(mode="before" | "after")`
+
+For cross-field rules — "end must be after start", "exactly one of A/B set" —
+validate the whole model.
+
+```python
+from pydantic import BaseModel, model_validator
+from datetime import datetime
+from typing import Any
+
+class Booking(BaseModel):
+    start: datetime
+    end: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_legacy_keys(cls, data: Any) -> Any:
+        # runs on RAW input (dict), before field validation — good for shimming
+        if isinstance(data, dict):
+            data.pop("legacy_id", None)
+        return data
+
+    @model_validator(mode="after")
+    def end_after_start(self) -> "Booking":
+        # runs on the BUILT model — fields are typed, `self` is the instance
+        if self.end <= self.start:
+            raise ValueError("end must be after start")
+        return self
+```
+
+- `mode="before"` receives raw input (usually a `dict`) and is a `classmethod` —
+  use it to reshape/clean data before validation.
+- `mode="after"` receives the fully-built, typed instance (`self`) — use it for
+  cross-field invariants. This is the closest thing to a constructor invariant.
+
+### `Annotated` validators — reusable, composable rules
+
+Decorators live on one model. To reuse a rule across many models, attach it to a
+*type* with `Annotated` and `AfterValidator` / `BeforeValidator`. This is the
+most modern, composable style — the rule travels with the type.
+
+```python
+from typing import Annotated
+from pydantic import BaseModel, AfterValidator, BeforeValidator
+
+def must_be_even(v: int) -> int:
+    if v % 2 != 0:
+        raise ValueError("must be even")
+    return v
+
+EvenInt = Annotated[int, AfterValidator(must_be_even)]
+Trimmed = Annotated[str, BeforeValidator(lambda v: v.strip() if isinstance(v, str) else v)]
+
+class Config(BaseModel):
+    workers: EvenInt          # reuse the same validated type anywhere
+    name: Trimmed
+```
+
+`Annotated[T, ...]` is the same mechanism the
+[Modern Typing](/modern-python/02-typing/) module introduces for attaching
+metadata to types — Pydantic reads that metadata. `BeforeValidator` runs on raw
+input; `AfterValidator` runs on the coerced value.
+
+### `@computed_field` — derived output
+
+A property that's included in serialization (`model_dump`) but isn't an input
+field. Useful for response models.
+
+```python
+from pydantic import BaseModel, computed_field
+
+class Rectangle(BaseModel):
+    width: float
+    height: float
+
+    @computed_field
+    @property
+    def area(self) -> float:
+        return self.width * self.height
+
+Rectangle(width=3, height=4).model_dump()  # {'width': 3.0, 'height': 4.0, 'area': 12.0}
+```
+
+## `@validate_call` — validating function arguments
+
+You can validate function arguments against their annotations too — useful for
+internal service-boundary functions without wrapping args in a model.
+
+```python
+from pydantic import validate_call, Field
+from typing import Annotated
+
+@validate_call
+def send_retry(url: str, attempts: Annotated[int, Field(ge=1, le=5)]) -> None:
+    ...
+
+send_retry("https://x", attempts=3)     # ok
+send_retry("https://x", attempts="3")   # coerced to 3 (lax)
+send_retry("https://x", attempts=9)     # ValidationError: le=5
+```
+
+Think of it as a per-call schema check. Don't sprinkle it everywhere — it adds
+overhead on every call — but it's handy on a few critical entry points.
+
+## pydantic-settings: 12-factor config, typed
+
+Reading config by hand is the same anti-pattern in every language: scattered
+`os.environ["X"]` lookups, string-typed values, missing-key bugs found in prod,
+no defaults in one place. (You'll do this *once* by hand below to feel the pain,
+then never again.)
+
+```python
+# DON'T do this as your config strategy:
+import os
+DB_URL = os.environ["DATABASE_URL"]          # KeyError at import if unset
+PORT = int(os.environ.get("PORT", "8000"))   # manual parse, manual default
+DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true")  # bespoke bool parse
+```
+
+**pydantic-settings** turns config into a validated model. A `BaseSettings`
+subclass auto-loads each field from the environment (and `.env`), coerces it to
+the declared type, applies defaults, and fails loudly at startup with one
+structured error listing everything wrong.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// Common TS pattern: zod-validated env (e.g. t3-env / envsafe / hand-rolled)
+import { z } from "zod";
+const env = z.object({
+  DATABASE_URL: z.string().url(),
+  PORT: z.coerce.number().int().default(8000),
+  DEBUG: z.coerce.boolean().default(false),
+}).parse(process.env);
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Common Go pattern: envconfig / viper struct binding
+import "github.com/kelseyhightower/envconfig"
+
+type Config struct {
+    DatabaseURL string `envconfig:"DATABASE_URL" required:"true"`
+    Port        int    `envconfig:"PORT" default:"8000"`
+    Debug       bool   `envconfig:"DEBUG" default:"false"`
+}
+var cfg Config
+envconfig.Process("", &cfg)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",            # load .env if present
+        env_prefix="APP_",          # APP_PORT -> port
+        extra="ignore",
+    )
+    database_url: str               # required: missing -> startup error
+    port: int = 8000                # default + coercion from env string
+    debug: bool = False             # "true"/"1"/"yes" -> True
+
+settings = Settings()               # reads env + .env, validates once
+```
+
+  </TabItem>
+</Tabs>
+
+It's the same idea as the zod/envconfig patterns, but it reuses everything you
+already know about Pydantic — `Field` constraints, validators, nested models —
+because `BaseSettings` *is* a `BaseModel`.
+
+### Nested settings and precedence
+
+Group related config into sub-models and bind them with a delimiter. Sources are
+merged with a clear precedence.
+
+```python
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class RedisSettings(BaseModel):
+    host: str = "localhost"
+    port: int = 6379
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_nested_delimiter="__",   # APP_REDIS__PORT -> redis.port
+        env_prefix="APP_",
+    )
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    log_level: str = "INFO"
+
+# APP_REDIS__PORT=6380 in the environment sets settings.redis.port
+```
+
+Precedence (highest first): arguments passed to `Settings(...)` → environment
+variables → `.env` file → defaults. So an explicit env var always beats `.env`,
+which always beats the default — exactly the 12-factor behavior you want.
+
+:::tip[One settings object, injected everywhere]
+Instantiate `Settings()` once at startup and pass it down (FastAPI injects it as
+a dependency — see Module 07). Avoid re-reading `os.environ` deep in your code;
+the whole point is a single typed, validated source of truth.
+:::
+
+## Performance, and when to skip Pydantic
+
+Pydantic v2's core (`pydantic-core`) is written in **Rust** — validation is
+roughly an order of magnitude faster than v1's pure-Python core, fast enough to
+sit on every request in a FastAPI app without thinking about it.
+
+But validation is never free, and not all data needs it. The rule of thumb:
+
+| Use **Pydantic** when… | Use a plain **`@dataclass`** when… |
+|---|---|
+| Data crosses a trust boundary (HTTP, config, external JSON, queues) | Data is internal and already trusted |
+| You need coercion/parsing from strings/JSON | Values are already correctly typed |
+| You want OpenAPI schema generation (FastAPI) | It's a hot-loop internal value object |
+| You need serialization (`model_dump`) | A simple struct/DTO between your own functions |
+
+In short: **Pydantic at the edges, dataclasses in the core.** Don't validate the
+same data twice as it moves through trusted internal layers — parse once at the
+boundary, then pass the typed model around.
+
+:::caution[Honest take: Pydantic everywhere is a smell]
+It's tempting to make *every* class a `BaseModel`. Resist it. Re-validating data
+your own code produced is wasted CPU and obscures where the real trust boundary
+is. The mental model that ages well: a Pydantic model is a *gate*, and you want
+few, obvious gates — not a checkpoint on every street corner.
+:::
+
+## How this powers the rest of the guide
+
+Pydantic isn't a side topic — it's load-bearing for most of what follows:
+
+- **FastAPI** ([Module 07](/modern-python/07-fastapi/)) uses your Pydantic models
+  as request bodies (auto-validated), response models (auto-serialized), and to
+  generate OpenAPI docs. The model you write here is the same one FastAPI
+  validates and documents.
+- **Config** everywhere uses `BaseSettings` — DB DSNs, Redis hosts, JWT secrets,
+  feature flags.
+- **Litestar** ([Module 08](/modern-python/08-litestar/)) speaks Pydantic too.
+- **SQLModel** ([Module 09](/modern-python/09-database-postgresql/)) is Pydantic +
+  SQLAlchemy in one class.
+
+Get comfortable here and a third of the framework material later is "you already
+know this."
+
+## Practice
+
+Build a typed settings object plus request/response models with custom
+validators and a discriminated union — then watch validation errors fire.
+
+<CardGrid>
+  <LinkCard
+    title="Validated Settings & Models"
+    href="/modern-python/04-pydantic/validated-settings/"
+    description="A uv project: BaseSettings from env/.env, models with field/model validators, a discriminated union, and uv run steps showing real ValidationErrors."
+  />
+</CardGrid>

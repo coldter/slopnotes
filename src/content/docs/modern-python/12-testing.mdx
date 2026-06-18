@@ -1,0 +1,999 @@
+---
+title: Testing
+description: pytest, fixtures, parametrization, pytest-asyncio, mocking, Hypothesis, and Testcontainers for TypeScript and Go developers moving to Python.
+sidebar:
+  order: 12
+---
+
+import { Tabs, TabItem, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Python testing in 2026 is one tool wearing many hats: **pytest** is your runner,
+your assertion library, your fixture/DI system, and your plugin host all at once.
+There is no separate matcher library to import, no `expect().toBe()` chain, no
+verbose `if got != want { t.Errorf(...) }`. You write `assert x == y` and pytest
+rewrites it so the failure tells you exactly what `x` and `y` were. Around that
+core sit four packages worth knowing cold: `pytest-asyncio` (async tests),
+`pytest-mock` (mocking), **Hypothesis** (property testing), and
+**Testcontainers** (real Postgres/Redis in tests).
+
+The stdlib ships `unittest` (the JUnit-style `class TestX(TestCase)` /
+`self.assertEqual` legacy). You'll see it in old code; ignore it for new work.
+Everything here is pytest.
+
+## The testing ecosystem at a glance
+
+| Concept | TypeScript | Go | Python |
+|---------|-----------|-----|--------|
+| Test runner | Jest / Vitest | `go test` | **pytest** |
+| Assertions | `expect(x).toBe(y)` | `if x != y { t.Errorf() }` | plain `assert x == y` |
+| Setup/teardown | `beforeEach` / `afterEach` | `TestMain`, `t.Cleanup` | **fixtures** (`@pytest.fixture`) |
+| Table tests | `test.each([...])` | `[]struct{}` + `t.Run` | `@pytest.mark.parametrize` |
+| Mocking | `jest.mock()` / `vi.fn()` | hand-rolled interfaces / testify | `unittest.mock` / `pytest-mock` |
+| Async tests | native `async () => {}` | goroutines + sync | `pytest-asyncio` |
+| Property testing | fast-check | rapid / gopter | **Hypothesis** |
+| Integration (Docker) | testcontainers-node | testcontainers-go | **testcontainers** |
+| Coverage | `--coverage` | `go test -cover` | `pytest-cov` / `coverage` |
+| HTTP-level tests | supertest | `httptest` | `httpx.AsyncClient` + `ASGITransport` |
+
+### Project setup with uv
+
+There is no separate test toolchain to install. Add the dev dependencies to your
+`uv` project and run via `uv run`:
+
+```bash
+uv add --dev pytest pytest-asyncio pytest-mock pytest-cov hypothesis testcontainers
+uv run pytest
+```
+
+Dev dependencies land in a `[dependency-groups]` table and never ship in your
+built wheel. Configure pytest in the same `pyproject.toml` you already use for
+ruff and ty — no `pytest.ini`, no `setup.cfg`:
+
+```toml title="pyproject.toml"
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.14",
+    "pytest-cov>=6.0",
+    "hypothesis>=6.122",
+    "testcontainers>=4.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"          # treat every async test as a coroutine test
+markers = [
+    "integration: needs Docker (Testcontainers)",
+    "slow: deselect with -m 'not slow'",
+]
+```
+
+:::note[uv run, not activate]
+You never `source .venv/bin/activate`. `uv run pytest` resolves the project's
+environment, syncs if needed, and runs pytest inside it — the same way `npx vitest`
+or `go test` "just works" from the project root. If you've used `pip install
+pytest` into a hand-rolled virtualenv before, `uv` replaces that entire dance.
+:::
+
+## pytest fundamentals
+
+### Test discovery
+
+pytest finds tests by **convention**, like Go's `_test.go` / `TestXxx` rule. By
+default it collects:
+
+- files matching `test_*.py` or `*_test.py`,
+- functions prefixed `test_`,
+- methods prefixed `test_` inside classes prefixed `Test` (that have no
+  `__init__`).
+
+No registration, no suite files, no decorator required to be "a test." A bare
+function named `test_something` in a `test_*.py` file is a test.
+
+```python title="tests/test_calculator.py"
+from app.calc import add, divide
+import pytest
+
+
+def test_adds_two_numbers():
+    assert add(2, 3) == 5
+
+
+def test_divide_by_zero_raises():
+    with pytest.raises(ZeroDivisionError):
+        divide(1, 0)
+```
+
+The same two tests in each ecosystem — note how much the Python version *isn't*:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import { describe, test, expect } from "vitest";
+
+describe("calculator", () => {
+  test("adds two numbers", () => {
+    expect(add(2, 3)).toBe(5);
+  });
+
+  test("throws on divide by zero", () => {
+    expect(() => divide(1, 0)).toThrow();
+  });
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func TestAdd(t *testing.T) {
+    if got := Add(2, 3); got != 5 {
+        t.Errorf("Add(2, 3) = %d; want 5", got)
+    }
+}
+
+func TestDivideByZero(t *testing.T) {
+    if _, err := Divide(1, 0); err == nil {
+        t.Fatal("expected error for divide by zero")
+    }
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+def test_adds_two_numbers():
+    assert add(2, 3) == 5
+
+
+def test_divide_by_zero_raises():
+    with pytest.raises(ZeroDivisionError):
+        divide(1, 0)
+```
+
+  </TabItem>
+</Tabs>
+
+### Plain assert, rich introspection
+
+This is the part that surprises people coming from Jest or testify. You do not
+import a matcher library. You write Python's built-in `assert`, and pytest
+**rewrites the assertion's bytecode** at import time so a failure shows the
+operands, not just "assertion failed."
+
+```python
+def test_introspection():
+    actual = {"name": "alice", "roles": ["user"]}
+    expected = {"name": "alice", "roles": ["user", "admin"]}
+    assert actual == expected
+```
+
+The failure output diffs the two dicts for you:
+
+```text
+E       AssertionError: assert {'name': 'alice', 'roles': ['user']} == {'name': 'alice', 'roles': ['user', 'admin']}
+E         Common items:
+E         {'name': 'alice'}
+E         Differing items:
+E         {'roles': ['user']} != {'roles': ['user', 'admin']}
+```
+
+So the Jest matcher vocabulary collapses into plain Python operators:
+
+| Jest / Vitest | testify (Go) | pytest |
+|---------------|-------------|--------|
+| `expect(x).toBe(y)` | `assert.Equal(t, y, x)` | `assert x == y` |
+| `expect(x).toEqual(obj)` | `assert.Equal(t, obj, x)` | `assert x == obj` |
+| `expect(arr).toContain(v)` | `assert.Contains(t, arr, v)` | `assert v in arr` |
+| `expect(x).toBeNull()` | `assert.Nil(t, x)` | `assert x is None` |
+| `expect(fn).toThrow()` | — | `with pytest.raises(E):` |
+| `expect(x).toBeCloseTo(y)` | `assert.InDelta(...)` | `assert x == pytest.approx(y)` |
+
+`pytest.raises` doubles as an inspector — bind it to assert on the exception:
+
+```python
+def test_validation_message():
+    with pytest.raises(ValueError, match="must be positive") as exc_info:
+        set_quantity(-1)
+    assert exc_info.value.args[0].startswith("quantity")
+```
+
+The `match=` argument is a **regex searched** against `str(exception)` — handy
+for pinning down *which* error fired without an exact-string compare.
+
+### Selecting tests: -k, markers, node IDs
+
+You rarely run the whole suite while iterating. Three ways to narrow:
+
+```bash
+uv run pytest tests/test_tasks.py            # one file
+uv run pytest tests/test_tasks.py::test_create  # one test (node ID)
+uv run pytest -k "create and not slow"       # keyword expression over names
+uv run pytest -m integration                 # only tests with @pytest.mark.integration
+uv run pytest -m "not integration"           # everything except them
+```
+
+`-k` matches substrings of test names/paths with `and`/`or`/`not` — the rough
+equivalent of `go test -run` (regex) or Vitest's `-t`. **Markers** are labels you
+attach with `@pytest.mark.<name>`; declare them in `pyproject.toml` (we set
+`--strict-markers` above so a typo'd marker is an error, not a silent no-op):
+
+```python
+@pytest.mark.slow
+def test_full_reindex():
+    ...
+
+
+@pytest.mark.integration
+def test_against_real_postgres():
+    ...
+```
+
+A handful are built in: `@pytest.mark.skip`, `@pytest.mark.skipif(condition,
+reason=...)`, and `@pytest.mark.xfail` (expected to fail — passes the suite if it
+does, flags an unexpected pass).
+
+### conftest.py: shared fixtures & config
+
+`conftest.py` is pytest's magic file: any fixtures or hooks defined there are
+**auto-discovered** by every test in that directory and below — no import needed.
+It's the closest thing to Go's `TestMain` plus a shared `testutil` package, except
+it composes by directory tree.
+
+<FileTree>
+- tests/
+  - conftest.py shared fixtures (db, client, sample data)
+  - unit/
+    - test_service.py
+  - integration/
+    - conftest.py extra fixtures only integration tests see
+    - test_api.py
+</FileTree>
+
+A fixture defined in the top `conftest.py` is visible everywhere; one in
+`integration/conftest.py` is visible only to tests under `integration/`. This
+scoping-by-folder is how big suites stay organized.
+
+## Fixtures: dependency injection for tests
+
+Fixtures are pytest's headline feature and the biggest mental shift from
+`beforeEach`. Instead of imperative setup hooks that mutate shared state, a
+fixture is a **function that produces a value**, and a test **requests it by
+naming it as a parameter**. pytest sees the parameter name, runs the matching
+fixture, and injects the result. It's constructor injection for tests.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+describe("UserService", () => {
+  let db: Database;
+  beforeEach(async () => { db = await connectDb(); });
+  afterEach(async () => { await db.close(); });
+
+  test("creates user", async () => {
+    const svc = new UserService(db);
+    expect(await svc.create("alice")).toBeDefined();
+  });
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func TestMain(m *testing.M) {
+    db = connectDb()           // shared package var
+    code := m.Run()
+    db.Close()
+    os.Exit(code)
+}
+
+func TestCreateUser(t *testing.T) {
+    svc := NewUserService(db)
+    // ...
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+import pytest
+
+
+@pytest.fixture
+def db():
+    conn = connect_db()
+    yield conn          # everything before yield is setup
+    conn.close()        # everything after is teardown
+
+
+def test_creates_user(db):           # "db" param -> inject the fixture
+    svc = UserService(db)
+    assert svc.create("alice") is not None
+```
+
+  </TabItem>
+</Tabs>
+
+The mental model: **the parameter list is your `beforeEach`.** A test that needs a
+database asks for `db`; a test that doesn't, never pays for it. Fixtures can depend
+on other fixtures the same way (request them as parameters), so pytest builds a
+dependency graph and runs each only as needed — far closer to a DI container than
+to Jest's flat hooks.
+
+### Yield fixtures: setup and teardown in one place
+
+A fixture that `yield`s splits into setup (before) and teardown (after). The
+teardown runs even if the test fails — pytest's answer to `t.Cleanup` / `afterEach`,
+but co-located so you read the lifecycle top to bottom:
+
+```python
+@pytest.fixture
+def temp_table(db):
+    db.execute("CREATE TABLE t (id INT)")
+    yield "t"
+    db.execute("DROP TABLE t")     # always runs, even on test failure
+```
+
+### Scopes: function, module, session
+
+By default a fixture is recreated for **every test** (`function` scope). Widen the
+scope to share an expensive resource. This is where pytest beats `beforeEach`
+ergonomically — you control reuse per fixture, not per describe block.
+
+| Scope | Created once per | Use for |
+|-------|------------------|---------|
+| `function` (default) | each test function | cheap, mutable, per-test state |
+| `class` | each test class | shared within a `Test*` class |
+| `module` | each test file | a fixture file's worth of tests share it |
+| `package` | each package/dir | dir-wide setup |
+| `session` | the whole `pytest` run | a Docker container, a connection pool |
+
+```python
+@pytest.fixture(scope="session")
+def postgres_container():
+    with PostgresContainer("postgres:17") as pg:
+        yield pg              # one container for the entire test run
+
+
+@pytest.fixture(scope="function")
+def db_session(postgres_container):
+    # fresh, rolled-back session per test, built on the shared container
+    ...
+```
+
+A narrow fixture (`function`) can depend on a wide one (`session`); the reverse is
+an error. Typical pattern: a **session**-scoped container, a **function**-scoped
+transaction that rolls back after each test so tests stay isolated without paying
+to restart Postgres.
+
+### tmp_path, monkeypatch, capsys: the built-in fixtures
+
+pytest ships fixtures you never define — just request them:
+
+```python
+def test_writes_config(tmp_path):
+    # tmp_path is a unique pathlib.Path per test, auto-cleaned
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("debug = true")
+    assert load_config(cfg).debug is True
+
+
+def test_reads_env(monkeypatch):
+    # monkeypatch undoes itself after the test — no leaked global state
+    monkeypatch.setenv("API_KEY", "test-key")
+    monkeypatch.setattr("app.clock.now", lambda: FIXED_TIME)
+    assert get_api_key() == "test-key"
+
+
+def test_prints_banner(capsys):
+    print_banner()
+    captured = capsys.readouterr()
+    assert "Welcome" in captured.out
+```
+
+`monkeypatch` is the safe way to patch env vars, attributes, and dict items: every
+change is reverted at test end, so one test can't poison the next. (For replacing
+*objects* with fakes, prefer `mocker` — covered below.) `tmp_path` is your
+`t.TempDir()`. `capsys` captures stdout/stderr.
+
+### autouse: the implicit beforeEach
+
+An `autouse=True` fixture runs for every test in scope **without being requested**
+— the closest literal translation of `beforeEach`. Use sparingly (implicit setup
+is harder to trace), but it's perfect for resetting global state:
+
+```python
+@pytest.fixture(autouse=True)
+def reset_cache():
+    cache.clear()
+    yield
+    cache.clear()
+```
+
+## Parametrization: table-driven tests
+
+`@pytest.mark.parametrize` is the direct analog of Go's `[]struct{}` table tests
+and Jest's `test.each`. One test body, many input rows, **each row reported as a
+separate test** (so a failure points at the exact case):
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+test.each([
+  [1, 1, 2],
+  [2, 3, 5],
+  [0, 0, 0],
+  [-1, 1, 0],
+])("add(%i, %i) === %i", (a, b, expected) => {
+  expect(add(a, b)).toBe(expected);
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+func TestAdd(t *testing.T) {
+    cases := []struct {
+        name          string
+        a, b, want    int
+    }{
+        {"ones", 1, 1, 2},
+        {"mixed", 2, 3, 5},
+        {"zeros", 0, 0, 0},
+        {"negative", -1, 1, 0},
+    }
+    for _, tc := range cases {
+        t.Run(tc.name, func(t *testing.T) {
+            if got := Add(tc.a, tc.b); got != tc.want {
+                t.Errorf("Add(%d,%d)=%d want %d", tc.a, tc.b, got, tc.want)
+            }
+        })
+    }
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+import pytest
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "expected"),
+    [
+        (1, 1, 2),
+        (2, 3, 5),
+        (0, 0, 0),
+        (-1, 1, 0),
+    ],
+)
+def test_add(a, b, expected):
+    assert add(a, b) == expected
+```
+
+  </TabItem>
+</Tabs>
+
+That generates four tests: `test_add[1-1-2]`, `test_add[2-3-5]`, and so on. Give
+rows readable IDs with `pytest.param(..., id="...")` — the equivalent of Go's
+`tc.name`:
+
+```python
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("Hello World", "hello-world", id="simple"),
+        pytest.param("  spaced  out  ", "spaced-out", id="extra-spaces"),
+        pytest.param("Café!", "cafe", id="strips-accents-and-punct"),
+        pytest.param("already-a-slug", "already-a-slug", id="idempotent"),
+    ],
+)
+def test_slugify(raw, expected):
+    assert slugify(raw) == expected
+```
+
+Stack multiple `parametrize` decorators to get the **cross product** of inputs (12
+tests from a 3×4 grid) — something Go table tests make you nest loops for:
+
+```python
+@pytest.mark.parametrize("role", ["user", "admin", "guest"])
+@pytest.mark.parametrize("method", ["GET", "POST", "PUT", "DELETE"])
+def test_authz_matrix(role, method):
+    ...   # runs 3 * 4 = 12 times
+```
+
+You can also parametrize a **fixture** itself (`@pytest.fixture(params=[...])`),
+which reruns every test that uses it once per param — useful for "run the whole
+suite against sqlite and Postgres."
+
+## Async testing with pytest-asyncio
+
+Async functions don't run themselves — something has to drive the event loop. In
+TS the runner awaits your `async` test natively; in Go you just block on
+goroutines. In Python, `pytest-asyncio` provides the bridge.
+
+Set `asyncio_mode = "auto"` (we did, in `pyproject.toml`) and **every** `async def
+test_*` is collected and awaited automatically — no decorator needed. The
+alternative is `strict` mode, where you tag each with `@pytest.mark.asyncio`:
+
+```python
+# asyncio_mode = "auto"  ->  no marker needed
+async def test_fetches_user():
+    user = await repo.get(user_id=1)
+    assert user.name == "alice"
+
+
+# strict mode  ->  explicit marker per test
+@pytest.mark.asyncio
+async def test_fetches_user_strict():
+    ...
+```
+
+Async fixtures work the same — `async def` plus `yield`:
+
+```python
+import pytest_asyncio
+
+
+@pytest_asyncio.fixture
+async def db_pool():
+    pool = await asyncpg.create_pool(DSN)
+    yield pool
+    await pool.close()
+```
+
+### Testing a FastAPI app with httpx AsyncClient
+
+This is the Python equivalent of supertest (TS) or `httptest` (Go): drive the app
+**in-process**, no real socket, no `uvicorn` running. Point an
+`httpx.AsyncClient` at an `ASGITransport` wrapping your FastAPI app and the
+requests flow straight through the ASGI stack:
+
+```python title="tests/test_api.py"
+import httpx
+from httpx import ASGITransport
+from app.main import app
+
+
+async def test_create_and_get_task():
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        # create
+        resp = await client.post("/tasks", json={"title": "write tests"})
+        assert resp.status_code == 201
+        task_id = resp.json()["id"]
+
+        # read it back
+        resp = await client.get(f"/tasks/{task_id}")
+        assert resp.status_code == 200
+        assert resp.json()["title"] == "write tests"
+```
+
+:::tip[ASGITransport vs TestClient]
+FastAPI also ships a synchronous `TestClient` (Starlette's, built on httpx). Use it
+for quick sync tests. But once your endpoints, DB calls, and tests are all async,
+the `AsyncClient` + `ASGITransport` combo keeps everything on one event loop and
+lets you `await` your real async dependencies — no thread-bridging surprises. This
+ties directly into the FastAPI app you built in
+[module 07](/modern-python/07-fastapi/).
+:::
+
+Wrap the client in a fixture so every test gets one cheaply:
+
+```python title="tests/conftest.py"
+import pytest_asyncio
+import httpx
+from httpx import ASGITransport
+from app.main import app
+
+
+@pytest_asyncio.fixture
+async def client():
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as c:
+        yield c
+```
+
+```python
+async def test_list_is_empty(client):     # request the fixture
+    resp = await client.get("/tasks")
+    assert resp.json() == []
+```
+
+## Mocking: do less of it than you think
+
+Python mocking lives in the stdlib (`unittest.mock`) but you'll almost always reach
+for it through **pytest-mock**, which exposes a `mocker` fixture that auto-undoes
+every patch at test end — no `with` nesting, no manual `.stop()`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import { vi } from "vitest";
+
+test("sends email on signup", () => {
+  const send = vi.fn().mockResolvedValue(true);
+  const svc = new SignupService({ sendEmail: send });
+  svc.signup("alice@test.com");
+  expect(send).toHaveBeenCalledWith("alice@test.com");
+});
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// Hand-rolled fake satisfying the interface.
+type fakeMailer struct{ sent []string }
+
+func (f *fakeMailer) Send(to string) error {
+    f.sent = append(f.sent, to)
+    return nil
+}
+
+func TestSignup(t *testing.T) {
+    m := &fakeMailer{}
+    svc := NewSignupService(m)
+    svc.Signup("alice@test.com")
+    assert.Equal(t, []string{"alice@test.com"}, m.sent)
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+def test_sends_email_on_signup(mocker):
+    send = mocker.patch("app.signup.send_email", return_value=True)
+    signup("alice@test.com")
+    send.assert_called_once_with("alice@test.com")
+```
+
+  </TabItem>
+</Tabs>
+
+The single most important rule: **patch where the name is looked up, not where it's
+defined.** If `app/signup.py` does `from app.mail import send_email`, you patch
+`"app.signup.send_email"` — the name in the module that *uses* it — not
+`"app.mail.send_email"`. This trips up everyone once.
+
+### AsyncMock and patching async deps
+
+`mocker.patch` auto-detects async targets and returns an `AsyncMock`, whose return
+value is awaitable. You can force it explicitly:
+
+```python
+async def test_service_uses_repo(mocker):
+    fake_repo = mocker.patch("app.service.repo", autospec=True)
+    fake_repo.get = mocker.AsyncMock(return_value=Task(id=1, title="x"))
+
+    result = await service.get_task(1)
+
+    assert result.title == "x"
+    fake_repo.get.assert_awaited_once_with(1)
+```
+
+`autospec=True` makes the mock match the real object's signature, so a call with
+the wrong arguments fails the test instead of silently passing — the closest you
+get to Go's compile-time interface check.
+
+### When NOT to mock
+
+Here's the honest take. Mocking a dependency means your test no longer verifies how
+your code talks to the **real** thing — it verifies how it talks to your
+*assumptions* about the real thing. Mock a Postgres client and your test passes
+even if your SQL is malformed; mock Redis and you never catch a serialization bug.
+
+| Mock it | Use the real thing (Testcontainers) |
+|---------|-------------------------------------|
+| Third-party HTTP APIs (Stripe, SendGrid) | Your own Postgres / Redis / Kafka |
+| Slow/flaky external services | Anything where the integration *is* the logic |
+| Clock, randomness, UUIDs | ORM queries, migrations, transactions |
+| Code paths you can't trigger otherwise | Cache hit/miss behavior |
+
+Rule of thumb: **mock what you don't own and can't run; spin up what you do.** With
+Testcontainers making a real Postgres a 2-second `with` block (below), the old
+excuse — "a real DB is too slow/awkward for tests" — is gone.
+
+## Property-based testing with Hypothesis
+
+Example tests check the inputs you thought of. **Property tests** check the ones you
+didn't: you describe the *shape* of valid inputs with a **strategy**, declare a
+property that must hold for all of them, and Hypothesis throws hundreds of generated
+cases at it. If `fast-check` (TS) rings a bell, this is its Python cousin — and
+arguably the most mature property-testing library in any ecosystem.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+import fc from "fast-check";
+
+test("reverse of reverse is identity", () => {
+  fc.assert(
+    fc.property(fc.array(fc.integer()), (xs) => {
+      expect([...xs].reverse().reverse()).toEqual(xs);
+    }),
+  );
+});
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+from hypothesis import given, strategies as st
+
+
+@given(st.lists(st.integers()))
+def test_reverse_of_reverse_is_identity(xs):
+    assert list(reversed(list(reversed(xs)))) == xs
+```
+
+  </TabItem>
+</Tabs>
+
+`@given` feeds generated values as arguments; `strategies` (`st`) is the generator
+vocabulary — `st.integers()`, `st.text()`, `st.lists(...)`, `st.builds(MyModel,
+...)`, `st.from_type(SomeType)`. The headline feature is **shrinking**: when a
+property fails, Hypothesis doesn't hand you the 400-character string that broke it —
+it repeatedly simplifies the input and re-runs until it finds the *minimal* failing
+case, then reports that. The minimal example is usually the bug stated plainly.
+
+A real property worth writing — a round-trip. If you serialize then deserialize,
+you should get back what you started with:
+
+```python
+from hypothesis import given, strategies as st
+from app.models import Task
+
+
+@given(
+    st.builds(
+        Task,
+        id=st.integers(min_value=1),
+        title=st.text(min_size=1, max_size=200),
+        done=st.booleans(),
+    )
+)
+def test_task_json_roundtrip(task: Task):
+    # Pydantic: dump to JSON, parse back -> must be equal
+    restored = Task.model_validate_json(task.model_dump_json())
+    assert restored == task
+```
+
+Two more tools you'll reach for:
+
+- **`assume(predicate)`** discards a generated input that doesn't meet a
+  precondition (without failing), so you don't waste the run on degenerate cases:
+
+  ```python
+  from hypothesis import given, assume, strategies as st
+
+  @given(st.integers(), st.integers())
+  def test_division(a, b):
+      assume(b != 0)          # skip b == 0 rather than dividing by zero
+      assert (a // b) * b + (a % b) == a
+  ```
+
+- **Stateful testing** (`RuleBasedStateMachine`) generates whole *sequences* of
+  operations against a system and checks invariants after each — like fast-check's
+  model-based testing. Point it at an in-memory cache or a repo and it'll find the
+  ordering of `put`/`evict`/`get` that breaks your invariant:
+
+  ```python
+  from hypothesis.stateful import RuleBasedStateMachine, rule, invariant
+
+  class CacheMachine(RuleBasedStateMachine):
+      def __init__(self):
+          super().__init__()
+          self.cache = LRUCache(capacity=3)
+          self.model: dict[str, int] = {}
+
+      @rule(k=st.text(max_size=2), v=st.integers())
+      def put(self, k, v):
+          self.cache.put(k, v)
+          self.model[k] = v
+
+      @invariant()
+      def never_exceeds_capacity(self):
+          assert len(self.cache) <= 3
+  ```
+
+:::caution[Property tests are slower — budget for it]
+Each property runs many examples (100 by default), and shrinking on a failure adds
+more. Keep them in your normal suite, but don't put network or DB calls inside a
+`@given` body — that's hundreds of round-trips. Property-test pure logic
+(parsers, serializers, domain invariants); integration-test the wiring separately.
+:::
+
+## Testcontainers: real dependencies, disposable
+
+Testcontainers spins up a real service in a Docker container, scoped to your test
+run, and tears it down after. No `docker compose up` ceremony, no "is the DB
+ready?" polling — the library waits for readiness and hands you the connection
+details. It's the same project you may know as `testcontainers-go` /
+`testcontainers-node`.
+
+For comparison, the Go shape you've likely seen:
+
+```go
+pg, err := postgres.Run(ctx, "postgres:17",
+    postgres.WithDatabase("app"),
+    testcontainers.WithWaitStrategy(wait.ForListeningPort("5432/tcp")),
+)
+dsn, _ := pg.ConnectionString(ctx)
+```
+
+The Python version is a context manager — the `with` block *is* the lifecycle:
+
+```python
+import pytest
+from testcontainers.postgres import PostgresContainer
+
+
+@pytest.fixture(scope="session")
+def postgres_url():
+    with PostgresContainer("postgres:17") as pg:
+        # the container is up and ready here; tears down on block exit
+        yield pg.get_connection_url()   # postgresql+psycopg2://test:test@.../test
+
+
+@pytest.mark.integration
+def test_real_query(postgres_url):
+    # convert to the asyncpg DSN your app uses, run a real query...
+    ...
+```
+
+A `session`-scoped container starts **once** for the whole run; pair it with a
+`function`-scoped transaction-rollback fixture so each test sees a clean database
+without restarting Postgres. Redis, Kafka, and generic containers follow the same
+pattern (`RedisContainer`, `KafkaContainer`). This is the testing payoff of
+[module 09](/modern-python/09-database-postgresql/) and
+[module 10](/modern-python/10-redis-caching/): you test against the actual engines
+those modules target, not stand-ins.
+
+:::caution[Honest take: Testcontainers needs Docker, and it's not free]
+Containers add seconds to your suite and require a Docker daemon (locally and in
+CI). The discipline that keeps it sane: **mark them** (`@pytest.mark.integration`)
+and **scope the container to the session**. Your inner-loop run is `uv run pytest -m
+"not integration"` — pure-Python, sub-second. The full suite (`uv run pytest`)
+runs the integration layer before merge and in CI. You get real-database
+confidence without paying for it on every save.
+:::
+
+## Coverage
+
+`pytest-cov` wraps `coverage.py` and plugs `--cov` into pytest directly:
+
+```bash
+uv run pytest --cov=app --cov-report=term-missing
+uv run pytest --cov=app --cov-report=html      # htmlcov/index.html
+```
+
+`term-missing` lists the uncovered line numbers per file — the equivalent of `go
+test -cover` plus `go tool cover -html`, or Jest's `--coverage`. Enforce a floor so
+coverage can't silently rot, and fail CI below it:
+
+```toml title="pyproject.toml"
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+
+[tool.coverage.run]
+branch = true                  # measure branch coverage, not just lines
+omit = ["*/migrations/*", "*/__main__.py"]
+```
+
+```bash
+uv run pytest --cov=app        # exits non-zero if below fail_under
+```
+
+:::note[Coverage is a floor, not a target]
+85% line coverage means 15% of your code has *zero* tests — that's the number worth
+acting on. Chasing 100% rewards testing trivial getters and punishes you for a
+hard-to-reach error branch. Use `--cov-report=term-missing` to find untested
+*logic*, not to grind a vanity metric.
+:::
+
+## Test layout, speed, and the pyramid
+
+A conventional service layout separates fast unit tests from Docker-backed
+integration tests by directory, mirroring the marker split:
+
+<FileTree>
+- pyproject.toml pytest + coverage + markers config
+- src/
+  - app/
+    - main.py
+    - service.py
+    - repository.py
+- tests/
+  - conftest.py shared fixtures
+  - unit/ fast, no I/O — pure logic
+    - test_service.py
+  - integration/ Testcontainers, real Postgres
+    - conftest.py db/container fixtures
+    - test_repository.py
+    - test_api.py
+</FileTree>
+
+The **testing pyramid** for a Python service, costed by speed:
+
+| Layer | What | Speed | How many |
+|-------|------|-------|----------|
+| Unit | service/domain logic, mocked or pure | µs–ms | most |
+| Integration | repo + real DB (Testcontainers), API via `AsyncClient` | 10s–100s ms | some |
+| Property | invariants of pure functions (Hypothesis) | ms each, many cases | targeted |
+| E2E | full stack over real HTTP | seconds | a handful |
+
+Push assertions down to the cheap unit layer; reserve container-backed integration
+tests for the seams where the integration *is* the logic (SQL, serialization,
+transactions). Run `uv run pytest -m "not integration"` constantly while coding;
+run the full suite before you merge.
+
+### Fixtures vs factories
+
+Fixtures answer "what's set up." For test *data*, fixtures get repetitive fast —
+you don't want a fixture per object shape. Use a **factory function** with defaults
+(the Python equivalent of the Kotlin/Go test-data builder) so each test overrides
+only what it cares about:
+
+```python
+def make_task(**overrides) -> Task:
+    return Task(**{"id": 1, "title": "test task", "done": False, **overrides})
+
+
+def test_completed_filter():
+    tasks = [make_task(id=1, done=True), make_task(id=2, done=False)]
+    assert [t.id for t in completed(tasks)] == [1]
+```
+
+For larger projects, **factory-boy** (Django/SQLAlchemy-aware) generates model
+instances with sequences, sub-factories, and faker-backed fields — the Python
+analog of fishery (TS) or a Go fixtures package. Reach for it once hand-rolled
+`make_*` helpers start duplicating logic.
+
+## Summary
+
+| Concept | TypeScript | Go | Python |
+|---------|-----------|-----|--------|
+| Runner | Jest / Vitest | `go test` | `pytest` |
+| Assertions | `expect().toBe()` | `if/t.Error` | plain `assert` (rewritten) |
+| Setup/teardown | `beforeEach` / `afterEach` | `TestMain` / `t.Cleanup` | fixtures + `yield` |
+| Table tests | `test.each` | `[]struct{}` + `t.Run` | `@pytest.mark.parametrize` |
+| Mocking | `vi.fn()` / `vi.mock()` | hand-rolled / testify | `mocker` / `AsyncMock` |
+| Async tests | native | goroutines | `pytest-asyncio` |
+| HTTP tests | supertest | `httptest` | `AsyncClient` + `ASGITransport` |
+| Property testing | fast-check | rapid | Hypothesis (`@given`) |
+| Docker deps | testcontainers-node | testcontainers-go | testcontainers |
+| Coverage | `--coverage` | `go test -cover` | `pytest-cov` / `coverage` |
+
+## Practice
+
+Put the whole stack to work on the FastAPI Task API from module 07: unit tests of
+the logic, parametrized cases, async API tests, one Hypothesis property, and one
+Testcontainers-backed Postgres integration test.
+
+<CardGrid>
+  <LinkCard
+    title="Testing a Service"
+    href="/modern-python/12-testing/api-testing/"
+    description="Build a layered pytest suite for the FastAPI Task API: unit + parametrized tests, async httpx AsyncClient tests, a Hypothesis property, and a Testcontainers Postgres integration test."
+  />
+</CardGrid>

@@ -1,0 +1,748 @@
+---
+title: PostgreSQL Access
+description: Async Postgres in modern Python — raw asyncpg, SQLAlchemy 2.0 Core and ORM, SQLModel, Alembic migrations, and FastAPI integration, mapped from Go and TypeScript.
+sidebar:
+  order: 9
+---
+
+import { Tabs, TabItem, Steps, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Everything you know about database access from TypeScript (`pg`/`postgres.js`, Drizzle, Prisma) and Go (`database/sql` + `pgx`, sqlc, GORM) has a Python counterpart. The big shift for the 2026 Python stack: **it is async-first**. You talk to Postgres over a non-blocking driver inside an event loop, the same way you do in Node, not with the blocking `psycopg2`-and-a-thread-pool model older Python tutorials assume.
+
+This module covers the **same tiny domain — a `tasks` table — four ways**, from the lowest-level driver up to the highest-level model, so you can feel the trade-offs and pick deliberately:
+
+1. **Raw asyncpg** — a connection pool and parametrized queries. Fastest, lowest-level. The peer of Go's `pgx` and Node's `postgres.js`.
+2. **SQLAlchemy 2.0 Core** — a typed SQL expression language (`select()`, `insert()`) over an async engine. The peer of Knex/Kysely or Go's `squirrel`.
+3. **SQLAlchemy 2.0 ORM (async)** — `Mapped[...]` models, `AsyncSession`, relationships, identity map. The peer of TypeORM/Prisma or GORM.
+4. **SQLModel** — Pydantic v2 and SQLAlchemy fused into one model class. Optimized for FastAPI CRUD.
+
+:::note[Shared infrastructure]
+Start Postgres 17 from the guide's shared stack first:
+
+```bash
+cd shared-infra
+docker compose up -d postgres
+# Postgres 17 on localhost:5432 — user dev, password dev, db app
+```
+
+DSN convention used everywhere in this module:
+
+- SQLAlchemy / SQLModel async: `postgresql+asyncpg://dev:dev@localhost:5432/app`
+- Raw asyncpg: `postgresql://dev:dev@localhost:5432/app`
+
+See the [Dev Environment module](/modern-python/01-dev-environment/) for the full infra walkthrough.
+:::
+
+## The Python database landscape
+
+### Mapping from what you know
+
+| Your background | Closest Python equivalent | Style |
+|---|---|---|
+| `pgx` / `database/sql` (Go) | **asyncpg** | Raw async SQL, manual mapping |
+| `pg` / `postgres.js` (TS) | **asyncpg** | Raw async SQL, connection pool |
+| `sqlc` (Go) | (no exact peer) — closest is **SQLAlchemy Core** + typed rows | Typed queries |
+| Knex / Kysely (TS) | **SQLAlchemy 2.0 Core** | Type-checked query builder |
+| `squirrel` (Go) | **SQLAlchemy 2.0 Core** | Expression-language builder |
+| GORM (Go) | **SQLAlchemy 2.0 ORM** | Full ORM, identity map |
+| TypeORM / Prisma (TS) | **SQLAlchemy 2.0 ORM** or **SQLModel** | ORM with model classes |
+| Drizzle (TS) | **SQLAlchemy 2.0 Core** (closest typed builder) | Schema-as-code, typed |
+| golang-migrate / Prisma Migrate | **Alembic** | Versioned migrations |
+
+### The four approaches at a glance
+
+The four sit on a spectrum from raw driver control on the left to model-level convenience on the right:
+
+```text
+ asyncpg          SQLAlchemy Core      SQLAlchemy ORM        SQLModel
+ ───────────►     ───────────────►     ──────────────►       ────────────►
+ raw async SQL    typed expression     Mapped[] models       Pydantic + ORM
+ manual mapping   language, no ORM     identity map, units   one class, FastAPI
+ lowest level     full SQL control     of work, relations    -native CRUD
+ fastest          no entity overhead   rich domain logic     least boilerplate
+```
+
+| | asyncpg | SQLAlchemy Core | SQLAlchemy ORM | SQLModel |
+|---|---|---|---|---|
+| Level | Driver | Query builder | ORM | ORM + validation |
+| Returns | `Record` (dict-like) | `Row` tuples | mapped objects | mapped objects (Pydantic) |
+| Type safety | manual | typed columns | `Mapped[T]` | `Mapped[T]` + Pydantic |
+| Identity map / dirty tracking | No | No | Yes | Yes |
+| Relationships | manual joins | manual joins | `relationship()` + eager loading | `Relationship()` |
+| Best for | hot paths, bulk, full SQL | reporting, dynamic SQL | rich domains | FastAPI CRUD |
+
+:::tip[They are layers, not rivals]
+asyncpg is the *driver* the other three ultimately use. SQLAlchemy Core is the SQL
+engine the ORM is built on. SQLModel is a thin layer over the SQLAlchemy ORM. You can
+mix them in one app over the same pool — ORM for rich domain writes, Core or raw
+asyncpg for a gnarly reporting query — which is exactly what production codebases do.
+:::
+
+## Async, not blocking: the mental model
+
+The one thing to internalize coming from Node: in 2026 Python you use a **non-blocking driver inside the asyncio event loop**, just like `pg` in Node. Every query is awaited; nothing blocks the loop. If you've seen blocking `psycopg2` in old tutorials, that's the legacy path — we don't use it here.
+
+Coming from Go, the difference is that there is no implicit parallelism: one event loop, one thread (see the [Async module](/modern-python/05-async-concurrency/)). A connection pool hands out connections to coroutines, and you must not hand the *same* connection or ORM session to two coroutines running concurrently — more on that in the gotchas.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// postgres.js — pooled, parametrized, async
+import postgres from "postgres";
+
+const sql = postgres("postgres://dev:dev@localhost:5432/app");
+
+const rows = await sql`
+  SELECT id, title, done FROM tasks WHERE done = ${false}
+`;
+for (const row of rows) console.log(row.id, row.title);
+
+await sql.end();
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// pgx pool — parametrized, context-aware
+ctx := context.Background()
+pool, err := pgxpool.New(ctx, "postgres://dev:dev@localhost:5432/app")
+if err != nil {
+    log.Fatal(err)
+}
+defer pool.Close()
+
+rows, err := pool.Query(ctx,
+    "SELECT id, title, done FROM tasks WHERE done = $1", false)
+if err != nil {
+    log.Fatal(err)
+}
+defer rows.Close()
+for rows.Next() {
+    var id int64
+    var title string
+    var done bool
+    rows.Scan(&id, &title, &done)
+    fmt.Println(id, title)
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# asyncpg — pooled, parametrized, async
+import asyncio
+import asyncpg
+
+async def main() -> None:
+    pool = await asyncpg.create_pool("postgresql://dev:dev@localhost:5432/app")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, title, done FROM tasks WHERE done = $1", False
+        )
+        for row in rows:
+            print(row["id"], row["title"])
+    await pool.close()
+
+asyncio.run(main())
+```
+
+  </TabItem>
+</Tabs>
+
+Note that asyncpg, like pgx and Postgres itself, uses native `$1`, `$2` placeholders — not the `?` of JDBC or sqlite. SQLAlchemy abstracts placeholders away entirely.
+
+## 1. Raw asyncpg
+
+[asyncpg](https://github.com/MagicStack/asyncpg) is a from-scratch async Postgres driver — it does not implement DB-API, it speaks the Postgres binary protocol directly, and it is one of the fastest Postgres drivers in any language. It is the Python peer of Go's `pgx` and Node's `postgres.js`: a pool, parametrized queries, and rows you map yourself.
+
+### Connection pool
+
+You create one pool at startup and share it for the whole process — never open a connection per request.
+
+```python title="app/db_asyncpg.py"
+import asyncpg
+
+# Create once, at startup. Reused for the whole process.
+pool = await asyncpg.create_pool(
+    "postgresql://dev:dev@localhost:5432/app",
+    min_size=5,        # connections kept warm
+    max_size=20,       # ceiling under load
+    max_inactive_connection_lifetime=300.0,  # recycle idle conns after 5 min
+    command_timeout=30.0,
+)
+```
+
+| Concern | Go (`pgxpool`) | TS (`postgres.js`) | Python (asyncpg) |
+|---|---|---|---|
+| Create pool | `pgxpool.New` | `postgres(url, { max })` | `asyncpg.create_pool` |
+| Max connections | `pool_max_conns` in URL | `max` | `max_size` |
+| Min / warm | `pool_min_conns` | `idle_timeout` (inverse) | `min_size` |
+| Acquire | `pool.Acquire(ctx)` | implicit per query | `pool.acquire()` |
+| Query timeout | `context.WithTimeout` | `{ timeout }` | `command_timeout` |
+
+### The query methods
+
+asyncpg gives you four read shapes, all parametrized with `$n`:
+
+```python
+async with pool.acquire() as conn:
+    # All matching rows -> list[Record]
+    rows = await conn.fetch("SELECT * FROM tasks WHERE done = $1", False)
+
+    # Single row or None
+    row = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", 1)
+
+    # Single scalar value (first column of first row)
+    count = await conn.fetchval("SELECT count(*) FROM tasks")
+
+    # No result set (INSERT/UPDATE/DELETE without RETURNING)
+    await conn.execute("DELETE FROM tasks WHERE id = $1", 1)
+```
+
+A `Record` is dict-like *and* tuple-like: `row["title"]` and `row[1]` both work. There is no automatic mapping to a class — you do it yourself, which is the whole point of staying at this level.
+
+:::caution[asyncpg does not parse `?` or named params]
+asyncpg only understands Postgres-native `$1`, `$2`. Passing `?` placeholders (sqlite/JDBC
+habit) or `:name` (SQLAlchemy habit) will fail. And asyncpg uses real server-side prepared
+statements automatically, which is why it's fast — but it also means it does **not** do
+client-side string interpolation, so you can't build `SELECT ... IN (?, ?, ?)` by hand the
+way you might elsewhere. Use `= ANY($1)` with a Python list instead.
+:::
+
+```python
+# Postgres-native IN: pass a list to ANY()
+ids = [1, 2, 3]
+rows = await conn.fetch("SELECT * FROM tasks WHERE id = ANY($1)", ids)
+```
+
+### Transactions
+
+```python
+async with pool.acquire() as conn:
+    async with conn.transaction():
+        await conn.execute("UPDATE accounts SET balance = balance - $1 WHERE id = $2", 100, 1)
+        await conn.execute("UPDATE accounts SET balance = balance + $1 WHERE id = $2", 100, 2)
+    # commits on clean exit, rolls back if the block raises
+```
+
+This is exactly `pgx`'s `conn.Begin(ctx)` / `tx.Commit()` discipline, but with `async with` doing the commit/rollback for you, the way Go's `defer tx.Rollback()` pattern wishes it could.
+
+## 2. SQLAlchemy 2.0 Core
+
+[SQLAlchemy](https://www.sqlalchemy.org/) 2.0 is two things in one package: **Core** (a typed SQL expression language and connection engine) and the **ORM** built on top of it. Core is the Knex/Kysely layer — you build queries from Python objects, get full SQL control, but no entity tracking. With the 2.0 async engine it runs on top of asyncpg.
+
+### Engine and table metadata
+
+```python title="app/db_core.py"
+import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import create_async_engine
+
+engine = create_async_engine(
+    "postgresql+asyncpg://dev:dev@localhost:5432/app",
+    pool_size=20,
+    max_overflow=10,
+    pool_pre_ping=True,   # validate a conn before handing it out
+    echo=False,           # set True to log every SQL statement
+)
+
+metadata = sa.MetaData()
+
+tasks = sa.Table(
+    "tasks",
+    metadata,
+    sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True),
+    sa.Column("title", sa.String(255), nullable=False),
+    sa.Column("done", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+)
+```
+
+Note `postgresql+asyncpg://` — the `+asyncpg` part tells SQLAlchemy to use asyncpg as the driver. Drop it and you get the blocking default; the async engine *requires* an async driver.
+
+### Querying with the expression language
+
+```python
+from sqlalchemy import select, insert, update, delete
+
+async with engine.begin() as conn:  # begin() => transaction, auto-commit on exit
+    # INSERT ... RETURNING id
+    result = await conn.execute(
+        insert(tasks).values(title="Write docs").returning(tasks.c.id)
+    )
+    new_id = result.scalar_one()
+
+    # SELECT with a typed WHERE
+    result = await conn.execute(
+        select(tasks).where(tasks.c.done == False).order_by(tasks.c.id)  # noqa: E712
+    )
+    for row in result.mappings():       # .mappings() => dict-like rows
+        print(row["title"])
+
+    # UPDATE
+    await conn.execute(
+        update(tasks).where(tasks.c.id == new_id).values(done=True)
+    )
+
+    # DELETE
+    await conn.execute(delete(tasks).where(tasks.c.id == new_id))
+```
+
+The query objects are composable Python — `select(tasks).where(...)` builds an AST, not a string, so a typo in a column name (`tasks.c.titel`) is caught the moment it runs, and `ty`/`mypy` can flag the obvious mistakes statically. This is the Knex/Drizzle value proposition.
+
+:::note[`== False` looks wrong but is correct]
+`tasks.c.done == False` does **not** evaluate to a Python bool — SQLAlchemy overloads
+`==` on Column objects to build a SQL expression (`tasks.done = false`). Linters will nag
+about `== False`; silence it with `# noqa: E712` or use `tasks.c.done.is_(False)`, which
+reads better anyway. This operator overloading is the one piece of Core magic to get used to.
+:::
+
+## 3. SQLAlchemy 2.0 ORM (async)
+
+The ORM adds an identity map, change tracking (the "unit of work"), and `relationship()` navigation on top of Core. The modern 2.0 style uses `Mapped[...]` annotations and `mapped_column()` — fully typed, checked by `ty`/`mypy`.
+
+:::caution[Use the 2.0 style, not legacy `Query`]
+If you find old tutorials using `session.query(Task).filter_by(...)` — that's the **legacy 1.x
+Query API**. It still works but is frozen; the 2.0 way is `select()` + `session.execute()` /
+`session.scalars()`, the same `select()` you use in Core. We name the legacy API once here so
+you recognize it in the wild, then never use it again.
+:::
+
+### Declarative models with `Mapped`
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// TypeORM entity
+@Entity("tasks")
+export class Task {
+  @PrimaryGeneratedColumn("increment")
+  id: number;
+
+  @Column({ length: 255 })
+  title: string;
+
+  @Column({ default: false })
+  done: boolean;
+
+  @CreateDateColumn()
+  createdAt: Date;
+}
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// GORM model
+type Task struct {
+    ID        int64 `gorm:"primaryKey"`
+    Title     string
+    Done      bool `gorm:"default:false"`
+    CreatedAt time.Time
+}
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python title="app/models.py"
+import datetime as dt
+from sqlalchemy import String, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(255))
+    done: Mapped[bool] = mapped_column(default=False, server_default="false")
+    created_at: Mapped[dt.datetime] = mapped_column(server_default=func.now())
+```
+
+  </TabItem>
+</Tabs>
+
+The `Mapped[int]` / `Mapped[str]` annotations are how SQLAlchemy 2.0 infers column types *and* gives you a typed attribute — `task.title` is a `str` to the type checker, `task.done` is a `bool`. `Mapped[str | None]` makes a column nullable. This is a genuine improvement over the old untyped `Column(...)` class attributes.
+
+### Async sessions
+
+The session is the unit-of-work scope. You build it from an `async_sessionmaker` and open one per logical operation (per request, in a web app).
+
+```python title="app/db.py"
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    async_sessionmaker,
+    AsyncSession,
+)
+
+engine = create_async_engine("postgresql+asyncpg://dev:dev@localhost:5432/app")
+
+# expire_on_commit=False keeps objects usable after commit (important for web responses)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+```
+
+### CRUD with `select()` + `session.scalars()`
+
+```python
+from sqlalchemy import select
+
+async with SessionLocal() as session:
+    async with session.begin():           # one transaction; commits on clean exit
+        # CREATE
+        task = Task(title="Write docs")
+        session.add(task)
+        await session.flush()              # assigns task.id without committing yet
+
+    # READ one — get by PK uses the identity map
+    task = await session.get(Task, 1)
+
+    # READ list
+    result = await session.scalars(
+        select(Task).where(Task.done == False).order_by(Task.id)  # noqa: E712
+    )
+    tasks = result.all()                   # list[Task], fully typed
+
+    # UPDATE — just mutate; the unit of work flushes the change
+    async with session.begin():
+        task = await session.get(Task, 1)
+        task.done = True
+    # no explicit UPDATE — dirty tracking emits it at flush
+
+    # DELETE
+    async with session.begin():
+        task = await session.get(Task, 1)
+        await session.delete(task)
+```
+
+`session.scalars(select(Task))` returns the `Task` *objects* (the ORM unwraps the single-entity rows for you); `session.execute(select(Task))` returns `Row` tuples instead. Use `scalars` when you select whole entities.
+
+### Relationships and the N+1 trap
+
+Add a parent and a `relationship()`:
+
+```python title="app/models.py"
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import relationship
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    tasks: Mapped[list["Task"]] = relationship(back_populates="project")
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(255))
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project | None"] = relationship(back_populates="tasks")
+```
+
+The N+1 problem is the same one GORM and TypeORM have: loop over N projects, touch `project.tasks` on each, and you fire 1 + N queries. The fix is **eager loading** with `selectinload` (one extra query, batched by `IN`) or `joinedload` (a single JOIN):
+
+```python
+from sqlalchemy.orm import selectinload
+
+# 1 query for projects + 1 batched query for all their tasks = 2 total
+result = await session.scalars(
+    select(Project).options(selectinload(Project.tasks))
+)
+for project in result:
+    print(project.name, len(project.tasks))   # no extra query
+```
+
+:::caution[Async ORM and lazy loading do not mix]
+Under the async ORM, *implicit* lazy loading (touching `project.tasks` without having
+loaded it) raises an error, not a silent extra query — because a lazy load would need to
+run blocking I/O outside an `await`. This is actually a gift: it forces you to declare your
+loading strategy with `selectinload`/`joinedload` up front, so N+1 surprises become errors
+at development time instead of slow endpoints in production. (Go and TS ORMs let the N+1
+happen silently.)
+:::
+
+| N+1 fix | When to use | SQL emitted |
+|---|---|---|
+| `selectinload(rel)` | one-to-many, large child sets | parent query + `WHERE child.fk IN (...)` |
+| `joinedload(rel)` | many-to-one, small fan-out | single `LEFT JOIN` |
+| `.where(...).join(...)` (manual) | full control, reporting | whatever you write |
+
+## 4. SQLModel
+
+[SQLModel](https://sqlmodel.tiangolo.com/) is from the author of FastAPI. One class is **both** a Pydantic v2 model (validation, serialization, OpenAPI schema) **and** a SQLAlchemy ORM model (a real table). For FastAPI CRUD this collapses the usual "DB model + request schema + response schema" triplet into far less code.
+
+```python title="app/sqlmodels.py"
+from sqlmodel import SQLModel, Field
+
+class Task(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    title: str = Field(max_length=255)
+    done: bool = Field(default=False)
+```
+
+`table=True` makes it a real table; the same class without it is a plain Pydantic model you can use as a request body. Querying uses SQLModel's `select()` (a thin wrapper over SQLAlchemy's) and the async session:
+
+```python
+from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+async with AsyncSession(engine) as session:
+    task = Task(title="Write docs")        # also validates as a Pydantic model
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    result = await session.exec(select(Task).where(Task.done == False))  # noqa: E712
+    for t in result.all():
+        print(t.title)
+```
+
+### The tradeoffs
+
+| | SQLAlchemy ORM | SQLModel |
+|---|---|---|
+| Model definition | `Mapped[...]` + `mapped_column` | one `Field(...)` per column |
+| Validation | none (separate Pydantic schema) | built-in (it *is* Pydantic) |
+| FastAPI integration | manual response models | model doubles as request/response |
+| Escape hatch to Core | full | full (it's SQLAlchemy underneath) |
+| Maturity / docs for advanced cases | very high | thinner; you fall back to SQLAlchemy docs |
+
+:::caution[Honest take on SQLModel]
+SQLModel is delightful for straightforward FastAPI CRUD and the demo-to-prototype path. But it
+is a younger, thinner layer: the moment you need composite relationships, complex eager loading,
+or advanced typing, you end up reading SQLAlchemy 2.0 docs and dropping to the underlying API
+anyway. And the "one class for table, request, and response" pattern leaks — you usually still
+want a separate `TaskCreate`/`TaskRead` to avoid exposing or accepting the wrong fields. Reach
+for SQLModel when CRUD-with-validation is the whole job; reach for the SQLAlchemy ORM directly
+when the domain is rich.
+:::
+
+## When to use which
+
+| Factor | asyncpg | SQLAlchemy Core | SQLAlchemy ORM | SQLModel |
+|---|---|---|---|---|
+| **Abstraction** | none (raw SQL) | typed query builder | full ORM | ORM + validation |
+| **Type safety** | manual | typed columns | `Mapped[T]` | `Mapped[T]` + Pydantic |
+| **Boilerplate** | medium (map rows) | low | low | lowest |
+| **Performance ceiling** | highest | high | good (object overhead) | good |
+| **Complex/dynamic SQL** | easy (write it) | easy (compose it) | possible (drop to Core) | drop to Core |
+| **Rich domain + relations** | painful | manual | excellent | good |
+| **FastAPI request/response** | manual schemas | manual schemas | manual schemas | built in |
+| **Comparable to** | `pgx` / `postgres.js` | Knex / Kysely / `squirrel` | GORM / TypeORM | Prisma-ish for FastAPI |
+
+**Reach for raw asyncpg** on hot paths, bulk loads (`copy_records_to_table`), and queries where you want to own every byte of SQL.
+
+**Reach for SQLAlchemy Core** for reporting and dynamic query building without entity overhead.
+
+**Reach for the SQLAlchemy ORM** for rich domains with relationships, where the identity map and unit-of-work pay for themselves.
+
+**Reach for SQLModel** when you're building FastAPI CRUD and want one model to serve as table, validation, and OpenAPI schema.
+
+And yes, you can mix them over the same engine/pool: ORM for domain writes, Core or asyncpg for the reporting query.
+
+## Connection pooling, sessions, and the gotchas
+
+### Pool sizing
+
+The defaults are conservative. Size the pool to your concurrency, and remember the hard ceiling is Postgres's `max_connections` (default 100) shared across *all* your app instances.
+
+| Knob | SQLAlchemy async engine | asyncpg pool | Rule of thumb |
+|---|---|---|---|
+| Steady-state size | `pool_size` | `min_size` | match expected concurrent queries |
+| Burst headroom | `max_overflow` | `max_size - min_size` | small buffer for spikes |
+| Liveness check | `pool_pre_ping=True` | built in | on; cheap insurance vs. stale conns |
+| Recycle | `pool_recycle=1800` | `max_inactive_connection_lifetime` | under any proxy idle timeout |
+
+### Transactions
+
+The modern idiom is `async with session.begin()` — it opens a transaction and commits on a clean exit, rolls back on exception. No manual `commit()`/`rollback()`.
+
+```python
+async with SessionLocal() as session:
+    async with session.begin():
+        session.add(Task(title="a"))
+        session.add(Task(title="b"))
+    # both committed together, or neither
+```
+
+### Don't share a session (or connection) across tasks
+
+This is the asyncio-specific footgun, and it bites Go developers who reach for the goroutine-style "fan out over a shared handle" pattern.
+
+:::caution[One session per task — never share]
+An `AsyncSession` (and a raw asyncpg connection) is **not** safe to use from multiple
+coroutines at once. A single session multiplexed over a `TaskGroup` will corrupt its
+connection state and raise `InterfaceError: another operation is in progress`. The rule:
+**one session per task.** If you fan out concurrent work, give each task its own session
+from the `sessionmaker` (each pulls its own connection from the pool).
+:::
+
+```python
+import asyncio
+
+# WRONG — shared session across concurrent tasks
+async def bad(session):
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(session.scalars(select(Task)))   # boom: concurrent use
+        tg.create_task(session.scalars(select(Project)))
+
+# RIGHT — a fresh session per task
+async def fetch_tasks():
+    async with SessionLocal() as s:
+        return (await s.scalars(select(Task))).all()
+
+async def fetch_projects():
+    async with SessionLocal() as s:
+        return (await s.scalars(select(Project))).all()
+
+async def good():
+    async with asyncio.TaskGroup() as tg:
+        t1 = tg.create_task(fetch_tasks())
+        t2 = tg.create_task(fetch_projects())
+    return t1.result(), t2.result()
+```
+
+## Migrations with Alembic
+
+[Alembic](https://alembic.sqlalchemy.org/) is SQLAlchemy's migration tool — the peer of Prisma Migrate, golang-migrate, or Rails migrations. It autogenerates migrations by diffing your models against the live database, and applies them up or down.
+
+| Tool | Style | Schema source |
+|---|---|---|
+| Prisma Migrate (TS) | schema-first, auto SQL | `schema.prisma` |
+| golang-migrate (Go) | hand-written SQL files | `*.up.sql` / `*.down.sql` |
+| Alembic (Python) | Python migration scripts, **autogenerated from models** | your `Base.metadata` |
+
+### Init, autogenerate, upgrade, downgrade
+
+<Steps>
+
+1. Scaffold an **async** Alembic environment:
+
+   ```bash
+   uv run alembic init -t async alembic
+   ```
+
+   The `-t async` template wires up an async engine in `env.py` — essential, since our engine is async.
+
+2. Point Alembic at your metadata. In `alembic/env.py`, set the target and the URL:
+
+   ```python title="alembic/env.py"
+   from app.models import Base
+   target_metadata = Base.metadata
+   # set the async URL (or read it from your settings / env)
+   config.set_main_option(
+       "sqlalchemy.url", "postgresql+asyncpg://dev:dev@localhost:5432/app"
+   )
+   ```
+
+3. Autogenerate a migration by diffing models vs. database:
+
+   ```bash
+   uv run alembic revision --autogenerate -m "create tasks table"
+   ```
+
+4. Apply it (and roll back if needed):
+
+   ```bash
+   uv run alembic upgrade head     # apply all pending
+   uv run alembic downgrade -1     # undo the last one
+   uv run alembic current          # show applied revision
+   ```
+
+</Steps>
+
+A generated migration is a Python module with `upgrade()` and `downgrade()`:
+
+```python title="alembic/versions/0001_create_tasks.py"
+def upgrade() -> None:
+    op.create_table(
+        "tasks",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("title", sa.String(length=255), nullable=False),
+        sa.Column("done", sa.Boolean(), server_default=sa.false(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+    )
+
+def downgrade() -> None:
+    op.drop_table("tasks")
+```
+
+:::caution[Always read the autogenerated diff]
+Autogenerate is a starting point, not gospel. It reliably catches new tables/columns/indexes
+but misses or mishandles renames (it sees a drop + add, losing data), server-side defaults,
+and check constraints. Treat every generated migration as a draft: read it, edit it, and test
+`upgrade` then `downgrade` against a scratch database before committing. This is the same
+discipline you'd apply to a Prisma migration diff.
+:::
+
+## Integrating with FastAPI
+
+The standard pattern (tie this to the [FastAPI module](/modern-python/07-fastapi/)): a single engine created at app startup via the **lifespan** handler, and a **session-per-request** injected with `Depends`.
+
+```python title="app/main.py"
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import (
+    create_async_engine, async_sessionmaker, AsyncSession,
+)
+
+from app.models import Task
+
+engine = create_async_engine("postgresql+asyncpg://dev:dev@localhost:5432/app")
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # startup: engine/pool is ready (created above)
+    yield
+    # shutdown: drain the pool cleanly
+    await engine.dispose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# Session-per-request dependency — one fresh session, closed after the response
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
+        yield session
+
+
+@app.get("/tasks/{task_id}")
+async def get_task(task_id: int, session: AsyncSession = Depends(get_session)):
+    task = await session.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "task not found")
+    return task
+
+
+@app.get("/tasks")
+async def list_tasks(session: AsyncSession = Depends(get_session)):
+    return (await session.scalars(select(Task).order_by(Task.id))).all()
+```
+
+The key moves: the engine (and its pool) is a process-wide singleton created once and disposed in `lifespan`; each request gets its own session from `Depends(get_session)`, which closes it (returning the connection to the pool) when the response is sent. This satisfies the "one session per task" rule automatically — each request is its own task.
+
+## Practice
+
+Implement the same CRUD four ways against the shared Postgres, with an Alembic migration to create the table.
+
+<CardGrid>
+  <LinkCard
+    title="CRUD Four Ways"
+    href="/modern-python/09-database-postgresql/four-ways-crud/"
+    description="Build create/get/list/update/delete on one tasks table with raw asyncpg, SQLAlchemy Core, SQLAlchemy ORM, and SQLModel — plus an Alembic migration — then compare the code shapes side by side."
+  />
+</CardGrid>

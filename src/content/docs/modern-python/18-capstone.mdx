@@ -1,0 +1,273 @@
+---
+title: "Capstone: Notification Service"
+description: A production-shaped async Python microservice tying together FastAPI, Pydantic, async SQLAlchemy, Kafka, Redis, JWT, observability, tests, and a uv Docker deploy.
+sidebar:
+  order: 18
+---
+
+import { Steps, FileTree, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+This is where the whole guide collapses into one program. We build a **Notification
+Service**: a real async microservice that accepts notification requests over a REST
+API, validates them, persists them to Postgres, publishes an event to Kafka, and a
+separate worker actually "delivers" them (email/SMS/push, simulated) with retries
+and a dead-letter queue. It rate-limits with Redis, authenticates with JWT, and is
+observable (structured logs, traces, metrics) and tested end to end. Then it ships
+as a `uv`-built multi-stage Docker image you can run on Kubernetes.
+
+This page is the **architecture and the map** — what the system looks like and how
+each subsystem ties back to the module that taught it. The full, runnable build —
+every key file, the worker, the Dockerfile, the compose stack — lives in the
+practice project linked at the bottom.
+
+:::note[What you should have under your belt]
+The whole guide, but especially [04 Pydantic](/modern-python/04-pydantic/),
+[05 Async](/modern-python/05-async-concurrency/), [07 FastAPI](/modern-python/07-fastapi/),
+[09 Postgres](/modern-python/09-database-postgresql/), [10 Redis](/modern-python/10-redis-caching/),
+[11 Kafka](/modern-python/11-kafka-events/), [12 Testing](/modern-python/12-testing/),
+[13 Auth](/modern-python/13-security-auth/), [15 Observability](/modern-python/15-observability/),
+and [17 Deployment](/modern-python/17-deployment/). Plus Docker and the guide's
+shared infra (`cd shared-infra && docker compose up -d`) for Postgres, Redis, and Kafka.
+:::
+
+## The mental model
+
+A notification service is the textbook **accept-fast, deliver-later** backend. The
+HTTP request must return in milliseconds, but actually sending an email or pushing
+to a device is slow, flaky, and rate-limited by third parties. So you split the
+system in two:
+
+- A **synchronous API** that validates, persists a durable `PENDING` row, publishes
+  one event, and returns `202 Accepted`. It never blocks on a provider.
+- An **asynchronous worker** that consumes events, simulates delivery per channel,
+  updates the row to `SENT`/`FAILED`, retries transient failures, and parks poison
+  messages on a DLQ.
+
+If you've built this in TypeScript (an Express API + a BullMQ worker) or Go (an
+HTTP handler + a goroutine pool reading a channel), the shape is identical. The
+Python difference is that *both halves are `asyncio`* — the API and the worker
+share the same async DB engine, Kafka client, and Redis client, no thread pools.
+
+```
+                        ┌──────────────────────────────────────────────┐
+                        │            Notification Service                │
+   client ─POST /v1─▶   │  FastAPI app                                   │
+   (Bearer JWT)         │  ├─ JWT auth ──▶ rate-limit (Redis)            │
+                        │  ├─ validate (Pydantic)                        │
+                        │  ├─ persist PENDING ──────────────▶ Postgres   │
+                        │  └─ publish ──▶ notifications topic ─┐         │
+                        └──────────────────────────────────────┼─────────┘
+                                                                │
+                        ┌───────────────────────────────────────▼────────┐
+                        │  Worker (separate process, same codebase)        │
+                        │  async for msg in consumer:                      │
+                        │    deliver(channel)  ──▶ SENT  (update Postgres)  │
+                        │    on transient fail ──▶ retry (bounded)          │
+                        │    on poison/exhausted ──▶ notifications.DLQ      │
+                        └───────────────────────────────────────────────────┘
+```
+
+The API and the worker are the **same package**, started by two different entry
+points (`uv run app` vs `uv run worker`) — one container image, two commands. That
+is the standard production shape: scale the API and the worker independently, but
+build and ship them together.
+
+## Module reference map
+
+Every subsystem in this capstone is something a specific module taught you:
+
+| Subsystem | Module | What you carry over |
+|---|---|---|
+| Project, `uv`, `pyproject.toml`, ruff/ty | [01 Dev Environment](/modern-python/01-dev-environment/) | `uv init/add/run/sync`, lockfile, tooling config |
+| Modern typing, `StrEnum`, `Protocol`, PEP 695 | [02 Typing](/modern-python/02-typing/) | Channel/status enums, typed repositories |
+| Dataclasses & FP for plain data | [03 Data Structures & FP](/modern-python/03-data-structures-fp/) | Domain value objects, mapping functions |
+| Pydantic v2 + pydantic-settings | [04 Pydantic](/modern-python/04-pydantic/) | Request/response models, discriminated channel union, `Settings` |
+| `asyncio`, `TaskGroup`, lifespans | [05 Async & Concurrency](/modern-python/05-async-concurrency/) | Everything is async; structured startup/shutdown |
+| Async generators & backpressure | [06 Streams](/modern-python/06-streams/) | The consumer's `async for` poll loop |
+| FastAPI app, dependencies, OpenAPI | [07 FastAPI](/modern-python/07-fastapi/) | Endpoints, DI, validation errors, docs |
+| async SQLAlchemy 2.0 + Alembic | [09 Postgres](/modern-python/09-database-postgresql/) | `AsyncSession`, the repository, migrations |
+| `redis.asyncio`, cache-aside, rate limit | [10 Redis & Caching](/modern-python/10-redis-caching/) | Sliding-window limiter, preference cache |
+| `aiokafka` producer/consumer, DLQ | [11 Kafka Events](/modern-python/11-kafka-events/) | Publish on create, worker + retries + DLQ |
+| pytest, pytest-asyncio, Testcontainers | [12 Testing](/modern-python/12-testing/) | Unit + integration suite against real infra |
+| JWT (`pyjwt`), argon2, FastAPI security | [13 Security & Auth](/modern-python/13-security-auth/) | Bearer auth dependency, RBAC, password hashing |
+| structlog + Prometheus + OpenTelemetry | [15 Observability](/modern-python/15-observability/) | JSON logs, `/metrics`, traced spans |
+| `uv` multi-stage Docker, K8s | [17 Deployment](/modern-python/17-deployment/) | Slim image, non-root, compose + manifests |
+
+The two modules conspicuously *not* load-bearing here are
+[08 Litestar](/modern-python/08-litestar/) (we picked FastAPI as the primary) and
+[14 API Design](/modern-python/14-api-design/) / [16 Advanced Python](/modern-python/16-advanced-python/)
+(GraphQL and metaprogramming would be enhancements, not the spine). That's the
+honest version of "uses everything": a real service uses what it needs.
+
+## Project layout
+
+The package is organized by **boundary**, not by framework. The domain
+(`models`, the `Notification` lifecycle) knows nothing about FastAPI, Kafka, or
+Redis. The infrastructure (`db`, `events`, `auth`, `observability`) is wiring. The
+two edges (`api`, `workers`) are the entry points. This is the clean-architecture
+discipline that keeps the worker and the API sharing logic without sharing globals.
+
+<FileTree>
+- notification-service/
+  - pyproject.toml uv project, deps, ruff + ty config, scripts
+  - alembic.ini migration config
+  - docker-compose.yml app + worker + Postgres + Redis + Kafka
+  - Dockerfile multi-stage uv build, runs api or worker
+  - src/app/
+    - **config.py** `Settings` (pydantic-settings) — one source of config
+    - models/ Pydantic API models + the domain (Modules 02, 03, 04)
+      - **schemas.py** request/response models, discriminated channel union
+      - **domain.py** `NotificationStatus` `StrEnum`, lifecycle rules
+    - db/
+      - **engine.py** async engine + session factory (Module 09)
+      - **tables.py** SQLAlchemy 2.0 ORM models
+      - **repository.py** `NotificationRepository` (the only thing that touches SQL)
+      - migrations/ Alembic revisions
+    - events/
+      - **producer.py** aiokafka producer, started in lifespan (Module 11)
+      - **consumer.py** the worker's poll loop, retry, DLQ (Module 11)
+      - **schemas.py** the Kafka event envelope (versioned)
+    - auth/
+      - **jwt.py** sign/verify with pyjwt, argon2 hashing (Module 13)
+      - **deps.py** FastAPI `CurrentUser` dependency + RBAC
+    - cache/
+      - **redis.py** client + sliding-window rate limiter (Module 10)
+    - observability/
+      - **logging.py** structlog config (Module 15)
+      - **metrics.py** Prometheus counters/histograms
+      - **tracing.py** OpenTelemetry setup
+    - api/
+      - **main.py** FastAPI app, lifespan, router mount, `/metrics`, `/health`
+      - **routes.py** the notification endpoints
+      - **service.py** `NotificationService` — orchestration across layers
+    - workers/
+      - **main.py** the worker entry point (`uv run worker`)
+  - tests/
+    - **test_service.py** unit: rate-limit and validation logic (mocked infra)
+    - **test_api.py** integration: API + Postgres via Testcontainers
+</FileTree>
+
+The one rule that makes this layout pay off: **only `repository.py` writes SQL, and
+only `service.py` orchestrates.** Routes are thin (parse, authorize, delegate); the
+worker reuses the *same* repository and service the API uses.
+
+## How the pieces connect
+
+The `NotificationService.create()` method is the seam where every module meets. Read
+it top to bottom and you see the whole guide:
+
+```python title="src/app/api/service.py (the orchestration spine)"
+async def create(self, req: CreateNotificationRequest, caller: CurrentUser) -> Notification:
+    # 1. Authorization (Module 13): only admins send on behalf of others
+    if caller.role != "admin" and req.user_id != caller.user_id:
+        raise Forbidden("cannot send notifications for other users")
+
+    # 2. Rate limit (Module 10): sliding window in Redis, fail closed
+    if not await self.limiter.allow(req.user_id):
+        raise RateLimited(f"rate limit exceeded for {req.user_id}")
+
+    # 3. Persist a durable PENDING row FIRST (Module 09) — durability before delivery
+    notification = await self.repo.create(req)            # Pydantic -> ORM row
+
+    # 4. Publish the event (Module 11). If Kafka is down the row still exists,
+    #    so a sweeper/retry can pick it up later. We never lose the request.
+    try:
+        await self.producer.publish(NotificationQueued.from_(notification))
+        await self.repo.set_status(notification.id, NotificationStatus.QUEUED)
+    except KafkaError:
+        log.error("queue_failed", notification_id=str(notification.id))  # stays PENDING
+
+    metrics.notifications_created.labels(channel=req.channel.type).inc()  # Module 15
+    return notification
+```
+
+The ordering is deliberate and is the single most important design decision in the
+service: **persist before you publish.** If you publish first and the DB write
+fails, you've promised to deliver something you have no record of. Persisting first
+means the worst case is a `PENDING` row that never got queued — recoverable, and
+visible.
+
+## Running the whole thing locally
+
+The service needs Postgres, Redis, and Kafka. Use the guide's shared infra for the
+backing stores, then run the two halves as separate processes:
+
+<Steps>
+
+1. Start the backing stores (Postgres 17, Redis 8, Kafka 4 in KRaft mode):
+
+   ```bash
+   cd shared-infra && docker compose up -d
+   # postgres :5432 (dev/dev/app), redis :6379, kafka :29092, kafka-ui :8090
+   ```
+
+2. Apply migrations and start the **API** (terminal 1):
+
+   ```bash
+   cd notification-service
+   uv run alembic upgrade head
+   uv run app          # FastAPI on :8000, docs at /docs, metrics at /metrics
+   ```
+
+3. Start the **worker** (terminal 2) — same codebase, different entry point:
+
+   ```bash
+   uv run worker       # consumes the notifications topic, delivers, retries
+   ```
+
+4. Mint a dev token, send a notification, watch the worker deliver it:
+
+   ```bash
+   TOKEN=$(uv run app-token --user user-1 --role user)
+   curl -s -X POST http://localhost:8000/v1/notifications \
+     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"user_id":"user-1","channel":{"type":"email","to":"a@b.com","subject":"Hi"},"body":"Welcome!"}' | jq
+   # -> 202 with status "QUEUED"; the worker logs "delivered" and flips it to SENT
+   ```
+
+</Steps>
+
+Or run the lot — API, worker, and infra — from the project's own `docker-compose.yml`
+with one `docker compose up`. Both are shown in full in the practice project.
+
+## What's next / what we'd add for real scale
+
+This is production-*shaped*, not production-*complete*. An honest list of what a
+real deployment adds:
+
+- **A reconciliation sweeper.** Rows stuck in `PENDING` (Kafka was down at publish
+  time) need a periodic job that re-publishes them. We persist-before-publish
+  precisely so this is possible; we don't ship the sweeper.
+- **Real providers behind a `Protocol`.** `deliver()` is simulated. In production
+  each channel is an adapter (SendGrid, Twilio, FCM) behind a typed `Protocol`
+  (Module 02), with per-provider timeouts via `asyncio.timeout` and circuit breakers.
+- **Idempotency keys.** Clients should send an `Idempotency-Key`; we'd dedupe in
+  Redis so a retried POST doesn't send twice. The Kafka producer is already
+  configured idempotent, but the *HTTP* edge isn't.
+- **Outbox pattern.** The persist-then-publish gap is a small window of
+  inconsistency. The bulletproof version writes the event to an `outbox` table in
+  the same transaction as the notification, and a relay publishes from there.
+- **Templating & localization, quiet hours, batching/digest**, and a
+  delivery-status webhook back to the caller.
+- **Horizontal scale**: more API replicas behind an LB, more worker replicas in the
+  same consumer group (Kafka rebalances partitions across them), Postgres read
+  replicas for the list endpoint, and Redis for hot preference reads.
+
+The point of the capstone isn't a finished product — it's that you can now reason
+about *where* each of those goes, because you built the skeleton they hang off.
+
+## Practice
+
+Build it. The project walks you through every key file — `pyproject.toml`, settings,
+Pydantic models, SQLAlchemy + Alembic, the FastAPI app with auth, the Kafka producer
+in the lifespan, the separate worker with retry/DLQ, the Redis rate limiter, the
+structlog/Prometheus/OTel wiring, a couple of tests, and the `uv` multi-stage
+Dockerfile — then runs it end to end.
+
+<CardGrid>
+  <LinkCard
+    title="Notification Service"
+    href="/modern-python/18-capstone/notification-service/"
+    description="Build the full async service: FastAPI + JWT, async SQLAlchemy + Alembic, an aiokafka producer in the lifespan and a separate worker with retry + DLQ, a Redis sliding-window rate limiter, structlog + Prometheus + OpenTelemetry, pytest + Testcontainers, and a uv multi-stage Docker deploy."
+  />
+</CardGrid>

@@ -1,0 +1,655 @@
+---
+title: Litestar — the Same API, Compared
+description: Litestar as the credible FastAPI alternative — controller classes, layered DI, guards, msgspec DTOs, plugins, and a head-to-head FastAPI↔Litestar comparison.
+sidebar:
+  order: 8
+---
+
+import { Tabs, TabItem, Steps, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+[Module 07](/modern-python/07-fastapi/) built the Task API in **FastAPI** — the
+default modern Python web framework, and the one you'll meet in most job postings.
+This module rebuilds the **same** API in **Litestar** so you get a direct
+side-by-side. Litestar (formerly Starlite) is the credible 2026 alternative:
+ASGI, the same Pydantic models you already wrote, but a different opinion about how
+an app should grow — **controller classes**, **layered dependency injection**, and
+**typed guards** instead of per-route `Depends`. The point of this module isn't
+"switch to Litestar." It's to see the same problem solved two ways so you can pick
+deliberately.
+
+:::note[Prerequisites]
+This builds directly on [Module 07 (FastAPI)](/modern-python/07-fastapi/) — same
+Task domain, same DTOs. You'll also want [Pydantic](/modern-python/04-pydantic/)
+and [async/await](/modern-python/05-async-concurrency/) basics, since Litestar is
+async-first like FastAPI.
+:::
+
+## Why a second framework?
+
+FastAPI is excellent and it's the right default. But it has a growth pattern that
+strains as an app gets large, and it's worth naming honestly:
+
+- **DI is per-parameter and per-route.** Every handler that needs the DB session
+  repeats `session: AsyncSession = Depends(get_session)`. There's no concept of "all
+  routes in this router share these dependencies" beyond `APIRouter(dependencies=[...])`
+  (which run for side effects but don't inject named values cleanly).
+- **Handlers are free functions.** Grouping is by `APIRouter` + file convention.
+  There's no first-class "controller" that owns a base path, shared dependencies,
+  and a set of related handlers as one unit.
+- **It's effectively Pydantic-only** for request/response models. That's fine — but
+  if your domain is `dataclasses`, `attrs`, or you want raw `msgspec` speed, you're
+  swimming upstream.
+
+Litestar takes different positions on each:
+
+- **Controller classes** group related handlers under one base path with shared
+  config — much like a NestJS or Spring `@RestController`.
+- **Layered DI**: dependencies declared at the **app**, **router**, **controller**,
+  or **handler** layer, with inner layers overriding outer ones. You declare
+  `dependencies={"repo": Provide(...)}` once on a controller and every handler in it
+  receives `repo`.
+- **Multiple data libraries**: Pydantic, `msgspec`, `attrs`, `dataclasses`, and
+  TypedDict all work as DTOs. `msgspec` is Litestar's native fast path — it's one of
+  the fastest serialization libraries in Python, and Litestar uses it internally.
+- **Typed guards** for authorization, **plugins** for cross-cutting integrations
+  (SQLAlchemy, etc.), and **OpenAPI built in** (served at `/schema`).
+
+:::tip[The honest take]
+Neither framework is "better." FastAPI has the larger ecosystem, more Stack Overflow
+answers, more tutorials, and is what a new hire will already know. Litestar has a
+cleaner story for **large, layered apps** — the controller + layered-DI model scales
+to dozens of route groups without the `Depends` repetition, and msgspec gives it an
+edge on raw serialization throughput. If you're shipping a service today and want
+the safe default, reach for FastAPI. If you're building something big, value the
+layered architecture, or want non-Pydantic models, Litestar earns its place. We give
+a full decision table at the end.
+:::
+
+### Mental model mapping
+
+If you read Module 07, this row reads as "the same idea, different surface":
+
+| Concept | NestJS (TS) | FastAPI (Python) | Litestar (Python) |
+|---------|-------------|------------------|-------------------|
+| Philosophy | Opinionated, DI-first, decorators | Minimal, function-first, type hints | Layered, controller-first, type hints |
+| Route grouping | `@Controller('tasks')` class | `APIRouter(prefix="/tasks")` | `class TaskController(Controller)` |
+| Handlers | class methods | free functions | class methods |
+| DI | constructor injection, providers | `Depends()` per parameter | `Provide()` + `dependencies={}` per layer |
+| Validation | `class-validator` DTOs | Pydantic models | Pydantic / msgspec / attrs / dataclass |
+| Auth | `@UseGuards(AuthGuard)` | `Depends(get_current_user)` | `guards=[requires_auth]` |
+| Lifespan | `onModuleInit` / lifecycle hooks | `lifespan` async context manager | `on_startup` / `lifespan` |
+| OpenAPI | `@nestjs/swagger` | built in (`/docs`) | built in (`/schema`) |
+| ASGI server | — | uvicorn / hypercorn | uvicorn / `litestar run` / granian |
+
+:::tip[Key insight for the NestJS crowd]
+If anyone on your team came from TypeScript via NestJS, Litestar will feel more
+familiar than FastAPI did. `Controller` classes own a `path` and a set of handlers;
+`dependencies={}` is the provider list; `guards=[]` is `@UseGuards`. It's the closest
+mainstream Python framework to the Nest controller style.
+:::
+
+## Project setup
+
+Same `uv` workflow as everywhere else in this guide — no `pip`, no `virtualenv`.
+Litestar publishes the `litestar` CLI as part of the package, so you also get
+`litestar run`/`litestar version` for free.
+
+<Steps>
+
+1. Create the project and add dependencies:
+
+   ```bash
+   uv init example-app
+   cd example-app
+   uv add litestar uvicorn
+   ```
+
+2. Optionally add the dev tools the rest of the guide uses:
+
+   ```bash
+   uv add --dev ruff ty
+   ```
+
+</Steps>
+
+Litestar bundles `msgspec`, the OpenAPI generator, and the CLI — there's no separate
+"starter" to install. Compare the two dependency lists:
+
+| Concern | FastAPI | Litestar |
+|---------|---------|----------|
+| Core install | `uv add fastapi` | `uv add litestar` |
+| ASGI server | `uv add uvicorn` (separate) | `uv add uvicorn` (or use `litestar run`) |
+| Data models | Pydantic (bundled) | msgspec (bundled); Pydantic/attrs optional |
+| CLI | none (use `uvicorn`/`fastapi` CLI) | `litestar` CLI bundled |
+| OpenAPI UI | Swagger + ReDoc at `/docs`, `/redoc` | Swagger/ReDoc/Scalar/RapiDoc at `/schema` |
+
+## Routing: decorators and controllers
+
+Litestar's route decorators (`@get`, `@post`, `@put`, `@delete`, `@patch`) look like
+FastAPI's, with one key difference: **the HTTP method is the decorator name**, not a
+method on an app/router object. The bigger structural difference is the
+**`Controller` class** — handlers live as methods on a class that owns a base `path`.
+
+### The simplest handler
+
+```python
+from litestar import get
+
+@get("/hello")
+async def hello() -> dict[str, str]:
+    return {"message": "Hello, World!"}
+```
+
+The same endpoint in FastAPI is `@app.get("/hello")` on the app object. Litestar's
+decorator is standalone — you register the handler with the app (or a controller, or
+a router) afterwards, which is what lets the same handler be wired at different layers.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts
+// NestJS — controller method
+@Controller()
+export class HelloController {
+  @Get("hello")
+  hello() {
+    return { message: "Hello, World!" };
+  }
+}
+```
+
+  </TabItem>
+  <TabItem label="Go">
+
+```go
+// chi
+r.Get("/hello", func(w http.ResponseWriter, r *http.Request) {
+    json.NewEncoder(w).Encode(map[string]string{"message": "Hello, World!"})
+})
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# FastAPI                              # Litestar
+@app.get("/hello")                     @get("/hello")
+async def hello():                     async def hello() -> dict[str, str]:
+    return {"message": "Hello"}            return {"message": "Hello"}
+```
+
+  </TabItem>
+</Tabs>
+
+:::note[Return types are load-bearing]
+In Litestar the **return annotation drives serialization and the OpenAPI schema** —
+`-> dict[str, str]` or `-> Task` isn't optional decoration, it's how Litestar knows
+what to encode and document. FastAPI infers this from `response_model=` or the return
+hint too, but Litestar leans on it harder. Annotate your handlers.
+:::
+
+### Controller classes
+
+This is the headline feature. A `Controller` owns a `path`, and its methods are
+handlers whose paths are appended to it:
+
+```python
+from litestar import Controller, get, post, delete
+
+class TaskController(Controller):
+    path = "/tasks"
+
+    @get()
+    async def list_tasks(self) -> list[Task]: ...
+
+    @get("/{task_id:str}")
+    async def get_task(self, task_id: str) -> Task: ...
+
+    @post()
+    async def create_task(self, data: CreateTask) -> Task: ...
+
+    @delete("/{task_id:str}")
+    async def delete_task(self, task_id: str) -> None: ...
+```
+
+Path parameters carry an **inline type**: `{task_id:str}`, `{task_id:int}`,
+`{task_id:uuid}`. Litestar parses and validates them by that type before your handler
+runs — `{id:int}` rejects `/tasks/abc` with a 400 automatically, where FastAPI relies
+on the parameter's type hint to do the same.
+
+The FastAPI equivalent is an `APIRouter` plus free functions:
+
+```python
+# FastAPI — router + free functions
+router = APIRouter(prefix="/tasks")
+
+@router.get("")
+async def list_tasks() -> list[Task]: ...
+
+@router.get("/{task_id}")
+async def get_task(task_id: str) -> Task: ...
+```
+
+| | FastAPI | Litestar |
+|--|---------|----------|
+| Grouping | `APIRouter(prefix="/tasks")` | `class TaskController(Controller): path = "/tasks"` |
+| Handler form | free function | class method (`self` is fine) |
+| Path param type | from the function signature | inline `{id:int}` **and** signature |
+| Shared deps for the group | `APIRouter(dependencies=[...])` (side-effect only) | `dependencies={...}` injected into every method |
+| Shared guards/middleware | `APIRouter(dependencies=[...])` workaround | `guards=[...]`, `middleware=[...]` on the class |
+
+### Registering handlers and the app object
+
+The app's `route_handlers=[]` list is where controllers and standalone handlers get
+wired in — the Litestar equivalent of FastAPI's `app.include_router(...)`:
+
+```python
+from litestar import Litestar
+
+app = Litestar(route_handlers=[TaskController, hello])
+```
+
+```python
+# FastAPI equivalent
+app = FastAPI()
+app.include_router(task_router)
+app.add_api_route("/hello", hello)
+```
+
+Routers nest too: `Router(path="/api/v1", route_handlers=[TaskController])` gives every
+task route a `/api/v1/tasks/...` prefix — that's your fourth DI/config layer
+(app → router → controller → handler).
+
+## Dependency injection: `Provide` and layers
+
+This is where Litestar diverges most from FastAPI, and it's the reason to learn it.
+
+### FastAPI: `Depends`, per parameter
+
+In FastAPI a dependency is a callable, and you request it by adding a parameter with
+`Depends(...)`. Every handler that needs it repeats the parameter:
+
+```python
+# FastAPI
+async def get_repo() -> TaskRepository:
+    return TaskRepository(...)
+
+@router.get("/{task_id}")
+async def get_task(task_id: str, repo: TaskRepository = Depends(get_repo)) -> Task:
+    ...
+
+@router.delete("/{task_id}")
+async def delete_task(task_id: str, repo: TaskRepository = Depends(get_repo)) -> None:
+    ...   # repeated on every handler that needs repo
+```
+
+### Litestar: `Provide`, declared once per layer
+
+In Litestar you register a provider in a `dependencies={}` dict at whatever layer
+makes sense, and every handler **under** that layer receives it by **matching the key
+name to a parameter name**:
+
+```python
+from litestar import Controller, get, delete
+from litestar.di import Provide
+
+async def provide_repo() -> TaskRepository:
+    return TaskRepository(...)
+
+class TaskController(Controller):
+    path = "/tasks"
+    dependencies = {"repo": Provide(provide_repo)}   # declared ONCE
+
+    @get("/{task_id:str}")
+    async def get_task(self, task_id: str, repo: TaskRepository) -> Task:
+        ...   # `repo` is injected by name — no Depends() needed
+
+    @delete("/{task_id:str}")
+    async def delete_task(self, task_id: str, repo: TaskRepository) -> None:
+        ...   # same here, zero repetition
+```
+
+The matching is **by parameter name**: the key `"repo"` in the dict fills any handler
+parameter named `repo`. No `Depends` marker in the signature.
+
+### The four DI layers
+
+A dependency can be declared at any of four layers; inner layers override outer ones
+for the same key. This is the part FastAPI has no direct equivalent for:
+
+```python
+app = Litestar(
+    route_handlers=[TaskController],
+    dependencies={"clock": Provide(provide_clock)},        # 1. app — everywhere
+)
+
+router = Router(
+    path="/api",
+    route_handlers=[TaskController],
+    dependencies={"tenant": Provide(provide_tenant)},      # 2. router — under /api
+)
+
+class TaskController(Controller):
+    dependencies = {"repo": Provide(provide_repo)}          # 3. controller — these handlers
+
+    @get("/{task_id:str}", dependencies={"repo": Provide(provide_cached_repo)})
+    async def get_task(self, task_id: str, repo: TaskRepository) -> Task:
+        ...                                                 # 4. handler — overrides #3 for THIS route
+```
+
+| Layer | Declared on | Scope |
+|-------|-------------|-------|
+| App | `Litestar(dependencies={})` | every route in the app |
+| Router | `Router(dependencies={})` | every route under that router's path |
+| Controller | `class C(Controller): dependencies =` | every handler in the controller |
+| Handler | `@get(dependencies={})` | that single handler |
+
+:::tip[Why this matters at scale]
+Picture 30 route groups that all need a DB session, a current-user, and a tenant id.
+In FastAPI that's three `Depends(...)` parameters on every one of ~150 handlers. In
+Litestar you declare `session`/`user`/`tenant` once at the app or router layer and
+every handler just lists the names it actually uses. That's the layered-DI payoff —
+and the strongest single reason to choose Litestar.
+:::
+
+### Dependency caching and sync deps
+
+By default Litestar caches a dependency's result **within a single request** — if two
+things need `repo`, `provide_repo` runs once. Use `Provide(fn, use_cache=False)` to
+opt out. Providers can be `async def`, plain `def` (run in a threadpool), generators
+(for cleanup, like FastAPI's `yield` dependencies), or even a `sync_to_thread=True`
+plain callable.
+
+```python
+async def provide_session() -> AsyncGenerator[AsyncSession, None]:
+    async with session_factory() as session:   # setup
+        yield session                            # injected value
+    # teardown runs after the response, like FastAPI's yield-dependency
+```
+
+## Lifespan: startup and shutdown
+
+Litestar gives you two equivalent ways to run setup/teardown, and they map cleanly
+onto FastAPI's `lifespan`.
+
+```python
+# Option A: on_startup / on_shutdown hooks (simple lists of callables)
+async def open_pool(app: Litestar) -> None:
+    app.state.pool = await create_pool()
+
+async def close_pool(app: Litestar) -> None:
+    await app.state.pool.close()
+
+app = Litestar(
+    route_handlers=[TaskController],
+    on_startup=[open_pool],
+    on_shutdown=[close_pool],
+)
+```
+
+```python
+# Option B: lifespan context manager — the same shape as FastAPI
+from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator
+
+@asynccontextmanager
+async def lifespan(app: Litestar) -> AsyncGenerator[None, None]:
+    app.state.pool = await create_pool()   # startup
+    yield
+    await app.state.pool.close()           # shutdown
+
+app = Litestar(route_handlers=[TaskController], lifespan=[lifespan])
+```
+
+The `lifespan` form is **identical in spirit** to FastAPI's `lifespan=` argument — an
+async context manager that yields once. If you wrote FastAPI's lifespan in Module 07,
+you can paste the body here almost verbatim. Shared state lives on `app.state` in both
+frameworks (`request.app.state` inside handlers).
+
+| | FastAPI | Litestar |
+|--|---------|----------|
+| Hook style | — | `on_startup=[...]`, `on_shutdown=[...]` |
+| Context-manager style | `lifespan=lifespan` (single CM) | `lifespan=[lifespan]` (list of CMs) |
+| Shared state | `app.state` / `request.app.state` | `app.state` / `request.app.state` |
+
+## DTOs: msgspec, Pydantic, or anything
+
+In FastAPI, request and response models are Pydantic models, full stop. Litestar
+accepts **any** of msgspec `Struct`, Pydantic `BaseModel`, `attrs` classes, stdlib
+`dataclasses`, or `TypedDict` — the request body is parsed into whatever you annotate
+the `data` parameter with.
+
+```python
+# msgspec — Litestar's native, fastest path
+import msgspec
+
+class CreateTask(msgspec.Struct):
+    title: str
+    description: str = ""
+
+@post()
+async def create_task(self, data: CreateTask) -> Task:
+    ...   # `data` is the parsed, validated body — the param MUST be named `data`
+```
+
+The request body always arrives as the parameter named **`data`** (Litestar's
+convention), where FastAPI infers the body parameter from "the one that's a Pydantic
+model." Validation failures produce a 400 with a structured error in both.
+
+| | FastAPI | Litestar |
+|--|---------|----------|
+| Body model types | Pydantic only | msgspec, Pydantic, attrs, dataclass, TypedDict |
+| Body parameter | inferred (the model-typed param) | the param named `data` |
+| Fastest path | Pydantic v2 (Rust core) | msgspec `Struct` (used internally) |
+| Field-level control | Pydantic `Field` | per-library, plus Litestar **DTO** layer |
+
+Litestar also has a dedicated **DTO** abstraction (`SQLAlchemyDTO`, `MsgspecDTO`,
+`DataclassDTO`) for the common "expose a subset of a DB model, rename fields, exclude
+secrets" problem — declared as `dto=` / `return_dto=` on a handler. FastAPI solves the
+same problem by hand-writing separate `Create`/`Read`/`Update` Pydantic models, which
+is exactly what we do in [the sub-project](/modern-python/08-litestar/task-api-litestar/)
+to keep the diff against Module 07 tight.
+
+:::caution[msgspec is fast but stricter]
+msgspec is genuinely faster than Pydantic for plain parse/serialize, and it's why
+Litestar tops a lot of ASGI benchmarks. But it does less: no validators, no computed
+fields, fewer coercion niceties. If you lean on Pydantic v2 validators today, keep
+using Pydantic models in Litestar (they're fully supported) rather than rewriting to
+msgspec for a benchmark number that your database will dwarf anyway.
+:::
+
+## Exception handling
+
+FastAPI uses `HTTPException` plus `@app.exception_handler(...)`. Litestar ships a
+hierarchy of typed HTTP exceptions (`NotFoundException`, `ValidationException`,
+`PermissionDeniedException`, ...) you simply **raise**, and an `exception_handlers={}`
+dict for custom mapping — registerable at any layer, like dependencies.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```python
+# FastAPI
+from fastapi import HTTPException
+
+if task is None:
+    raise HTTPException(status_code=404, detail="Task not found")
+```
+
+  </TabItem>
+</Tabs>
+
+```python
+# Litestar — typed exceptions, no status-code literals
+from litestar.exceptions import NotFoundException
+
+if task is None:
+    raise NotFoundException(detail="Task not found")   # -> 404 automatically
+```
+
+Custom handlers map an exception type (or status code) to a response, the same
+centralized-handler idea as FastAPI's `@app.exception_handler`:
+
+```python
+from litestar import Litestar, Request, Response
+from litestar.exceptions import HTTPException
+
+def handle_http_exc(request: Request, exc: HTTPException) -> Response:
+    return Response(
+        content={"error": exc.detail, "status": exc.status_code},
+        status_code=exc.status_code,
+    )
+
+app = Litestar(
+    route_handlers=[TaskController],
+    exception_handlers={HTTPException: handle_http_exc},
+)
+```
+
+| Concern | FastAPI | Litestar |
+|---------|---------|----------|
+| Raise an error | `raise HTTPException(404, detail=...)` | `raise NotFoundException(detail=...)` |
+| Error types | one `HTTPException` + `status_code` | typed hierarchy (`NotFoundException`, ...) |
+| Custom mapping | `@app.exception_handler(Exc)` | `exception_handlers={Exc: handler}` (any layer) |
+| Validation errors | `RequestValidationError` (422) | `ValidationException` (400) |
+
+## Middleware and guards
+
+**Middleware** is the same ASGI concept in both — wraps the whole request/response.
+The interesting Litestar-specific tool is the **guard**: a small typed callable that
+runs *after* routing and DI but *before* the handler, purpose-built for
+authorization. It's Litestar's `@UseGuards` from Nest, and a cleaner fit than
+FastAPI's "auth is just another dependency" approach.
+
+```python
+from litestar.connection import ASGIConnection
+from litestar.handlers.base import BaseRouteHandler
+from litestar.exceptions import NotAuthorizedException
+
+def requires_auth(connection: ASGIConnection, handler: BaseRouteHandler) -> None:
+    if not connection.headers.get("authorization"):
+        raise NotAuthorizedException()   # raise to deny; return None to allow
+
+class TaskController(Controller):
+    path = "/tasks"
+    guards = [requires_auth]   # applies to every handler; also valid per-handler or per-app
+```
+
+| | FastAPI | Litestar |
+|--|---------|----------|
+| Cross-cutting wrap | ASGI/`@app.middleware("http")` | `middleware=[...]` (any layer) |
+| Authorization | `Depends(get_current_user)` per route | `guards=[...]` (any layer), typed |
+| Runs | as a dependency, inline with the handler | dedicated phase before the handler |
+
+## OpenAPI
+
+Both generate OpenAPI from your type hints with zero extra annotations. The
+differences are cosmetic: FastAPI serves Swagger at `/docs` and ReDoc at `/redoc`;
+Litestar serves a schema hub at **`/schema`** with Swagger, ReDoc, **Scalar**, and
+RapiDoc renderers available out of the box, and the raw spec at `/schema/openapi.json`.
+Configure title/version via `OpenAPIConfig` passed to `Litestar(openapi_config=...)`.
+
+## Run it
+
+Two ways — the bundled CLI, or uvicorn directly (identical to how you'd run FastAPI).
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```bash
+# Litestar CLI — auto-discovers `app` in app.py / asgi.py
+uv run litestar run --reload          # dev, hot reload
+uv run litestar run --port 8000       # pick a port
+
+# Or uvicorn directly — same as FastAPI
+uv run uvicorn app:app --reload
+```
+
+  </TabItem>
+</Tabs>
+
+`litestar run` auto-discovers an app named `app` and adds niceties like `--reload`,
+`--web-concurrency`, and a `litestar routes` command that prints your whole route
+table. For production it's the same advice as FastAPI: run uvicorn (or granian/
+hypercorn) workers behind a process manager — see [Deployment](/modern-python/17-deployment/).
+
+| | FastAPI | Litestar |
+|--|---------|----------|
+| Dev server | `uvicorn app:app --reload` / `fastapi dev` | `litestar run --reload` / `uvicorn app:app --reload` |
+| Inspect routes | `/docs` | `litestar routes` (CLI) + `/schema` |
+| Production | uvicorn/gunicorn workers | uvicorn/granian/hypercorn workers |
+
+## FastAPI vs Litestar — how to choose
+
+You've now seen the same API two ways. Here's the fair version of the decision.
+
+### The big comparison
+
+| Dimension | FastAPI | Litestar |
+|-----------|---------|----------|
+| First release | 2018 | 2021 (as Starlite); renamed 2023 |
+| ASGI | Yes (Starlette underneath) | Yes (own ASGI toolkit) |
+| Route grouping | `APIRouter` + free functions | `Controller` classes + routers |
+| DI | `Depends()`, per parameter | `Provide()` + `dependencies={}`, **layered** |
+| DI layers | router-level side effects only | app / router / controller / handler |
+| Data models | Pydantic v2 | msgspec, Pydantic, attrs, dataclass, TypedDict |
+| Serialization speed | fast (Pydantic Rust core) | faster on plain encode (msgspec) |
+| Authorization | dependency-based | typed **guards** |
+| Plugins | middleware + libraries | first-class plugin system (SQLAlchemy, etc.) |
+| OpenAPI | `/docs`, `/redoc` | `/schema` (Swagger/ReDoc/Scalar/RapiDoc) |
+| Ecosystem / answers | very large | growing, smaller |
+| Hiring familiarity | most candidates know it | fewer do |
+| Docs | excellent, beginner-friendly | excellent, more reference-style |
+
+### Decision table
+
+| If you... | Reach for |
+|-----------|-----------|
+| Want the safe default a new hire already knows | **FastAPI** |
+| Are shipping a small/medium service fast | **FastAPI** |
+| Rely heavily on Pydantic v2 validators/computed fields | **FastAPI** (or Pydantic models in Litestar) |
+| Need the biggest ecosystem / most tutorials | **FastAPI** |
+| Are building a large app with many route groups | **Litestar** |
+| Are tired of repeating `Depends()` everywhere | **Litestar** |
+| Want controller classes / a Nest-like structure | **Litestar** |
+| Use dataclasses/attrs/msgspec as your domain models | **Litestar** |
+| Want layered guards for authz | **Litestar** |
+| Want the tightest possible serialization throughput | **Litestar** (msgspec) |
+
+:::tip[Honest take]
+For most teams in 2026, **FastAPI is still the right first choice** — it's the lingua
+franca, the ecosystem is deeper, and "boring and well-known" is a feature for a
+backend. Choose **Litestar** deliberately: when the app is large enough that layered
+DI and controllers pay for themselves, when your team likes the structure, or when
+non-Pydantic models matter. The good news is they're close enough conceptually that
+moving between them is a few days of work, not a rewrite — which is exactly why this
+module rebuilds the *same* API.
+:::
+
+## Summary
+
+| Concept | What you learned |
+|---------|------------------|
+| Why a second framework | FastAPI's per-route `Depends` strains at scale; Litestar's layered DI + controllers don't |
+| Routing | `@get/@post/...` decorators + `Controller` classes with a base `path` and inline param types |
+| DI | `Provide()` + `dependencies={}` injected by name, across app/router/controller/handler layers |
+| Lifespan | `on_startup`/`on_shutdown` hooks or a `lifespan` context manager (same shape as FastAPI) |
+| DTOs | msgspec/Pydantic/attrs/dataclass; the `data` param is the body; dedicated DTO layer |
+| Errors | typed exceptions you `raise` + `exception_handlers={}` at any layer |
+| Middleware/guards | ASGI middleware plus typed `guards=[]` for authorization |
+| OpenAPI | built in at `/schema` (multiple renderers) |
+| Choosing | FastAPI is the safe default; pick Litestar deliberately for large, layered apps |
+
+## Practice
+
+Rebuild the **exact** Task API from Module 07 in Litestar so you can diff the two line
+by line — `Controller` class, `Provide`-injected repository, layered DI, a DTO, and a
+`lifespan`.
+
+<CardGrid>
+  <LinkCard
+    title="Task API in Litestar"
+    href="/modern-python/08-litestar/task-api-litestar/"
+    description="Rebuild the Module 07 Task CRUD API in Litestar: Controller class, Provide DI, layered dependencies, a DTO, and lifespan — then diff it against FastAPI."
+  />
+</CardGrid>
