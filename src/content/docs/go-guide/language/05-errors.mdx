@@ -10,9 +10,9 @@ import Mermaid from "~/components/Mermaid.astro";
 
 Go has no exceptions for normal control flow. A function that can fail returns an `error` as its last result, and the caller checks it. That is the entire model — there is no `try`, no `catch`, no checked-exception list. The interesting engineering lives in *how* you classify, wrap, and inspect those error values.
 
-To make that concrete, we'll read **multigres** ("Vitess for Postgres"), which layers a canonical-code error model — its `mterrors` package — on top of the stdlib so that failures survive an RPC hop and can drive retry and metric decisions. The Go is all standard; multigres just shows what a production error strategy looks like.
+To make that concrete, we'll read the example system (a distributed SQL proxy), which layers a canonical-code error model — its structured-error package, `errx` — on top of the stdlib so that failures survive an RPC hop and can drive retry and metric decisions. The Go is all standard; the example system just shows what a production error strategy looks like.
 
-This chapter leans on a few earlier ones: the `error` interface and `errors.As` from [Interfaces & composition](/go-guide/language/03-interfaces-composition/), and value-vs-pointer receivers and the typed-nil trap from [Pointers, values & memory](/go-guide/language/04-pointers-values-memory/). The project-track companion is [mterrors & observability](/go-guide/project/09-mterrors-and-observability/).
+This chapter leans on a few earlier ones: the `error` interface and `errors.As` from [Interfaces & composition](/go-guide/language/03-interfaces-composition/), and value-vs-pointer receivers and the typed-nil trap from [Pointers, values & memory](/go-guide/language/04-pointers-values-memory/). The project-track companion is [errx & observability](/go-guide/project/09-errors-and-observability/).
 
 ## `error` is just an interface
 
@@ -43,7 +43,7 @@ func parse(s string) error {
 
 The codebase has several concrete types that satisfy `error` the same way. The PostgreSQL diagnostic type is the clearest: a struct carrying all 14 PostgreSQL error fields, made into an `error` by a single method.
 
-```go title="go/common/mterrors/pgdiagnostic.go"
+```go title="internal/errx/pgdiagnostic.go"
 func (d *PgDiagnostic) Error() string {
     if d == nil {
         return "ERROR: unknown error"
@@ -69,10 +69,10 @@ err2 := fmt.Errorf("connect to %s failed", addr)   // formatted message
 
 `errors.New` returns a pointer to a tiny unexported struct; `fmt.Errorf` builds a formatted string. Both are fine for *creating* a leaf error.
 
-What multigres adds is that its leaf errors carry a **canonical code** and a **stack trace**, captured at the call site:
+What the example system adds is that its leaf errors carry a **canonical code** and a **stack trace**, captured at the call site:
 
-```go title="go/common/mterrors/mterrors.go"
-func New(code mtrpcpb.Code, message string) error {
+```go title="internal/errx/errx.go"
+func New(code rpcpb.Code, message string) error {
     return &fundamental{
         msg:   message,
         code:  code,
@@ -110,7 +110,7 @@ func loadConfig(path string) error {
 
 The `*wrapping` type implements that contract — and also a *second*, older unwrap method inherited from `pkg/errors`:
 
-```go title="go/common/mterrors/mterrors.go"
+```go title="internal/errx/errx.go"
 func (w *wrapping) Error() string { return w.msg + ": " + w.cause.Error() }
 func (w *wrapping) Cause() error  { return w.cause }
 
@@ -124,13 +124,13 @@ So two parallel unwrap mechanisms coexist:
 - **`Unwrap() error`** — the stdlib contract. `errors.Is`/`errors.As` use it. This is the one you reach for almost always.
 - **`Cause() error`** — the older `causer` interface from `pkg/errors`. `Cause` returns the immediate cause; `RootCause` walks all the way to the bottom.
 
-:::caution[Gotcha — `mterrors.Unwrap` is NOT `errors.Unwrap`]
-The package exports its own `Unwrap` with the signature `func Unwrap(err error) (wasWrapped bool, unwrapped error)` — it returns a *boolean plus* the error and only peels a `*wrapping`. The stdlib `errors.Unwrap` returns a single `error`. Same short name, different functions. When you mean the standard chain traversal, use `errors.Is`/`errors.As` (which call the lowercase `Unwrap() error` method), not the exported `mterrors.Unwrap`.
+:::caution[Gotcha — `errx.Unwrap` is NOT `errors.Unwrap`]
+The package exports its own `Unwrap` with the signature `func Unwrap(err error) (wasWrapped bool, unwrapped error)` — it returns a *boolean plus* the error and only peels a `*wrapping`. The stdlib `errors.Unwrap` returns a single `error`. Same short name, different functions. When you mean the standard chain traversal, use `errors.Is`/`errors.As` (which call the lowercase `Unwrap() error` method), not the exported `errx.Unwrap`.
 :::
 
 One small but important detail: `Wrap` short-circuits on `nil`, so callers can wrap unconditionally without an `if err != nil` guard:
 
-```go title="go/common/mterrors/mterrors.go"
+```go title="internal/errx/errx.go"
 func Wrap(err error, message string) error {
     if err == nil {
         return nil   // wrapping nil yields nil
@@ -166,7 +166,7 @@ The second argument must be a *pointer to* the variable you want filled in (here
 
 The codebase uses `errors.As(err, &diag)` pervasively to pull a `*PgDiagnostic` out of a chain that `Wrapf` has layered several times over. A plain type assertion `err.(*PgDiagnostic)` would fail, because the *outermost* error is a `*wrapping`, not the diagnostic. Here's the pattern combined with sentinel checks:
 
-```go title="go/common/mterrors/mterrors.go"
+```go title="internal/errx/errx.go"
 var diag *PgDiagnostic
 if errors.As(err, &diag) {
     // Class 08: Connection Exception (all codes in this class).
@@ -197,7 +197,7 @@ These are the two ways to make an error *recognizable* by callers.
 
 A **sentinel** is a package-level `var` created once and compared by identity with `errors.Is`. It carries no data beyond its message:
 
-```go title="go/services/multipooler/internal/pools/connpool/pool.go"
+```go title="internal/pooler/internal/pools/connpool/pool.go"
 var (
     ErrTimeout    = errors.New("connection pool timed out")
     ErrCtxTimeout = errors.New("connection pool context already expired")
@@ -215,7 +215,7 @@ if errors.Is(err, ErrManagerClosed) || errors.Is(err, connpool.ErrPoolClosed) {
 
 A **typed** error is a struct (or value) carrying structured data, extracted with `errors.As` or matched by a custom `Is` method. The most instructive one here is `TopoError`, because it's a **value type** with a **custom `Is` method**:
 
-```go title="go/common/topoclient/errors.go"
+```go title="internal/topo/errors.go"
 type TopoError struct {
     Code    ErrorCode
     Message string
@@ -231,7 +231,7 @@ func (e TopoError) Is(target error) bool {
 
 Because `Is` compares **only `.Code`** and ignores `.Message`, a caller can match by *category* without caring about the node name baked into the message:
 
-```go title="go/services/multigateway/discovery.go"
+```go title="internal/gateway/discovery.go"
 if errors.Is(watchData.Err, &topoclient.TopoError{Code: topoclient.NoNode}) {
     // a topo node was deleted — handle the deletion event
 }
@@ -249,10 +249,10 @@ Choose a sentinel when callers only need to ask "is it this?"; choose a typed er
 
 Errors are the last return value and flow up explicitly. The canonical shape is to check, decorate, and return:
 
-```go title="go/services/multigateway/poolergateway/grpc_query_service.go"
+```go title="internal/gateway/poolergateway/grpc_query_service.go"
 res, err := g.client.ExecuteQuery(ctx, req)
 if err != nil {
-    return nil, nil, mterrors.Wrapf(mterrors.FromGRPC(err), "execute query")
+    return nil, nil, errx.Wrapf(errx.FromGRPC(err), "execute query")
 }
 ```
 
@@ -260,10 +260,10 @@ Read that inner-to-outer: `FromGRPC` reconstructs an error (preserving the canon
 
 On top of the chain sits a **canonical code** layer, so callers branch on a small enumeration rather than parsing strings. `Code` is the classifier:
 
-```go title="go/common/mterrors/mterrors.go"
-func Code(err error) mtrpcpb.Code {
+```go title="internal/errx/errx.go"
+func Code(err error) rpcpb.Code {
     if err == nil {
-        return mtrpcpb.Code_OK
+        return rpcpb.Code_OK
     }
     if err, ok := err.(ErrorWithCode); ok {   // does this error carry a code?
         return err.ErrorCode()
@@ -274,26 +274,26 @@ func Code(err error) mtrpcpb.Code {
     }
     switch err {
     case context.Canceled:
-        return mtrpcpb.Code_CANCELED            // sentinel → canonical code
+        return rpcpb.Code_CANCELED            // sentinel → canonical code
     case context.DeadlineExceeded:
-        return mtrpcpb.Code_DEADLINE_EXCEEDED
+        return rpcpb.Code_DEADLINE_EXCEEDED
     }
-    return mtrpcpb.Code_UNKNOWN
+    return rpcpb.Code_UNKNOWN
 }
 ```
 
 The `err.(ErrorWithCode)` line is a **type assertion to an interface** (see [Interfaces & composition](/go-guide/language/03-interfaces-composition/)). `ErrorWithCode` is a minimal interface that *embeds* `error`:
 
-```go title="go/common/mterrors/state.go"
+```go title="internal/errx/state.go"
 type ErrorWithCode interface {
     error
-    ErrorCode() mtrpcpb.Code
+    ErrorCode() rpcpb.Code
 }
 ```
 
-`*fundamental` satisfies it by implementing `ErrorCode() mtrpcpb.Code`. For PostgreSQL errors, the equivalent classifier matches on **SQLSTATE**, again via `errors.As`:
+`*fundamental` satisfies it by implementing `ErrorCode() rpcpb.Code`. For PostgreSQL errors, the equivalent classifier matches on **SQLSTATE**, again via `errors.As`:
 
-```go title="go/common/mterrors/code.go"
+```go title="internal/errx/code.go"
 func IsErrorCode(err error, codes ...string) bool {
     if err == nil {
         return false
@@ -308,12 +308,12 @@ func IsErrorCode(err error, codes ...string) bool {
 
 This isn't academic — it has operational teeth. The gateway decides whether to buffer-and-retry a query during a planned failover purely from the code:
 
-```go title="go/services/multigateway/poolergateway/pooler_gateway.go"
+```go title="internal/gateway/poolergateway/pooler_gateway.go"
 func classifyError(err error, target *query.Target) errorAction {
     if target.PoolerType != clustermetadatapb.PoolerType_PRIMARY {
         return actionFail
     }
-    if mterrors.IsErrorCode(err, mterrors.MTF01.ID, mterrors.PgSSReadOnlyTransaction) {
+    if errx.IsErrorCode(err, errx.PXF01.ID, errx.PgSSReadOnlyTransaction) {
         return actionBuffer
     }
     return actionFail
@@ -321,18 +321,18 @@ func classifyError(err error, target *query.Target) errorAction {
 ```
 
 :::caution[Gotcha — never branch on the message text]
-`MTF01.ID` is `"MTF01"` and `PgSSReadOnlyTransaction` is `"25006"` — stable identifiers. String-matching `err.Error()` would silently break the moment a message is reworded, translated, or wrapped with extra context. Classify on the code.
+`PXF01.ID` is `"PXF01"` and `PgSSReadOnlyTransaction` is `"25006"` — stable identifiers. String-matching `err.Error()` would silently break the moment a message is reworded, translated, or wrapped with extra context. Classify on the code.
 :::
 
-### MT codes are synthetic SQLSTATEs
+### PX codes are synthetic SQLSTATEs
 
-`MTError` is a template that produces a `*PgDiagnostic` whose SQLSTATE `Code` field holds a multigres-specific 5-character ID like `MTF01` or `MTD01`. These are **not real PostgreSQL codes** — they occupy the SQLSTATE slot so clients can spot system-specific conditions. A helper distinguishes them by prefix for metric attribution:
+`PXError` is a template that produces a `*PgDiagnostic` whose SQLSTATE `Code` field holds a project-specific 5-character ID like `PXF01` or `PXD01`. These are **not real PostgreSQL codes** — they occupy the SQLSTATE slot so clients can spot system-specific conditions. A helper distinguishes them by prefix for metric attribution:
 
-```go title="go/common/mterrors/error_helpers.go"
+```go title="internal/errx/error_helpers.go"
 var diag *PgDiagnostic
 if errors.As(err, &diag) {
-    if strings.HasPrefix(diag.Code, "MT") {
-        return "internal"   // MT-prefixed → our bug/condition, not the backend's
+    if strings.HasPrefix(diag.Code, "PX") {
+        return "internal"   // PX-prefixed → our bug/condition, not the backend's
     }
     return "backend"        // real PostgreSQL SQLSTATE
 }
@@ -366,8 +366,8 @@ Both variants show up in practice.
 
 **Variant A — closure over the named return.** A backup routine records success/failure metrics by inspecting `retErr`:
 
-```go title="go/services/multipooler/internal/manager/rpc_backup.go"
-func (pm *MultiPoolerManager) backupLocked(ctx context.Context /* ... */) (retBackupID string, retErr error) {
+```go title="internal/pooler/internal/manager/rpc_backup.go"
+func (pm *PoolerManager) backupLocked(ctx context.Context /* ... */) (retBackupID string, retErr error) {
     metrics := pm.backup.Metrics()
     metrics.IncBackupAttempts(ctx)
     defer func() {
@@ -383,16 +383,16 @@ func (pm *MultiPoolerManager) backupLocked(ctx context.Context /* ... */) (retBa
 
 **Variant B — pass `*error` (a pointer to the named return) into a helper.** This keeps the decoration logic in one reusable method by passing the *address* of the named return:
 
-```go title="go/services/multigateway/scatterconn/scatter_conn.go"
+```go title="internal/gateway/scatterconn/scatter_conn.go"
 defer sc.endAction(ctx, span, start, conn.Database(), tableGroup, shard, &retErr)
 ```
 
-```go title="go/services/multigateway/scatterconn/scatter_conn.go"
+```go title="internal/gateway/scatterconn/scatter_conn.go"
 func (sc *ScatterConn) endAction(ctx context.Context, span trace.Span, start time.Time,
     dbNamespace, tableGroup, shard string, err *error) {
     duration := time.Since(start).Seconds()
     if *err != nil {                              // dereference to read the final value
-        sqlstate := mterrors.ExtractSQLSTATE(*err)
+        sqlstate := errx.ExtractSQLSTATE(*err)
         span.RecordError(*err)
         span.SetStatus(codes.Error, (*err).Error())
         // ... record error metric labelled with sqlstate ...
@@ -422,26 +422,26 @@ func mustParse(s string) int {
 }
 ```
 
-The interesting choice multigres makes is to model "this should never happen" as a **normal error**, not a panic. The `MTD01` template is the idiomatic alternative:
+The interesting choice the example system makes is to model "this should never happen" as a **normal error**, not a panic. The `PXD01` template is the idiomatic alternative:
 
-```go title="go/common/mterrors/code.go"
-MTD01 = &MTError{
-    ID: "MTD01", Severity: "ERROR",
+```go title="internal/errx/code.go"
+PXD01 = &PXError{
+    ID: "PXD01", Severity: "ERROR",
     Format:      "[BUG] %s",
     Description: "This error should not happen and is a bug. Please file an issue on GitHub...",
 }
 ```
 
-A routing invariant that "can't" be violated returns `MTD01.New(...)` instead of crashing the process:
+A routing invariant that "can't" be violated returns `PXD01.New(...)` instead of crashing the process:
 
-```go title="go/services/multipooler/internal/poolerserver/pooler.go"
-return mterrors.MTD01.New("target tablegroup %q does not match pooler tablegroup %q",
+```go title="internal/pooler/internal/poolerserver/pooler.go"
+return errx.PXD01.New("target tablegroup %q does not match pooler tablegroup %q",
     target.TableGroup, s.tableGroup)
 ```
 
 The one place it genuinely uses `recover()` is at a **goroutine/connection boundary**, so one panicking client connection can't take down the whole server:
 
-```go title="go/common/pgprotocol/server/listener.go"
+```go title="internal/pgprotocol/server/listener.go"
 func (l *Listener) handleConnection(conn *Conn) {
     // Catch panics and ensure cleanup happens in all cases.
     defer func() {
@@ -476,18 +476,18 @@ When an error crosses a gRPC boundary it gets serialized and reconstructed, so o
 <Mermaid title="An error crossing the gRPC boundary" code={`
 flowchart LR
   subgraph Server["Server side"]
-    E["mterror + PgDiagnostic"] --> TG["ToGRPC"]
+    E["errx error + PgDiagnostic"] --> TG["ToGRPC"]
     TG --> ST["gRPC status (code + RPCError detail)"]
   end
   ST -->|"the wire"| FG["FromGRPC"]
   subgraph Client["Client side"]
-    FG --> R["reconstructed mterror (code + SQLSTATE preserved)"]
+    FG --> R["reconstructed errx error (code + SQLSTATE preserved)"]
   end
 `} />
 
 `FromGRPC` is where the reconstruction rules live:
 
-```go title="go/common/mterrors/grpc.go"
+```go title="internal/errx/grpc.go"
 func FromGRPC(err error) error {
     if err == nil {
         return nil
@@ -498,7 +498,7 @@ func FromGRPC(err error) error {
     }
     st, ok := status.FromError(err)
     if !ok {
-        return New(mtrpcpb.Code_UNKNOWN, err.Error())
+        return New(rpcpb.Code_UNKNOWN, err.Error())
     }
     switch st.Code() {
     case codes.DeadlineExceeded:
@@ -507,14 +507,14 @@ func FromGRPC(err error) error {
         return NewQueryCanceled()
     }
     for _, detail := range st.Details() {
-        if rpcErr, ok := detail.(*mtrpcpb.RPCError); ok {
+        if rpcErr, ok := detail.(*rpcpb.RPCError); ok {
             if rpcErr.GetPgDiagnostic() != nil {
                 return PgDiagnosticFromProto(rpcErr.GetPgDiagnostic())  // full SQLSTATE preserved
             }
             return New(rpcErr.Code, rpcErr.Message)
         }
     }
-    return New(mtrpcpb.Code(st.Code()), st.Message())
+    return New(rpcpb.Code(st.Code()), st.Message())
 }
 ```
 
@@ -551,22 +551,22 @@ Stream-finished detection relies on `err == io.EOF` identity (and `errors.Is(err
 <details><summary>Why must the deferred metric-recording closure in <code>backupLocked</code> use a <em>named</em> return value <code>retErr</code>?</summary>
 A deferred closure observes the named return variable's value *after* the `return` statement assigns it. If the function used a bare `error` return and the defer captured a local `err`, it would see the value at defer-registration time (typically nil), not the final error. The `*error`-pointer variant (a helper taking `&retErr`) is the other way to achieve the same post-return visibility.</details>
 
-<details><summary>Why is <code>MTD01.New(...)</code> returned instead of calling <code>panic</code> for a "this should never happen" routing invariant?</summary>
-Unexpected conditions are treated as recoverable failures that propagate up as ordinary errors carrying a `[BUG]` code, so one bad request fails cleanly with a diagnostic that clients and metrics can classify (`MT`-prefixed codes are tagged `"internal"`) instead of crashing the process. `panic`/`recover` is reserved for the goroutine boundary in `handleConnection`, where it contains blast radius rather than implementing control flow.</details>
+<details><summary>Why is <code>PXD01.New(...)</code> returned instead of calling <code>panic</code> for a "this should never happen" routing invariant?</summary>
+Unexpected conditions are treated as recoverable failures that propagate up as ordinary errors carrying a `[BUG]` code, so one bad request fails cleanly with a diagnostic that clients and metrics can classify (`PX`-prefixed codes are tagged `"internal"`) instead of crashing the process. `panic`/`recover` is reserved for the goroutine boundary in `handleConnection`, where it contains blast radius rather than implementing control flow.</details>
 
 ## Exercises
 
-1. Grep for `errors.As(err, &diag)` (and `&pgDiag`) across `go/services` and `go/common`. Pick three call sites and, for each, explain in two sentences why a wrapped chain (not a bare `*PgDiagnostic`) is expected there — trace back to the `Wrapf` that produced the wrapping.
+1. Grep for `errors.As(err, &diag)` (and `&pgDiag`) across the service and shared packages. Pick three call sites and, for each, explain in two sentences why a wrapped chain (not a bare `*PgDiagnostic`) is expected there — trace back to the `Wrapf` that produced the wrapping.
 
-2. Read `go/common/topoclient/errors.go`. Explain why `TopoError` uses a **value** receiver on `Is` and is stored as a value, yet callers pass `&topoclient.TopoError{Code: ...}` (a pointer) as the `errors.Is` target. Trace exactly how the `Is` method handles the pointer target via its type assertion.
+2. Read `internal/topo/errors.go`. Explain why `TopoError` uses a **value** receiver on `Is` and is stored as a value, yet callers pass `&topoclient.TopoError{Code: ...}` (a pointer) as the `errors.Is` target. Trace exactly how the `Is` method handles the pointer target via its type assertion.
 
-3. Find every package-level sentinel declared with `errors.New` under `go/services/multipooler/internal/pools` and, for each, find the matching `errors.Is` consumer. Argue why a sentinel (not a typed error) was the right choice for these specific conditions.
+3. Find every package-level sentinel declared with `errors.New` under `internal/pooler/internal/pools` and, for each, find the matching `errors.Is` consumer. Argue why a sentinel (not a typed error) was the right choice for these specific conditions.
 
 4. Compare the two defer-based decoration styles: the named-return closure in `backupLocked` versus the `*error` pointer passed to a helper (`endAction`). When would you reach for each?
 
-5. Trace one error from PostgreSQL to the client: start at a constructor in `go/common/mterrors/code.go`, follow `ToGRPC` (how the `PgDiagnostic` becomes a gRPC status detail), then `FromGRPC`. Identify at which step the canonical SQLSTATE/code is preserved versus where the human-readable message may change, and explain why `io.EOF` and the gRPC `DeadlineExceeded`/`Canceled` codes are special-cased.
+5. Trace one error from PostgreSQL to the client: start at a constructor in `internal/errx/code.go`, follow `ToGRPC` (how the `PgDiagnostic` becomes a gRPC status detail), then `FromGRPC`. Identify at which step the canonical SQLSTATE/code is preserved versus where the human-readable message may change, and explain why `io.EOF` and the gRPC `DeadlineExceeded`/`Canceled` codes are special-cased.
 
-6. Find the single non-test `recover()` in `go/common/pgprotocol/server/listener.go`. Explain why recovering inside the per-connection goroutine (and not at `main()`) is the correct boundary, and what would happen to *other* clients if the deferred recover were removed.
+6. Find the single non-test `recover()` in `internal/pgprotocol/server/listener.go`. Explain why recovering inside the per-connection goroutine (and not at `main()`) is the correct boundary, and what would happen to *other* clients if the deferred recover were removed.
 
 ## Next
 
@@ -580,9 +580,9 @@ Unexpected conditions are treated as recoverable failures that propagate up as o
 
 <CardGrid>
   <LinkCard
-    title="mterrors & observability"
+    title="errx & observability"
     description="The project-track deep dive: gRPC code propagation, SQLSTATE classification, and how errors feed metrics and tracing."
-    href="/go-guide/project/09-mterrors-and-observability/"
+    href="/go-guide/project/09-errors-and-observability/"
   />
   <LinkCard
     title="Interfaces & composition"
@@ -606,7 +606,7 @@ Unexpected conditions are treated as recoverable failures that propagate up as o
   />
   <LinkCard
     title="gRPC & Protobuf"
-    description="ToGRPC / FromGRPC, the mtrpcpb.Code enum, and the RPCError proto detail."
+    description="ToGRPC / FromGRPC, the rpcpb.Code enum, and the RPCError proto detail."
     href="/go-guide/project/04-grpc-and-protobuf/"
   />
   <LinkCard

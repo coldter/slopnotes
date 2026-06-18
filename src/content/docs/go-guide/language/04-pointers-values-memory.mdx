@@ -8,7 +8,7 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { LinkCard, CardGrid } from "@astrojs/starlight/components";
 
-Go has no hidden references and no manual memory management, but it does have a precise model of *what gets copied when*. Getting that model right is the difference between code that's fast and correct and code that mysteriously aliases, leaks, or corrupts data. We'll build the model from the ground up — value semantics, then the "reference-like" header types (slices, maps, strings) — using a real distributed-systems codebase, **multigres** ("Vitess for Postgres"), whose SQL lexer, parser, and wire codec lean hard on these details for performance.
+Go has no hidden references and no manual memory management, but it does have a precise model of *what gets copied when*. Getting that model right is the difference between code that's fast and correct and code that mysteriously aliases, leaks, or corrupts data. We'll build the model from the ground up — value semantics, then the "reference-like" header types (slices, maps, strings) — using a real distributed-systems codebase, the example system (a distributed SQL proxy), whose SQL lexer, parser, and wire codec lean hard on these details for performance.
 
 If you haven't met defined types and value-vs-pointer receivers yet, [Types, Structs & Methods](/go-guide/language/02-types-structs-methods/) covers them. New to the repo? Start at the [orientation](/go-guide/orientation/).
 
@@ -46,7 +46,7 @@ Go auto-dereferences through pointers for field/method access: `p.X` works wheth
 
 A method's receiver follows the same rules. A **value receiver** operates on a copy; a **pointer receiver** operates on the original. The codebase makes this distinction deliberately. In its `sqltypes` package, `Value` (a small 3-word slice header — more below) uses value receivers, while `Result`/`Row` (larger structs that also need nil-checking) use pointer receivers:
 
-```go title="go/common/sqltypes/sqltypes.go"
+```go title="internal/sqltypes/sqltypes.go"
 // Value represents a nullable column value.
 // nil means NULL, []byte{} means empty string.
 type Value []byte
@@ -56,7 +56,7 @@ func (v Value) IsNull() bool {
 }
 ```
 
-```go title="go/common/sqltypes/sqltypes.go"
+```go title="internal/sqltypes/sqltypes.go"
 func (r *Result) ToProto() *query.QueryResult { if r == nil { return nil } /* ... */ }
 func (r *Row) ToProto() *query.Row            { if r == nil { return nil } /* ... */ }
 ```
@@ -120,7 +120,7 @@ sub[0] = 'W'   // s is now "hello World" — aliasing!
 
 The SQL lexer scans by indexing and subslicing a single backing buffer, never copying per-token. Its `ParseContext` holds the source as a `[]byte` built once from the input string:
 
-```go title="go/common/parser/context.go"
+```go title="internal/parser/context.go"
 scanBuf    []byte // the string being scanned (for lexer)
 // ...
 scanBuf:    []byte(input),
@@ -133,7 +133,7 @@ The lexer then reads `scanBuf[pos]` by index and takes subslices like `scanBuf[s
 
 `RowFromProto` decodes a protobuf row whose values are concatenated into one big `[]byte` (`pr.Values`) plus a `Lengths` array. It carves each column out as a subslice of that one buffer:
 
-```go title="go/common/sqltypes/sqltypes.go" {11}
+```go title="internal/sqltypes/sqltypes.go" {11}
 func RowFromProto(pr *query.Row) *Row {
 	if pr == nil {
 		return nil
@@ -168,7 +168,7 @@ A subslice keeps its whole backing array alive. If you slice 8 bytes out of an 8
 
 When the lexer *exposes* its internal buffer to outside callers, it must not hand out an aliasing slice — a caller could mutate the lexer's state through it. So it does an explicit `make`+`copy`:
 
-```go title="go/common/parser/context.go"
+```go title="internal/parser/context.go"
 func (ctx *ParseContext) GetScanBuf() []byte {
 	// Return copy for safety
 	buf := make([]byte, len(ctx.scanBuf))
@@ -204,7 +204,7 @@ Because `append` *may or may not* reallocate, never assume the returned slice sh
 
 `ToProto` knows the exact final size up front, so it allocates once with `make([]byte, 0, totalLen)` — **length 0, capacity totalLen** — then appends without ever reallocating:
 
-```go title="go/common/sqltypes/sqltypes.go" {12}
+```go title="internal/sqltypes/sqltypes.go" {12}
 lengths := make([]int64, len(r.Values))
 var totalLen int
 for i, v := range r.Values {
@@ -233,7 +233,7 @@ Note the two `make` shapes side by side: `make([]int64, len(r.Values))` (`len ==
 
 When the exact size isn't known, the lexer uses cap as an *upper-bound estimate* — decoding a Unicode escape can't produce more bytes than the input:
 
-```go title="go/common/parser/lexer.go"
+```go title="internal/parser/lexer.go"
 result := make([]byte, 0, len(input))
 // ...
 result = append(result, []byte(string(cp))...) // rune -> string -> []byte (UTF-8)
@@ -253,7 +253,7 @@ copy(dst, src) // dst is independent; mutating dst won't touch src
 
 The generated AST cloner shows this in its purest form, preserving the nil/non-nil distinction (see nil-vs-empty below):
 
-```go title="go/common/parser/ast/ast_clone.go"
+```go title="internal/parser/ast/ast_clone.go"
 func CloneSliceOfOid(n []Oid) []Oid {
 	if n == nil {
 		return nil
@@ -266,7 +266,7 @@ func CloneSliceOfOid(n []Oid) []Oid {
 
 `copy` does a **shallow** copy — for `[]Oid` (a slice of values) that's a full deep copy, because the values *are* the data. But for a slice of *pointers*, `copy` would duplicate the pointers, leaving both slices pointing at the same elements. The cloner handles that case with a per-element deep clone instead:
 
-```go title="go/common/parser/ast/ast_clone.go" {6-7}
+```go title="internal/parser/ast/ast_clone.go" {6-7}
 func CloneSliceOfRefOfDefElem(n []*DefElem) []*DefElem {
 	if n == nil {
 		return nil
@@ -293,7 +293,7 @@ A `nil` slice (`var s []byte` or `[]byte(nil)`) has `ptr == nil`, `len == 0`, `c
 
 In `sqltypes` the difference is **semantic and must be preserved**: a `nil` `Value` is SQL `NULL`; an empty `Value` (`[]byte{}`) is the empty string `''`. Look back at `RowFromProto` — the `-1` and `0` cases are kept distinct on purpose:
 
-```go title="go/common/sqltypes/sqltypes.go"
+```go title="internal/sqltypes/sqltypes.go"
 case -1:
 	values[i] = nil      // NULL
 case 0:
@@ -325,7 +325,7 @@ m["x"] = 1               // ok
 
 The codebase builds its keyword lookup table in an `init()` using `make` with a **capacity hint**:
 
-```go title="go/common/parser/keywords.go"
+```go title="internal/parser/keywords.go"
 var keywordLookupMap map[string]*KeywordInfo
 // ...
 func init() {
@@ -365,7 +365,7 @@ v, ok := m["k"] // ok is false if absent
 
 A settings cache uses it, combining the lookup with pointer identity for deduplication:
 
-```go title="go/services/multipooler/internal/connstate/settings_cache.go"
+```go title="internal/pooler/internal/connstate/settings_cache.go"
 if elem, ok := c.cache[key]; ok {
 	// Move to front (most recently used)
 	c.lru.MoveToFront(elem)
@@ -417,7 +417,7 @@ The lexer pays this conversion **exactly once** — `scanBuf: []byte(input)` at 
 
 `GetCurrentText` does the reverse at a controlled point — subslice (cheap, aliases) then convert to string (one copy, makes the result safe to retain):
 
-```go title="go/common/parser/context.go"
+```go title="internal/parser/context.go"
 func (ctx *ParseContext) GetCurrentText(startPos int) string {
 	if startPos < 0 || startPos > ctx.scanPos {
 		return ""
@@ -432,7 +432,7 @@ The subslice aliases the live buffer (no copy), but `string(...)` copies those b
 
 There's one important exception to "conversion allocates." The Go compiler recognizes the pattern `string(byteSlice) == stringValue` and lowers it to a direct byte comparison (memcmp) **with no allocation** — the temporary string is never materialized on the heap. The lexer documents and relies on this in its hot scanning loop:
 
-```go title="go/common/parser/context.go" {8}
+```go title="internal/parser/context.go" {8}
 // HasPrefixAtScanPos reports whether scanBuf at the current scan position
 // starts with needle. needle is taken as a string so callers don't have to
 // allocate a []byte: `string(byteSlice) == stringLit` lowers to a direct
@@ -454,7 +454,7 @@ This optimization only fires when the conversion is *consumed directly* by the c
 
 `normalizeKeywordCase` lowercases a keyword for lookup, but most keywords are already lowercase. It scans first and returns the *original* string untouched if there's nothing to change — paying zero allocations on the common path — and only allocates when it must rewrite bytes:
 
-```go title="go/common/parser/keywords.go" {10}
+```go title="internal/parser/keywords.go" {10}
 func normalizeKeywordCase(s string) string {
 	hasUpper := false
 	for i := 0; i < len(s); i++ {
@@ -504,7 +504,7 @@ return b.String() // "xxx", one final allocation
 
 The SQL-rendering code threads a `*strings.Builder` through helper functions so writes accumulate in the caller's builder:
 
-```go title="go/common/parser/ast/json_parse_nodes.go"
+```go title="internal/parser/ast/json_parse_nodes.go"
 func appendJsonReturning(b *strings.Builder, output *JsonOutput) {
 	// ...
 	b.WriteString(" RETURNING ")
@@ -516,7 +516,7 @@ The parameter is `*strings.Builder` (pointer), not `strings.Builder` (value), fo
 
 For the same reason, `ParseContext` embeds a `strings.Builder` **as a value field**, which is exactly why `ParseContext` is *only ever* used as `*ParseContext` (every method is `func (ctx *ParseContext) ...`):
 
-```go title="go/common/parser/context.go"
+```go title="internal/parser/context.go"
 literalBuf    strings.Builder // accumulates literal values
 ```
 
@@ -586,7 +586,7 @@ The alloc-avoidance code you saw earlier — `normalizeKeywordCase` returning th
 You **cannot tell from reading source** whether a given value escapes — it depends on the compiler. You observe it by asking the compiler to print its decisions:
 
 ```bash title="observe escape decisions"
-go build -gcflags=-m ./go/common/parser/...
+go build -gcflags=-m ./internal/parser/...
 ```
 
 This prints lines like `([]byte)(input) escapes to heap` and `moved to heap: x`, each tagged with the source position. Higher verbosity (`-gcflags='-m -m'`) explains *why*. For allocation *counts* in benchmarks, `go test -bench=. -benchmem` reports `allocs/op`. See [Debugging & Profiling](/go-guide/tooling/05-debugging-profiling/).
@@ -599,12 +599,12 @@ Don't micro-optimize for the stack blindly. Escape analysis is an optimization, 
 
 One more distinction that interacts with everything above. `type Value []byte` defines a **new named type** with its own method set — it *is not* `[]byte` for method/interface purposes, even though it has the same memory layout. `type TokenType = int` (note the `=`) is a pure **alias**: `TokenType` and `int` are the *same* type, fully interchangeable, sharing one identity and one method set.
 
-```go title="go/common/parser/tokens.go"
+```go title="internal/parser/tokens.go"
 // This is now just an alias for int to maintain compatibility during transition
 type TokenType = int
 ```
 
-```go title="go/common/sqltypes/sqltypes.go"
+```go title="internal/sqltypes/sqltypes.go"
 type Value []byte
 ```
 
@@ -626,13 +626,13 @@ You can pass a `TokenType` anywhere an `int` is wanted and vice versa (same type
 
 ## Exercises
 
-1. In `go/common/sqltypes/sqltypes.go`, trace one byte from `RowFromProto` back to where `pr.Values` originates (look at `Row.ToProto`). List every `[]byte`/`Value` that aliases the same backing array after `RowFromProto` returns, and argue whether retaining one small `Value` keeps the whole buffer alive.
+1. In `internal/sqltypes/sqltypes.go`, trace one byte from `RowFromProto` back to where `pr.Values` originates (look at `Row.ToProto`). List every `[]byte`/`Value` that aliases the same backing array after `RowFromProto` returns, and argue whether retaining one small `Value` keeps the whole buffer alive.
 
-2. Grep `go/common/parser/context.go` for `Return copy for safety` (two hits). For each method, write the concrete aliasing bug that would occur if it returned `ctx.scanBuf` (or `ctx.scanBuf[ctx.scanPos:]`) directly instead of a `make`+`copy`.
+2. Grep `internal/parser/context.go` for `Return copy for safety` (two hits). For each method, write the concrete aliasing bug that would occur if it returned `ctx.scanBuf` (or `ctx.scanBuf[ctx.scanPos:]`) directly instead of a `make`+`copy`.
 
 3. In `keywords.go`'s `init()`, explain why `&Keywords[i]` is used rather than `&k` from `for _, k := range Keywords`. What capacity does the `make(...)` request, and what does the runtime do differently because of it?
 
-4. Pick any three `CloneSliceOf*` functions in `go/common/parser/ast/ast_clone.go`. Classify each as a shallow `make`+`copy` (slice of values) or a per-element deep clone (slice of pointers), and explain why slices of pointers need the per-element form to fully break aliasing.
+4. Pick any three `CloneSliceOf*` functions in `internal/parser/ast/ast_clone.go`. Classify each as a shallow `make`+`copy` (slice of values) or a per-element deep clone (slice of pointers), and explain why slices of pointers need the per-element form to fully break aliasing.
 
 5. Read `normalizeKeywordCase` and `HasPrefixAtScanPos`. For each, name the exact allocation a naive implementation would incur and the precise source construct that avoids it.
 

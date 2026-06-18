@@ -22,36 +22,36 @@ Go's stdlib gives you `errors.New`, `fmt.Errorf("...: %w", err)`, and `errors.As
 2. A native PostgreSQL error (a `syntax_error`, a `read_only_sql_transaction`) must reach the client looking *exactly* like PostgreSQL would have sent it — all 14 wire fields preserved.
 3. Errors must carry a stack trace for debugging, even after crossing process boundaries.
 
-Multigres ("Vitess for Postgres") solves all three with one package, `go/common/mterrors`. The Go here is all standard library; mterrors is a good worked example of what a production error strategy looks like once a single process is no longer the whole story. Its prime directive is stated up front in the package doc:
+The example system solves all three with one package, `internal/errx`. The Go here is all standard library; `errx` is a good worked example of what a production error strategy looks like once a single process is no longer the whole story. Its prime directive is stated up front in the package doc:
 
-```go title="go/common/mterrors/mterrors.go"
+```go title="internal/errx/errx.go"
 // In all code, errors should be propagated using Wrapf
 // and not fmt.Errorf(). This ensures stacktraces are kept and propagated correctly.
 ```
 
 :::caution[Gotcha — `Wrapf`, not `fmt.Errorf`]
-`fmt.Errorf("%w", err)` builds a chain that `errors.As`/`Is` can walk, but it loses the captured stack and is *not* traversed by `mterrors.Code()`/`Cause()`, which rely on the package's own unexported `causer` interface. Always use `mterrors.Wrapf` for propagation.
+`fmt.Errorf("%w", err)` builds a chain that `errors.As`/`Is` can walk, but it loses the captured stack and is *not* traversed by `errx.Code()`/`Cause()`, which rely on the package's own unexported `causer` interface. Always use `errx.Wrapf` for propagation.
 :::
 
 ---
 
 ## Two error families
 
-This is the single most important thing to internalize: mterrors has **two distinct error types**, and conflating them is the most common newcomer mistake.
+This is the single most important thing to internalize: `errx` has **two distinct error types**, and conflating them is the most common newcomer mistake.
 
 | | `*fundamental` | `*PgDiagnostic` |
 | --- | --- | --- |
 | Role | internal RPC error | PostgreSQL-native error |
-| Carries | `mtrpcpb.Code` (int enum, gRPC-style) | SQLSTATE (5-char string) + 14 PG wire fields |
-| Built by | `New` / `Errorf` | `NewPgError`, `NewParseError`, `MTError.New`, `NewFeatureNotSupported`, ... |
+| Carries | `rpcpb.Code` (int enum, gRPC-style) | SQLSTATE (5-char string) + 14 PG wire fields |
+| Built by | `New` / `Errorf` | `NewPgError`, `NewParseError`, `PXError.New`, `NewFeatureNotSupported`, ... |
 | Stack trace | yes | implements `error` directly |
 
 ### Family 1: `*fundamental` — the canonical-code error
 
-`New`/`Errorf` produce a `*fundamental` carrying an `mtrpcpb.Code` plus a captured stack:
+`New`/`Errorf` produce a `*fundamental` carrying an `rpcpb.Code` plus a captured stack:
 
-```go title="go/common/mterrors/mterrors.go"
-func New(code mtrpcpb.Code, message string) error {
+```go title="internal/errx/errx.go"
+func New(code rpcpb.Code, message string) error {
 	return &fundamental{
 		msg:   message,
 		code:  code,
@@ -61,17 +61,17 @@ func New(code mtrpcpb.Code, message string) error {
 
 type fundamental struct {
 	msg  string
-	code mtrpcpb.Code
+	code rpcpb.Code
 	*stack   // embedded — promotes the stack's methods onto *fundamental
 }
 ```
 
 Real construction sites use the canonical codes directly, picking the code that matches the condition:
 
-```go title="go/services/multipooler/internal/manager/rpc_manager.go"
-return mterrors.New(mtrpcpb.Code_INVALID_ARGUMENT, "operation must be specified")
+```go title="internal/pooler/internal/manager/rpc_manager.go"
+return errx.New(rpcpb.Code_INVALID_ARGUMENT, "operation must be specified")
 // ...
-return mterrors.New(mtrpcpb.Code_FAILED_PRECONDITION, ...)
+return errx.New(rpcpb.Code_FAILED_PRECONDITION, ...)
 ```
 
 The `*stack` is **embedded** (written `*stack`, with no field name) — that is Go struct embedding, which promotes the stack's methods onto `*fundamental`.
@@ -80,7 +80,7 @@ The `*stack` is **embedded** (written `*stack`, with no field name) — that is 
 
 `*PgDiagnostic` mirrors the PostgreSQL `ErrorResponse`/`NoticeResponse` wire message — 14 fields — and **implements `error` itself**:
 
-```go title="go/common/mterrors/pgdiagnostic.go"
+```go title="internal/errx/pgdiagnostic.go"
 type PgDiagnostic struct {
 	MessageType byte   // 'E' = ErrorResponse, 'N' = NoticeResponse
 	Severity    string
@@ -100,19 +100,19 @@ func (d *PgDiagnostic) Error() string {
 }
 ```
 
-The `Code` field here is a **5-character SQLSTATE string** (`"42601"`), *not* the `mtrpcpb.Code` int enum. The class is the first two characters, which is how predicates like `IsConnectionError` branch — `diag.IsClass("08")` matches the whole connection-exception class.
+The `Code` field here is a **5-character SQLSTATE string** (`"42601"`), *not* the `rpcpb.Code` int enum. The class is the first two characters, which is how predicates like `IsConnectionError` branch — `diag.IsClass("08")` matches the whole connection-exception class.
 
 :::caution[Gotcha — `Code` (enum) vs SQLSTATE (string)]
-Don't conflate the canonical `mtrpcpb.Code` (an int, 0–18) with the PostgreSQL SQLSTATE (a 5-char string). A `*fundamental` has a `Code`; a `*PgDiagnostic` has a SQLSTATE. They are different fields on different types.
+Don't conflate the canonical `rpcpb.Code` (an int, 0–18) with the PostgreSQL SQLSTATE (a 5-char string). A `*fundamental` has a `Code`; a `*PgDiagnostic` has a SQLSTATE. They are different fields on different types.
 :::
 
 ---
 
 ## Canonical error codes (the source of truth)
 
-The code set lives in `proto/mtrpc.proto` as `enum Code`. It mirrors gRPC's codes 0–16 *exactly* — same names, same numbers — and adds two system-specific codes:
+The code set lives in `proto/rpc.proto` as `enum Code`. It mirrors gRPC's codes 0–16 *exactly* — same names, same numbers — and adds two system-specific codes:
 
-```proto title="proto/mtrpc.proto"
+```proto title="proto/rpc.proto"
 enum Code {
   OK = 0;
   CANCELED = 1;
@@ -134,10 +134,10 @@ The proto carries gRPC's "litmus test" comments verbatim — they tell you *why*
 
 `Code(err)` digs through the chain: it checks for the `ErrorWithCode` interface first, then walks `Cause()`, then special-cases the context sentinels.
 
-```go title="go/common/mterrors/mterrors.go"
-func Code(err error) mtrpcpb.Code {
+```go title="internal/errx/errx.go"
+func Code(err error) rpcpb.Code {
 	if err == nil {
-		return mtrpcpb.Code_OK
+		return rpcpb.Code_OK
 	}
 	if err, ok := err.(ErrorWithCode); ok {
 		return err.ErrorCode()
@@ -148,42 +148,42 @@ func Code(err error) mtrpcpb.Code {
 	}
 	switch err {
 	case context.Canceled:
-		return mtrpcpb.Code_CANCELED
+		return rpcpb.Code_CANCELED
 	case context.DeadlineExceeded:
-		return mtrpcpb.Code_DEADLINE_EXCEEDED
+		return rpcpb.Code_DEADLINE_EXCEEDED
 	}
-	return mtrpcpb.Code_UNKNOWN
+	return rpcpb.Code_UNKNOWN
 }
 ```
 
 `ErrorWithCode` is the tiny interface that makes `*fundamental` discoverable — it just embeds `error` and adds one method, which `*fundamental` satisfies by returning its stored code:
 
-```go title="go/common/mterrors/state.go"
+```go title="internal/errx/state.go"
 type ErrorWithCode interface {
 	error
-	ErrorCode() mtrpcpb.Code
+	ErrorCode() rpcpb.Code
 }
 ```
 
 :::caution[Gotcha — branch on the code, never the message]
-The entire model exists so handlers call `mterrors.Code(err)`, `mterrors.IsErrorCode(err, ...)`, or `errors.As(&diag)`. Never write `if strings.Contains(err.Error(), "...")` — a reworded, translated, or further-wrapped message would silently break it. `classifyError` (below) is the model to copy.
+The entire model exists so handlers call `errx.Code(err)`, `errx.IsErrorCode(err, ...)`, or `errors.As(&diag)`. Never write `if strings.Contains(err.Error(), "...")` — a reworded, translated, or further-wrapped message would silently break it. `classifyError` (below) is the model to copy.
 :::
 
 ---
 
-## `MT*` templates: codes for conditions PostgreSQL has no name for
+## `PX*` templates: codes for conditions PostgreSQL has no name for
 
-Some conditions — "planned failover in progress", "`[BUG]`" — have no real PostgreSQL SQLSTATE. The `MTError` type is a *template* that builds a `*PgDiagnostic`, stuffing a 5-character synthetic ID into the SQLSTATE field so clients can still identify it:
+Some conditions — "planned failover in progress", "`[BUG]`" — have no real PostgreSQL SQLSTATE. The `PXError` type is a *template* that builds a `*PgDiagnostic`, stuffing a 5-character synthetic ID into the SQLSTATE field so clients can still identify it:
 
-```go title="go/common/mterrors/code.go"
-type MTError struct {
-	ID          string // e.g. "MTD01" — 5-char code used as the SQLSTATE
+```go title="internal/errx/code.go"
+type PXError struct {
+	ID          string // e.g. "PXD01" — 5-char code used as the SQLSTATE
 	Description string // long description, used as the Detail field
 	Severity    string
 	Format      string // fmt format string for the message
 }
 
-func (e *MTError) New(args ...any) *PgDiagnostic {
+func (e *PXError) New(args ...any) *PgDiagnostic {
 	msg := e.Format
 	if len(args) != 0 {
 		msg = fmt.Sprintf(e.Format, args...)
@@ -191,18 +191,18 @@ func (e *MTError) New(args ...any) *PgDiagnostic {
 	return &PgDiagnostic{
 		MessageType: 'E',
 		Severity:    e.Severity,
-		Code:        e.ID,       // the MT ID goes in the SQLSTATE slot
+		Code:        e.ID,       // the PX ID goes in the SQLSTATE slot
 		Message:     msg,
 		Detail:      e.Description,
 	}
 }
 ```
 
-The catalog is a set of package-level vars (`MTD01`..`MTD08`, `MTE01`, `MTB01`..`MTB03`, `MTF01`). The most important for failover is `MTF01`:
+The catalog is a set of package-level vars (`PXD01`..`PXD08`, `PXE01`, `PXB01`..`PXB03`, `PXF01`). The most important for failover is `PXF01`:
 
-```go title="go/common/mterrors/code.go"
-MTF01 = &MTError{
-	ID: "MTF01", Severity: "ERROR",
+```go title="internal/errx/code.go"
+PXF01 = &PXError{
+	ID: "PXF01", Severity: "ERROR",
 	Format:      "planned failover in progress",
 	Description: "The pooler is transitioning during a planned failover. The query will be retried automatically.",
 }
@@ -210,8 +210,8 @@ MTF01 = &MTError{
 
 For conditions that *do* have a real PG SQLSTATE, use `NewPgError` or the named constructors instead (`NewParseError` → `42601`, `NewFeatureNotSupported` → `0A000`, `NewQueryCanceled` → `57014`, ...). The SQLSTATE constants are named too — `PgSSSyntaxError`, `PgSSReadOnlyTransaction` (`"25006"`), and so on.
 
-:::note[Why `MTF01` lives in SQLSTATE space, not `Code` space]
-It must travel *as a PostgreSQL diagnostic* so the gateway can read it with `IsErrorCode` (which inspects `PgDiagnostic.Code`) and so that, if it ever reached a client, it would render as a normal PG error line. The canonical `mtrpcpb.Code` enum is for *transport-level* classification; MT codes are *application-level* PG conditions.
+:::note[Why `PXF01` lives in SQLSTATE space, not `Code` space]
+It must travel *as a PostgreSQL diagnostic* so the gateway can read it with `IsErrorCode` (which inspects `PgDiagnostic.Code`) and so that, if it ever reached a client, it would render as a normal PG error line. The canonical `rpcpb.Code` enum is for *transport-level* classification; PX codes are *application-level* PG conditions.
 :::
 
 ---
@@ -220,7 +220,7 @@ It must travel *as a PostgreSQL diagnostic* so the gateway can read it with `IsE
 
 This is where the two families meet the wire. The envelope is the `RPCError` message in the proto:
 
-```proto title="proto/mtrpc.proto"
+```proto title="proto/rpc.proto"
 message RPCError {
   string message = 1;
   Code code = 2;
@@ -233,20 +233,20 @@ The server stamps the error onto a gRPC status on the way out, and the client re
 <Mermaid title="An error crossing the gRPC boundary" code={`
 flowchart LR
   subgraph Server["Server side"]
-    E["mterror + PgDiagnostic"] --> TG["ToGRPC"]
+    E["errx error + PgDiagnostic"] --> TG["ToGRPC"]
     TG --> ST["gRPC status (code + RPCError detail)"]
   end
   ST -->|"the wire"| FG["FromGRPC"]
   subgraph Client["Client side"]
-    FG --> R["reconstructed mterror (code + SQLSTATE preserved)"]
+    FG --> R["reconstructed errx error (code + SQLSTATE preserved)"]
   end
 `} />
 
 ### Server side: `ToGRPC`
 
-Every multipooler RPC method ends with `return nil, mterrors.ToGRPC(err)`. `ToGRPC` branches on whether the error carries a `*PgDiagnostic`:
+Every pooler RPC method ends with `return nil, errx.ToGRPC(err)`. `ToGRPC` branches on whether the error carries a `*PgDiagnostic`:
 
-```go title="go/common/mterrors/grpc.go"
+```go title="internal/errx/grpc.go"
 func ToGRPC(err error) error {
 	if err == nil {
 		return nil
@@ -254,9 +254,9 @@ func ToGRPC(err error) error {
 	var diag *PgDiagnostic
 	if errors.As(err, &diag) {
 		st := status.New(codes.Code(Code(err)), truncateError(err))
-		rpcErr := &mtrpcpb.RPCError{
+		rpcErr := &rpcpb.RPCError{
 			Message:      err.Error(),
-			Code:         mtrpcpb.Code_UNKNOWN,
+			Code:         rpcpb.Code_UNKNOWN,
 			PgDiagnostic: PgDiagnosticToProto(diag),
 		}
 		stWithDetails, detailErr := st.WithDetails(rpcErr)
@@ -277,7 +277,7 @@ Three things to note:
 
 `FromGRPC` reverses it, reconstructing a `*PgDiagnostic` from the detail and special-casing the sentinels:
 
-```go title="go/common/mterrors/grpc.go"
+```go title="internal/errx/grpc.go"
 func FromGRPC(err error) error {
 	if err == nil {
 		return nil
@@ -288,7 +288,7 @@ func FromGRPC(err error) error {
 	}
 	st, ok := status.FromError(err)
 	if !ok {
-		return New(mtrpcpb.Code_UNKNOWN, err.Error())
+		return New(rpcpb.Code_UNKNOWN, err.Error())
 	}
 	switch st.Code() {
 	case codes.DeadlineExceeded:
@@ -297,14 +297,14 @@ func FromGRPC(err error) error {
 		return NewQueryCanceled()      // -> PG 57014 PgDiagnostic
 	}
 	for _, detail := range st.Details() {
-		if rpcErr, ok := detail.(*mtrpcpb.RPCError); ok {
+		if rpcErr, ok := detail.(*rpcpb.RPCError); ok {
 			if rpcErr.GetPgDiagnostic() != nil {
 				return PgDiagnosticFromProto(rpcErr.GetPgDiagnostic())
 			}
 			return New(rpcErr.Code, rpcErr.Message)
 		}
 	}
-	return New(mtrpcpb.Code(st.Code()), st.Message())
+	return New(rpcpb.Code(st.Code()), st.Message())
 }
 ```
 
@@ -320,8 +320,8 @@ Here is the whole journey of a single `syntax_error`, server-side construction t
 sequenceDiagram
   autonumber
   participant PG as PostgreSQL
-  participant Pool as multipooler
-  participant GW as multigateway
+  participant Pool as pooler
+  participant GW as gateway
   participant Client
   PG->>Pool: syntax_error (42601)
   Note over Pool: *PgDiagnostic{Code:"42601"}
@@ -335,19 +335,19 @@ sequenceDiagram
 
 `classifyError` is the canonical "read the code, not the message" consumer. It decides whether to buffer-and-retry a query during a planned failover purely from the code:
 
-```go title="go/services/multigateway/poolergateway/pooler_gateway.go"
+```go title="internal/gateway/poolergateway/pooler_gateway.go"
 func classifyError(err error, target *query.Target) errorAction {
 	if target.PoolerType != clustermetadatapb.PoolerType_PRIMARY {
 		return actionFail
 	}
-	if mterrors.IsErrorCode(err, mterrors.MTF01.ID, mterrors.PgSSReadOnlyTransaction) {
+	if errx.IsErrorCode(err, errx.PXF01.ID, errx.PgSSReadOnlyTransaction) {
 		return actionBuffer
 	}
 	return actionFail
 }
 ```
 
-`IsErrorCode` does `errors.As(err, &diag)` and checks `slices.Contains(codes, diag.Code)` — so it transparently sees through wrap chains and matches either the MT ID `"MTF01"` *or* the real SQLSTATE `"25006"`.
+`IsErrorCode` does `errors.As(err, &diag)` and checks `slices.Contains(codes, diag.Code)` — so it transparently sees through wrap chains and matches either the PX ID `"PXF01"` *or* the real SQLSTATE `"25006"`.
 
 ---
 
@@ -355,7 +355,7 @@ func classifyError(err error, target *query.Target) errorAction {
 
 The error model would be half-finished if it stopped at control flow. The same errors also drive metrics — but a metric label must have **bounded cardinality**, so the bridge converts an error into two short, finite attributes, never the message string:
 
-```go title="go/common/mterrors/error_helpers.go"
+```go title="internal/errx/error_helpers.go"
 func ExtractSQLSTATE(err error) string {
 	if err == nil {
 		return ""
@@ -376,7 +376,7 @@ func ClassifyErrorSource(err error) string {
 	}
 	var diag *PgDiagnostic
 	if errors.As(err, &diag) {
-		if strings.HasPrefix(diag.Code, "MT") {
+		if strings.HasPrefix(diag.Code, "PX") {
 			return "internal"   // MT-prefixed -> our condition, not the backend's
 		}
 		return "backend"        // real PG SQLSTATE
@@ -399,7 +399,7 @@ Searching for `prometheus.NewCounter` will mislead you. Everything is created th
 
 The project uses Go's stdlib `log/slog` everywhere — no zap, no glog. A small telemetry layer wraps slog handlers to add trace context and an OTLP bridge, composing three layers using the `slog.Handler` interface:
 
-```go title="go/tools/telemetry/telemetry.go"
+```go title="internal/tools/telemetry/telemetry.go"
 func (t *Telemetry) WrapSlogHandler(handler slog.Handler) slog.Handler {
 	handlerWithTrace := &traceHandler{wrapped: handler}
 	// ...
@@ -426,20 +426,20 @@ Until you set the `OTEL_*` env vars, a freshly started binary exports nothing. D
 
 `NewGatewayMetrics` is the canonical pattern: create instruments via `otel.Meter(...)`, fall back to a noop on failure so the struct is always usable, and tag at record time with `attribute.String`:
 
-```go title="go/services/multigateway/metrics.go"
+```go title="internal/gateway/metrics.go"
 func NewGatewayMetrics() (*GatewayMetrics, error) {
-	meter := otel.Meter(".../go/services/multigateway")
+	meter := otel.Meter(".../internal/gateway")
 	m := &GatewayMetrics{meter: meter}
 	var errs []error
 	var err error
 
 	m.authAttempts, err = meter.Int64Counter(
-		"mg.gateway.auth.attempts",
+		"platform.gateway.auth.attempts",
 		metric.WithDescription("Client authentication attempts"),
 		metric.WithUnit("{attempt}"),
 	)
 	if err != nil {
-		errs = append(errs, fmt.Errorf("mg.gateway.auth.attempts counter: %w", err))
+		errs = append(errs, fmt.Errorf("platform.gateway.auth.attempts counter: %w", err))
 		m.authAttempts = noop.Int64Counter{}
 	}
 	// histograms add metric.WithExplicitBucketBoundaries(...)
@@ -453,7 +453,7 @@ func NewGatewayMetrics() (*GatewayMetrics, error) {
 
 Record methods are **nil-safe** so call sites stay unconditional:
 
-```go title="go/services/multigateway/metrics.go"
+```go title="internal/gateway/metrics.go"
 func (m *GatewayMetrics) RecordAuthAttempt(ctx context.Context, outcome string) {
 	if m == nil {
 		return
@@ -468,7 +468,7 @@ An **observable gauge** (pull, not push) registers a callback instead of a `Reco
 
 The query-path metrics go one step further. Building an OTel `MeasurementOption` sorts and dedups the attribute slice inside the SDK, so on the latency-sensitive path they **cache** the option keyed by the label tuple in a `sync.Map`:
 
-```go title="go/services/multigateway/handler/metrics.go"
+```go title="internal/gateway/handler/metrics.go"
 func (m *QueryErrors) optionFor(key queryErrorsKey) metric.MeasurementOption {
 	if v, ok := m.optsCache.Load(key); ok {
 		return v.(metric.MeasurementOption)
@@ -497,12 +497,12 @@ There is a neat compile-time trick here worth lingering on. Running `make metric
 ```bash title="Makefile"
 metrics: ## Generate the Prometheus metric catalog/keep-list.
 	@echo "$$(date): Generating metric catalog"
-	go run ./go/tools/metricsgen/main
+	go run ./internal/tools/metricsgen/main
 ```
 
 The generator statically loads the packages *with full type info*, finds every OTel instrument constructor call, and computes the exact Prometheus series name using **the same library the OTel exporter uses at runtime** (`github.com/prometheus/otlptranslator`). The naming rules it encodes: monotonic counters (`Int64Counter`, ...) get a `_total` suffix; histograms (`Float64Histogram`) expand into `_bucket`/`_count`/`_sum`; gauges stay bare.
 
-So `mg.gateway.auth.attempts` (an `Int64Counter`) becomes the Prometheus series `mg_gateway_auth_attempts_total`, and `mg.gateway.query.duration` (a histogram in seconds) becomes `mg_gateway_query_duration_seconds_{bucket,count,sum}`.
+So `platform.gateway.auth.attempts` (an `Int64Counter`) becomes the Prometheus series `platform_gateway_auth_attempts_total`, and `platform.gateway.query.duration` (a histogram in seconds) becomes `platform_gateway_query_duration_seconds_{bucket,count,sum}`.
 
 The generated file (header: `// Code generated ... DO NOT EDIT.`) contains the catalog of metrics, the global scrape keep-list regex, and per-binary keep-lists whose union equals the global one.
 
@@ -516,7 +516,7 @@ CI runs catalog tests that assert the catalog is non-empty, that the keep-list m
 
 One engineering principle governs all of this instrumentation: never log credentials, tokens, or sensitive query data. The per-query log is the concrete enforcement — it records **only metadata**, and uses `slog.LogAttrs` for low allocation on the latency-sensitive path:
 
-```go title="go/services/multigateway/handler/querylog.go"
+```go title="internal/gateway/handler/querylog.go"
 attrs := []slog.Attr{
 	slog.String("db.namespace", entry.Database),
 	slog.String("db.operation.name", entry.OperationName),
@@ -538,10 +538,10 @@ There is **no raw SQL and no bind-parameter value** anywhere in the entry — on
 
 The whole instrumentation flow is centralized in one place, where an error becomes its two safe labels and is recorded:
 
-```go title="go/services/multigateway/handler/handler.go"
+```go title="internal/gateway/handler/handler.go"
 if err != nil {
 	status = QueryStatusError
-	errorType = mterrors.ExtractSQLSTATE(err)
+	errorType = errx.ExtractSQLSTATE(err)
 	errorSource = classifyErrorSource(err)
 	h.metrics.queryErrors.Add(ctx, errorType, errorSource, dbNamespace, operationName, fingerprintLabel)
 }
@@ -557,8 +557,8 @@ Two reasons the fingerprint matters. (1) Security: the raw SQL may contain liter
 
 ## Checkpoints
 
-<details><summary>You catch a <code>*PgDiagnostic</code> whose <code>Code</code> is <code>"MTF01"</code>. Is that a <code>mtrpcpb.Code</code> enum value or a SQLSTATE, and how does the gateway decide to buffer on it?</summary>
-It is a SQLSTATE-slot string — `MTError.New` stuffs the 5-char MT ID into `PgDiagnostic.Code`. It is *not* an `mtrpcpb.Code` enum value (those are ints 0–18). The gateway's `classifyError` calls `mterrors.IsErrorCode(err, mterrors.MTF01.ID, mterrors.PgSSReadOnlyTransaction)`, which does `errors.As(err, &diag)` and checks `slices.Contains(codes, diag.Code)`; a match returns `actionBuffer`.</details>
+<details><summary>You catch a <code>*PgDiagnostic</code> whose <code>Code</code> is <code>"PXF01"</code>. Is that a <code>rpcpb.Code</code> enum value or a SQLSTATE, and how does the gateway decide to buffer on it?</summary>
+It is a SQLSTATE-slot string — `PXError.New` stuffs the 5-char PX ID into `PgDiagnostic.Code`. It is *not* an `rpcpb.Code` enum value (those are ints 0–18). The gateway's `classifyError` calls `errx.IsErrorCode(err, errx.PXF01.ID, errx.PgSSReadOnlyTransaction)`, which does `errors.As(err, &diag)` and checks `slices.Contains(codes, diag.Code)`; a match returns `actionBuffer`.</details>
 
 <details><summary>Why does <code>FromGRPC</code> special-case <code>codes.DeadlineExceeded</code> and <code>codes.Canceled</code> instead of passing the status through?</summary>
 gRPC converts `context.DeadlineExceeded`/`Canceled` into status errors that no longer wrap the original sentinels, so an `errors.Is(err, context.Canceled)` check downstream would fail. `FromGRPC` instead returns a proper `*PgDiagnostic` (`NewStatementTimeout()` / `NewQueryCanceled()`, both SQLSTATE `57014`) so the client gets a native PG error. `io.EOF` is the exception — it is passed through untouched because stream-finished checks compare against it directly.</details>
@@ -573,13 +573,13 @@ Two reasons. Security: raw SQL may contain credentials or PII, which must never 
 
 ## Exercises
 
-1. **Trace a PG error across the gateway-to-pooler boundary.** Start at a `return nil, mterrors.ToGRPC(err)` in `go/services/multipooler/grpcmanagerservice/service.go`, follow `ToGRPC` serializing a `*PgDiagnostic` into `RPCError.pg_diagnostic` (`go/common/mterrors/grpc.go` plus `PgDiagnosticToProto`), then `FromGRPC` reconstructing it on the gateway side, and finally `classifyError` in `go/services/multigateway/poolergateway/pooler_gateway.go` reading `diag.Code`. Write down what concrete Go type the error is at each hop.
+1. **Trace a PG error across the gateway-to-pooler boundary.** Start at a `return nil, errx.ToGRPC(err)` in `internal/pooler/grpcmanagerservice/service.go`, follow `ToGRPC` serializing a `*PgDiagnostic` into `RPCError.pg_diagnostic` (`internal/errx/grpc.go` plus `PgDiagnosticToProto`), then `FromGRPC` reconstructing it on the gateway side, and finally `classifyError` in `internal/gateway/poolergateway/pooler_gateway.go` reading `diag.Code`. Write down what concrete Go type the error is at each hop.
 
-2. **Trace one query's instrumentation end to end.** In `recordQueryCompletion` (`go/services/multigateway/handler/handler.go`), follow how an error becomes `errorType = ExtractSQLSTATE(err)` and `errorSource = classifyErrorSource(err)`, how those feed `queryErrors.Add` (`handler/metrics.go`), and how the same fields land in the per-query log (`handler/querylog.go`). Confirm by inspection that no raw SQL or bind value is ever recorded.
+2. **Trace one query's instrumentation end to end.** In `recordQueryCompletion` (`internal/gateway/handler/handler.go`), follow how an error becomes `errorType = ExtractSQLSTATE(err)` and `errorSource = classifyErrorSource(err)`, how those feed `queryErrors.Add` (`handler/metrics.go`), and how the same fields land in the per-query log (`handler/querylog.go`). Confirm by inspection that no raw SQL or bind value is ever recorded.
 
-3. **Predict a Prometheus name.** Imagine adding `meter.Int64Counter("mg.gateway.foo.bar")` and a `Float64Histogram("mg.gateway.foo.latency", WithUnit("s"))`. Using the naming rules in `go/tools/metricsgen/metricsgen.go`, predict the exact series for each, then verify against existing entries (e.g. `mg_gateway_auth_attempts_total`, `mg_gateway_query_duration_seconds_*`).
+3. **Predict a Prometheus name.** Imagine adding `meter.Int64Counter("platform.gateway.foo.bar")` and a `Float64Histogram("platform.gateway.foo.latency", WithUnit("s"))`. Using the naming rules in `internal/tools/metricsgen/metricsgen.go`, predict the exact series for each, then verify against existing entries (e.g. `platform_gateway_auth_attempts_total`, `platform_gateway_query_duration_seconds_*`).
 
-4. **Map codes to behavior.** Open `enum Code` in `proto/mtrpc.proto`, then `grep -rn "mterrors.New(mtrpcpb.Code_" go/services` and categorize a handful of call sites by which code they use and why. Cross-check `FAILED_PRECONDITION` vs `INVALID_ARGUMENT` vs `UNAVAILABLE` against the litmus-test comments in the proto.
+4. **Map codes to behavior.** Open `enum Code` in `proto/rpc.proto`, then `grep -rn "errx.New(rpcpb.Code_" internal/` and categorize a handful of call sites by which code they use and why. Cross-check `FAILED_PRECONDITION` vs `INVALID_ARGUMENT` vs `UNAVAILABLE` against the litmus-test comments in the proto.
 
 ---
 
@@ -596,7 +596,7 @@ Continue to [build & make](/go-guide/tooling/01-build-and-make/) — the `make` 
   <LinkCard title="gRPC & protobuf" description="gRPC status codes and the RPCError proto that ToGRPC/FromGRPC sit on." href="/go-guide/project/04-grpc-and-protobuf/" />
   <LinkCard title="Service anatomy" description="Where ToGRPC is called at every RPC method and where metrics and loggers are wired into a service." href="/go-guide/project/05-service-anatomy/" />
   <LinkCard title="pg-wire & sqltypes" description="PgDiagnostic mirrors the PG ErrorResponse/NoticeResponse wire message and SQLSTATE codes." href="/go-guide/project/07-pg-wire-and-sqltypes/" />
-  <LinkCard title="Consensus & failover" description="MTF01 failover buffering and the recovery metrics tie the error model to failover." href="/go-guide/project/08-consensus-and-failover/" />
+  <LinkCard title="Consensus & failover" description="PXF01 failover buffering and the recovery metrics tie the error model to failover." href="/go-guide/project/08-consensus-and-failover/" />
   <LinkCard title="Interfaces & composition" description="error is an interface, ErrorWithCode embeds it, and slog.Handler composition wraps the telemetry layers." href="/go-guide/language/03-interfaces-composition/" />
   <LinkCard title="Context" description="context.Canceled / DeadlineExceeded are the sentinels Code and FromGRPC special-case." href="/go-guide/language/08-context/" />
   <LinkCard title="Idioms & Gotchas" description="Sentinel vs typed errors, %w wrapping, SQLSTATE, and canonical codes." href="/go-guide/reference/idioms-and-gotchas/" />

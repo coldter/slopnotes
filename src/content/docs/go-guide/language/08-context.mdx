@@ -8,14 +8,14 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { LinkCard, CardGrid } from "@astrojs/starlight/components";
 
-`context.Context` is one of the most pervasive types in real Go code, and the **multigres** codebase ("Vitess for Postgres") is no exception — a grep across its source touches several hundred files, with thousands of individual call sites. It is the spine of the latency-sensitive query path and of every RPC the system makes. If you internalize one cross-cutting Go concept, make it this one.
+`context.Context` is one of the most pervasive types in real Go code, and the example system — a distributed SQL proxy in front of PostgreSQL — is no exception: a grep across its source touches several hundred files, with thousands of individual call sites. It is the spine of the latency-sensitive query path and of every RPC the system makes. If you internalize one cross-cutting Go concept, make it this one.
 
 We'll learn it the same way: by reading how a real distributed system threads a context through every hop, from the gateway down to a goroutine waiting on a ticker.
 
 <Mermaid title="A context threaded through the request path" code={`
 flowchart LR
-  Client["Client"] -->|"PG wire"| GW["multigateway"]
-  GW -->|"gRPC (deadline travels)"| PL["multipooler"]
+  Client["Client"] -->|"PG wire"| GW["gateway"]
+  GW -->|"gRPC (deadline travels)"| PL["pooler"]
   PL -->|"pooled SQL"| PG["PostgreSQL"]
   GW -. "ctx (deadline + cancel)" .-> PL
   PL -. "same ctx" .-> PG
@@ -55,13 +55,13 @@ func main() {
 
 A service entry point that owns a long-lived lifecycle creates its root from `Background()` and immediately wraps it in `WithCancel` so it can shut the whole tree down later:
 
-```go title="go/cmd/pgctld/command/server.go"
+```go title="cmd/dbctld/command/server.go"
 ctx, cancel := context.WithCancel(context.Background())
 ```
 
 `context.TODO()` is byte-for-byte identical to `Background()` at runtime, but it means something different to a reader: *"a real context should be threaded in here, but it isn't yet."* It is a marker for incomplete plumbing, not a polite alias.
 
-```go title="go/services/multipooler/internal/heartbeat/reader.go"
+```go title="internal/pooler/heartbeat/reader.go"
 func (r *Reader) GetLeadershipView() (*LeadershipView, error) {
     ctx, cancel := context.WithTimeout(context.TODO(), r.interval)
     defer cancel()
@@ -87,10 +87,10 @@ result, err := doRPC(ctx)
 
 The codebase does exactly this before every consensus RPC, using a named timeout constant (more on those below):
 
-```go title="go/services/multiorch/consensus/rule_change.go" {1-2}
+```go title="internal/orchestrator/consensus/rule_change.go" {1-2}
 rpcCtx, cancel := context.WithTimeout(ctx, timeouts.RuleWriteTimeout)
 defer cancel()
-resp, err := r.coordinator.rpcClient.Recruit(rpcCtx, p.MultiPooler, &consensusdatapb.RecruitRequest{
+resp, err := r.coordinator.rpcClient.Recruit(rpcCtx, p.Pooler, &consensusdatapb.RecruitRequest{
     TermRevocation: revocation,
 })
 ```
@@ -105,8 +105,8 @@ Forgetting `defer cancel()` is the single most common context bug. With `WithTim
 
 Sometimes you want to *conditionally* apply a deadline but still let the caller `defer cancel()` unconditionally. Return a do-nothing cancel func in the "no deadline" branch:
 
-```go title="go/services/multigateway/handler/handler.go" {6-9}
-func (h *MultiGatewayHandler) statementTimeoutCtx(ctx context.Context, state *MultiGatewayConnectionState, query ast.Stmt) (context.Context, context.CancelFunc) {
+```go title="internal/gateway/handler/handler.go" {6-9}
+func (h *GatewayHandler) statementTimeoutCtx(ctx context.Context, state *GatewayConnectionState, query ast.Stmt) (context.Context, context.CancelFunc) {
     timeout := ResolveStatementTimeout(
         ParseStatementTimeoutDirective(query),
         state.GetStatementTimeout(),
@@ -143,14 +143,14 @@ for {
 
 The `WaitForLSN` routine is exactly this — poll PostgreSQL every 100ms until a standby has replayed WAL up to a target position, but bail the instant the caller's context expires:
 
-```go title="go/services/multipooler/internal/manager/rpc_manager.go" {3-7}
+```go title="internal/pooler/manager/rpc_manager.go" {3-7}
 for {
     select {
     case <-ctx.Done():
         pm.logger.ErrorContext(ctx, "WaitForLSN context cancelled or timed out",
             "target_lsn", targetLsn,
             "error", ctx.Err())
-        return mterrors.Wrap(ctx.Err(), "context cancelled or timed out while waiting for LSN")
+        return errx.Wrap(ctx.Err(), "context cancelled or timed out while waiting for LSN")
     case <-ticker.C:
         reachedTarget, err := pm.checkLSNReached(ctx, targetLsn)
         if err != nil {
@@ -163,11 +163,11 @@ for {
 }
 ```
 
-Two things to notice. First, `ctx.Err()` is wrapped with `mterrors.Wrap` so the error chain still satisfies `errors.Is(err, context.DeadlineExceeded)` while carrying extra context — see [Errors](/go-guide/language/05-errors/) for why wrapping preserves the sentinel. Second, `ctx` is *also* passed into `checkLSNReached`, so the inner query inherits the same deadline; cancellation propagates all the way down, not just to the `select` you can see here.
+Two things to notice. First, `ctx.Err()` is wrapped with `errx.Wrap` so the error chain still satisfies `errors.Is(err, context.DeadlineExceeded)` while carrying extra context — see [Errors](/go-guide/language/05-errors/) for why wrapping preserves the sentinel. Second, `ctx` is *also* passed into `checkLSNReached`, so the inner query inherits the same deadline; cancellation propagates all the way down, not just to the `select` you can see here.
 
 A subtler variant: select over *two* done-like channels when there are two independent reasons to stop. A connection-pool waitlist races the pool being closed against the caller's deadline:
 
-```go title="go/services/multipooler/internal/pools/connpool/waitlist.go"
+```go title="internal/pooler/pools/connpool/waitlist.go"
 select {
 case <-closeChan:
     // Pool was closed while we were waiting. Remove ourselves from the waitlist...
@@ -192,11 +192,11 @@ That branch returns `context.Cause(ctx)` rather than `ctx.Err()`. `context.Cause
 
 Any method that does I/O, blocks, or makes an RPC takes `ctx context.Context` as its **first** parameter, conventionally named `ctx`. This is not enforced by the compiler; it is a universal Go convention that tooling and reviewers rely on. An entire client interface follows it:
 
-```go title="go/common/rpcclient/client.go"
-type MultiPoolerClient interface {
-    Recruit(ctx context.Context, pooler *clustermetadatapb.MultiPooler, request *consensusdatapb.RecruitRequest) (*consensusdatapb.RecruitResponse, error)
-    Promote(ctx context.Context, pooler *clustermetadatapb.MultiPooler, request *consensusdatapb.PromoteRequest) (*consensusdatapb.PromoteResponse, error)
-    SetPrimary(ctx context.Context, pooler *clustermetadatapb.MultiPooler, request *consensusdatapb.SetPrimaryRequest) (*consensusdatapb.SetPrimaryResponse, error)
+```go title="internal/rpcclient/client.go"
+type PoolerClient interface {
+    Recruit(ctx context.Context, pooler *clustermetadatapb.Pooler, request *consensusdatapb.RecruitRequest) (*consensusdatapb.RecruitResponse, error)
+    Promote(ctx context.Context, pooler *clustermetadatapb.Pooler, request *consensusdatapb.PromoteRequest) (*consensusdatapb.PromoteResponse, error)
+    SetPrimary(ctx context.Context, pooler *clustermetadatapb.Pooler, request *consensusdatapb.SetPrimaryRequest) (*consensusdatapb.SetPrimaryResponse, error)
     // ...
 }
 ```
@@ -207,7 +207,7 @@ The corollary: **do not store a `Context` in a struct field** as a general habit
 
 There is one legitimate reason to store a context in a struct: an object that owns a long-lived background goroutine and exposes a `Start()`/`Stop()` lifecycle. It derives a cancellable context once at construction, keeps it *and its cancel func*, loops on it in the goroutine, and calls the cancel func from `Stop()`.
 
-```go title="go/services/multigateway/discovery.go" {12,21-24}
+```go title="internal/gateway/discovery.go" {12,21-24}
 type CellPoolerDiscovery struct {
     // ...
     ctx        context.Context
@@ -215,7 +215,7 @@ type CellPoolerDiscovery struct {
     wg         sync.WaitGroup
 }
 
-func NewCellPoolerDiscovery(ctx context.Context, topoStore topoclient.Store, cell string, logger *slog.Logger) *CellPoolerDiscovery {
+func NewCellPoolerDiscovery(ctx context.Context, topoStore topo.Store, cell string, logger *slog.Logger) *CellPoolerDiscovery {
     discoveryCtx, cancel := context.WithCancel(ctx)
     return &CellPoolerDiscovery{
         ctx:        discoveryCtx,
@@ -251,8 +251,8 @@ A context's cancellation and deadline travel over the wire automatically. When y
 
 The `rpcclient` here is a deliberately thin pass-through. It adds *no timeout of its own* — it forwards the caller's `ctx` straight to the stub. Bounding the call is the caller's job (which is exactly why `rule_change.go` wraps with `WithTimeout(ctx, timeouts.RuleWriteTimeout)` before calling).
 
-```go title="go/common/rpcclient/grpc_client.go" {2,6}
-func (c *Client) Recruit(ctx context.Context, pooler *clustermetadatapb.MultiPooler, request *consensusdatapb.RecruitRequest) (*consensusdatapb.RecruitResponse, error) {
+```go title="internal/rpcclient/grpc_client.go" {2,6}
+func (c *Client) Recruit(ctx context.Context, pooler *clustermetadatapb.Pooler, request *consensusdatapb.RecruitRequest) (*consensusdatapb.RecruitResponse, error) {
     conn, closer, err := c.dialPersistent(ctx, pooler) // ctx also bounds connection acquisition
     if err != nil {
         return nil, err
@@ -264,7 +264,7 @@ func (c *Client) Recruit(ctx context.Context, pooler *clustermetadatapb.MultiPoo
 
 Notice `ctx` does double duty: it bounds *acquiring* the connection and then propagates as the *call's* deadline. Connection acquisition itself respects the context — when the pool is at capacity and must wait for an evictable connection, it polls in a loop that bails on `ctx.Done()`:
 
-```go title="go/common/rpcclient/conn_cache.go"
+```go title="internal/rpcclient/conn_cache.go"
 for {
     select {
     case <-ctx.Done():
@@ -284,7 +284,7 @@ Long-lived streams use the context as the stream's lifetime: such a stream stays
 
 On the server side, a handler can ask whether the caller imposed a deadline via `ctx.Deadline()`. The `TriggerRecoveryNow` handler does this and, when a deadline exists, derives a *slightly shorter* child deadline so it leaves headroom to actually serialize and send the response:
 
-```go title="go/services/multiorch/grpcserver/server.go" {6}
+```go title="internal/orchestrator/grpcserver/server.go" {6}
 deadline, hasDeadline := ctx.Deadline()
 if !hasDeadline {
     var cancel context.CancelFunc
@@ -309,14 +309,14 @@ If a server forwards work using the *exact* inbound deadline, the inner operatio
 
 When an RPC's deadline fires, gRPC surfaces it on the *client* as a `status` error (code `DeadlineExceeded`), not as a bare `context.DeadlineExceeded`. But within a server, an operation that watched its own `ctx` will return the Go sentinel. A recovery handler treats a deadline or cancellation as an *expected* outcome (recovery ran out of time — that's information, not a crash) and only maps genuine errors to `Internal`:
 
-```go title="go/services/multiorch/grpcserver/server.go"
+```go title="internal/orchestrator/grpcserver/server.go"
 remainingProblems, err := s.engine.TriggerRecoveryNow(ctx, req.MaxCycles)
 if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
     return nil, status.Error(codes.Internal, fmt.Sprintf("recovery trigger failed: %v", err))
 }
 ```
 
-Use `errors.Is` against the sentinels — never string-match `"context deadline exceeded"`. Wrapping with `mterrors.Wrap(ctx.Err(), ...)` preserves `errors.Is` reachability, which is precisely why the check above keeps working even through several wrap layers. Cross-reference [Errors](/go-guide/language/05-errors/).
+Use `errors.Is` against the sentinels — never string-match `"context deadline exceeded"`. Wrapping with `errx.Wrap(ctx.Err(), ...)` preserves `errors.Is` reachability, which is precisely why the check above keeps working even through several wrap layers. Cross-reference [Errors](/go-guide/language/05-errors/).
 
 ## `context.WithValue` — request-scoped data, used sparingly
 
@@ -332,7 +332,7 @@ v, ok := ctx.Value(ctxKey{}).(*MyType)     // retrieve + type-assert
 
 An "action lock" is the textbook good use. It threads *proof that the caller holds the lock* through a call chain, so deep functions can assert the lock is held without the lock object being passed down explicitly:
 
-```go title="go/services/multipooler/internal/manager/actionlock/action_lock.go"
+```go title="internal/pooler/manager/actionlock/action_lock.go"
 type actionLockKey struct{}
 
 type actionLockValue struct {
@@ -373,7 +373,7 @@ Sometimes a background task is *triggered by* a request but must *outlive* it �
 
 A `ctxutil.Detach` helper starts from `Background()` and copies over OpenTelemetry baggage and the parent span (stored separately so background work can *link to* rather than *nest under* the originating trace):
 
-```go title="go/tools/ctxutil/ctxutil.go"
+```go title="internal/ctxutil/ctxutil.go"
 func Detach(parent context.Context) context.Context {
     ctx := context.Background() // start fresh - no cancellation inheritance
     if bag := baggage.FromContext(parent); bag.Len() > 0 {
@@ -388,7 +388,7 @@ func Detach(parent context.Context) context.Context {
 
 This contrasts with the standard library's `context.WithoutCancel` (Go 1.21+): `WithoutCancel` keeps the parent span so the background work appears as a *child* of the request; `Detach` deliberately demotes it to a *linked* span so it gets its own trace. The graceful-shutdown hook uses it, then re-imposes a bound:
 
-```go title="go/services/multipooler/init.go"
+```go title="internal/pooler/init.go"
 mp.senv.OnClose(func() {
     // Detach from startCtx so a cancelled startup ctx doesn't block
     // the shutdown write, while preserving any trace/telemetry values.
@@ -406,7 +406,7 @@ Detaching breaks cancellation *on purpose* — the detached context will not be 
 
 Notice that the consensus RPC sites do not hardcode a magic `30 * time.Second`. Deadline durations are collected into a `timeouts` package, each constant carrying a comment that *justifies its specific value* from operational experience:
 
-```go title="go/common/timeouts/rpc.go"
+```go title="internal/timeouts/rpc.go"
 // RemoteOperationTimeout is the default timeout for remote operations such as
 // RPC calls, etcd data fetches, and synchronous replication health checks.
 const RemoteOperationTimeout = 15 * time.Second
@@ -427,7 +427,7 @@ Watch for stale comments: a duration described in prose can drift from the const
 
 ## ctx-aware logging
 
-A small but pervasive idiom: the codebase logs with slog's `*Context` methods — `logger.ErrorContext(ctx, ...)`, `InfoContext`, `DebugContext` — rather than the context-free `Error`/`Info`. Passing `ctx` lets the logging backend extract trace/baggage data carried in the context, so a log line can be correlated with the request that produced it. You saw it in `WaitForLSN` above (`ErrorContext(ctx, "WaitForLSN context cancelled or timed out", ...)`). When you add logging on a code path that has a `ctx`, prefer the `*Context` variant. See [mterrors & Observability](/go-guide/project/09-mterrors-and-observability/).
+A small but pervasive idiom: the codebase logs with slog's `*Context` methods — `logger.ErrorContext(ctx, ...)`, `InfoContext`, `DebugContext` — rather than the context-free `Error`/`Info`. Passing `ctx` lets the logging backend extract trace/baggage data carried in the context, so a log line can be correlated with the request that produced it. You saw it in `WaitForLSN` above (`ErrorContext(ctx, "WaitForLSN context cancelled or timed out", ...)`). When you add logging on a code path that has a `ctx`, prefer the `*Context` variant. See [errx & Observability](/go-guide/project/09-errors-and-observability/).
 
 ## Checkpoints
 
@@ -445,13 +445,13 @@ If the server runs the inner operation up to the *exact* inbound deadline, it fi
 
 ## Exercises
 
-1. **Trace the timeout constants.** Open `go/common/timeouts/rpc.go` and pick three constants (e.g. `RuleWriteTimeout`, `ReadyTopoCheckTimeout`, `RemoteOperationTimeout`). Grep the repo for each constant name and find a call site that passes it to `context.WithTimeout`. For each, identify the *blocking operation* the deadline bounds (an RPC? an etcd probe?) and read the constant's comment to explain why that specific duration was chosen.
+1. **Trace the timeout constants.** Open `internal/timeouts/rpc.go` and pick three constants (e.g. `RuleWriteTimeout`, `ReadyTopoCheckTimeout`, `RemoteOperationTimeout`). Grep the repo for each constant name and find a call site that passes it to `context.WithTimeout`. For each, identify the *blocking operation* the deadline bounds (an RPC? an etcd probe?) and read the constant's comment to explain why that specific duration was chosen.
 
-2. **Follow a `WithValue` end to end.** In `go/services/multipooler/internal/manager/actionlock/action_lock.go`, trace the `*actionLockValue` pointer from `Acquire` (where it's stored) to `Release` and to the package-level `AssertActionLockHeld`. Then find a caller in `rpc_manager.go` that asserts the lock is held via the context. Explain why the `released *atomic.Bool` is a *pointer* shared across the contexts rather than a plain `bool` copied into each.
+2. **Follow a `WithValue` end to end.** In `internal/pooler/manager/actionlock/action_lock.go`, trace the `*actionLockValue` pointer from `Acquire` (where it's stored) to `Release` and to the package-level `AssertActionLockHeld`. Then find a caller in `rpc_manager.go` that asserts the lock is held via the context. Explain why the `released *atomic.Bool` is a *pointer* shared across the contexts rather than a plain `bool` copied into each.
 
-3. **Compare two `select`-on-`Done` loops.** Read `WaitForLSN` (`rpc_manager.go`) and `getOrDial` (`conn_cache.go`). For each, name the *other* `select` case (a ticker channel vs. a `default` poll) and explain the difference between a blocking `select` and a busy `default` loop. Then explain why `WaitForLSN` wraps `ctx.Err()` with `mterrors.Wrap` while `getOrDial` returns `ctx.Err()` directly.
+3. **Compare two `select`-on-`Done` loops.** Read `WaitForLSN` (`rpc_manager.go`) and `getOrDial` (`conn_cache.go`). For each, name the *other* `select` case (a ticker channel vs. a `default` poll) and explain the difference between a blocking `select` and a busy `default` loop. Then explain why `WaitForLSN` wraps `ctx.Err()` with `errx.Wrap` while `getOrDial` returns `ctx.Err()` directly.
 
-4. **Detach vs. direct context.** Read `ctxutil.Detach` and the `OnClose` hook in `go/services/multipooler/init.go`. Explain precisely what would break if the hook used `startCtx` directly instead of `Detach(startCtx)`, and what would break if it used `Detach(startCtx)` *without* wrapping it in `WithTimeout`.
+4. **Detach vs. direct context.** Read `ctxutil.Detach` and the `OnClose` hook in `internal/pooler/init.go`. Explain precisely what would break if the hook used `startCtx` directly instead of `Detach(startCtx)`, and what would break if it used `Detach(startCtx)` *without* wrapping it in `WithTimeout`.
 
 ## Next
 
@@ -490,9 +490,9 @@ If the server runs the inner operation up to the *exact* inbound deadline, it fi
     href="/go-guide/project/01-architecture-request-flow/"
   />
   <LinkCard
-    title="mterrors & Observability"
+    title="errx & Observability"
     description="The ErrorContext / InfoContext slog idiom and OTel baggage carried in ctx."
-    href="/go-guide/project/09-mterrors-and-observability/"
+    href="/go-guide/project/09-errors-and-observability/"
   />
   <LinkCard
     title="Idioms & Gotchas"

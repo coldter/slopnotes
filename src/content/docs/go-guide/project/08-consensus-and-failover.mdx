@@ -14,7 +14,7 @@ import { Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
 
 ---
 
-In the multigres cluster, `multiorch` is the brain that keeps a PostgreSQL shard available. When the primary dies, it is the component that notices, picks a survivor, and re-points everyone at the new leader. Get that wrong and you get split-brain (two primaries accepting writes) or data loss. So this is where the codebase's concurrency discipline is at its most deliberate: every goroutine has an owner, every RPC has a deadline tied to a parent context, and shared state is either cloned or guarded.
+In the example system's cluster, the `orchestrator` is the brain that keeps a PostgreSQL shard available. When the primary dies, it is the component that notices, picks a survivor, and re-points everyone at the new leader. Get that wrong and you get split-brain (two primaries accepting writes) or data loss. So this is where the codebase's concurrency discipline is at its most deliberate: every goroutine has an owner, every RPC has a deadline tied to a parent context, and shared state is either cloned or guarded.
 
 This page is the most concurrency-dense in the project track, and it rewards a top-down read. We'll go: the protocol vocabulary, then the three-loop engine that owns the goroutine lifecycles, then the worked election state machine, then the supporting primitives, and finally the safety properties that keep it from corrupting the cluster.
 
@@ -89,7 +89,7 @@ The **recovery loop** (1s) is where failover lives: it reads health snapshots, d
 
 ### The Engine struct: two mutexes, one shutdown context
 
-```go title="go/services/multiorch/recovery/engine.go"
+```go title="internal/orchestrator/recovery/engine.go"
 type Engine struct {
 	// ...
 	poolerStore  *store.PoolerStore
@@ -116,7 +116,7 @@ Two things are worth internalising here.
 
 **A single `shutdownCtx`** is the root of the cancellation tree for the entire service. `Stop()` cancels it, then stops each runner:
 
-```go title="go/services/multiorch/recovery/engine.go"
+```go title="internal/orchestrator/recovery/engine.go"
 func (re *Engine) Stop() {
 	re.cancel()
 	re.bookkeepingRunner.Stop()
@@ -140,7 +140,7 @@ Its machinery is a small state machine (`stopped` / `running` / `stopping`) guar
 
 `execute()` implements **backpressure**:
 
-```go title="go/tools/timer/periodic_runner.go"
+```go title="internal/tools/timer/periodic_runner.go"
 func (r *PeriodicRunner) execute() {
 	r.mu.Lock()
 	r.wg.Add(1)
@@ -169,7 +169,7 @@ Two deliberate choices:
 
 `Stop()` waits *outside* the lock:
 
-```go title="go/tools/timer/periodic_runner.go"
+```go title="internal/tools/timer/periodic_runner.go"
 func (r *PeriodicRunner) Stop() {
 	r.mu.Lock()
 	if r.state != running {
@@ -227,7 +227,7 @@ flowchart TB
   Skip --> Wait
 `} />
 
-```go title="go/services/multiorch/recovery/recovery_loop.go"
+```go title="internal/orchestrator/recovery/recovery_loop.go"
 // Process each shard independently in parallel
 var wg sync.WaitGroup
 for _, shardProblems := range problemsByShard {
@@ -244,7 +244,7 @@ Shards are independent failure domains, so they recover in parallel; `wg.Wait()`
 
 Detection itself is interface-driven. `analysis.DefaultAnalyzers(...)` returns analyzers that each `Analyze` a shard view and emit problems. The "leader is dead" decision lives in its own analyzer, and it is mostly *suppression of false positives* — a great window into distributed-systems edge cases. It declines to fail over if, for example, replicas are still connected to the supposedly dead leader, or if the "deadness" is just TCP-keepalive staleness:
 
-```go title="go/services/multiorch/recovery/analysis/leader_is_dead_analyzer.go"
+```go title="internal/orchestrator/recovery/analysis/leader_is_dead_analyzer.go"
 // Suppress failover during a known pg_promote() window.
 ```
 
@@ -254,7 +254,7 @@ When it does fire, it emits one shard-scoped problem at `PriorityEmergency` whos
 
 Before acting on a detected problem, `attemptRecovery` re-checks it against *fresh* store state, then wraps the action in a deadline:
 
-```go title="go/services/multiorch/recovery/recovery_loop.go"
+```go title="internal/orchestrator/recovery/recovery_loop.go"
 // Force re-poll to validate the problem still exists
 stillExists, err := re.recheckProblem(ctx, problem)
 // ... if !stillExists: skip ...
@@ -269,7 +269,7 @@ err = problem.RecoveryAction.Execute(ctx, problem)
 
 The action's timeout comes from its own metadata. For appointment:
 
-```go title="go/services/multiorch/recovery/actions/appoint_leader.go"
+```go title="internal/orchestrator/recovery/actions/appoint_leader.go"
 Timeout: 2*timeouts.RuleWriteTimeout + 5*time.Second,
 ```
 
@@ -305,8 +305,8 @@ stateDiagram-v2
 
 ### Phase 1 — fan-out into a buffered channel
 
-```go title="go/services/multiorch/consensus/rule_change.go"
-func (r *coordinatorLedRuleChange) dispatchRecruit(ctx context.Context, cohort []*multiorchdatapb.PoolerHealthState, revocation *clustermetadatapb.TermRevocation) chan recruitResult {
+```go title="internal/orchestrator/consensus/rule_change.go"
+func (r *coordinatorLedRuleChange) dispatchRecruit(ctx context.Context, cohort []*orchdatapb.PoolerHealthState, revocation *clustermetadatapb.TermRevocation) chan recruitResult {
 	recruited := make(chan recruitResult, len(cohort))
 	for _, p := range cohort {
 		go func() {
@@ -321,7 +321,7 @@ One goroutine per cohort member, each writing its result to a channel. The chann
 
 ### Phase 2 — fan-in with early commit
 
-```go title="go/services/multiorch/consensus/rule_change.go"
+```go title="internal/orchestrator/consensus/rule_change.go"
 func (r *coordinatorLedRuleChange) collectRecruitsAndBuildProposal(/* ... */) (*consensusdatapb.PromoteRequest, string, error) {
 	var err error
 	var p *consensusdatapb.CoordinatorProposal
@@ -352,7 +352,7 @@ The coordinator never invents a leader: it picks the most-advanced node that sti
 
 ### Phase 3/4 — propose to everyone, wait for all, fail fast on the leader
 
-```go title="go/services/multiorch/consensus/rule_change.go"
+```go title="internal/orchestrator/consensus/rule_change.go"
 promoteResults := r.dispatchPromote(ctx, cohort, propReq, leaderKey)
 // Phase 4: Wait for every Promote to return, not just the leader's.
 leaderErr := r.waitForPromotes(ctx, cohort, promoteResults)
@@ -360,7 +360,7 @@ leaderErr := r.waitForPromotes(ctx, cohort, promoteResults)
 
 `dispatchPromote` again fans out into a buffered `chan promoteResult` of size `len(cohort)`: the leader gets `Promote`, everyone else gets `SetPrimary`. `waitForPromotes` then drains all of them, with one asymmetry:
 
-```go title="go/services/multiorch/consensus/rule_change.go"
+```go title="internal/orchestrator/consensus/rule_change.go"
 for range len(cohort) {
 	pr := <-promoteResults
 	if pr.err != nil {
@@ -380,11 +380,11 @@ Phase 4 deliberately waits for *every* `Promote`/`SetPrimary`, not just the lead
 
 Every leaf RPC wraps the inherited context:
 
-```go title="go/services/multiorch/consensus/rule_change.go"
+```go title="internal/orchestrator/consensus/rule_change.go"
 func (r *coordinatorLedRuleChange) recruit(ctx context.Context, /* ... */) *clustermetadatapb.ConsensusStatus {
 	rpcCtx, cancel := context.WithTimeout(ctx, timeouts.RuleWriteTimeout)
 	defer cancel()
-	resp, err := r.coordinator.rpcClient.Recruit(rpcCtx, p.MultiPooler, /* ... */)
+	resp, err := r.coordinator.rpcClient.Recruit(rpcCtx, p.Pooler, /* ... */)
 	// ...
 }
 ```
@@ -399,7 +399,7 @@ The full chain is `engine.shutdownCtx` → recovery cycle `ctx` → `attemptReco
 
 The store every loop reads and writes is generic:
 
-```go title="go/services/multiorch/store/store.go"
+```go title="internal/orchestrator/store/store.go"
 type ProtoStore[K comparable, V proto.Message] struct {
 	mu    sync.Mutex
 	items map[K]V
@@ -408,7 +408,7 @@ type ProtoStore[K comparable, V proto.Message] struct {
 
 A `sync.Mutex` plus a map, where **every `Get`/`Set`/`Range` deep-clones via `proto.Clone`**:
 
-```go title="go/services/multiorch/store/store.go"
+```go title="internal/orchestrator/store/store.go"
 func (s *ProtoStore[K, V]) Get(key K) (V, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -429,7 +429,7 @@ Why mutex+map and not `sync.Map`? `sync.Map` is tuned for write-once-read-many, 
 
 `DoUpdate` gives an atomic read-modify-write under one lock acquisition:
 
-```go title="go/services/multiorch/store/store.go"
+```go title="internal/orchestrator/store/store.go"
 func (s *ProtoStore[K, V]) DoUpdate(key K, fn func(value V) V) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -453,7 +453,7 @@ Compare this to the coordinator's `policyCache`, a `sync.Map`: a durability-poli
 
 Detection needs fresh data, which comes from one long-lived gRPC stream per pooler. `Start` launches it:
 
-```go title="go/services/multiorch/recovery/health_stream.go"
+```go title="internal/orchestrator/recovery/health_stream.go"
 hs.wg.Go(func() {
 	defer func() {
 		hs.mu.Lock()
@@ -470,7 +470,7 @@ hs.wg.Go(func() {
 
 The goroutine **removes itself from the map via `defer`** when it exits, so `Stop` only has to call `entry.cancel()` and let the goroutine clean up — no shared deletion race. `runStream` loops over a retry iterator and reads current pooler metadata from the store on each reconnect (so host/port changes are picked up):
 
-```go title="go/services/multiorch/recovery/health_stream.go"
+```go title="internal/orchestrator/recovery/health_stream.go"
 r := retry.New(streamReconnectInitialBackoff, streamReconnectMaxBackoff, retry.WithInitialDelay())
 for _, err := range r.Attempts(ctx) {
 	if err != nil {
@@ -486,7 +486,7 @@ for _, err := range r.Attempts(ctx) {
 
 The subtle part is the **staleness watchdog** inside `streamOnce`:
 
-```go title="go/services/multiorch/recovery/health_stream.go"
+```go title="internal/orchestrator/recovery/health_stream.go"
 watchdogCtx, cancelWatchdog := context.WithCancel(ctx)
 defer cancelWatchdog()
 
@@ -517,7 +517,7 @@ go func() {
 		}
 	}
 }()
-stream, err := hs.rpcClient.ManagerHealthStream(watchdogCtx, poolerHealth.MultiPooler)
+stream, err := hs.rpcClient.ManagerHealthStream(watchdogCtx, poolerHealth.Pooler)
 ```
 
 :::caution[Gotcha — gRPC keepalive can't catch a stuck-but-alive server]
@@ -528,7 +528,7 @@ If the pooler's server goroutine hangs while the TCP connection stays alive, kee
 
 All the deadlines live in one place, with rationale comments. The numbers were tuned against real failover tests:
 
-```go title="go/common/timeouts/rpc.go"
+```go title="internal/timeouts/rpc.go"
 const RuleWriteTimeout = 30 * time.Second                    // per election RPC
 const DefaultHealthStreamStalenessTimeout = 90 * time.Second // watchdog window
 const DefaultSnapshotInterval = 5 * time.Second              // proactive snapshot rate
@@ -545,7 +545,7 @@ Centralising them keeps the action timeout (`2*RuleWriteTimeout + 5s`) and the p
 
 `Run` brackets the election with structured events through a tiny interface-driven logger:
 
-```go title="go/common/eventlog/eventlog.go"
+```go title="internal/eventlog/eventlog.go"
 type Event interface {
 	EventType() string
 	LogAttrs() []slog.Attr
@@ -556,15 +556,15 @@ func Emit(ctx context.Context, logger *slog.Logger, outcome Outcome, event Event
 	if outcome == Failed {
 		level = slog.LevelError
 	}
-	// ... logger.LogAttrs(ctx, level, "multigres.event", attrs...)
+	// ... logger.LogAttrs(ctx, level, "platform.event", attrs...)
 }
 ```
 
-`Outcome` is `Started`/`Success`/`Failed`; `Failed` logs at ERROR, the rest at INFO; `ctx` is threaded for OpenTelemetry correlation (see [mterrors & observability](/go-guide/project/09-mterrors-and-observability/)). The interface lets any typed event plug in — see [interfaces](/go-guide/language/03-interfaces-composition/).
+`Outcome` is `Started`/`Success`/`Failed`; `Failed` logs at ERROR, the rest at INFO; `ctx` is threaded for OpenTelemetry correlation (see [errors across boundaries & observability](/go-guide/project/09-errors-and-observability/)). The interface lets any typed event plug in — see [interfaces](/go-guide/language/03-interfaces-composition/).
 
 The event for a promotion is `PrimaryPromotion`:
 
-```go title="go/common/eventlog/events.go"
+```go title="internal/eventlog/events.go"
 type PrimaryPromotion struct {
 	NewPrimary   string
 	ProposedTerm int64
@@ -588,7 +588,7 @@ Split-brain prevention is not assumed — it's defended at multiple independent 
 | `SetPrimary` applies only strictly-higher rule | A stale/duplicate RPC demoting the new primary |
 | `TermRevocation` floor | A stale coordinator's proposals being accepted |
 
-```go title="go/services/multiorch/consensus/rule_change.go"
+```go title="internal/orchestrator/consensus/rule_change.go"
 // checkRecentAcceptance: back off if another coordinator may be mid-election
 const backoffWindow = 4 * time.Second
 // ... if a cohort member accepted a revocation within 4s, return UNAVAILABLE and abort.
@@ -624,7 +624,7 @@ Access pattern. Pooler state is write-heavy (health/topology churn every few sec
 
 3. **Lock-discipline diagram.** Read `periodic_runner.go` `Stop()` and `execute()`. Draw the lock acquire/release timeline for a `Stop()` that races an in-flight callback, and explain exactly where a deadlock would appear if `wg.Wait()` were moved inside the held lock. Then define "backpressure" in this context and name the bug it prevents under a slow recovery cycle.
 
-4. **Deadline-chain grep.** Run `grep -rn "context.WithTimeout" go/services/multiorch`. For each hit, identify the parent context and the timeout value, then explain how the chain ties back to `engine.shutdownCtx` so a `Stop()` cancels an in-flight election. Cross-check that `appoint_leader.go`'s `Metadata().Timeout` (`2*RuleWriteTimeout + 5s`) is at least the two sequential `RuleWriteTimeout` phases in `rule_change.go`.
+4. **Deadline-chain grep.** Run `grep -rn "context.WithTimeout" internal/orchestrator`. For each hit, identify the parent context and the timeout value, then explain how the chain ties back to `engine.shutdownCtx` so a `Stop()` cancels an in-flight election. Cross-check that `appoint_leader.go`'s `Metadata().Timeout` (`2*RuleWriteTimeout + 5s`) is at least the two sequential `RuleWriteTimeout` phases in `rule_change.go`.
 
 5. **Extend the event model (read-only).** Sketch a new typed `Event` for `events.go` (e.g. a hypothetical `CohortReconcile`) implementing `EventType()`/`LogAttrs()`, and point at one place in the recovery actions where `Emit(ctx, logger, Started/Success/Failed, ...)` is already used as a template. Describe the diff; don't write the file.
 
@@ -634,7 +634,7 @@ Access pattern. Pooler state is write-heavy (health/topology churn every few sec
 
 ## Next
 
-Continue to [mterrors & observability](/go-guide/project/09-mterrors-and-observability/) to see how `Emit`, OpenTelemetry spans, and `mterrors` wrapping turn this subsystem's events into traces and structured errors.
+Continue to [errors across boundaries & observability](/go-guide/project/09-errors-and-observability/) to see how `Emit`, OpenTelemetry spans, and `errx` wrapping turn this subsystem's events into traces and structured errors.
 
 ---
 
@@ -647,7 +647,7 @@ Continue to [mterrors & observability](/go-guide/project/09-mterrors-and-observa
   <LinkCard title="Generics" description="The generic ProtoStore[K, V]." href="/go-guide/language/06-generics/" />
   <LinkCard title="Stdlib & idioms" description="Go 1.23 range-over-func iterator, functional options, time.Timer." href="/go-guide/language/10-stdlib-and-idioms/" />
   <LinkCard title="gRPC & protobuf" description="The consensus messages and the typed pooler client." href="/go-guide/project/04-grpc-and-protobuf/" />
-  <LinkCard title="Service anatomy" description="How multiorch is wired in init.go and the service lifecycle." href="/go-guide/project/05-service-anatomy/" />
-  <LinkCard title="Architecture & request flow" description="Where multiorch sits relative to multigateway/multipooler." href="/go-guide/project/01-architecture-request-flow/" />
+  <LinkCard title="Service anatomy" description="How the orchestrator is wired in init.go and the service lifecycle." href="/go-guide/project/05-service-anatomy/" />
+  <LinkCard title="Architecture & request flow" description="Where the orchestrator sits relative to the gateway/pooler." href="/go-guide/project/01-architecture-request-flow/" />
   <LinkCard title="Glossary" description="leader/follower, primary/standby, cohort, term, quorum." href="/go-guide/reference/glossary/" />
 </CardGrid>

@@ -16,42 +16,42 @@ import { Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
 
 ## The one-paragraph mental model
 
-Multigres is *Vitess for Postgres*: a set of small Go services that sit in front of real PostgreSQL servers and add routing, connection pooling, and automated failover. A client speaks the ordinary PostgreSQL wire protocol to a **multigateway**; the gateway is a stateless proxy that turns each query into a **gRPC** call to a **multipooler**; the pooler runs the query on a pooled SQL connection to a real **PostgreSQL** process. Everything else — lifecycle management, consensus/failover, admin — happens off to the side and is *not* on the query path.
+The example system is a **distributed SQL proxy**: a set of small Go services that sit in front of real PostgreSQL servers and add routing, connection pooling, and automated failover. A client speaks the ordinary PostgreSQL wire protocol to a **gateway**; the gateway is a stateless proxy that turns each query into a **gRPC** call to a **pooler**; the pooler runs the query on a pooled SQL connection to a real **PostgreSQL** process. Everything else — lifecycle management, consensus/failover, admin — happens off to the side and is *not* on the query path.
 
 :::note[The single most important sentence on this page]
-The latency-sensitive path is `multigateway -> multipooler -> postgres`, and only the first hop is gRPC. The second hop is a real pooled SQL connection.
+The latency-sensitive path is `gateway -> pooler -> postgres`, and only the first hop is gRPC. The second hop is a real pooled SQL connection.
 :::
 
 ---
 
 ## The five services (plus a test binary)
 
-Each service is a separate binary under `go/cmd/<svc>/main.go`. The descriptions below are taken from the package doc-comments and cobra `Short` strings in those files — the system's own words for what each one does.
+Each service is a separate binary under `cmd/<svc>/main.go`. The descriptions below are taken from the package doc-comments and cobra `Short` strings in those files — the system's own words for what each one does.
 
 | Service | Binary location | On the query path? | One-line responsibility |
 | --- | --- | --- | --- |
-| **multigateway** | `go/cmd/multigateway/main.go` | **Yes (hop 1)** | "a stateless proxy responsible for accepting requests from applications and routing them to the appropriate multipooler server(s) ... It speaks both the PostgreSQL Protocol and a gRPC protocol." |
-| **multipooler** | `go/cmd/multipooler/main.go` | **Yes (hop 2)** | "provides connection pooling and communicates with pgctld via gRPC to serve queries from multigateway instances." |
-| **pgctld** | `go/cmd/pgctld/main.go` | No (control plane) | "manages PostgreSQL server instances ... providing lifecycle management and configuration control." |
-| **multiorch** | `go/services/multiorch/init.go` | No (control plane) | Consensus + failover: builds a `consensus.NewCoordinator` and a `recovery.NewEngine`, watches topology, and drives recovery. |
-| **multiadmin** | `go/cmd/multiadmin/main.go` | No (admin/observability) | "provides administrative services for the multigres cluster, exposing both HTTP and gRPC endpoints" + an HTTP reverse proxy to per-cell status pages. |
-| **portpoolserver** | `go/cmd/portpoolserver/main.go` | No (tests only) | "a cross-process port allocation service for integration tests." |
+| **gateway** | `cmd/gateway/main.go` | **Yes (hop 1)** | "a stateless proxy responsible for accepting requests from applications and routing them to the appropriate pooler server(s) ... It speaks both the PostgreSQL Protocol and a gRPC protocol." |
+| **pooler** | `cmd/pooler/main.go` | **Yes (hop 2)** | "provides connection pooling and communicates with dbctld via gRPC to serve queries from gateway instances." |
+| **dbctld** | `cmd/dbctld/main.go` | No (control plane) | "manages PostgreSQL server instances ... providing lifecycle management and configuration control." |
+| **orchestrator** | `services/orchestrator/init.go` | No (control plane) | Consensus + failover: builds a `consensus.NewCoordinator` and a `recovery.NewEngine`, watches topology, and drives recovery. |
+| **admin** | `cmd/admin/main.go` | No (admin/observability) | "provides administrative services for the cluster, exposing both HTTP and gRPC endpoints" + an HTTP reverse proxy to per-cell status pages. |
+| **portpoolserver** | `cmd/portpoolserver/main.go` | No (tests only) | "a cross-process port allocation service for integration tests." |
 
-`multigres` itself is the operator CLI (cluster management), not a long-running service.
+The operator CLI `platformctl` handles cluster management; it is not a long-running service.
 
-:::caution[Gotcha — pgctld is NOT a query relay]
-It's tempting to read a flat data-flow list ("pgctld → handles starting and stopping PostgreSQL") and assume queries pass through pgctld. They do not. The pgctld service surface is entirely lifecycle: `Start`, `Stop`, `Restart`, plus `ReloadConfig`/`Status`/`Version`/`InitDataDir`/`PgRewind`. The pooler keeps a *separate* gRPC link to pgctld (a `PgctldAddr` in its config) used only to start/stop/configure Postgres — never to run a `SELECT`.
+:::caution[Gotcha — dbctld is NOT a query relay]
+It's tempting to read a flat data-flow list ("dbctld → handles starting and stopping PostgreSQL") and assume queries pass through dbctld. They do not. The dbctld service surface is entirely lifecycle: `Start`, `Stop`, `Restart`, plus `ReloadConfig`/`Status`/`Version`/`InitDataDir`/`PgRewind`. The pooler keeps a *separate* gRPC link to dbctld (a `DBCtldAddr` in its config) used only to start/stop/configure Postgres — never to run a `SELECT`.
 :::
 
 :::caution[Gotcha — gateways barely talk to each other]
-The cross-gateway contract (`proto/multigatewayservice.proto`) defines exactly one RPC: `CancelQuery`. PostgreSQL cancel requests arrive on a fresh connection carrying a PID; the system encodes a gateway prefix into that PID, so a cancel that lands on the wrong gateway is *forwarded* to the owner. Gateways never route normal queries to each other.
+The cross-gateway contract (`proto/gatewayservice.proto`) defines exactly one RPC: `CancelQuery`. PostgreSQL cancel requests arrive on a fresh connection carrying a PID; the system encodes a gateway prefix into that PID, so a cancel that lands on the wrong gateway is *forwarded* to the owner. Gateways never route normal queries to each other.
 :::
 
 ---
 
 ## Cells and the topology store
 
-A **cell** is an availability zone. Each cell runs its own full stack of services (gateway, pooler, orch, pgctld + postgres). The cluster's metadata lives in a **topology store** — etcd in production (`etcdtopo`), an in-process fake (`memorytopo`) in tests. The Go package that reads and writes it is `go/common/topoclient`.
+A **cell** is an availability zone. Each cell runs its own full stack of services (gateway, pooler, orch, dbctld + postgres). The cluster's metadata lives in a **topology store** — etcd in production (`etcdtopo`), an in-process fake (`memorytopo`) in tests. The Go package that reads and writes it is `internal/topo`.
 
 The store is split into two logically separate connections:
 
@@ -65,9 +65,9 @@ flowchart TB
 `} />
 
 - **Global topology** holds *static* cluster-level metadata: `Database` records and `Cell` locations. A `Cell` is just `` `{ name, server_addresses, root }` `` — how to connect to that cell's topology service.
-- **Cell topology** holds *dynamic* per-cell catalogs: the `MultiPooler`, `MultiGateway`, and `MultiOrch` records for components living in that cell.
+- **Cell topology** holds *dynamic* per-cell catalogs: the `Pooler`, `Gateway`, and `Orch` records for components living in that cell.
 
-The global and cell topologies may run on the same etcd cluster, but they remain separate in terms of naming and client management: `topoclient` keeps one connection to the global topology service and one connection to each cell topology service.
+The global and cell topologies may run on the same etcd cluster, but they remain separate in terms of naming and client management: the topology client keeps one connection to the global topology service and one connection to each cell topology service.
 
 :::caution[Gotcha — `Cell` records are essentially static]
 Cell records are not meant to be changed while the system is running, and a cell cannot be removed while a shard still references it. Cells are added during provisioning, not reshuffled at runtime.
@@ -76,14 +76,14 @@ Cell records are not meant to be changed while the system is running, and a cell
 Every component is uniquely named by an `` `ID{component, cell, name}` ``. That is how the gateway, given a routing decision, names the exact pooler it must reach.
 
 :::caution[Gotcha — minimum two cells]
-A shard bootstraps with an `` `AtLeastN(2)` `` durability policy, so a single pooler can never elect a leader. The `MULTIGRES_NUM_CELLS` minimum is 2. Any tutorial that says "spin up one of everything" is wrong for failover-capable clusters.
+A shard bootstraps with an `` `AtLeastN(2)` `` durability policy, so a single pooler can never elect a leader. The `PLATFORM_NUM_CELLS` minimum is 2. Any tutorial that says "spin up one of everything" is wrong for failover-capable clusters.
 :::
 
 ---
 
 ## Topology diagram (two cells, the real deployment shape)
 
-This combines the service list, the cell split, and the concrete container layout from a typical local deployment (etcd + multiadmin + per-cell stacks, exposing zone1's gateway on PG port 15432).
+This combines the service list, the cell split, and the concrete container layout from a typical local deployment (etcd + admin + per-cell stacks, exposing zone1's gateway on PG port 15432).
 
 <Mermaid title="Two-cell deployment" height={560} code={`
 flowchart TB
@@ -91,20 +91,20 @@ flowchart TB
   Client --> GW1
 
   subgraph zone1["zone1 (cell)"]
-    GW1["multigateway (PG wire in)"]
-    POOL1["multipooler"]
+    GW1["gateway (PG wire in)"]
+    POOL1["pooler"]
     PG1["PostgreSQL"]
-    PGCTL1["pgctld (lifecycle)"]
-    ORCH1["multiorch (consensus + failover)"]
-    GW1 -->|"gRPC: MultiPoolerService"| POOL1
+    PGCTL1["dbctld (lifecycle)"]
+    ORCH1["orchestrator (consensus + failover)"]
+    GW1 -->|"gRPC: PoolerService"| POOL1
     POOL1 -->|"pooled SQL"| PG1
-    POOL1 -->|"gRPC: PgCtld"| PGCTL1
+    POOL1 -->|"gRPC: DBCtld"| PGCTL1
     PGCTL1 -->|"lifecycle"| PG1
     ORCH1 -->|"controls recovery"| PG1
   end
 
   subgraph zone2["zone2 (cell)"]
-    Z2["full stack: gateway, pooler,<br/>multiorch, pgctld + PostgreSQL"]
+    Z2["full stack: gateway, pooler,<br/>orchestrator, dbctld + PostgreSQL"]
   end
 
   ETCD[("etcd: GLOBAL topology<br/>(Databases, Cell locations)<br/>+ cell topo zone1<br/>+ cell topo zone2")]
@@ -112,13 +112,13 @@ flowchart TB
   zone1 --- ETCD
   zone2 --- ETCD
 
-  ADMIN["multiadmin (admin/observability front door;<br/>off the query path)"]
+  ADMIN["admin (admin/observability front door;<br/>off the query path)"]
   ADMIN -.->|"HTTP reverse proxy /proxy/&lt;type&gt;/&lt;cell&gt;/&lt;name&gt;"| zone1
 `} />
 
 Three different things are labelled with words derived from "primary"; keep them distinct:
 
-- **leader / follower** — consensus roles owned by multiorch.
+- **leader / follower** — consensus roles owned by the orchestrator.
 - **primary / standby / replica** — PostgreSQL recovery-mode state (`pg_is_in_recovery()`).
 - **PoolerType PRIMARY / REPLICA** — a *topology routing label* (writes vs. reads) set by the gateway.
 
@@ -130,19 +130,19 @@ They are different concepts that happen to share a word. The routing label is se
 
 ## How gRPC wires the services together
 
-The inter-service contract is protobuf. Each service has a `*.proto` in `proto/` that generates Go into `` `go/pb/<name>` ``. The contracts that matter for the big picture:
+The inter-service contract is protobuf. Each service has a `*.proto` in `proto/` that generates Go into `` `internal/pb/<name>` ``. The contracts that matter for the big picture:
 
-- `MultiPoolerService` (`proto/multipoolerservice.proto`) — the gateway-to-pooler contract: `ExecuteQuery`, `StreamExecute`, `PortalStreamExecute`, plus `Describe`, `GetAuthCredentials`, `CopyBidiExecute`, `ConcludeTransaction`, etc.
-- `PgCtld` (`proto/pgctldservice.proto`) — pooler-to-pgctld lifecycle control.
-- `MultiOrchService` (`proto/multiorchservice.proto`) — recovery/failover control RPCs.
-- `MultiGatewayService` (`proto/multigatewayservice.proto`) — cross-gateway `CancelQuery` only.
+- `PoolerService` (`proto/poolerservice.proto`) — the gateway-to-pooler contract: `ExecuteQuery`, `StreamExecute`, `PortalStreamExecute`, plus `Describe`, `GetAuthCredentials`, `CopyBidiExecute`, `ConcludeTransaction`, etc.
+- `DBCtld` (`proto/dbctldservice.proto`) — pooler-to-dbctld lifecycle control.
+- `OrchService` (`proto/orchservice.proto`) — recovery/failover control RPCs.
+- `GatewayService` (`proto/gatewayservice.proto`) — cross-gateway `CancelQuery` only.
 
 :::caution[Gotcha — `ExecuteQuery` vs `StreamExecute`]
 The proto comment is blunt: `ExecuteQuery` "should be used sparingly only when we know the result set is small, otherwise StreamExecute should be used." The simple-query hot path uses `StreamExecute`, so streaming is the default.
 :::
 
 :::note[Generated code is read-only]
-Everything under `go/pb/` carries `// Code generated` and must not be hand-edited. Trace bugs to the `.proto` source and regenerate with `make proto`. Treat `go/pb` as the *contract*, not as logic. For the full story see [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/).
+Everything under `internal/pb/` carries `// Code generated` and must not be hand-edited. Trace bugs to the `.proto` source and regenerate with `make proto`. Treat `internal/pb` as the *contract*, not as logic. For the full story see [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/).
 :::
 
 ---
@@ -155,8 +155,8 @@ Let's follow a single `SELECT 1` from the client socket to Postgres and back. Ea
 sequenceDiagram
   autonumber
   participant Client
-  participant Gateway as multigateway
-  participant Pooler as multipooler
+  participant Gateway as gateway
+  participant Pooler as pooler
   participant Postgres
   Client->>Gateway: PG 'Q' message (raw SQL)
   Note over Gateway: handler.HandleQuery
@@ -172,10 +172,10 @@ sequenceDiagram
 
 ### Step 1 — PG wire arrives at the gateway handler
 
-In `go/services/multigateway/handler/handler.go`, `HandleQuery` receives a simple-protocol `Q` message carrying the raw SQL string. The handler parses it (syntactic only) and runs the executor under a statement-timeout context:
+In `services/gateway/handler/handler.go`, `HandleQuery` receives a simple-protocol `Q` message carrying the raw SQL string. The handler parses it (syntactic only) and runs the executor under a statement-timeout context:
 
-```go title="go/services/multigateway/handler/handler.go"
-func (h *MultiGatewayHandler) HandleQuery(ctx context.Context, conn *server.Conn, queryStr string, callback func(ctx context.Context, result *sqltypes.Result) error) error {
+```go title="services/gateway/handler/handler.go"
+func (h *GatewayHandler) HandleQuery(ctx context.Context, conn *server.Conn, queryStr string, callback func(ctx context.Context, result *sqltypes.Result) error) error {
 	// ...
 	asts, err := parser.ParseSQL(queryStr)
 	// ...
@@ -185,14 +185,14 @@ func (h *MultiGatewayHandler) HandleQuery(ctx context.Context, conn *server.Conn
 Notice the `callback` parameter: results are *pushed* back, not collected then returned. The handler wraps the caller's callback in a `countingCallback` that tallies rows. The extended query protocol (`Parse`/`Bind`/`Execute`/`Describe`/`Close`/`Sync`) has sibling handlers in the same file that ultimately funnel into the same executor.
 
 :::note
-A parse failure is turned into `mterrors.NewParseError(...)` so the client sees the same `42601` SQLSTATE PostgreSQL would. See [mterrors & observability](/go-guide/project/09-mterrors-and-observability/).
+A parse failure is turned into `errx.NewParseError(...)` so the client sees the same `42601` SQLSTATE PostgreSQL would. See [structured errors & observability](/go-guide/project/09-errors-and-observability/).
 :::
 
 ### Step 2 — the gateway executor plans
 
-In `go/services/multigateway/executor/executor.go`, `StreamExecute` consults the plan cache + planner, then routes through an interface, not a concrete type:
+In `services/gateway/executor/executor.go`, `StreamExecute` consults the plan cache + planner, then routes through an interface, not a concrete type:
 
-```go title="go/services/multigateway/executor/executor.go"
+```go title="services/gateway/executor/executor.go"
 type Executor struct {
 	planner   *planner.Planner
 	exec      engine.IExecute
@@ -205,10 +205,10 @@ type Executor struct {
 
 ### Step 3 — scatterconn decides read vs write
 
-In `go/services/multigateway/scatterconn/scatter_conn.go`, `buildTarget` converts the connection state into a `query.Target`:
+In `services/gateway/scatterconn/scatter_conn.go`, `buildTarget` converts the connection state into a `query.Target`:
 
-```go title="go/services/multigateway/scatterconn/scatter_conn.go"
-func (sc *ScatterConn) buildTarget(tableGroup, shard string, state *handler.MultiGatewayConnectionState) *querypb.Target {
+```go title="services/gateway/scatterconn/scatter_conn.go"
+func (sc *ScatterConn) buildTarget(tableGroup, shard string, state *handler.GatewayConnectionState) *querypb.Target {
 	poolerType := clustermetadatapb.PoolerType_PRIMARY
 	if state.TargetReplica() {
 		poolerType = clustermetadatapb.PoolerType_REPLICA
@@ -224,25 +224,25 @@ func (sc *ScatterConn) buildTarget(tableGroup, shard string, state *handler.Mult
 This is *the* place read-vs-write routing is decided. `Target` (`proto/query.proto`) is `` `{ table_group, shard, pooler_type }` ``, and `PoolerType` is `PRIMARY` / `REPLICA` / `DRAINED`.
 
 :::caution[Gotcha — reads vs writes are split by TCP port, not by parsing the SQL]
-The gateway optionally starts a *second* listener for replica reads. In `go/services/multigateway/init.go` it only builds the replica listener when `pgReplicaPort > 0`, and on that listener calls `replicaHandler.SetTargetReplica(true)`. That flag is exactly what flips `buildTarget` to `REPLICA`. Connect to the primary port → `PRIMARY`; connect to the replica port → `REPLICA`.
+The gateway optionally starts a *second* listener for replica reads. In `services/gateway/init.go` it only builds the replica listener when `pgReplicaPort > 0`, and on that listener calls `replicaHandler.SetTargetReplica(true)`. That flag is exactly what flips `buildTarget` to `REPLICA`. Connect to the primary port → `PRIMARY`; connect to the replica port → `REPLICA`.
 :::
 
 ### Step 4 — poolergateway resolves a concrete pooler
 
-In `go/services/multigateway/poolergateway/pooler_gateway.go`, `PoolerGateway` implements `queryservice.QueryService`. `QueryServiceByID` resolves a `Target`/`ID` to a live pooler connection; `StreamExecute` forwards the call. The actual gRPC client is created in `go/services/multigateway/poolergateway/pooler_connection.go` via `grpccommon.NewClient(addr, ...)` then:
+In `services/gateway/poolergateway/pooler_gateway.go`, `PoolerGateway` implements `queryservice.QueryService`. `QueryServiceByID` resolves a `Target`/`ID` to a live pooler connection; `StreamExecute` forwards the call. The actual gRPC client is created in `services/gateway/poolergateway/pooler_connection.go` via `grpccommon.NewClient(addr, ...)` then:
 
-```go title="go/services/multigateway/poolergateway/pooler_connection.go"
-client: multipoolerservice.NewMultiPoolerServiceClient(conn),
+```go title="services/gateway/poolergateway/pooler_connection.go"
+client: poolerservice.NewPoolerServiceClient(conn),
 ```
 
-That single line is the proof the gateway-to-pooler hop is gRPC. *Which* pooler gets picked is driven by service discovery: `go/services/multigateway/discovery.go` watches the cell topology for `MultiPooler` records and feeds a `poolergateway.LoadBalancer`.
+That single line is the proof the gateway-to-pooler hop is gRPC. *Which* pooler gets picked is driven by service discovery: `services/gateway/discovery.go` watches the cell topology for `Pooler` records and feeds a `poolergateway.LoadBalancer`.
 
 ### Step 5 — the wire call
 
-In `go/services/multigateway/poolergateway/grpc_query_service.go`, `StreamExecute` builds the proto request and pumps the server stream into the callback:
+In `services/gateway/poolergateway/grpc_query_service.go`, `StreamExecute` builds the proto request and pumps the server stream into the callback:
 
-```go title="go/services/multigateway/poolergateway/grpc_query_service.go"
-req := &multipoolerservice.StreamExecuteRequest{
+```go title="services/gateway/poolergateway/grpc_query_service.go"
+req := &poolerservice.StreamExecuteRequest{
 	Query:              sql,
 	Target:             target,
 	Options:            options,
@@ -256,12 +256,12 @@ This is the boundary where in-process Go calls become bytes on the network. `ctx
 
 ### Step 6 — pooler server side
 
-In `go/services/multipooler/grpcpoolerservice/service.go`, `StreamExecute` runs *admission control* (`StartRequest`, which lets a graceful drain keep serving single queries while rejecting new transactions), fetches its executor, and streams results back via `stream.Send`:
+In `services/pooler/grpcpoolerservice/service.go`, `StreamExecute` runs *admission control* (`StartRequest`, which lets a graceful drain keep serving single queries while rejecting new transactions), fetches its executor, and streams results back via `stream.Send`:
 
-```go title="go/services/multipooler/grpcpoolerservice/service.go"
-func (s *poolerService) StreamExecute(req *multipoolerpb.StreamExecuteRequest, stream multipoolerpb.MultiPoolerService_StreamExecuteServer) error {
+```go title="services/pooler/grpcpoolerservice/service.go"
+func (s *poolerService) StreamExecute(req *poolerpb.StreamExecuteRequest, stream poolerpb.PoolerService_StreamExecuteServer) error {
 	if err := s.pooler.StartRequest(req.Target, admissionKind(...)); err != nil {
-		return mterrors.ToGRPC(err)
+		return errx.ToGRPC(err)
 	}
 	executor, err := s.pooler.Executor()
 	// ...
@@ -270,9 +270,9 @@ func (s *poolerService) StreamExecute(req *multipoolerpb.StreamExecuteRequest, s
 
 ### Step 7 — the pooler runs real SQL
 
-In `go/services/multipooler/internal/executor/executor.go`, the pooler pulls a pooled Postgres connection, stamps a `multigres_vpid`, and runs the query with retry:
+In `services/pooler/internal/executor/executor.go`, the pooler pulls a pooled Postgres connection, stamps a virtual PID, and runs the query with retry:
 
-```go title="go/services/multipooler/internal/executor/executor.go"
+```go title="services/pooler/internal/executor/executor.go"
 conn, err := e.poolManager.GetRegularConnWithSettings(ctx, settings, user, clientKey, serverKey)
 // ...
 if err := conn.Conn.QueryStreamingWithRetry(ctx, sql, callback); err != nil {
@@ -280,7 +280,7 @@ if err := conn.Conn.QueryStreamingWithRetry(ctx, sql, callback); err != nil {
 }
 ```
 
-This is the `multipooler -> postgres` hop. It is a real pooled SQL connection (pgx/libpq-style), *not* gRPC and *not* via pgctld. Rows stream back up the same chain — pooler stream → gateway callback → PG `DataRow`/`CommandComplete` to the client.
+This is the `pooler -> postgres` hop. It is a real pooled SQL connection (pgx/libpq-style), *not* gRPC and *not* via dbctld. Rows stream back up the same chain — pooler stream → gateway callback → PG `DataRow`/`CommandComplete` to the client.
 
 ---
 
@@ -289,23 +289,23 @@ This is the `multipooler -> postgres` hop. It is a real pooled SQL connection (p
 - **Stateless gateway, stateful pooler.** Pooling and per-connection reservation state live in the pooler (close to Postgres), so gateways can be scaled and replaced freely. The gateway only holds routing + plan caches.
 - **Interface seams at every hop** (`engine.IExecute`, `queryservice.QueryService`) make each layer unit-testable in isolation and let the gateway swap a real gRPC client for a fake. See [interfaces & composition](/go-guide/language/03-interfaces-composition/).
 - **Topology in etcd, not config files.** The sample `config/*.yaml` files are tiny (mostly `http-port`, `log-level`). Real cell/pooler wiring is discovered from the topology store at runtime, which is what makes failover and live rebalancing possible.
-- **Strict dependency direction** keeps it all decoupled: `cmd/` may depend on anything; `services/` may not depend on `cmd/` or *other* services; `common/` may not depend on `cmd/` or `services/`; `tools/` may not depend on any repo code outside `tools/`. This is enforced by package layout, and it is why the gateway reaches the pooler over a generated gRPC client (a `common`/`pb` boundary) rather than importing the pooler package.
+- **Strict dependency direction** keeps it all decoupled: `cmd/` may depend on anything; `services/` may not depend on `cmd/` or *other* services; shared `internal/` packages may not depend on `cmd/` or `services/`; the lowest-level tooling packages may not depend on any repo code outside themselves. This is enforced by package layout, and it is why the gateway reaches the pooler over a generated gRPC client (a shared `internal`/`pb` boundary) rather than importing the pooler package.
 
 ---
 
 ## Checkpoints
 
 <details><summary>Which hops in the latency-sensitive query path are gRPC, and which is not?</summary>
-Only `multigateway -> multipooler` is gRPC (`MultiPoolerService`, via `multipoolerservice.NewMultiPoolerServiceClient`). The `multipooler -> postgres` hop is a real pooled SQL connection (`conn.Conn.QueryStreamingWithRetry`). pgctld is not on the path at all.</details>
+Only `gateway -> pooler` is gRPC (`PoolerService`, via `poolerservice.NewPoolerServiceClient`). The `pooler -> postgres` hop is a real pooled SQL connection (`conn.Conn.QueryStreamingWithRetry`). dbctld is not on the path at all.</details>
 
 <details><summary>You connect to the gateway's replica-reads port. Trace how that becomes <code>PoolerType_REPLICA</code> in the gRPC request.</summary>
 `init.go` builds a second listener whose handler has `SetTargetReplica(true)`. That makes `state.TargetReplica()` true, so `scatterconn.buildTarget` sets `poolerType = REPLICA`, which is placed in the `query.Target` carried by the `StreamExecuteRequest`. The decision is made by *which TCP port* you connected to, not by inspecting the SQL.</details>
 
 <details><summary>What is the difference between global topology and cell topology, and where is each stored?</summary>
-Global topology holds static metadata (`Database` records, `Cell` locations); cell topology holds dynamic per-cell catalogs (`MultiPooler`/`MultiGateway`/`MultiOrch` records). `topoclient` keeps one connection to global and one per cell; both may live on the same etcd cluster but are separate connections/namespaces (`go/common/topoclient/store.go`).</details>
+Global topology holds static metadata (`Database` records, `Cell` locations); cell topology holds dynamic per-cell catalogs (`Pooler`/`Gateway`/`Orch` records). The topology client keeps one connection to global and one per cell; both may live on the same etcd cluster but are separate connections/namespaces (`internal/topo/store.go`).</details>
 
 <details><summary>Why can't this cluster run with a single cell?</summary>
-The shard bootstraps with an `AtLeastN(2)` durability policy, so a single pooler can never form a quorum to elect a leader. The `MULTIGRES_NUM_CELLS` minimum is 2.</details>
+The shard bootstraps with an `AtLeastN(2)` durability policy, so a single pooler can never form a quorum to elect a leader. The `PLATFORM_NUM_CELLS` minimum is 2.</details>
 
 ---
 
@@ -313,13 +313,13 @@ The shard bootstraps with an `AtLeastN(2)` durability policy, so a single pooler
 
 <Steps>
 
-1. **Trace the flow yourself.** Open these files in order and write down, at each, what the request looks like (PG message? Go args? proto message? SQL?): `go/services/multigateway/handler/handler.go` (`HandleQuery`) → `go/services/multigateway/executor/executor.go` (`StreamExecute`) → `go/services/multigateway/scatterconn/scatter_conn.go` (`buildTarget` + `StreamExecute`) → `go/services/multigateway/poolergateway/pooler_gateway.go` (`StreamExecute`/`QueryServiceByID`) → `go/services/multigateway/poolergateway/grpc_query_service.go` → `go/services/multipooler/grpcpoolerservice/service.go` (`StreamExecute`) → `go/services/multipooler/internal/executor/executor.go`.
+1. **Trace the flow yourself.** Open these files in order and write down, at each, what the request looks like (PG message? Go args? proto message? SQL?): `services/gateway/handler/handler.go` (`HandleQuery`) → `services/gateway/executor/executor.go` (`StreamExecute`) → `services/gateway/scatterconn/scatter_conn.go` (`buildTarget` + `StreamExecute`) → `services/gateway/poolergateway/pooler_gateway.go` (`StreamExecute`/`QueryServiceByID`) → `services/gateway/poolergateway/grpc_query_service.go` → `services/pooler/grpcpoolerservice/service.go` (`StreamExecute`) → `services/pooler/internal/executor/executor.go`.
 
-2. **Name the seven cmd binaries from their own docs.** Open each `go/cmd/<svc>/main.go` (and the doc-comments) and copy the one-sentence responsibility from the package comment or cobra `Short`. Then mark each as query-path, control-plane, or test-only. Check yourself against the table above.
+2. **Name the six cmd binaries from their own docs.** Open each `cmd/<svc>/main.go` (and the doc-comments) and copy the one-sentence responsibility from the package comment or cobra `Short`. Then mark each as query-path, control-plane, or test-only. Check yourself against the table above.
 
-3. **Find where read/write routing is decided.** Run `grep -n "TargetReplica\|buildTarget"` over `go/services/multigateway/` and locate the two `server.NewListener` calls in `go/services/multigateway/init.go`. Explain in two sentences how connecting to the replica port ends up as `PoolerType_REPLICA` on the wire.
+3. **Find where read/write routing is decided.** Run `grep -n "TargetReplica\|buildTarget"` over `services/gateway/` and locate the two `server.NewListener` calls in `services/gateway/init.go`. Explain in two sentences how connecting to the replica port ends up as `PoolerType_REPLICA` on the wire.
 
-4. **Map the topology model.** Open `proto/clustermetadata.proto` and sort its messages into "global topology" vs "per-cell topology", cross-checking against the topology diagram above. Then connect the `MULTIGRES_NUM_CELLS` minimum of 2 back to the durability requirement.
+4. **Map the topology model.** Open `proto/clustermetadata.proto` and sort its messages into "global topology" vs "per-cell topology", cross-checking against the topology diagram above. Then connect the `PLATFORM_NUM_CELLS` minimum of 2 back to the durability requirement.
 
 </Steps>
 
@@ -334,12 +334,12 @@ Continue to [cmd & cobra](/go-guide/project/02-cmd-and-cobra/) to see how each `
 ## See also
 
 <CardGrid>
-  <LinkCard title="config & viperutil" description="The flags/config that set ports and cells." href="/go-guide/project/03-config-viperutil/" />
-  <LinkCard title="gRPC & protobuf" description="The proto/ → go/pb contract on the gateway-to-pooler hop." href="/go-guide/project/04-grpc-and-protobuf/" />
+  <LinkCard title="config" description="The flags/config that set ports and cells." href="/go-guide/project/03-config-and-flags/" />
+  <LinkCard title="gRPC & protobuf" description="The proto/ → internal/pb contract on the gateway-to-pooler hop." href="/go-guide/project/04-grpc-and-protobuf/" />
   <LinkCard title="service anatomy" description="A deeper dive into one service's Init/RunDefault/listeners." href="/go-guide/project/05-service-anatomy/" />
   <LinkCard title="pg-wire & sqltypes" description="The wire protocol the gateway speaks and sqltypes.Result." href="/go-guide/project/07-pg-wire-and-sqltypes/" />
-  <LinkCard title="consensus & failover" description="multiorch's coordinator + recovery engine." href="/go-guide/project/08-consensus-and-failover/" />
-  <LinkCard title="mterrors & observability" description="mterrors.NewParseError / FromGRPC seen along the path." href="/go-guide/project/09-mterrors-and-observability/" />
+  <LinkCard title="consensus & failover" description="The orchestrator's coordinator + recovery engine." href="/go-guide/project/08-consensus-and-failover/" />
+  <LinkCard title="structured errors & observability" description="errx.NewParseError / FromGRPC seen along the path." href="/go-guide/project/09-errors-and-observability/" />
   <LinkCard title="Interfaces & composition" description="The interface seams glueing the request path together." href="/go-guide/language/03-interfaces-composition/" />
   <LinkCard title="Context" description="The ctx threaded through every hop." href="/go-guide/language/08-context/" />
   <LinkCard title="Concurrency" description="How results stream back through callbacks and gRPC streams." href="/go-guide/language/07-concurrency/" />

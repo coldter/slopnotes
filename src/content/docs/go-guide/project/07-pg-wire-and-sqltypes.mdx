@@ -14,18 +14,18 @@ import Mermaid from "~/components/Mermaid.astro";
 
 ---
 
-This is the chapter where bytes meet meaning. A `psql` client opens a TCP socket to the gateway and starts speaking a binary, message-framed protocol that PostgreSQL has used since version 7.4. To accept that connection, multigres has to *be* a PostgreSQL server on the socket. On the far end, the pooler has to *be* a PostgreSQL client to a real backend database. Both jobs live in `go/common/pgprotocol`, and they are near-mirror-images of each other.
+This is the chapter where bytes meet meaning. A `psql` client opens a TCP socket to the gateway and starts speaking a binary, message-framed protocol that PostgreSQL has used since version 7.4. To accept that connection, the gateway has to *be* a PostgreSQL server on the socket. On the far end, the pooler has to *be* a PostgreSQL client to a real backend database. Both jobs live in `internal/pgprotocol`, and they are near-mirror-images of each other.
 
 <Mermaid title="Where pg-wire sits" code={`
 flowchart LR
   Client(["psql / pgx (a client)"])
-  Client -->|"pg wire (server role)"| GW["multigateway<br/>(Handler)"]
-  GW -->|"gRPC (sqltypes ⇄ proto)"| Pool["multipooler"]
+  Client -->|"pg wire (server role)"| GW["gateway<br/>(Handler)"]
+  GW -->|"gRPC (sqltypes ⇄ proto)"| Pool["pooler"]
   Pool -->|"pg wire (client role)"| PG[("PostgreSQL<br/>(a server)")]
 `} />
 
 :::note[Two "clients", do not confuse them]
-`pgprotocol/client` is multigres acting as a client *to backend PostgreSQL* — this is the production data path. The `jackc/pgx` driver appears only in *tests*, as a real client *driving the gateway*. The gateway never uses pgx for the data path.
+`pgprotocol/client` is the pooler acting as a client *to backend PostgreSQL* — this is the production data path. The `jackc/pgx` driver appears only in *tests*, as a real client *driving the gateway*. The gateway never uses pgx for the data path.
 :::
 
 ---
@@ -50,7 +50,7 @@ Two facts are load-bearing and easy to get wrong:
 
 The decode side reflects fact #1 exactly:
 
-```go title="go/common/pgprotocol/server/packet.go"
+```go title="internal/pgprotocol/server/packet.go"
 func (c *Conn) ReadMessageLength() (int, error) {
 	hdr, err := c.bufferedReader.Peek(4)
 	if err != nil {
@@ -73,7 +73,7 @@ Reading 4 bytes into a stack-local `[4]byte` would force the slice header to the
 
 ### The single source of truth: `constants.go`
 
-Every message-type byte is a named constant in `go/common/pgprotocol/protocol/constants.go`. Never write a raw `'T'` in protocol code — use the constant. The groups:
+Every message-type byte is a named constant in `internal/pgprotocol/protocol/constants.go`. Never write a raw `'T'` in protocol code — use the constant. The groups:
 
 | Group | Examples |
 |---|---|
@@ -91,7 +91,7 @@ Every message-type byte is a named constant in `go/common/pgprotocol/protocol/co
 
 The protocol version is a typed integer with methods — a small but clean example of [a defined type carrying behavior](/go-guide/language/02-types-structs-methods/):
 
-```go title="go/common/pgprotocol/protocol/protocol.go"
+```go title="internal/pgprotocol/protocol/protocol.go"
 type ProtocolVersion uint32
 
 func (v ProtocolVersion) Major() uint16 { return uint16(v >> 16) }
@@ -110,7 +110,7 @@ The cleanest way to internalize the protocol is to read an encoder and its match
 
 The gateway sending rows back to `psql`:
 
-```go title="go/common/pgprotocol/server/query.go"
+```go title="internal/pgprotocol/server/query.go"
 func (c *Conn) writeDataRow(row *sqltypes.Row) error {
 	bodyLen := 2 // column count (Int16)
 	for _, value := range row.Values {
@@ -139,7 +139,7 @@ func (c *Conn) writeDataRow(row *sqltypes.Row) error {
 
 The pooler reading rows from a backend PostgreSQL:
 
-```go title="go/common/pgprotocol/client/query.go"
+```go title="internal/pgprotocol/client/query.go"
 func (c *Conn) parseDataRow(body []byte) (*sqltypes.Row, error) {
 	reader := NewMessageReader(body)
 	columnCount, err := reader.ReadInt16()
@@ -165,7 +165,7 @@ Notice the symmetry: the encoder writes `-1` for a nil value; the decoder's `Rea
 :::caution[Gotcha — the bodyLen pre-pass must match the encode loop exactly]
 `startPacket` reserves `5 + bodyLen` bytes; `writePacket` asserts `pos == len(buf)`:
 
-```go title="go/common/pgprotocol/server/packet.go"
+```go title="internal/pgprotocol/server/packet.go"
 if pos != len(buf) {
     panic(fmt.Sprintf("pgwire: packet size mismatch: encoded %d bytes, expected %d", pos, len(buf)))
 }
@@ -178,7 +178,7 @@ Get the per-field `4+2+4+2+4+2` sum in `writeRowDescription` wrong and the proce
 
 The `writeXxxAt` helpers all take `(buf, pos)`, write at `buf[pos:]`, and return the new `pos`. They never allocate; the buffer is sized once by `startPacket`. One subtle correctness rule:
 
-```go title="go/common/pgprotocol/server/packet.go"
+```go title="internal/pgprotocol/server/packet.go"
 // writeStringAt writes s followed by a single null terminator.
 // Caller is responsible for ensuring s contains no embedded NULs.
 func writeStringAt(buf []byte, pos int, s string) int {
@@ -194,7 +194,7 @@ An embedded NUL truncates the field and mis-frames the packet. `writeStringAt` d
 
 On the read side, `MessageReader` is a tiny cursor over a `[]byte`. It is **returned by value** but its methods take **pointer receivers** to mutate `pos`:
 
-```go title="go/common/pgprotocol/server/packet.go"
+```go title="internal/pgprotocol/server/packet.go"
 func NewMessageReader(buf []byte) MessageReader { return MessageReader{buf: buf, pos: 0} }
 ```
 
@@ -241,7 +241,7 @@ sequenceDiagram
 
 Both protocols funnel through one loop. `serve()` reads the type byte, opens a write-buffering window, dispatches, and flushes **only at `Sync`/`Query` boundaries**:
 
-```go title="go/common/pgprotocol/server/conn.go"
+```go title="internal/pgprotocol/server/conn.go"
 switch msgType {
 case protocol.MsgSync, protocol.MsgQuery:
 	if err := c.endWriterBuffering(); err != nil { // flush bufio to socket
@@ -262,7 +262,7 @@ Never after a Parse/Bind/Describe/Execute error. Sending it early desyncs strict
 
 The protocol layer knows nothing about gRPC, routing, or query planning. It decodes a message and calls a method on a `Handler`. This is the classic [interface-as-seam idiom](/go-guide/language/03-interfaces-composition/): `pgprotocol/server` depends on the *interface*; the gateway provides the *implementation* that routes to the pooler over gRPC.
 
-```go title="go/common/pgprotocol/server/handler.go"
+```go title="internal/pgprotocol/server/handler.go"
 type Handler interface {
 	HandleQuery(ctx context.Context, conn *Conn, query string,
 		callback func(ctx context.Context, result *sqltypes.Result) error) error
@@ -292,7 +292,7 @@ Two design notes worth absorbing:
 
 The internal value model deliberately avoids Go scalars. A column value is just bytes:
 
-```go title="go/common/sqltypes/sqltypes.go"
+```go title="internal/sqltypes/sqltypes.go"
 // Value represents a nullable column value.
 // nil means NULL, []byte{} means empty string.
 type Value []byte
@@ -306,7 +306,7 @@ Why bytes and not `int64`/`string`/`bool`? Because PostgreSQL sends most values 
 - `Value.SQLLiteral` renders a value as a quoted, escaped SQL literal (doubling embedded `'`), or the keyword `NULL`.
 - `ParseTextArray` parses `{foo,bar}` literals into `[]string`, honoring quoting/backslash escapes and rejecting NULL elements and multi-dimensional arrays.
 
-```go title="go/common/sqltypes/arrays.go"
+```go title="internal/sqltypes/arrays.go"
 func ParseTextArray(s string) ([]string, error) {
 	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
 		return nil, fmt.Errorf("not a PostgreSQL array literal: %q", s)
@@ -317,12 +317,12 @@ func ParseTextArray(s string) ([]string, error) {
 
 Type identity does not travel in the value bytes — it travels as **OIDs** in `query.Field.DataTypeOid`. The client decoder resolves the OID to a human-readable name via the parser's OID table:
 
-```go title="go/common/pgprotocol/client/query.go"
+```go title="internal/pgprotocol/client/query.go"
 field.DataTypeOid = dataTypeOID
 field.Type = ast.Oid(dataTypeOID).String()
 ```
 
-`ast.Oid` and the OID constants (`BOOLOID`, `TEXTOID`, `INT4OID`, …) live in `go/common/parser/ast/oids.go` — see [the parser chapter](/go-guide/project/06-parser-lexer-ast-codegen/). Reuse them; don't redefine `uint32 = 25` for TEXT.
+`ast.Oid` and the OID constants (`BOOLOID`, `TEXTOID`, `INT4OID`, …) live in `internal/parser/ast/oids.go` — see [the parser chapter](/go-guide/project/06-parser-lexer-ast-codegen/). Reuse them; don't redefine `uint32 = 25` for TEXT.
 
 :::caution[Gotcha — code that assumes text format breaks on binary clients]
 Bind and result format codes can request binary (`FormatBinary = 1`) per-parameter or per-column. `DecodeBindAsBool` has an explicit binary branch. If you write parsing that assumes ASCII, a pgx client requesting binary results will hand you a 4-byte big-endian int where you expected `"42"`.
@@ -337,7 +337,7 @@ The trouble is the gRPC hop. Protobuf cannot distinguish a `nil` repeated field 
 <Tabs syncKey="proto-dir">
   <TabItem label="ToProto">
 
-```go title="go/common/sqltypes/sqltypes.go"
+```go title="internal/sqltypes/sqltypes.go"
 // Row.ToProto
 for i, v := range r.Values {
 	if v == nil {
@@ -352,7 +352,7 @@ for i, v := range r.Values {
   </TabItem>
   <TabItem label="FromProto">
 
-```go title="go/common/sqltypes/sqltypes.go"
+```go title="internal/sqltypes/sqltypes.go"
 // RowFromProto
 switch length {
 case -1:
@@ -378,7 +378,7 @@ Trace one NULL all the way: wire `-1` → `parseDataRow` `ReadByteString` return
 
 The extended protocol's `Parse`/`Bind` state is modeled by two types that **embed** their proto carriers plus a parsed AST (embedding is the [composition idiom](/go-guide/language/03-interfaces-composition/)):
 
-```go title="go/common/preparedstatement/consolidator.go"
+```go title="internal/preparedstatement/consolidator.go"
 type PortalInfo struct {
 	*querypb.Portal
 	*PreparedStatementInfo
@@ -392,11 +392,11 @@ type PreparedStatementInfo struct {
 
 `NewPreparedStatementInfo` parses the SQL up front and maps syntax errors to SQLSTATE `42601`:
 
-```go title="go/common/preparedstatement/consolidator.go"
+```go title="internal/preparedstatement/consolidator.go"
 asts, err := parser.ParseSQL(ps.Query)
 if err != nil {
 	// ParseSQL only does syntactic parsing, so any error here is a syntax error.
-	return nil, mterrors.NewParseError(err.Error()) // 42601
+	return nil, errx.NewParseError(err.Error()) // 42601
 }
 ```
 
@@ -404,7 +404,7 @@ if err != nil {
 
 Two different client connections often prepare the *same* SQL with the same parameter types under different statement names. The `Consolidator` dedups them so a single backend prepared statement is reused, reference-counted across connections:
 
-```go title="go/common/preparedstatement/consolidator.go"
+```go title="internal/preparedstatement/consolidator.go"
 type Consolidator struct {
 	mu sync.Mutex
 	stmts      map[string]*PreparedStatementInfo            // (query, paramTypes) -> canonical stmt
@@ -420,7 +420,7 @@ type Consolidator struct {
 
 When the planner needs the concrete value of a `$N` parameter, `lookupBind` recombines three pieces: the raw bytes (from the portal's packed param array), the declared OID, and the per-parameter wire format:
 
-```go title="go/common/preparedstatement/binddecode.go"
+```go title="internal/preparedstatement/binddecode.go"
 func lookupBind(portalInfo *PortalInfo, pr *ast.ParamRef, callSite string) (raw []byte, oid ast.Oid, format int32, err error) {
 	// ...
 	params := sqltypes.ParamsFromProto(portalInfo.Portal.ParamLengths, portalInfo.Portal.ParamValues)
@@ -438,23 +438,23 @@ func lookupBind(portalInfo *PortalInfo, pr *ast.ParamRef, callSite string) (raw 
 
 ## 7. Errors are wire-shaped: `ErrorResponse` and `NoticeResponse`
 
-`ErrorResponse` (`E`) and `NoticeResponse` (`N`) have an **identical** field-coded body; only the type byte differs. So multigres models both with one type, `mterrors.PgDiagnostic`, which captures all 14 PostgreSQL diagnostic fields (`Severity`, `Code`/SQLSTATE, `Message`, `Detail`, `Hint`, `Position`, …).
+`ErrorResponse` (`E`) and `NoticeResponse` (`N`) have an **identical** field-coded body; only the type byte differs. So the example system models both with one type, `errx.PgDiagnostic`, which captures all 14 PostgreSQL diagnostic fields (`Severity`, `Code`/SQLSTATE, `Message`, `Detail`, `Hint`, `Position`, …).
 
 The encode path uses [`errors.As`](/go-guide/language/05-errors/) to recover the structured diagnostic from a wrapped Go error:
 
-```go title="go/common/pgprotocol/server/query.go"
+```go title="internal/pgprotocol/server/query.go"
 func (c *Conn) writeError(err error) error {
 	if err == nil {
 		return nil
 	}
-	rootErr := mterrors.RootCause(err)
-	var diag *mterrors.PgDiagnostic
+	rootErr := errx.RootCause(err)
+	var diag *errx.PgDiagnostic
 	if errors.As(rootErr, &diag) {
 		return c.writePgDiagnosticResponse(protocol.MsgErrorResponse, diag)
 	}
 	// Generic Go error: synthesize an INTERNAL diagnostic.
 	return c.writePgDiagnosticResponse(protocol.MsgErrorResponse,
-		mterrors.NewPgError("ERROR", mterrors.PgSSInternalError, err.Error(), ""))
+		errx.NewPgError("ERROR", errx.PgSSInternalError, err.Error(), ""))
 }
 ```
 
@@ -462,7 +462,7 @@ func (c *Conn) writeError(err error) error {
 `writeErrorOrNotice` walks a fixed `diagFieldOrder` array reproducing PostgreSQL's canonical S, V, C, M, D, H, P, p, q, W, s, t, c, d, n, F, L, R ordering. The bodyLen pre-pass and the encode loop both iterate `diagFieldOrder`, so they stay in lockstep (recall the `writePacket` panic-on-mismatch). The same function serves both error and notice via the `msgType` argument — one body encoder, two message types.
 :::
 
-For SQLSTATE codes, `NewParseError` (42601), and the full error→wire flow, see [mterrors & observability](/go-guide/project/09-mterrors-and-observability/).
+For SQLSTATE codes, `NewParseError` (42601), and the full error→wire flow, see [errors across boundaries & observability](/go-guide/project/09-errors-and-observability/).
 
 ---
 
@@ -472,7 +472,7 @@ The query path is latency-sensitive, so the packet machinery is built to avoid p
 
 ### `bufpool` — a bucketed `sync.Pool` of `*[]byte`
 
-```go title="go/common/pgprotocol/bufpool/pool.go"
+```go title="internal/pgprotocol/bufpool/pool.go"
 func (p *Pool) Get(size int) *[]byte {
 	sp := p.findPool(size)
 	if sp == nil { // size > maxSize: no pooling, allocate directly
@@ -493,7 +493,7 @@ Putting a `[]byte` (a 3-word slice header) into `sync.Pool` would box the header
 
 `startPacket` reserves space and `writePacket` commits it. The fast path writes the body **directly into the buffered writer's internal slice** via `AvailableBuffer()`, so the commit is a self-copy that just advances the cursor — no separate buffer, no pool round-trip, no allocation:
 
-```go title="go/common/pgprotocol/server/packet.go"
+```go title="internal/pgprotocol/server/packet.go"
 func (c *Conn) startPacket(msgType byte, bodyLen int) ([]byte, int) {
 	totalLen := 5 + bodyLen
 	c.bufMu.Lock()
@@ -531,7 +531,7 @@ pgproto: build
 
 Known, accepted divergences are recorded as patches under the test's `testdata/patches/*.patch`. In `verify` mode this is a CI gate; a separate generate mode regenerates them. The `.pgproto` data files are line-oriented directives mapping directly to wire messages — `Q` Simple Query, `P` Parse, `B` Bind, `D` Describe, `E` Execute, `S` Sync, `H` Flush, plus reader directives `Y`/`y`.
 
-Separately, the gateway is also exercised as a *server* by real Go drivers: tests drive it with `jackc/pgx`. pgx speaks pg-wire *to* the gateway — confirming the server role end to end. (Multigres wrote its own SCRAM-SHA-256 server because pgx is client-only and offers no server-side SCRAM.)
+Separately, the gateway is also exercised as a *server* by real Go drivers: tests drive it with `jackc/pgx`. pgx speaks pg-wire *to* the gateway — confirming the server role end to end. (The gateway implements its own SCRAM-SHA-256 server because pgx is client-only and offers no server-side SCRAM.)
 
 :::note[The most common confusion in this subsystem]
 Production backend connections use `pgprotocol/client` (`client.Connect`); pgx is a *test* client of the gateway only. Do not say "the gateway uses pgx to talk to Postgres."
@@ -559,7 +559,7 @@ Only after `Sync` (the serve loop flushes at the Sync/Query boundary). Sending i
 
 1. **Trace the simple-query reply path.** Starting at `serve()` → `handleMessage()` for an incoming `Q`, follow into `handler.HandleQuery`, then back through the reply writers `writeRowDescription` / `writeDataRow` / `writeCommandComplete` / `writeReadyForQuery`. Draw the frontend→backend message sequence and mark *exactly* where the `bufio` writer is flushed (the Sync/Query boundary in `serve()`).
 
-2. **Trace the extended-query pipeline.** Open `go/common/pgprotocol/server/extended_query_test.go`, pick one Parse+Bind+Describe+Execute+Sync scenario, and map each Go call to wire bytes: `handleParse` (decode stmt name, query, param-type OIDs), `handleBind` (decode formats + params via `ReadByteString`), then the `ParseComplete`/`BindComplete`/`ParameterDescription`/`RowDescription` replies. Confirm from the code why `ReadyForQuery` appears only after `Sync`.
+2. **Trace the extended-query pipeline.** Open `internal/pgprotocol/server/extended_query_test.go`, pick one Parse+Bind+Describe+Execute+Sync scenario, and map each Go call to wire bytes: `handleParse` (decode stmt name, query, param-type OIDs), `handleBind` (decode formats + params via `ReadByteString`), then the `ParseComplete`/`BindComplete`/`ParameterDescription`/`RowDescription` replies. Confirm from the code why `ReadyForQuery` appears only after `Sync`.
 
 3. **Prove the NULL-vs-empty invariant on paper.** Follow a NULL column value from `writeDataRow` (`-1` length) → `parseDataRow` `ReadByteString` (returns `nil`) → `Row.ToProto` (`lengths[i] = -1`) → `RowFromProto` (`nil`). List every spot where collapsing `nil` and `[]byte{}` would corrupt a result, including `Result.HasFields`.
 
@@ -571,7 +571,7 @@ Only after `Sync` (the serve loop flushes at the Sync/Query boundary). Sending i
 
 ## Next
 
-Continue to [consensus & failover](/go-guide/project/08-consensus-and-failover/) — how multiorch elects a leader and reroutes traffic when a PostgreSQL primary fails.
+Continue to [consensus & failover](/go-guide/project/08-consensus-and-failover/) — how the orchestrator elects a leader and reroutes traffic when a PostgreSQL primary fails.
 
 ---
 
@@ -581,7 +581,7 @@ Continue to [consensus & failover](/go-guide/project/08-consensus-and-failover/)
 - [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/) — the `query.proto` `Field`/`Row`/`PreparedStatement`/`Portal` carriers that `ToProto`/`FromProto` bridge.
 - [Service anatomy](/go-guide/project/05-service-anatomy/) — how the gateway's `Handler` implementation wires `pgprotocol/server` to gRPC routing.
 - [Parser, lexer, AST & codegen](/go-guide/project/06-parser-lexer-ast-codegen/) — `ast.Oid`/`oids.go` for type-OID names; `parser.ParseSQL` used by `NewPreparedStatementInfo`.
-- [mterrors & observability](/go-guide/project/09-mterrors-and-observability/) — `PgDiagnostic`, SQLSTATE, `NewParseError` (42601), the error→`ErrorResponse` flow.
+- [errors across boundaries & observability](/go-guide/project/09-errors-and-observability/) — `PgDiagnostic`, SQLSTATE, `NewParseError` (42601), the error→`ErrorResponse` flow.
 - Language: [interfaces](/go-guide/language/03-interfaces-composition/), [pointers/memory](/go-guide/language/04-pointers-values-memory/), [errors](/go-guide/language/05-errors/), [sync & memory model](/go-guide/language/09-sync-and-memory-model/).
 - Reference: [glossary](/go-guide/reference/glossary/) (OID, portal, prepared statement, simple vs extended query, SQLSTATE), [idioms & gotchas](/go-guide/reference/idioms-and-gotchas/) (nil-vs-empty slice, sync.Pool of pointers, length-prefix framing).
 - Tooling: [testing workflow](/go-guide/tooling/02-testing-workflow/) (running the pgproto suite / `RUN_EXTENDED_QUERY_SERVING_TESTS`).

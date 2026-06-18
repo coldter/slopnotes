@@ -10,13 +10,13 @@ import { Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
 
 **What you will learn:** how a long-running Go service is structured, brought to a serving state, kept healthy, and shut down gracefully — by dissecting one small lifecycle engine and the service that drives it end to end.
 
-**Prerequisites:** [interfaces & composition](/go-guide/language/03-interfaces-composition/), [concurrency](/go-guide/language/07-concurrency/), [context](/go-guide/language/08-context/), [sync & the memory model](/go-guide/language/09-sync-and-memory-model/), and [errors](/go-guide/language/05-errors/). It also helps to have read [cmd & cobra](/go-guide/project/02-cmd-and-cobra/) (process entry) and [config & viperutil](/go-guide/project/03-config-viperutil/) (where the flag values come from).
+**Prerequisites:** [interfaces & composition](/go-guide/language/03-interfaces-composition/), [concurrency](/go-guide/language/07-concurrency/), [context](/go-guide/language/08-context/), [sync & the memory model](/go-guide/language/09-sync-and-memory-model/), and [errors](/go-guide/language/05-errors/). It also helps to have read [cmd & cobra](/go-guide/project/02-cmd-and-cobra/) (process entry) and [config](/go-guide/project/03-config-and-flags/) (where the flag values come from).
 
 ---
 
-Every long-running binary in this system — gateway, pooler, orchestrator, admin, the Postgres controller — is a server, and they all share one bootstrapping engine called **`servenv`** (short for *serving environment*). Understand `servenv` plus one concrete service and you understand all of them. We'll use **multigateway** as the worked example because its startup is the most complete and self-contained, and bring in **multipooler** for contrast.
+Every long-running binary in this system — gateway, pooler, orchestrator, admin, the Postgres controller — is a server, and they all share one bootstrapping engine called **`servenv`** (short for *serving environment*). Understand `servenv` plus one concrete service and you understand all of them. We'll use the **gateway** as the worked example because its startup is the most complete and self-contained, and bring in the **pooler** for contrast.
 
-A `*servenv.ServEnv` is the per-process object that owns the HTTP mux, the lifecycle hooks, readiness checks, telemetry, the PID file, and the signal channel. A service struct like `MultiGateway` *holds* a `*ServEnv` and a `*GrpcServer` rather than embedding the machinery itself — composition over inheritance, the Go way.
+A `*servenv.ServEnv` is the per-process object that owns the HTTP mux, the lifecycle hooks, readiness checks, telemetry, the PID file, and the signal channel. A service struct like `Gateway` *holds* a `*ServEnv` and a `*GrpcServer` rather than embedding the machinery itself — composition over inheritance, the Go way.
 
 ## The big picture: a hook-driven state machine
 
@@ -54,7 +54,7 @@ stateDiagram-v2
 
 The six registration methods give you a hook for each interesting moment:
 
-```go title="go/common/servenv/servenv.go"
+```go title="internal/servenv/servenv.go"
 func (se *ServEnv) OnInit(f func()) { se.onInitHooks.Add(f) }      // start of lifecycle
 func (se *ServEnv) OnRun(f func()) { se.onRunHooks.Add(f) }        // start of Run
 func (se *ServEnv) OnRunE(f func() error) { se.onRunEHooks.Add(f) } // start of Run, can error
@@ -80,7 +80,7 @@ func (sv *ServEnv) OnClose(f func()) { sv.onCloseHooks.Add(f) }    // end of lif
 
 The hook lists launch **one goroutine per registered function** and wait for all of them:
 
-```go title="go/tools/event/hooks.go"
+```go title="internal/event/hooks.go"
 // Fire launches a goroutine for each function and waits for all to finish.
 func (h *Hooks) Fire() {
 	h.mu.Lock()
@@ -103,24 +103,24 @@ Because every hook in a family runs on its own goroutine, the order you register
 
 The entry point is tiny. The `main.go` builds a cobra command whose `RunE` calls a `run` function that is just `Init` then `RunDefault`:
 
-```go title="go/cmd/multigateway/main.go"
-func run(ctx context.Context, mg *multigateway.MultiGateway) error {
-	if err := mg.Init(ctx); err != nil {
+```go title="cmd/gateway/main.go"
+func run(ctx context.Context, g *gateway.Gateway) error {
+	if err := g.Init(ctx); err != nil {
 		return err
 	}
-	return mg.RunDefault()
+	return g.RunDefault()
 }
 ```
 
-`PreRunE` is wired to load the config before `RunE` runs (see [config & viperutil](/go-guide/project/03-config-viperutil/)). `main()` calls `cmd.Execute()` and `os.Exit(1)` on error — and that's the *only* place `os.Exit` is allowed.
+`PreRunE` is wired to load the config before `RunE` runs (see [config](/go-guide/project/03-config-and-flags/)). `main()` calls `cmd.Execute()` and `os.Exit(1)` on error — and that's the *only* place `os.Exit` is allowed.
 
 ## Phase 2 — `ServEnv.Init`: the serving environment comes up
 
-`MultiGateway.Init` calls `senv.Init(...)` first, handing it a service identity (name, instance ID, cell):
+`Gateway.Init` calls `senv.Init(...)` first, handing it a service identity (name, instance ID, cell):
 
-```go title="go/services/multigateway/init.go"
-if err := mg.senv.Init(servenv.ServiceIdentity{
-	ServiceName:       constants.ServiceMultigateway,
+```go title="services/gateway/init.go"
+if err := g.senv.Init(servenv.ServiceIdentity{
+	ServiceName:       constants.ServiceGateway,
 	ServiceInstanceID: serviceID,
 	Cell:              cell,
 }); err != nil {
@@ -148,17 +148,17 @@ if err := mg.senv.Init(servenv.ServiceIdentity{
 
 After `senv.Init` returns, `Init` builds the **service object graph** — where the request-flow components are wired (see [architecture & request flow](/go-guide/project/01-architecture-request-flow/)). The first thing it does is create a service-lifetime context cancelled on shutdown:
 
-```go title="go/services/multigateway/init.go"
+```go title="services/gateway/init.go"
 // A service-lifetime context, cancelled once at shutdown.
-mg.shutdownCtx, mg.shutdownCancel = context.WithCancel(ctx)
+g.shutdownCtx, g.shutdownCancel = context.WithCancel(ctx)
 ```
 
-`mg.shutdownCtx` is then threaded into *every* long-running goroutine — pooler discovery, the load balancer, the failover buffer:
+`g.shutdownCtx` is then threaded into *every* long-running goroutine — pooler discovery, the load balancer, the failover buffer:
 
-```go title="go/services/multigateway/init.go"
-mg.poolerDiscovery = NewGlobalPoolerDiscovery(mg.shutdownCtx, mg.ts, mg.cell.Get(), logger)
-loadBalancer := poolergateway.NewLoadBalancer(mg.shutdownCtx, mg.cell.Get(), logger, poolerTransportCreds)
-mg.buffer = buffer.New(mg.shutdownCtx, mg.bufferConfig, logger)
+```go title="services/gateway/init.go"
+g.poolerDiscovery = NewGlobalPoolerDiscovery(g.shutdownCtx, g.ts, g.cell.Get(), logger)
+loadBalancer := poolergateway.NewLoadBalancer(g.shutdownCtx, g.cell.Get(), logger, poolerTransportCreds)
+g.buffer = buffer.New(g.shutdownCtx, g.bufferConfig, logger)
 ```
 
 This is the canonical Go pattern for fanning a cancel signal out to many goroutines: derive one cancellable context, store its `CancelFunc`, pass the context down, and cancel once at shutdown. See [context](/go-guide/language/08-context/).
@@ -167,13 +167,13 @@ This is the canonical Go pattern for fanning a cancel signal out to many gorouti
 
 Here is the single most important structural rule in one of these services. The service holds a `*servenv.GrpcServer`, but its embedded `*grpc.Server` field **does not exist yet during `Init`** — it's created later, inside `ServEnv.Run`, by `grpcServer.Create()`. So you can't register gRPC handlers in `Init` (you'd dereference `nil`), and you can't register them after `Serve()` (gRPC panics). The handlers go in an `OnRun` hook, which fires in the narrow window in between:
 
-```go title="go/services/multigateway/init.go"
+```go title="services/gateway/init.go"
 // Register gRPC services via OnRun because grpcServer.Server is only
 // created in servenv.Run() (after Create()), which runs after Init().
-managerServer := NewManagerServer(mg.queryRegistry, mg.pgHandler)
-mg.senv.OnRun(func() {
-	mg.cancelManager.RegisterWithGRPCServer(mg.grpcServer.Server)
-	managerServer.RegisterWithGRPCServer(mg.grpcServer.Server)
+managerServer := NewManagerServer(g.queryRegistry, g.pgHandler)
+g.senv.OnRun(func() {
+	g.cancelManager.RegisterWithGRPCServer(g.grpcServer.Server)
+	managerServer.RegisterWithGRPCServer(g.grpcServer.Server)
 })
 ```
 
@@ -187,7 +187,7 @@ Never in `Init` (the `*grpc.Server` is `nil`), and never after `Serve` (panic). 
 
 Whether a gRPC sub-service is even registered is gated by a `--service-map` flag through `GrpcServer.CheckServiceMap`. The pooler shows this concretely:
 
-```go title="go/services/multipooler/grpcpoolerservice/service.go" {3-9}
+```go title="services/pooler/grpcpoolerservice/service.go" {3-9}
 func RegisterPoolerServices(senv *servenv.ServEnv, grpc *servenv.GrpcServer) {
 	poolerserver.RegisterPoolerServices = append(poolerserver.RegisterPoolerServices, func(p *poolerserver.QueryPoolerServer) {
 		if grpc.CheckServiceMap("pooler", senv) {
@@ -195,7 +195,7 @@ func RegisterPoolerServices(senv *servenv.ServEnv, grpc *servenv.GrpcServer) {
 				pooler: p,
 				pubsub: p.PubSubListener(),
 			}
-			multipoolerpb.RegisterMultiPoolerServiceServer(grpc.Server, srv)
+			poolerpb.RegisterPoolerServiceServer(grpc.Server, srv)
 		}
 	})
 }
@@ -207,13 +207,13 @@ func RegisterPoolerServices(senv *servenv.ServEnv, grpc *servenv.GrpcServer) {
 If a gRPC sub-service's name isn't enabled in `--service-map`, or gRPC itself is off, the service simply isn't registered — no error. If a client gets `unimplemented`, check the service map before suspecting the handler.
 :::
 
-Note that `poolerService` embeds `multipoolerpb.UnimplementedMultiPoolerServiceServer`. That embedded "Unimplemented" struct is the standard gRPC forward-compatibility idiom: it satisfies the generated server interface so new RPCs in the proto don't break the build. See [interfaces & composition](/go-guide/language/03-interfaces-composition/) and [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/).
+Note that `poolerService` embeds `poolerpb.UnimplementedPoolerServiceServer`. That embedded "Unimplemented" struct is the standard gRPC forward-compatibility idiom: it satisfies the generated server interface so new RPCs in the proto don't break the build. See [interfaces & composition](/go-guide/language/03-interfaces-composition/) and [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/).
 
 ## Phase 4 — `Run`: HTTP first, then serve, then block
 
 `RunDefault` simply delegates to `servenv`, which runs the blocking serve-and-shutdown loop. Here is the startup half:
 
-```go title="go/common/servenv/run.go" {6-9,12-15,18}
+```go title="internal/servenv/run.go" {6-9,12-15,18}
 func (sv *ServEnv) Run(bindAddress string, port int, grpcServer *GrpcServer) error {
 	sv.PopulateListeningURL(int32(port))
 
@@ -255,7 +255,7 @@ A service exposes two independent health surfaces, and they mean different thing
 - `/live` always returns ok — pure liveness.
 - `/ready` iterates the registered ready checks and returns **503** if any of them errors:
 
-```go title="go/common/servenv/pages.go"
+```go title="internal/servenv/pages.go"
 sv.HTTPHandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 	sv.readyMu.RLock()
 	checks := sv.readyChecks
@@ -273,14 +273,14 @@ sv.HTTPHandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 
 A service adds its own readiness logic via `RegisterReadyCheck`. The gateway reports not-ready until topology registration has succeeded *and* at least one pooler has been discovered:
 
-```go title="go/services/multigateway/init.go"
-mg.senv.RegisterReadyCheck(func() error {
-	mg.serverStatus.mu.Lock()
-	defer mg.serverStatus.mu.Unlock()
-	if len(mg.serverStatus.InitError) > 0 {
-		return errors.New(mg.serverStatus.InitError)
+```go title="services/gateway/init.go"
+g.senv.RegisterReadyCheck(func() error {
+	g.serverStatus.mu.Lock()
+	defer g.serverStatus.mu.Unlock()
+	if len(g.serverStatus.InitError) > 0 {
+		return errors.New(g.serverStatus.InitError)
 	}
-	if mg.poolerDiscovery.PoolerCount() == 0 {
+	if g.poolerDiscovery.PoolerCount() == 0 {
 		return errors.New("no poolers discovered")
 	}
 	return nil
@@ -295,7 +295,7 @@ mg.senv.RegisterReadyCheck(func() error {
 
 **gRPC health** is auto-registered when the gRPC server starts. Every registered gRPC service is marked `SERVING`, alongside reflection and a build-identity service:
 
-```go title="go/common/servenv/grpc_server.go"
+```go title="internal/servenv/grpc_server.go"
 healthServer := health.NewServer()
 healthpb.RegisterHealthServer(g.Server, healthServer)
 for service := range g.Server.GetServiceInfo() {
@@ -307,7 +307,7 @@ for service := range g.Server.GetServiceInfo() {
 
 Once `<-sv.exitChan` unblocks on `SIGTERM`/`SIGINT`, the shutdown sequence runs in a fixed order, and each waited step is bounded by a timeout:
 
-```go title="go/common/servenv/run.go"
+```go title="internal/servenv/run.go"
 startTime := time.Now()
 slog.Info("entering lameduck mode", "period", sv.lameduckPeriod.Get())
 go sv.onTermHooks.Fire()                        // async OnTerm, NOT waited on
@@ -340,7 +340,7 @@ The exact ordered sequence on a signal:
 
 Both `OnTermSync` and `OnClose` funnel through one helper that `select`s the hooks-done channel against a timer:
 
-```go title="go/common/servenv/servenv.go"
+```go title="internal/servenv/servenv.go"
 func (se *ServEnv) fireHooksWithTimeout(timeout time.Duration, name string, hookFn func()) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -365,17 +365,17 @@ This is the classic `select`-with-timer pattern from [concurrency](/go-guide/lan
 
 The gateway wires its `Shutdown` as the `OnClose` hook. The very first move is to cancel the service-lifetime context:
 
-```go title="go/services/multigateway/init.go" {2-5}
-func (mg *MultiGateway) Shutdown() {
+```go title="services/gateway/init.go" {2-5}
+func (g *Gateway) Shutdown() {
 	// Cancel the service-lifetime context first so health-stream goroutines
 	// stop promptly, before we close the gRPC connections they use.
-	if mg.shutdownCancel != nil {
-		mg.shutdownCancel()
+	if g.shutdownCancel != nil {
+		g.shutdownCancel()
 	}
 	// ... close listeners, cancelManager, executor, queryRegistry,
 	//     buffer, poolerGateway, poolerDiscovery ...
-	mg.tr.Unregister()
-	mg.ts.Close()
+	g.tr.Unregister()
+	g.ts.Close()
 }
 ```
 
@@ -389,7 +389,7 @@ Call `shutdownCancel()` *before* closing gRPC connections. Otherwise health-stre
 
 The lifecycle exists to serve queries, and the request path is glued together by one interface: `queryservice.QueryService`. Its package doc says it's implemented on the pooler side (the *server* of the gRPC connection), by `PoolerGateway` (which abstracts away managing pooler connections), and by the gateway-side gRPC *client*:
 
-```go title="go/common/queryservice/queryservice.go"
+```go title="internal/queryservice/queryservice.go"
 // All methods must be safe to be called concurrently.
 type QueryService interface {
 	ExecuteQuery(ctx context.Context, target *query.Target, sql string, options *query.ExecuteOptions) (*sqltypes.Result, *query.ReservedState, error)
@@ -408,9 +408,9 @@ This is **interface-based dependency inversion across a network boundary**: the 
 
 ## Contrast: the manager pattern
 
-`multipooler` has the same skeleton — `Init` / `RunDefault` / `Shutdown`, a `senv` and a `grpcServer` — but organizes differently. It delegates its state and topology to a dedicated `manager.MultiPoolerManager` and registers gRPC through helper functions:
+The `pooler` has the same skeleton — `Init` / `RunDefault` / `Shutdown`, a `senv` and a `grpcServer` — but organizes differently. It delegates its state and topology to a dedicated `manager.PoolerManager` and registers gRPC through helper functions:
 
-```go title="go/services/multipooler/init.go"
+```go title="services/pooler/init.go"
 poolerManager.Start(mp.senv)
 grpcmanagerservice.RegisterPoolerManagerServices(mp.senv, mp.grpcServer)
 grpcconsensusservice.RegisterConsensusServices(mp.senv, mp.grpcServer)
@@ -419,7 +419,7 @@ grpcpoolerservice.RegisterPoolerServices(mp.senv, mp.grpcServer)
 
 Topology registration and shutdown are delegated to the manager via `OnRun` / `OnClose`:
 
-```go title="go/services/multipooler/init.go" {8}
+```go title="services/pooler/init.go" {8}
 mp.senv.OnRun(func() {
 	poolerManager.StartTopoRegistration(func(s string) {
 		mp.serverStatus.mu.Lock()
@@ -456,18 +456,18 @@ Yes. <code>OnTermSync</code> and <code>OnClose</code> fire through <code>fireHoo
 <details><summary>Why does <code>ServEnv.Run</code> start the HTTP listener before firing the run hooks and before gRPC <code>Serve</code>?</summary>
 So Kubernetes liveness/startup probes can respond while <code>OnRun</code> hooks (which may block on topology or manager readiness) are still running. On K8s 1.33+ native sidecars, a probe deadlock there would stall pod startup.</details>
 
-<details><summary>What is the very first thing <code>MultiGateway.Shutdown</code> does, and why does order matter?</summary>
-It calls <code>mg.shutdownCancel()</code> to cancel the service-lifetime context first, so health-stream goroutines stop before the gRPC connections they use are closed. The rest of teardown then runs in reverse of construction order (LIFO), ending with topology unregister and closing the topo store.</details>
+<details><summary>What is the very first thing <code>Gateway.Shutdown</code> does, and why does order matter?</summary>
+It calls <code>g.shutdownCancel()</code> to cancel the service-lifetime context first, so health-stream goroutines stop before the gRPC connections they use are closed. The rest of teardown then runs in reverse of construction order (LIFO), ending with topology unregister and closing the topo store.</details>
 
 ## Exercises
 
 <Steps>
 
-1. **Trace the full lifecycle through the real files.** Start at `go/cmd/multigateway/main.go` (`main` → `cmd.Execute` → `RunE` → `run`). Follow `run` into `go/services/multigateway/init.go` (`Init`); note where `senv.Init` runs, and where `OnRun`, `RegisterReadyCheck`, and `OnClose` are registered. Then jump to `RunDefault` → `go/common/servenv/run.go` (`Run`). Write down the exact line where the process blocks, and the ordered list of every step that runs after a `SIGTERM`.
+1. **Trace the full lifecycle through the real files.** Start at `cmd/gateway/main.go` (`main` → `cmd.Execute` → `RunE` → `run`). Follow `run` into `services/gateway/init.go` (`Init`); note where `senv.Init` runs, and where `OnRun`, `RegisterReadyCheck`, and `OnClose` are registered. Then jump to `RunDefault` → `internal/servenv/run.go` (`Run`). Write down the exact line where the process blocks, and the ordered list of every step that runs after a `SIGTERM`.
 
-2. **Classify every hook in one service.** Run `grep -rn 'OnInit\|OnRun\|OnTermSync\|OnTerm(\|OnClose' go/services/multigateway/ go/common/servenv/grpc_server.go`. For each match, classify it as init / run / term-async / term-sync / close, and predict the order and timeout under which it fires during shutdown. Verify against `run.go`.
+2. **Classify every hook in one service.** Run `grep -rn 'OnInit\|OnRun\|OnTermSync\|OnTerm(\|OnClose' services/gateway/ internal/servenv/grpc_server.go`. For each match, classify it as init / run / term-async / term-sync / close, and predict the order and timeout under which it fires during shutdown. Verify against `run.go`.
 
-3. **Map `QueryService` to its implementations.** Open `go/common/queryservice/queryservice.go`, then `grep -rn 'queryservice.QueryService' go/` and confirm the pooler-side server, the gateway-side gRPC client, and `PoolerGateway` all satisfy it. For `StreamExecute`, trace one call from the gateway client across the wire to the pooler server.
+3. **Map `QueryService` to its implementations.** Open `internal/queryservice/queryservice.go`, then `grep -rn 'queryservice.QueryService' .` and confirm the pooler-side server, the gateway-side gRPC client, and `PoolerGateway` all satisfy it. For `StreamExecute`, trace one call from the gateway client across the wire to the pooler server.
 
 4. **Compare the two lifecycle styles.** List the structural differences between the gateway (inline `toporeg.RegisterSynchronous`, inline `Shutdown`) and the pooler (a manager with `StartTopoRegistration` / `StopTopoRegistration`). Argue which is easier to test and why.
 
@@ -482,10 +482,10 @@ Continue to [parser, lexer, AST & codegen](/go-guide/project/06-parser-lexer-ast
 <CardGrid>
   <LinkCard title="Architecture & request flow" description="What the object graph built in Init actually does." href="/go-guide/project/01-architecture-request-flow/" />
   <LinkCard title="cmd & cobra" description="The process entry point that feeds Init." href="/go-guide/project/02-cmd-and-cobra/" />
-  <LinkCard title="config & viperutil" description="Where the flag values — timeouts, ports, service-map — come from." href="/go-guide/project/03-config-viperutil/" />
+  <LinkCard title="config" description="Where the flag values — timeouts, ports, service-map — come from." href="/go-guide/project/03-config-and-flags/" />
   <LinkCard title="gRPC & protobuf" description="What RegisterWithGRPCServer registers." href="/go-guide/project/04-grpc-and-protobuf/" />
   <LinkCard title="consensus & failover" description="The orchestrator's lifecycle and topology role." href="/go-guide/project/08-consensus-and-failover/" />
-  <LinkCard title="mterrors & observability" description="The telemetry initialized in senv.Init." href="/go-guide/project/09-mterrors-and-observability/" />
+  <LinkCard title="structured errors & observability" description="The telemetry initialized in senv.Init." href="/go-guide/project/09-errors-and-observability/" />
   <LinkCard title="Interfaces & composition" description="The interface seams gluing the request path together." href="/go-guide/language/03-interfaces-composition/" />
   <LinkCard title="Concurrency" description="Goroutines, channels, and the select-with-timer pattern." href="/go-guide/language/07-concurrency/" />
   <LinkCard title="Context" description="The ctx threaded through every goroutine and over the wire." href="/go-guide/language/08-context/" />

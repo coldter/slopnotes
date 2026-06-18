@@ -10,38 +10,39 @@ import { LinkCard, CardGrid } from "@astrojs/starlight/components";
 
 This is the on-ramp. If you're an experienced engineer new to Go, start here:
 we'll learn Go by reading a real production codebase rather than working through
-toy examples. The running example throughout this guide is **multigres**, a
-distributed-systems project written in Go, and this page covers what it is, how
-its code is laid out, and — most importantly — how to read unfamiliar Go fast
-enough to find your way around a large codebase.
+toy examples. The running example throughout this guide is **a distributed SQL
+proxy** — a real, well-known architecture, written in Go — and this page covers
+what it is, how its code is laid out, and — most importantly — how to read
+unfamiliar Go fast enough to find your way around a large codebase.
 
 The "how to read Go" material here is language-general; it pays off in any Go
 project you ever touch.
 
-## What multigres is
+## What the example system is
 
-Multigres is *Vitess for Postgres*: a set of small Go services that sit *in
-front of* real PostgreSQL servers and add horizontal scaling, connection
-pooling, and automated failover. An application speaks the ordinary PostgreSQL
-wire protocol; it never knows it is talking to a proxy. Behind the proxy, the
-system decides which Postgres to run a query on, reuses connections, and — when
-a Postgres dies — elects a new leader and reconnects, all without the client
-noticing.
+The example system is a **distributed SQL proxy**: a set of small Go services
+that sit *in front of* real PostgreSQL servers and add horizontal scaling,
+connection pooling, and automated failover. (This is a well-trodden
+architecture — Vitess, PgBouncer, and ProxySQL all do a version of it.) An
+application speaks the ordinary PostgreSQL wire protocol; it never knows it is
+talking to a proxy. Behind the proxy, the system decides which Postgres to run a
+query on, reuses connections, and — when a Postgres dies — elects a new leader
+and reconnects, all without the client noticing.
 
-It is a single Go module, `github.com/multigres/multigres`, on Go 1.25. All Go
-code lives under `go/`. The project is early-stage; the wire protocol and gRPC
-contracts are its stable spine.
+It is a single Go module, `github.com/example/platform`, on Go 1.25, laid out in
+the standard `cmd/` + `internal/` style. The wire protocol and gRPC contracts
+are its stable spine.
 
 ## The mental model: service topology and the request path
 
-There are **five long-running services** (implementations under `go/services/`)
+There are **five long-running services** (implementations under `internal/`)
 plus operator and test binaries. The latency-sensitive path is just two hops,
 and **only the first hop is gRPC** — the second is a real pooled SQL connection:
 
 <Mermaid title="Request path" height={360} code={`
 flowchart LR
-  Client["psql / app"] -->|"PostgreSQL wire protocol"| GW["multigateway<br/>(stateless proxy, PG wire in)"]
-  GW -->|"gRPC: MultiPoolerService"| PL["multipooler<br/>(connection pool, serves queries)"]
+  Client["psql / app"] -->|"PostgreSQL wire protocol"| GW["gateway<br/>(stateless proxy, PG wire in)"]
+  GW -->|"gRPC: PoolerService"| PL["pooler<br/>(connection pool, serves queries)"]
   PL -->|"pooled SQL"| PG["PostgreSQL<br/>(real PG process)"]
 `} />
 
@@ -49,21 +50,21 @@ Everything else is **off the query path**:
 
 | Service | Role | On the query path? |
 | --- | --- | --- |
-| **multigateway** | Stateless proxy: speaks PG wire + gRPC, routes queries | Yes (hop 1) |
-| **multipooler** | Connection pooling; serves queries; talks to pgctld via gRPC | Yes (hop 2) |
-| **pgctld** | PostgreSQL control daemon — lifecycle only (start/stop/restart) | No (control plane) |
-| **multiorch** | Consensus + failover orchestration | No (control plane) |
-| **multiadmin** | Admin service, HTTP + gRPC endpoints | No (admin) |
+| **gateway** | Stateless proxy: speaks PG wire + gRPC, routes queries | Yes (hop 1) |
+| **pooler** | Connection pooling; serves queries; talks to dbctld via gRPC | Yes (hop 2) |
+| **dbctld** | PostgreSQL control daemon — lifecycle only (start/stop/restart) | No (control plane) |
+| **orchestrator** | Consensus + failover orchestration | No (control plane) |
+| **admin** | Admin service, HTTP + gRPC endpoints | No (admin) |
 
-Two binaries under `go/cmd/` are **not** services: `multigres` is the operator
+Two binaries under `cmd/` are **not** services: `platformctl` is the operator
 CLI, and `portpoolserver` is a cross-process port allocator used only by
 integration tests.
 
-:::caution[Gotcha — pgctld is not a query relay]
-Queries never pass through pgctld. Its entire RPC surface
-(`proto/pgctldservice.proto`) is lifecycle: `Start`, `Stop`, `Restart`,
+:::caution[Gotcha — dbctld is not a query relay]
+Queries never pass through dbctld. Its entire RPC surface
+(`proto/dbctldservice.proto`) is lifecycle: `Start`, `Stop`, `Restart`,
 `Status`, `Version`, `InitDataDir`, and so on. The pooler keeps a *separate*
-gRPC link to pgctld only to start, stop, and configure Postgres.
+gRPC link to dbctld only to start, stop, and configure Postgres.
 :::
 
 The cluster is organized into **cells** (availability zones), with metadata in a
@@ -73,27 +74,28 @@ leader/primary terminology, and the exact query trace, see the deep dive:
 
 ## Repo map
 
-The repo root holds the contracts and config; everything Go lives under `go/`.
+The repo root holds the contracts and config; the Go source follows the standard
+`cmd/` + `internal/` layout.
 
 | Path | What lives here |
 | --- | --- |
-| `proto/` | gRPC/protobuf contracts (`.proto`). Source of truth for service surfaces; generates into `go/pb/`. Key files: `multipoolerservice.proto`, `pgctldservice.proto`, `multiorchservice.proto`, `multigatewayservice.proto`, `clustermetadata.proto`, `query.proto`. |
-| `config/` | Per-component YAMLs (e.g. `multigateway.yaml`, `multipooler.yaml`, `pgctld.yaml`, `multiorch.yaml`) — small files holding things like `http-port` and `log-level`. They are one source in a precedence chain (flags > env > config file > defaults); cluster-wide metadata lives in the topology store, not here. |
+| `proto/` | gRPC/protobuf contracts (`.proto`). Source of truth for service surfaces; generates into `pb/`. Key files: `poolerservice.proto`, `dbctldservice.proto`, `orchservice.proto`, `gatewayservice.proto`, `clustermetadata.proto`, `query.proto`. |
+| `config/` | Per-component YAMLs (e.g. `gateway.yaml`, `pooler.yaml`, `dbctld.yaml`, `orch.yaml`) — small files holding things like `http-port` and `log-level`. They are one source in a precedence chain (flags > env > config file > defaults); cluster-wide metadata lives in the topology store, not here. |
 | `Makefile` | Self-documenting build/dev driver (`make help`). |
-| `go/` | All Go source — see below. |
+| `cmd/` / `internal/` / … | All Go source — see below. |
 
-Inside `go/`:
+The Go tree:
 
 | Path | What lives here | Dependency rule |
 | --- | --- | --- |
-| `go/cmd/` | 7 binaries (the 5 services + `multigres` CLI + `portpoolserver`). Each is a tiny `main.go`. | **Can depend on anything.** |
-| `go/services/` | The 5 long-running services' implementations (`multiadmin`, `multigateway`, `multiorch`, `multipooler`, `pgctld`). | **Cannot** depend on `cmd/` or other services. |
-| `go/common/` | Shared code: `mterrors`, `pgprotocol`, `sqltypes`, `parser`, `queryservice`, `topoclient`, `consensus`, `constants`, etc. | **Cannot** depend on `cmd/` or `services/`. |
-| `go/tools/` | Generic, project-agnostic helpers (timers, retry, …). | **Cannot** depend on any repo code outside `tools/`. |
-| `go/pb/` | Generated protobuf Go (`// Code generated`). Read-only. | — |
-| `go/observability/` | Metric catalog. | — |
-| `go/provisioner/` | Cluster provisioning (local + `provisioner.go`). | — |
-| `go/test/` | End-to-end tests and test utilities (`endtoend`, `utils`). | — |
+| `cmd/` | 7 binaries (the 5 services + `platformctl` CLI + `portpoolserver`). Each is a tiny `main.go`. | **Can depend on anything.** |
+| `internal/` (services) | The 5 long-running services' implementations (`admin`, `gateway`, `orch`, `pooler`, `dbctld`). | **Cannot** depend on `cmd/` or other services. |
+| `internal/` (shared) | Shared code: `errx`, `pgprotocol`, `sqltypes`, `parser`, `queryservice`, `topo`, `consensus`, `constants`, etc. | **Cannot** depend on `cmd/` or the services. |
+| `tools/` | Generic, project-agnostic helpers (timers, retry, …). | **Cannot** depend on any repo code outside `tools/`. |
+| `pb/` | Generated protobuf Go (`// Code generated`). Read-only. | — |
+| `observability/` | Metric catalog. | — |
+| `provisioner/` | Cluster provisioning (local + `provisioner.go`). | — |
+| `test/` | End-to-end tests and test utilities (`endtoend`, `utils`). | — |
 
 The dependency direction is strict and worth internalizing — it tells you which
 way imports may point:
@@ -101,8 +103,8 @@ way imports may point:
 <Mermaid title="Allowed dependency directions" height={320} code={`
 flowchart TB
   cmd["cmd/<br/>(can depend on anything)"]
-  services["services/"]
-  common["common/"]
+  services["services (internal/)"]
+  common["shared libs (internal/)"]
   tools["tools/"]
   cmd --> services
   cmd --> common
@@ -112,12 +114,12 @@ flowchart TB
   common --> tools
 `} />
 
-In words: `cmd/` may depend on anything; `services/` may not depend on `cmd/`
-or on other services; `common/` may not depend on `cmd/` or `services/`; and
-`tools/` may not depend on anything outside `tools/`.
+In words: `cmd/` may depend on anything; the services may not depend on `cmd/`
+or on each other; the shared libraries may not depend on `cmd/` or the services;
+and `tools/` may not depend on anything outside `tools/`.
 
 :::caution[Gotcha — generated code is read-only]
-Files under `go/pb/` carry `// Code generated`. Never hand-edit them; trace a
+Files under `pb/` carry `// Code generated`. Never hand-edit them; trace a
 bug to the `.proto` and run `make proto`. The SQL parser (`postgres.go` from
 `goyacc`) and the AST clone/rewrite helpers are regenerated the same way via
 `make parser` / `make build-all`.
@@ -130,9 +132,9 @@ in knowing where to start and how the pieces are wired.
 
 ### Import path == directory
 
-`github.com/multigres/multigres/go/services/multigateway` *is* the directory
-`go/services/multigateway`. Strip the module prefix
-(`github.com/multigres/multigres`) and you have a path relative to the repo
+`github.com/example/platform/internal/gateway` *is* the directory
+`internal/gateway`. Strip the module prefix
+(`github.com/example/platform`) and you have a path relative to the repo
 root. This mapping is exact and always holds.
 
 :::note
@@ -143,32 +145,32 @@ The import path maps to the directory, but the **package name** is whatever the
 
 ### Start at the entry points
 
-Every binary is a tiny `go/cmd/<svc>/main.go` that delegates immediately. There
+Every binary is a tiny `cmd/<svc>/main.go` that delegates immediately. There
 are two shapes.
 
 **Service binaries** build a [cobra](/go-guide/project/02-cmd-and-cobra/)
 command, then run an `Init` / `RunDefault` pair. From
-`go/cmd/multigateway/main.go`:
+`cmd/gateway/main.go`:
 
-```go title="go/cmd/multigateway/main.go"
-func run(ctx context.Context, mg *multigateway.MultiGateway) error {
-	if err := mg.Init(ctx); err != nil {
+```go title="cmd/gateway/main.go"
+func run(ctx context.Context, gw *gateway.Gateway) error {
+	if err := gw.Init(ctx); err != nil {
 		return err
 	}
-	return mg.RunDefault()
+	return gw.RunDefault()
 }
 ```
 
 The package doc-comment and the cobra `Short` string are the project's own
-one-line descriptions — read them first. (multigateway's `Short`: *"Multigateway
+one-line descriptions — read them first. (The gateway's `Short`: *"gateway
 is a stateless proxy responsible for accepting requests from applications and
-routing them to the appropriate multipooler server(s) for query execution. It
+routing them to the appropriate pooler server(s) for query execution. It
 speaks both the PostgreSQL Protocol and a gRPC protocol."*)
 
-**The operator CLI** has a different shape — `go/cmd/multigres/main.go` just
-dispatches to subcommands (which live under `go/cmd/multigres/command/`):
+**The operator CLI** has a different shape — `cmd/platformctl/main.go` just
+dispatches to subcommands (which live under `cmd/platformctl/command/`):
 
-```go title="go/cmd/multigres/main.go"
+```go title="cmd/platformctl/main.go"
 func main() {
 	root := command.GetRootCommand()
 	if err := root.Execute(); err != nil {
@@ -184,7 +186,7 @@ hit one — `engine.IExecute`, `queryservice.QueryService` — `grep` for its na
 to find the definition and the concrete implementation(s):
 
 ```bash
-grep -rn 'IExecute' go/
+grep -rn 'IExecute' .
 ```
 
 This is the single most useful habit for reading Go service code: an interface
