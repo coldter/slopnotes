@@ -32,6 +32,18 @@ npm run dev        # http://localhost:4321
 | `npm run preview` | Preview the production build locally        |
 | `npm run check`   | Run `astro check` (type/diagnostics)        |
 
+## Deploy
+
+The site is a fully static build deployed to Cloudflare Workers via
+[Wrangler](https://developers.cloudflare.com/workers/):
+
+```bash
+npm run preview:cf-workers   # build + run locally on the Workers runtime
+npm run deploy:cf-workers    # build + deploy (requires `wrangler login`)
+```
+
+Deploy credentials come from your local Wrangler auth — nothing is committed.
+
 ## How it is organized
 
 Each topic is a **course** — a folder under `src/content/docs/`. Every Markdown
