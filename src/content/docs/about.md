@@ -33,9 +33,9 @@ enough for me.
 
 ## How it is organized
 
-Each topic is a **course** — a folder under `src/content/docs/`. Every Markdown
+Each topic is a **guide** — a folder under `src/content/docs/`. Every Markdown
 or MDX file inside becomes a page, and `src/config/sidebar.json` groups them in
-the navigation. Browse what's here from the [Courses](/courses/) page.
+the navigation. Browse what's here from the [Content](/content/) page.
 
 ## How it is built
 

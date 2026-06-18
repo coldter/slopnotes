@@ -19,6 +19,10 @@ export const locales = locals
 
 // https://astro.build/config
 export default defineConfig({
+  // The catalog moved from /courses/ to /content/. Keep old links working.
+  redirects: {
+    "/courses": "/content/",
+  },
   image: {
     service: { entrypoint: "astro/assets/services/noop" },
   },
