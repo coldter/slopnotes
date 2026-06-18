@@ -564,7 +564,9 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 
-def configure_tracing(app, *, service_name: str, otlp_endpoint: str) -> None:
+def configure_tracing(
+    app, *, service_name: str, otlp_endpoint: str
+) -> TracerProvider:
     resource = Resource.create({"service.name": service_name})
     provider = TracerProvider(resource=resource)
     # Batch + export over OTLP gRPC to the collector (default :4317).
@@ -577,6 +579,9 @@ def configure_tracing(app, *, service_name: str, otlp_endpoint: str) -> None:
     FastAPIInstrumentor.instrument_app(app)
     HTTPXClientInstrumentor().instrument()
     SQLAlchemyInstrumentor().instrument(enable_commenter=True)
+
+    # Return the concrete provider so the caller can .shutdown() it on exit.
+    return provider
 ```
 
 That alone gives you a span per HTTP request, a child span per outbound `httpx`
@@ -660,11 +665,20 @@ alive?" `/readyz` checks the things you need to serve a request (DB, Redis) and
 returns `503` when they're down, so traffic drains without a kill.
 
 ```python title="app/health.py"
-from fastapi import APIRouter, Response, status
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 router = APIRouter(tags=["health"])
+
+
+def get_engine(request: Request) -> AsyncEngine:
+    # The engine is stashed on app.state in the lifespan (see main.py).
+    # A FastAPI dependency is how a route gets at it — a plain typed
+    # parameter would be treated as a query param, not injected.
+    return request.app.state.engine
 
 
 @router.get("/healthz")
@@ -674,7 +688,10 @@ async def healthz() -> dict[str, str]:
 
 
 @router.get("/readyz")
-async def readyz(response: Response, engine: AsyncEngine) -> dict[str, object]:
+async def readyz(
+    response: Response,
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+) -> dict[str, object]:
     checks: dict[str, str] = {}
     ready = True
     try:
@@ -699,17 +716,23 @@ own resource cleanup via FastAPI's `lifespan`:
 ```python title="app/main.py (lifespan)"
 from contextlib import asynccontextmanager
 
-from opentelemetry import trace
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from app.tracing import configure_tracing
 
 
 @asynccontextmanager
 async def lifespan(app):
-    engine = create_engine(...)
+    engine = create_async_engine(...)
     app.state.engine = engine
+    # configure_tracing returns the concrete TracerProvider it created, so
+    # we can call .shutdown() on *that* — get_tracer_provider() may hand back
+    # the API's no-op provider, which has no shutdown() (AttributeError).
+    provider = configure_tracing(app, service_name="api", otlp_endpoint=...)
     yield
     # Shutdown: flush pending spans, then close pools.
     await engine.dispose()
-    trace.get_tracer_provider().shutdown()  # forces BatchSpanProcessor to flush
+    provider.shutdown()  # forces BatchSpanProcessor to flush
 ```
 
 :::caution[Flush your exporter or lose your last traces]

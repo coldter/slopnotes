@@ -360,6 +360,7 @@ users table — shown minimal here). The dev CLI mints a token so you can curl.
 ```python title="src/app/auth/jwt.py"
 import sys, time, jwt
 from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 from app.config import settings
 
 ph = PasswordHasher()  # argon2id — the right default; never sha/md5 a password
@@ -367,7 +368,7 @@ ph = PasswordHasher()  # argon2id — the right default; never sha/md5 a passwor
 def hash_password(pw: str) -> str: return ph.hash(pw)
 def verify_password(hash_: str, pw: str) -> bool:
     try: return ph.verify(hash_, pw)
-    except Exception: return False
+    except VerifyMismatchError: return False
 
 def mint(user_id: str, role: str = "user") -> str:
     s = settings()
@@ -410,8 +411,12 @@ _bearer = HTTPBearer()
 def current_user(cred: Annotated[HTTPAuthorizationCredentials, Depends(_bearer)]) -> CurrentUser:
     try:
         payload = decode(cred.credentials)
-    except jwt.PyJWTError:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return CurrentUser(user_id=payload["sub"], role=payload.get("role", "user"))
 
 CurrentUserDep = Annotated[CurrentUser, Depends(current_user)]
@@ -419,16 +424,32 @@ CurrentUserDep = Annotated[CurrentUser, Depends(current_user)]
 
 ### 6. Redis sliding-window rate limiter (Module 10)
 
-A sorted set per user, scored by timestamp: drop the old window, count, add this
-request, set a TTL — pipelined so it's atomic-ish. Roll back the add if it would
-exceed the cap.
+A sorted set per user, scored by timestamp. The check-and-add must be atomic, so it
+runs as a single Lua script: prune the old window, count, then reject-or-add. A
+pipeline can't do this (the count→decision→add gap races under concurrency, and a
+score-based "roll back" would clobber other requests landing in the same instant).
 
 ```python title="src/app/cache/redis.py"
-import time
+import time, uuid
 from redis.asyncio import Redis
 from app.config import settings
 
 redis = Redis.from_url(settings().redis_url, decode_responses=True)
+
+# KEYS[1] = zset key; ARGV: now_ms, window_ms, limit, member, ttl_seconds
+SLIDING_WINDOW_LUA = """
+local now    = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit  = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+local count = redis.call('ZCARD', KEYS[1])
+if count + 1 > limit then
+  return 0
+end
+redis.call('ZADD', KEYS[1], now, ARGV[4])
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+return 1
+"""
 
 class RateLimiter:
     WINDOW = 3600  # 1 hour
@@ -438,17 +459,13 @@ class RateLimiter:
 
     async def allow(self, user_id: str) -> bool:
         key = f"rl:notify:{user_id}"
-        now = time.time()
-        async with redis.pipeline(transaction=True) as pipe:
-            pipe.zremrangebyscore(key, 0, now - self.WINDOW)  # drop old
-            pipe.zcard(key)                                   # count window
-            pipe.zadd(key, {f"{now}:{id(now)}": now})         # add this one
-            pipe.expire(key, self.WINDOW)
-            _, count, _, _ = await pipe.execute()
-        if count >= self.max:
-            await redis.zremrangebyscore(key, now, now)       # roll back
-            return False
-        return True
+        now_ms = int(time.time() * 1000)
+        member = f"{now_ms}-{uuid.uuid4()}"  # unique per request
+        allowed = await redis.eval(
+            SLIDING_WINDOW_LUA, 1,
+            key, now_ms, self.WINDOW * 1000, self.max, member, self.WINDOW,
+        )
+        return bool(allowed)
 ```
 
 ### 7. Kafka — producer in the lifespan, worker with retry + DLQ (Module 11)
