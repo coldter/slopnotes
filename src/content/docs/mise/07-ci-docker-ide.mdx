@@ -1,0 +1,252 @@
+---
+title: CI, Docker & IDEs
+description: Wire mise into GitHub Actions, GitLab, and slim multi-stage Docker images, get reproducible builds with --locked, and make your editor see mise tools.
+sidebar:
+  order: 7
+---
+
+import { Tabs, TabItem, Steps } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+You designed the team layout in [Designing Your Workflow](/mise/06-workflow-design/):
+`mise.toml` and `mise.lock` are committed, `*.local.toml` is gitignored. This page
+takes that exact same config and runs it three places your interactive shell never
+reaches — **CI runners, Docker builds, and your IDE** — without `mise activate`.
+
+The thread tying all three together is the [lockfile](/mise/02-tools-backends/): the
+versions and checksums your laptop resolved are the versions CI installs and Docker
+bakes in. That's the whole reproducibility story.
+
+<Mermaid title="The reproducibility loop" height={360} code={`
+flowchart LR
+  dev["dev laptop<br/>mise use / mise install"] -->|writes exact versions + checksums| lock["mise.lock"]
+  lock -->|git commit| repo["repo<br/>mise.toml + mise.lock"]
+  repo --> ci["CI<br/>mise install --locked"]
+  repo --> docker["Docker build<br/>mise install --locked"]
+  ci -->|identical toolchain| build["green build"]
+  docker -->|identical toolchain| image["slim image"]
+`} />
+
+## GitHub Actions
+
+Use [`jdx/mise-action@v4`](https://github.com/jdx/mise-action). It installs mise,
+installs your tools, and caches them. There's no "run a task" input — run tasks as
+ordinary steps with `mise run` / `mise exec`.
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v4   # installs mise + tools, caches them
+      - run: mise run lint
+      - run: mise run build
+      - run: mise exec -- npm test  # mise exec runs one-off in the resolved env
+```
+
+:::note[The action lags its own version]
+The mise docs page still shows `@v3`. Use **`@v4`** — it's the current major.
+:::
+
+If a `mise.lock` is present, the action automatically appends `--locked` to the
+install, so CI fails loudly when a tool can't be resolved from the lockfile rather
+than silently pulling a different version. Pin it explicitly if you want it visible:
+
+```yaml
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.6.4          # pin mise itself
+          install_args: "--locked"   # strict install from mise.lock
+          cache: true                # default; tools cached between runs
+```
+
+### Caching across a matrix
+
+Caching is on by default with `cache_key_prefix: mise-v1`. The trap: a build matrix
+shares one cache key, so different variants stomp on each other's cache. Give each
+matrix leg a **distinct prefix**.
+
+```yaml title="matrix build with per-variant cache"
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v4
+        with:
+          cache_key_prefix: mise-${{ matrix.os }}   # distinct per variant
+      - run: mise run ci
+```
+
+:::tip[Export the env to later steps]
+The action's `env` input (default `true`) exports `[env]` from your `mise.toml`
+into `$GITHUB_ENV`, so steps that *aren't* `mise exec` still see your variables.
+Set `reshim: true` if a tool installs binaries lazily and a later step can't find them.
+:::
+
+## GitLab CI & a generic runner
+
+No dedicated action outside GitHub — just install mise and put its shims on `PATH`.
+This `curl | sh` shape works on any CI, cron box, or bare runner.
+
+<Tabs>
+  <TabItem label="GitLab CI">
+
+```yaml title=".gitlab-ci.yml"
+default:
+  before_script:
+    - curl https://mise.run | sh
+    - export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+    - mise install --locked       # strict install from mise.lock
+
+test:
+  script:
+    - mise run build
+    - mise exec -- npm test
+```
+
+  </TabItem>
+  <TabItem label="Generic (any runner)">
+
+```bash title="bootstrap on any CI / cron box"
+curl https://mise.run | sh
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+mise install --locked   # NOTE: --locked, not --frozen (no such flag)
+mise run ci
+```
+
+  </TabItem>
+</Tabs>
+
+:::caution[It's `--locked`, not `--frozen`]
+Other tools call this `--frozen`. mise does **not** have a `--frozen` flag.
+The strict, reproducible install is `mise install --locked` (or `[settings] locked = true`).
+It fails when the lockfile has no resolved URL for the runner's platform — which is
+exactly the signal you want. Lock for every platform you build on with
+`mise lock --platform linux-x64,macos-arm64`.
+:::
+
+## Docker
+
+Two rules account for almost every broken mise Dockerfile:
+
+1. **Never `mise activate` in a container.** Activation is for interactive shells.
+   Containers are non-interactive — put the **shims** on `PATH` instead, or invoke
+   tools through `mise exec --`.
+2. **`mise trust -a` *before* `mise install`.** This is the #1 mistake. The build's
+   working dir isn't trusted yet, so a config with env templates, hooks, or
+   `_.source` is ignored — tools silently don't install. Trust first.
+
+```dockerfile title="single stage — the shape that works"
+FROM debian:bookworm-slim
+ENV MISE_VERSION=2026.6.4 \
+    MISE_DATA_DIR=/mise \
+    MISE_CONFIG_DIR=/mise \
+    MISE_CACHE_DIR=/mise/cache \
+    PATH="/mise/shims:$PATH"     # shims on PATH — NOT `mise activate`
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl https://mise.run | sh && mv ~/.local/bin/mise /usr/local/bin/mise
+
+WORKDIR /app
+COPY mise.toml mise.lock ./
+RUN mise trust -a && mise install --locked   # trust BEFORE install
+```
+
+### A worked multi-stage slim image
+
+Build with the full toolchain, then copy only the binaries + installed tools into a
+slim runtime. Mount a BuildKit cache on `MISE_CACHE_DIR` so re-installs are fast.
+
+```dockerfile title="Dockerfile"
+# syntax=docker/dockerfile:1
+# ---- builder ----
+FROM debian:bookworm-slim AS builder
+ENV MISE_VERSION=2026.6.4 \
+    MISE_DATA_DIR=/mise \
+    MISE_CONFIG_DIR=/mise \
+    MISE_CACHE_DIR=/mise/cache \
+    PATH="/mise/shims:$PATH"
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git \
+    && curl https://mise.run | sh && mv ~/.local/bin/mise /usr/local/bin/mise
+
+WORKDIR /app
+COPY mise.toml mise.lock ./
+# trust before install; BuildKit cache mount keeps the cache out of the layer
+RUN --mount=type=cache,target=/mise/cache \
+    mise trust -a && mise install --locked
+
+COPY . .
+RUN mise run build
+
+# ---- runtime ----
+FROM debian:bookworm-slim
+ENV MISE_DATA_DIR=/mise PATH="/mise/shims:$PATH"
+COPY --from=builder /usr/local/bin/mise /usr/local/bin/mise
+COPY --from=builder /mise /mise           # installed tools + shims
+COPY --from=builder /app /app
+WORKDIR /app
+CMD ["mise", "exec", "--", "node", "server.js"]
+```
+
+:::tip[Alpine / musl]
+On a musl base (`alpine`), tell mise to fetch musl builds:
+
+```dockerfile
+FROM alpine:3.20
+ENV MISE_LIBC=musl PATH="/mise/shims:$PATH"
+```
+:::
+
+:::note[Devcontainers]
+For a devcontainer where mise should write into system paths, use
+`mise install --system`. `mise generate devcontainer` scaffolds the config.
+:::
+
+## IDEs
+
+Your editor doesn't source `~/.bashrc`, so it never runs `mise activate` — it can't
+see PATH-mode tools. **Shims are the answer.** They're static wrappers in
+`~/.local/share/mise/shims` that resolve the right version with no shell involved,
+which is exactly what an IDE (and CI, and cron) needs.
+
+<Steps>
+
+1. Make sure shims exist (they do once any tool is installed). Point the IDE at:
+
+   ```text
+   ~/.local/share/mise/shims
+   ```
+
+2. Install the editor plugin so paths, env, and tasks wire up automatically:
+
+   - **VS Code** — [`mise-vscode`](https://marketplace.visualstudio.com/items?itemName=hverlin.mise-vscode) (hverlin)
+   - **JetBrains** (IntelliJ, PyCharm, GoLand, …) — [`intellij-mise`](https://plugins.jetbrains.com/plugin/mise)
+
+3. After a tool adds a *new* binary (e.g. `corepack enable` exposes `pnpm`), refresh
+   the shims so the IDE can find it:
+
+   ```bash
+   mise reshim
+   ```
+
+</Steps>
+
+:::tip[Why shims, not activate, everywhere non-interactive]
+PATH activation rewrites your env on every `cd` — great for a terminal, invisible to
+a GUI editor or a CI step. Shims are dumb static wrappers that always resolve the
+pinned version. Reach for shims for IDEs, CI, cron, and `systemd`; reach for
+`mise activate` only in your interactive shell.
+:::
+
+---
+
+That's the same `mise.toml` + `mise.lock` running on your laptop, in CI, in a
+container, and in your editor — one config, four environments, identical tools. Now
+[migrate your existing projects onto it](/mise/08-migration/), then raid the
+[Cookbook](/mise/09-recipes/) for the sharp tricks.

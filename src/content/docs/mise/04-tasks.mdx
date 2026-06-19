@@ -1,0 +1,301 @@
+---
+title: The Task Runner
+description: mise tasks — TOML & file tasks, dependency DAGs, parallelism, incremental builds, and usage-spec args, replacing your Makefile and npm scripts.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, FileTree } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Your `Makefile` shells out to the wrong `node`. Your `npm` scripts can't depend on
+a Go build step. `just` is nice but it's a fifth tool to install. mise already
+manages your toolchain and your env — so it runs your chores too, with the right
+tools on `PATH`, real dependencies, parallelism, and incremental builds.
+
+```bash
+mise run build        # run a task (recommended spelling)
+mise r build          # short alias
+mise run              # runs the task named "default"
+mise tasks            # list every task it can see
+```
+
+:::caution[Avoid bare `mise build` in scripts]
+`mise build` works interactively, but a task name can collide with a real
+subcommand. Always write `mise run build` (or `mise r build`) in scripts and CI.
+:::
+
+## TOML tasks
+
+Define tasks inline in `mise.toml`. A one-liner is just `run`:
+
+```toml title="mise.toml"
+[tasks.build]
+run = "go build -o bin/app ./..."
+description = "Compile the server"
+
+[tasks.lint]
+run = ["ruff check .", "ruff format --check ."]   # array = sequential steps
+```
+
+The full set of keys (use these verbatim — don't invent others):
+
+```toml title="mise.toml"
+[tasks.deploy]
+description = "Ship to staging"
+run         = "./scripts/deploy.sh"
+run_windows = "pwsh ./scripts/deploy.ps1"   # platform override
+alias       = "d"                            # SINGULAR (string or array)
+depends     = ["build", "test"]              # run first, in parallel
+depends_post = ["notify"]                    # run after this task succeeds
+wait_for    = ["migrate"]                    # soft: run after IF also scheduled
+dir         = "{{cwd}}"                       # default = config root
+env         = { TARGET = "staging" }
+tools       = { node = "22" }                 # per-task tool install
+confirm     = "Deploy to staging?"            # prompt before running
+```
+
+| Key | What it does |
+|---|---|
+| `run` / `run_windows` | command string, or **array = sequential** steps |
+| `depends` | hard deps — run (in parallel) before this task |
+| `depends_post` | run **after** this task finishes successfully |
+| `wait_for` | soft ordering — only waits if the dep is *also* being run; never triggers it |
+| `dir` | working dir (default: the config's root; `"{{cwd}}"` = where you invoked from) |
+| `env` | extra env vars for this task |
+| `alias` | short name(s) — **singular key**, string or array |
+| `description` | shown in `mise tasks` and completions |
+| `confirm` | y/n prompt string before running (great for destructive tasks) |
+| `tools` | tools to install/expose just for this task |
+
+:::note[`depends` vs `wait_for`]
+`depends` *pulls in* and runs the dependency. `wait_for` only enforces ordering
+**if** that other task happens to be in the same run — handy for "if we're also
+migrating, do it before me" without forcing a migration every time.
+:::
+
+## File tasks
+
+For anything longer than a line, write a real script. Drop executables (`chmod +x`)
+into `mise-tasks/` (or `.mise-tasks/`, `mise/tasks/`, `.config/mise/tasks/`).
+Subdirectories namespace with `:` — `mise-tasks/test/units` becomes the task `test:units`.
+
+<FileTree>
+- mise-tasks/
+  - build
+  - test/
+    - units
+    - e2e
+</FileTree>
+
+Metadata lives in `#MISE` directive comments; arguments in `#USAGE`:
+
+```bash title="mise-tasks/build" frame="code"
+#!/usr/bin/env bash
+#MISE description="Build the release binary"
+#MISE depends=["lint"]
+#MISE sources=["src/**/*.go", "go.mod"]
+#MISE outputs=["bin/app"]
+#USAGE flag "-r --release" help="Optimized build"
+#USAGE arg "<target>" default="./..."
+
+set -euo pipefail
+go build -o bin/app "$usage_target"      # see "Arguments" below
+```
+
+A few language portability notes:
+
+```bash
+# [MISE] description="…"   # formatter-safe form — survives shfmt/black reformatting
+//MISE description="…"     # for languages whose comments aren't '#' (JS, Go, Rust…)
+//USAGE arg "<file>"       # likewise for usage directives in non-bash scripts
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```python title="mise-tasks/seed" frame="code"
+#!/usr/bin/env python
+#MISE description="Seed the dev database"
+import os
+print("seeding", os.environ["DATABASE_URL"])
+```
+
+  </TabItem>
+  <TabItem label="Node">
+
+```javascript title="mise-tasks/codegen" frame="code"
+#!/usr/bin/env node
+//MISE description="Generate API client"
+//USAGE flag "--watch" help="Regenerate on change"
+console.log("generating client…");
+```
+
+  </TabItem>
+</Tabs>
+
+:::tip[Inline or file?]
+Inline TOML tasks keep small projects tidy. Reach for file tasks once a task grows
+past a couple of lines, needs `set -euo pipefail`, or wants its own arguments —
+you get a normal script you can run and debug directly.
+:::
+
+## Dependencies & the DAG
+
+`depends` builds a directed acyclic graph. mise runs independent branches in
+parallel and only serializes where a real dependency exists.
+
+```toml title="mise.toml"
+[tasks.build] # leaf — runs first
+run = "go build ./..."
+
+[tasks.lint]
+run = "golangci-lint run"
+depends = ["build"]
+
+[tasks.test]
+run = "go test ./..."
+depends = ["build"]
+
+[tasks.ci]
+run = "echo all green"
+depends = ["lint", "test"]   # lint + test run in parallel; both wait on build
+```
+
+<Mermaid title="Task dependency DAG: mise run ci" height={360} code={`
+flowchart TD
+  build["build"]
+  lint["lint"]
+  test["test"]
+  ci["ci"]
+  build --> lint
+  build --> test
+  lint --> ci
+  test --> ci
+  classDef parallel fill:#0d3b24,stroke:#2ecc71,color:#d6ffe6;
+  class lint,test parallel
+`} />
+
+`mise run ci` runs `build` once, then `lint` and `test` together (highlighted),
+then `ci`. Inspect the tree without running anything:
+
+```bash
+mise tasks deps           # show the dependency tree
+mise tasks deps ci        # just the subgraph for one task
+```
+
+## Running tasks
+
+```bash
+mise run build                 # one task
+mise run build ::: test        # several tasks; ::: separates, each gets own args
+mise run test -- --verbose -k auth   # everything after -- is passed through
+mise run "test:*"              # glob over task names
+mise run "{build,lint}"        # brace expansion
+```
+
+Parallelism and control:
+
+```bash
+mise run ci --jobs 8           # up to 8 tasks at once (default 4; or MISE_JOBS)
+mise run ci --jobs 1           # serialize — interleaves output deterministically
+mise run ci --interleave       # stream child output as it arrives
+mise run deploy --skip-deps    # run just this task, skip its depends
+mise tasks                     # list (add --hidden to include hide=true tasks)
+```
+
+## Incremental builds with `sources` / `outputs`
+
+Declare a task's inputs and outputs and mise skips it when the outputs are already
+newer than every source — same idea as `make`, but cross-language and lockstep with
+your toolchain.
+
+```toml title="mise.toml"
+[tasks.build]
+run     = "esbuild src/index.ts --bundle --outfile=dist/app.js"
+sources = ["src/**/*.ts", "package.json"]
+outputs = ["dist/app.js"]
+
+[tasks.bundle-css]
+run     = "tailwindcss -i src/app.css -o dist/app.css"
+sources = ["src/**/*.css", "tailwind.config.*", "!src/_scratch/**"]  # ! excludes
+outputs = { auto = true }   # checksum every output dir automatically
+```
+
+The rule: **skip when the oldest output is newer than the newest source.** Use
+`outputs = { auto = true }` to track outputs by checksum instead of naming files —
+ideal when a build emits a whole directory.
+
+:::tip[Pairs perfectly with watch]
+`sources` is also what `mise watch` monitors by default — no extra config. See
+[Watch, Hooks & Automation](/mise/05-watch-hooks/).
+:::
+
+## Arguments: the `usage` spec
+
+Tasks take typed args via the [`usage`](https://usage.jdx.dev) spec. In TOML, set
+`usage`; in file tasks, use `#USAGE` directives. Parsed values land in
+`$usage_<name>` environment variables.
+
+```toml title="mise.toml"
+[tasks.greet]
+usage = '''
+arg "<name>" help="Who to greet"
+flag "-l --loud" help="Shout it"
+'''
+run = '''
+msg="hello $usage_name"
+[ "$usage_loud" = "true" ] && msg=$(echo "$msg" | tr a-z A-Z)
+echo "$msg"
+'''
+```
+
+```bash
+mise run greet world --loud   # → HELLO WORLD
+```
+
+:::danger[Don't use the old Tera arg functions]
+Reading args via Tera `{{ arg(i=0) }}` / `{{ option() }}` / `{{ flag() }}` inside a
+run script is **deprecated and scheduled for removal in 2027.5.0**. Use the `usage`
+spec and `$usage_*` env vars shown above for all new tasks.
+:::
+
+## Splitting up large task files
+
+When `mise.toml` gets crowded, move tasks into dedicated files and pull them in with
+`[task_config].includes`:
+
+```toml title="mise.toml"
+[task_config]
+includes = ["tasks.toml", "mytasks/"]   # extra TOML files and/or task dirs
+```
+
+:::caution[`includes` replaces the defaults]
+Setting `includes` **overrides** the default file-task discovery directories. If
+you still want `mise-tasks/` picked up, list it explicitly in `includes`.
+:::
+
+Working in a monorepo with tasks spread across packages? mise has first-class
+`//path:task` addressing for that — covered in
+[Designing Your Workflow](/mise/06-workflow-design/).
+
+## mise vs Make / npm scripts / just
+
+| | Make | npm scripts | just | **mise** |
+|---|---|---|---|---|
+| Polyglot (not JS-only) | yes | no | yes | **yes** |
+| Tools on `PATH` automatically | no | partial | no | **yes** (your pinned versions) |
+| Real dependency DAG | yes | no | partial | **yes** (`depends`, parallel) |
+| Incremental (skip-if-fresh) | yes (mtime) | no | no | **yes** (`sources`/`outputs`, checksums) |
+| Typed CLI args | no | no | partial | **yes** (`usage` spec) |
+| Built-in parallelism | `-j` | no | no | **yes** (`--jobs`) |
+| Cross-platform (Windows) | painful | yes | yes | **yes** (`run_windows`) |
+
+The pitch: mise tasks see the *exact* toolchain mise pinned for the project, so
+`mise run build` behaves the same on your laptop, a teammate's, and CI.
+
+---
+
+**Next:** re-run tasks automatically on file changes and wire them into git hooks in
+[Watch, Hooks & Automation](/mise/05-watch-hooks/), or design a team/monorepo task
+layout in [Designing Your Workflow](/mise/06-workflow-design/).

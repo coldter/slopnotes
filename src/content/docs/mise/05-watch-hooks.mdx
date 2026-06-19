@@ -1,0 +1,273 @@
+---
+title: Watch, Hooks & Automation
+description: Re-run tasks on file change with mise watch, fire shell hooks on enter/cd/leave, react to watched files, and generate git pre-commit hooks.
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem, Steps } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+You have [tasks](/mise/04-tasks/). Now make them *react*: re-run on save, fire on
+`cd`, install on the first `enter`, and gate your commits. This page is the glue
+between "I defined a task" and "it runs itself at the right moment."
+
+## `mise watch` — re-run a task on file change
+
+`mise watch` wraps [watchexec](https://github.com/watchexec/watchexec) and re-runs
+a task whenever its files change.
+
+```bash
+mise use -g watchexec   # required — mise shells out to it
+mise watch build        # re-runs the `build` task on change
+mise w build            # `w` is the alias
+```
+
+By default it watches the task's [`sources`](/mise/04-tasks/) — so the same
+globs that power incremental builds also tell `watch` what to look at:
+
+```toml title="mise.toml"
+[tasks.build]
+run = "go build -o dist/app ./..."
+sources = ["**/*.go"]        # watch (and incremental-build) key
+outputs = ["dist/app"]
+```
+
+```bash
+mise watch build   # watches **/*.go, rebuilds on save
+```
+
+:::danger[The #1 mise watch mistake: there is no -t / --task]
+The task is a **positional** argument. `mise watch -t build` and
+`mise watch --task build` are **not valid** — there is no such flag. Just name the
+task: `mise watch build`. Everything that *isn't* a mise flag is passed straight
+through to watchexec.
+:::
+
+### watchexec passthrough flags
+
+`mise watch` owns exactly one flag of its own — `--skip-deps`. Everything else is
+forwarded to watchexec. The ones you'll actually reach for:
+
+| Flag | Does |
+|---|---|
+| `-r`, `--restart` | Kill the running task and restart it on change (servers!) |
+| `-c`, `--clear` | Clear the screen before each run |
+| `-e <ext>` | Watch by extension, e.g. `-e rs` or `-e go,mod` |
+| `-w <path>` | Watch specific path(s), overriding `sources` |
+| `-d <dur>` | Debounce, e.g. `-d 500ms` — collapse rapid saves |
+| `-s <sig>` | Signal to send on restart, e.g. `-s SIGTERM` |
+
+```bash
+# Dev server: restart on any change under src/, only .rs files, clear each time
+mise watch serve -w src -e rs --restart --clear
+
+# Test loop with a debounce so a "save all" fires once
+mise watch test -d 500ms
+```
+
+:::tip[`--skip-deps`]
+`mise watch build` re-runs `build`'s [`depends`](/mise/04-tasks/) every cycle. On a
+tight loop where deps are already satisfied, `mise watch build --skip-deps` skips
+straight to the task body.
+:::
+
+## `[hooks]` — run code on directory events
+
+Hooks fire on lifecycle events instead of file changes. Define them in `mise.toml`:
+
+```toml title="mise.toml"
+[hooks]
+enter = "echo 'entered $MISE_PROJECT_ROOT'"   # first cd into the project tree
+cd    = "ls"                                   # any cd within the project
+leave = "echo bye"                             # cd out of the project tree
+preinstall  = "echo 'about to install tools'"
+postinstall = "corepack enable"                # after `mise install`
+```
+
+| Hook | Fires when |
+|---|---|
+| `enter` | You `cd` **into** the project directory (or a child of it) |
+| `cd` | You `cd` **anywhere within** an already-entered project |
+| `leave` | You `cd` **out of** the project tree |
+| `preinstall` | Before `mise install` resolves/installs tools |
+| `postinstall` | After `mise install` finishes |
+
+:::note[enter/cd/leave need an active shell session]
+`enter`, `cd`, and `leave` depend on [`mise activate`](/mise/01-install-activate/)
+being live in your shell — they ride the same prompt hook that rewrites your
+`PATH`. `preinstall`/`postinstall` fire on the install itself, so they work
+everywhere (CI, Docker, shims).
+:::
+
+### The enter → cd → leave lifecycle
+
+<Mermaid title="Hook lifecycle as you move in and out of a project" height={420} code={`
+stateDiagram-v2
+  [*] --> Outside
+  Outside --> Inside: cd into project<br/>fires enter (then cd)
+  Inside --> Inside: cd within project<br/>fires cd
+  Inside --> Outside: cd out of tree<br/>fires leave
+  Inside --> Sibling: cd to another project<br/>fires leave then enter
+  Sibling --> Inside: cd back<br/>fires leave then enter
+`} />
+
+So `enter` is a one-shot "you arrived" event; `cd` fires on every move while you're
+inside; `leave` is your cleanup hook. Jumping straight from one mise project to
+another fires `leave` for the old one and `enter` for the new one.
+
+### Env vars hooks receive
+
+Every hook script gets a few variables it can branch on:
+
+| Variable | Meaning |
+|---|---|
+| `MISE_PROJECT_ROOT` | Root of the project the hook fired for |
+| `MISE_ORIGINAL_CWD` | The directory you were in when the event fired |
+| `MISE_PREVIOUS_DIR` | Where you came *from* (for `cd`/`enter`/`leave`) |
+| `MISE_INSTALLED_TOOLS` | JSON of just-installed tools (`postinstall` only) |
+
+```toml title="mise.toml"
+[hooks]
+# Auto-install tools the moment you enter a project that lacks them
+enter = "mise install"
+```
+
+### In-shell hooks (`shell=` / `script=`)
+
+A normal hook runs in a *subshell*, so it can't change your current shell's state.
+For `enter`/`cd`/`leave` you can opt into running **in the current shell** — needed
+when you want to `source` something or export a var that sticks:
+
+```toml title="mise.toml"
+[hooks.enter]
+shell  = "bash"
+script = "source ./scripts/dev-shell.sh"   # runs in YOUR shell, not a subshell
+```
+
+:::caution[In-shell hooks are powerful and sharp]
+A `script` running in your interactive shell can clobber your environment. Keep it
+small and idempotent. For env *values*, prefer
+[`[env]`](/mise/03-environments-secrets/) — it's declarative and doesn't need a
+hook at all.
+:::
+
+### Task-reference hooks
+
+Don't inline a script when you already have a task — point the hook at it. Keeps
+the logic testable via `mise run`:
+
+```toml title="mise.toml"
+[hooks]
+enter = { task = "setup" }     # runs `mise run setup` on first entry
+
+[tasks.setup]
+run = "npm install && mise run db:migrate"
+```
+
+Values can also be an **array** (run several) or a table with `run` / `run_windows`
+/ `shell` for cross-platform scripts:
+
+```toml title="mise.toml"
+[hooks]
+enter = ["mise install", { task = "setup" }]
+
+[hooks.cd]
+run = "eza --git -l"
+run_windows = "dir"
+```
+
+## `[[watch_files]]` — react to specific files changing
+
+Distinct from `mise watch` (a foreground command): `[[watch_files]]` is an
+**array-of-tables** in config that fires a task/script automatically when matching
+files change during normal `cd`/prompt activity.
+
+```toml title="mise.toml"
+[[watch_files]]
+patterns = ["package.json", "package-lock.json"]
+task = "install"               # or: run = "npm install"
+
+[[watch_files]]
+patterns = ["**/*.proto"]
+run = "buf generate"
+```
+
+The changed paths are handed to your script as `MISE_WATCH_FILES_MODIFIED`:
+
+```toml title="mise.toml"
+[[watch_files]]
+patterns = ["migrations/*.sql"]
+run = "echo \"changed: $MISE_WATCH_FILES_MODIFIED\" && mise run db:migrate"
+```
+
+:::note[`watch_files` vs `mise watch`]
+Use **`[[watch_files]]`** for "keep my generated/installed state in sync as I work"
+(regenerate protobufs, re-`npm install` when the lockfile moves). Use **`mise watch
+<task>`** for an explicit foreground loop you start and stop (dev server, test
+runner).
+:::
+
+## Per-tool `postinstall`
+
+A tool can carry its own post-install step in the [`[tools]`](/mise/02-tools-backends/)
+table — handy for enabling sidecar tooling right after the runtime lands:
+
+```toml title="mise.toml"
+[tools]
+node   = { version = "22", postinstall = "corepack enable" }   # pnpm/yarn ready
+python = { version = "3.13", postinstall = "pip install -U pip" }
+```
+
+The script receives `MISE_TOOL_NAME` and `MISE_TOOL_VERSION` so one snippet can
+adapt to the version just installed.
+
+## Git hooks: `mise generate git-pre-commit`
+
+Generate a real `.git/hooks/pre-commit` that runs a mise task. Staged files arrive
+in `$STAGED`:
+
+```bash
+mise generate git-pre-commit --write --task pre-commit
+```
+
+```toml title="mise.toml"
+[tasks.pre-commit]
+run = "mise run lint && mise run test"
+# $STAGED holds the staged file paths — lint only what's changing:
+# run = "biome check $STAGED"
+```
+
+The generated hook simply calls `mise run pre-commit`, so the logic lives in your
+versioned `mise.toml` — not in an untracked `.git/hooks/` file. We wire this into a
+team flow in [Designing Your Workflow](/mise/06-workflow-design/).
+
+:::tip[Want more than pre-commit? Meet `hk`]
+For a full hook manager — multiple hook stages, parallel linters, fix-on-commit —
+jdx's sister project [**hk**](https://hk.jdx.dev) is purpose-built and integrates
+with mise. `git-pre-commit` is the zero-dependency option; `hk` is the upgrade.
+:::
+
+## `mise generate task-docs` — document your tasks
+
+Keep a tasks reference in your README or docs in sync, generated from the task
+definitions themselves:
+
+```bash
+mise generate task-docs -o docs/tasks.md -s detailed
+```
+
+```bash
+# Or inject between markers in an existing file (idempotent, CI-friendly):
+mise generate task-docs --inject -o README.md
+```
+
+`--inject` rewrites only the block between `<!-- mise-tasks -->` markers, so it's
+safe to run in CI to catch drift between your tasks and their docs.
+
+---
+
+**Next:** you've got the automation primitives — watch loops, lifecycle hooks, and
+git hooks. [Designing Your Workflow](/mise/06-workflow-design/) assembles them into
+a team setup: shared `mise.toml`, bootstrap script, the trust model, and monorepo
+task fan-out.
