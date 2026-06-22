@@ -32,6 +32,22 @@ npm run dev        # http://localhost:4321
 | `npm run preview` | Preview the production build locally        |
 | `npm run check`   | Run `astro check` (type/diagnostics)        |
 
+## AI assistant
+
+The floating **Ask slopnotes** widget is mounted globally and talks to the sibling
+`slopnote-rag` Worker.
+
+Optional public build variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PUBLIC_SLOPNOTES_RAG_URL` | Dev: `http://localhost:8787`; prod: `https://slopnote-rag.kuldeep.tech` | Base URL for `/pow/request` and streaming `POST /ask` |
+| `PUBLIC_TURNSTILE_SITE_KEY` | unset | Cloudflare Turnstile site key; set this for production when the RAG Worker runs with Turnstile enabled |
+
+For local end-to-end testing, run the RAG Worker from `../slopnote-rag` and this
+site at `localhost:4321`; the RAG dev environment disables production gates but
+still streams through the same `/ask` contract.
+
 ## Deploy
 
 The site is a fully static build deployed to Cloudflare Workers via
