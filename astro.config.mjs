@@ -61,6 +61,15 @@ export default defineConfig({
     }),
   ],
   vite: {
+    optimizeDeps: {
+      include: [
+        "astro/toolbar",
+        "@pagefind/default-ui",
+        "markdown-it",
+        "shiki-transformer-copy-button",
+        "shiki"
+      ],
+    },
     plugins: /** @type {any} */ ([tailwindcss(), viewTransitions()]),
     resolve: {
       alias: {
