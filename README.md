@@ -2,6 +2,8 @@
 
 [![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
 
+## Mostly build to learn public facing production grade RAG system. Checkout backend [Slopnotes RAG](https://github.com/coldter/slopnote-rag)
+
 A place to keep the learning material I generate with AI.
 
 Here's how I pick up new stuff these days: instead of grinding through hours of
