@@ -1,0 +1,830 @@
+---
+title: "DateTime & Clock"
+description: "Effect's DateTime over Date — Utc vs Zoned, parsing safety via Option, immutable calendar math, IANA zones, CurrentTimeZone service, formatting, Duration inputs, and virtual time with TestClock."
+sidebar:
+  order: 18
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+`Date` is famously hostile: months are zero-based, arithmetic mutates, parsing `new Date("2024-02-30")` silently rolls over, `Date.now()` is untestable, and "9 am Auckland" is a wall-clock problem disguised as an instant problem. Effect replaces it with `DateTime` — an immutable instant (`epochMilliseconds`) optionally carrying an IANA `TimeZone` — plus `Clock`/`TestClock` for testable time and `Duration` string literals so sleeps never hide bare millisecond counts.
+
+## Why DateTime
+
+| Concern | `Date` / ISO strings in your codebase | `DateTime` |
+|---|---|---|
+| Identity | mutable object; `===` checks reference, not instant | immutable value; `Equivalence` by `epochMilliseconds` |
+| Parsing | `new Date(s)` returns `Invalid Date` silently | `DateTime.make(s)` → `Option<DateTime.Utc>`; `makeUnsafe` throws `IllegalArgumentError` explicitly |
+| Zones | `Date` is always system-local; offset is an afterthought | `Utc` (pure instant) vs `Zoned` (instant + zone) enforced by types |
+| Arithmetic | `setDate/getDate` mutates; month zero-indexed | `.pipe(DateTime.add({ months: 1 }))` — immutable, calendar-aware |
+| Formatting | `toLocaleString` depends on runtime locale; no ISO zoned | `formatIso`, `formatIsoZoned`, `format` with Intl |
+| Testability | `Date.now()` is ambient and uncontrollable | `DateTime.now` is `Effect<DateTime.Utc>` via `Clock`; `TestClock.adjust` moves it without wall-clock waits |
+
+A `DateTime` always holds `epochMilliseconds`. A `Zoned` adds `zone: TimeZone` and derived `adjustedEpochMilliseconds` / `partsAdjusted` for wall-clock calculations. Comparison (`Order`, `between`, `isFuture`) compares instants, ignoring zone.
+
+<Mermaid title="Utc vs Zoned: same instant, different wall time" height={260} code={`
+flowchart LR
+  E["epoch 1704067200000<br/>2024-01-01T00:00:00.000Z"]:::utc
+  E --> U["DateTime.Utc<br/>zone = none<br/>formatIso → 2024-01-01T00:00:00.000Z"]:::utc
+  E --> Z1["DateTime.Zoned Europe/London<br/>offset +00:00<br/>00:00 wall"]:::z
+  E --> Z2["DateTime.Zoned Pacific/Auckland<br/>offset +13:00<br/>13:00 wall (next day)"]:::z
+  classDef utc fill:#dbeafe,stroke:#2563eb
+  classDef z fill:#fef3c7,stroke:#d97706
+`} />
+
+## Creating & parsing
+
+### Current time — the effectful vs unsafe split
+
+```ts title="src/datetime-now.ts"
+import { DateTime, Effect } from "effect"
+import { TestClock } from "effect/testing"
+
+// effectful — reads `Clock`, controllable by TestClock
+const now: Effect.Effect<DateTime.Utc> = DateTime.now
+const nowDate: Effect.Effect<Date> = DateTime.nowAsDate
+
+// synchronous — reads `Date.now()` directly, not controllable
+const nowUnsafe: DateTime.Utc = DateTime.nowUnsafe()
+
+// zone-aware current time — requires CurrentTimeZone in context
+const nowAuckland: Effect.Effect<DateTime.Zoned, never, DateTime.CurrentTimeZone> =
+  DateTime.nowInCurrentZone
+
+// providing a zone for the duration of an effect
+const program = Effect.gen(function* () {
+  const z = yield* DateTime.nowInCurrentZone
+  return DateTime.formatIsoZoned(z)
+}).pipe(DateTime.withCurrentZoneNamed("Pacific/Auckland"))
+
+const layerProgram = Effect.gen(function* () {
+  const z = yield* DateTime.nowInCurrentZone
+  return DateTime.formatIsoZoned(z)
+}).pipe(Effect.provide(DateTime.layerCurrentZoneNamed("Pacific/Auckland")))
+```
+
+| Accessor | Type | Clock source | Testable |
+|---|---|---|---|
+| `DateTime.now` | `Effect<DateTime.Utc>` | `Clock` service | yes — `TestClock` |
+| `DateTime.nowAsDate` | `Effect<Date>` | `Clock` | yes |
+| `DateTime.nowUnsafe()` | `() => DateTime.Utc` (sync) | `Date.now()` | no |
+| `DateTime.nowInCurrentZone` | `Effect<DateTime.Zoned, never, CurrentTimeZone>` | `Clock` + zone | yes |
+
+:::note[Yieldable]
+`DateTime.now` and `DateTime.nowInCurrentZone` are yieldable — `yield* DateTime.now` works inside `Effect.gen` alongside `Option` and `Result`.
+:::
+
+### From inputs — Option vs unsafe
+
+```ts title="src/datetime-make.ts"
+import { DateTime, Option } from "effect"
+
+// returns Option — preferred at boundaries (query params, JSON, user input)
+const fromString: Option.Option<DateTime.Utc> = DateTime.make("2024-06-15T14:30:00.000Z")
+const fromNumber: Option.Option<DateTime.Utc> = DateTime.make(1_718_451_000_000)
+const fromDate: Option.Option<DateTime.Utc> = DateTime.make(new Date("2024-01-01T12:00:00Z"))
+const fromParts: Option.Option<DateTime.Utc> = DateTime.make({ year: 2024, month: 6, day: 15, hour: 14 })
+const fromInstantObj: Option.Option<DateTime.Utc> = DateTime.make({ epochMilliseconds: 0 })
+
+DateTime.make("not a date")    // => Option.none()
+DateTime.make("not a date").pipe(Option.isNone) // true
+
+// throws IllegalArgumentError on invalid input — use when the literal is trusted
+const trusted: DateTime.Utc = DateTime.makeUnsafe("2024-06-15T14:30:00.000Z")
+const fromPartsUnsafe = DateTime.makeUnsafe({ year: 2024 })
+const fromEpochSec = DateTime.fromEpochSeconds(1_704_067_200)
+
+// parsing a fully-qualified zoned string (requires offset + [IANA] suffix)
+const zonedFromString: Option.Option<DateTime.Zoned> =
+  DateTime.makeZonedFromString("2024-01-01T12:00:00+02:00[Europe/Berlin]")
+```
+
+`DateTime.Input` in `packages/effect/src/DateTime.ts:97` is a union of: `DateTime`, partial `Parts` (`{ year, month, day, hour, minute, second, millisecond }`), `Instant` (`{ epochMilliseconds }`), `InstantWithZone` (`{ timeZoneId, epochMilliseconds }`), `Date`, `number`, or `string`. Strings are parsed via `Date.parse` — valid ISO-8601 is reliable cross-runtime; locale-dependent strings are not.
+
+### Zoned creation — wall clock vs instant
+
+Two mental models for `makeZoned` options:
+
+```ts title="src/datetime-zoned.ts"
+import { DateTime, Option } from "effect"
+
+// default: input is an instant (UTC), zone is attached without changing epoch
+// 14:30Z + Europe/London (BST +01:00) → wall clock 15:30, same instant
+const asInstant: Option.Option<DateTime.Zoned> =
+  DateTime.makeZoned("2024-06-15T14:30:00Z", { timeZone: "Europe/London" })
+// formatIso(asInstant)        => "2024-06-15T14:30:00.000Z"   (unchanged instant)
+// formatIsoZoned(asInstant)   => "2024-06-15T15:30:00.000+01:00[Europe/London]"
+
+// adjustForTimeZone: input is interpreted as wall time IN the zone
+// "14:30" in Europe/London → 13:30Z
+const asWallTime: Option.Option<DateTime.Zoned> =
+  DateTime.makeZoned("2024-06-15T14:30:00", {
+    timeZone: "Europe/London",
+    adjustForTimeZone: true
+  })
+// epoch moves; wall time is the input
+
+// unsafe variant — throws instead of returning Option.none
+const zonedUnsafe: DateTime.Zoned =
+  DateTime.makeZonedUnsafe("2026-06-05", {
+    timeZone: "Pacific/Auckland",
+    adjustForTimeZone: true
+  })
+
+// from an explicit offset
+const withOffset = DateTime.zoneMakeOffset(3 * 60 * 60 * 1000) // +03:00
+const offsetZoned = DateTime.makeZonedUnsafe("2024-01-01T12:00:00Z", {
+  timeZone: withOffset
+})
+```
+
+:::caution[adjustForTimeZone changes the instant]
+Omitting `adjustForTimeZone` means "this string is UTC, attach zone for display". Setting it to `true` means "this string is wall time in that zone, compute the matching UTC instant". Getting this backwards shifts your event by the zone offset — typically 8–13 hours for Pacific timezones — and is the single most common DateTime bug. Name variables `wallTime` vs `instantUtc` to keep them apart.
+:::
+
+### DST disambiguation
+
+On DST transitions a wall time may happen twice (fall back) or not at all (spring forward). The `disambiguation` option controls the resolution:
+
+```ts title="src/datetime-disambiguation.ts"
+import { DateTime, Option } from "effect"
+
+const tz = DateTime.zoneMakeNamedUnsafe("America/New_York")
+
+// 01:30 on fall-back day — occurs twice; pick which instant you mean
+const earlier = DateTime.makeZoned({ year: 2025, month: 11, day: 2, hour: 1, minute: 30 }, {
+  timeZone: tz, adjustForTimeZone: true, disambiguation: "earlier"
+}) // => 2025-11-02T05:30:00.000Z (EDT occurrence)
+const later = DateTime.makeZoned({ year: 2025, month: 11, day: 2, hour: 1, minute: 30 }, {
+  timeZone: tz, adjustForTimeZone: true, disambiguation: "later"
+}) // => 2025-11-02T06:30:00.000Z (EST occurrence)
+
+// 02:30 on spring-forward day — does not exist
+const beforeGap = DateTime.makeZoned({ year: 2025, month: 3, day: 9, hour: 2, minute: 30 }, {
+  timeZone: tz, adjustForTimeZone: true, disambiguation: "earlier"
+}) // => 2025-03-09T06:30:00.000Z (01:30 EST)
+const afterGap = DateTime.makeZoned({ year: 2025, month: 3, day: 9, hour: 2, minute: 30 }, {
+  timeZone: tz, adjustForTimeZone: true, disambiguation: "later"
+}) // => 2025-03-09T07:30:00.000Z (03:30 EDT)
+
+const rejectGap = DateTime.makeZoned({ year: 2025, month: 3, day: 9, hour: 2, minute: 30 }, {
+  timeZone: tz, adjustForTimeZone: true, disambiguation: "reject"
+}) // => Option.none()
+```
+
+| Value | Repeated wall time | Gap (non-existent) wall time |
+|---|---|---|
+| `"compatible"` (default) | earlier occurrence | later interpretation |
+| `"earlier"` | earlier | before the gap |
+| `"later"` | later | after the gap |
+| `"reject"` | `Option.none()` / throw in `*Unsafe` | `Option.none()` / throw |
+
+## Reading, comparing, and converting
+
+```ts title="src/datetime-reading.ts"
+import { DateTime } from "effect"
+
+const zoned = DateTime.makeZonedUnsafe("2024-06-15T14:30:00.000Z", {
+  timeZone: "Pacific/Auckland",
+  adjustForTimeZone: false
+})
+
+// zone-aware parts (wall time)
+const parts = DateTime.toParts(zoned)
+// => { year: 2024, month: 6, day: 16, hour: 2, minute: 30, second: 0, millisecond: 0, weekDay: 0 }
+
+// UTC parts — always epoch projection
+const utcParts = DateTime.toPartsUtc(zoned)
+
+// single field access
+DateTime.getPart(zoned, "year")      // wall year
+DateTime.getPartUtc(zoned, "hour")   // UTC hour
+
+// numeric extraction
+DateTime.toEpochMillis(zoned) // => number (ms since Unix epoch)
+DateTime.toEpochSeconds(zoned)// => number (floored to seconds)
+DateTime.toDateUtc(zoned)     // => Date (always UTC)
+DateTime.toDate(zoned)        // => Date (zone-adjusted when Zoned)
+
+// instant comparison — zones irrelevant
+const a = DateTime.makeUnsafe("2024-01-01T00:00:00Z")
+const b = DateTime.makeUnsafe("2024-02-01T00:00:00Z")
+
+DateTime.Order(a, b)                // < 0 (Order)
+DateTime.Equivalence(a, a)          // true
+DateTime.isGreaterThan(b, a)        // true
+DateTime.isLessThanOrEqualTo(a, b)  // true
+DateTime.between(a, { minimum: a, maximum: b }) // true — inclusive bounds
+DateTime.clamp(b, { minimum: a, maximum: a })   // => a
+DateTime.distance(a, b)             // => Duration (positive if other is after self)
+
+// effectful "is it in the future/past" — reads Clock
+declare const isFuture: import("effect").Effect.Effect<boolean>
+const futureCheck = DateTime.isFuture(a) // Effect<boolean>
+const pastCheck   = DateTime.isPast(a)   // Effect<boolean>
+// sync variants (live clock): isFutureUnsafe, isPastUnsafe
+```
+
+Zones and identity:
+
+```ts title="src/datetime-zones-identity.ts"
+import { DateTime, Option } from "effect"
+
+DateTime.isUtc(DateTime.makeUnsafe("2024-01-01"))               // true
+DateTime.isZoned(DateTime.makeZonedUnsafe("2024-01-01", { timeZone: "Europe/London" })) // true
+
+// equivalence ignores zone — same instant, different wall time
+const utc   = DateTime.makeUnsafe("2024-01-01T12:00:00Z")
+const zoned = DateTime.makeZonedUnsafe("2024-01-01T12:00:00Z", { timeZone: "Europe/London" })
+DateTime.Equivalence(utc, zoned) // true
+
+// zone helpers
+DateTime.zoneToString(DateTime.zoneMakeNamedUnsafe("Europe/London")) // "Europe/London"
+DateTime.zoneToString(DateTime.zoneMakeOffset(3 * 60 * 60 * 1000))    // "+03:00"
+DateTime.zoneFromString("Europe/London").pipe(Option.map(DateTime.zoneToString))
+DateTime.zoneMakeLocal() // system local zone via Intl.DateTimeFormat().resolvedOptions().timeZone
+```
+
+## Immutable calendar math
+
+`add` / `subtract` are **calendar-aware**; `addDuration` / `subtractDuration` are **elapsed-time** operations. For months/years/days they diverge around DST.
+
+```ts title="src/datetime-math.ts"
+import { DateTime, Duration } from "effect"
+
+const dt = DateTime.makeZonedUnsafe("2024-03-09T10:00:00Z", {
+  timeZone: "America/New_York"
+})
+
+// calendar math — zone-aware, respects variable day/month/year lengths
+const plusOneDay   = dt.pipe(DateTime.add({ days: 1 }))
+const plusOneMonth = dt.pipe(DateTime.add({ months: 1 }))
+const minusHours   = dt.pipe(DateTime.subtract({ hours: 2 }))
+const multiField   = dt.pipe(DateTime.add({ years: 1, months: 2, days: 3 }))
+
+// explicit plural keys for arithmetic — DateTime.PartsForMath
+// { milliseconds, seconds, minutes, hours, days, weeks, months, years }
+
+// elapsed math — pure duration on epoch millis, zone-blind
+const plus90m = dt.pipe(DateTime.addDuration("90 minutes"))
+const minusDur = dt.pipe(DateTime.subtractDuration(Duration.hours(3)))
+
+// set/mutate — zone-aware when applied to Zoned
+const withY2025 = dt.pipe(DateTime.setParts({ year: 2025 }))
+const startDay  = dt.pipe(DateTime.startOf("day"))
+const endMonth  = dt.pipe(DateTime.endOf("month"))
+const nearHour  = dt.pipe(DateTime.nearest("hour")) // rounds to nearest hour
+
+// mutate via Date callback — still returns new DateTime (immutable)
+const bumped = dt.pipe(
+  DateTime.mutate((d) => { d.setHours(d.getHours() + 2) })
+)
+const bumpedUtc = dt.pipe(
+  DateTime.mutateUtc((d) => { d.setUTCHours(d.getUTCHours() + 2) })
+)
+
+// low-level epoch mapping — rarely needed
+const shifted = dt.pipe(DateTime.mapEpochMillis((ms) => ms + 86_400_000))
+```
+
+:::tip[Which add to use]
+- **Calendar add** (`add`): "next month on the 15th", "tomorrow at 9 am", "one week from now as a wall-clock duration". Handles varying month lengths, DST folds.
+- **Elapsed add** (`addDuration`): "90 minutes from now", "exactly 24 hours later". Ignores wall-clock semantics — a fixed number of milliseconds.
+If you are working with zoned times, prefer `add` for domain concepts (days, months) and `addDuration` for timers/timeouts.
+:::
+
+Rounding table:
+
+| Helper | Effect |
+|---|---|
+| `startOf("day")` | wall midnight start of that day |
+| `endOf("day")` | 23:59:59.999 wall end |
+| `nearest("hour")` | snap to closest hour boundary |
+| `removeTime` | strip time → `Utc` midnight UTC |
+
+### Immutability discipline
+
+Every `DateTime` operation returns a new value. The only mutation-adjacent API is `mutate` / `mutateUtc`, and even it copies first — the callback receives a mutable `Date` *copy* that is converted back into a fresh `DateTime`:
+
+```ts title="src/datetime-immutable.ts"
+import { DateTime } from "effect"
+
+const original = DateTime.makeUnsafe("2024-06-15T12:00:00Z")
+const modified = original.pipe(DateTime.add({ hours: 2 }))
+
+// original unchanged; === compares instants via Equivalence, not reference
+DateTime.toEpochMillis(original) // 1718452800000
+DateTime.toEpochMillis(modified) // 1718452800000 + 7_200_000
+```
+
+## Formatting
+
+```ts title="src/datetime-format.ts"
+import { DateTime } from "effect"
+
+const utc   = DateTime.makeUnsafe("2024-06-15T14:30:45.123Z")
+const zoned = DateTime.makeZonedUnsafe("2024-06-15T14:30:45.123Z", {
+  timeZone: "Europe/London"
+})
+
+// stable ISO — always the UTC instant
+DateTime.formatIso(utc)          // "2024-06-15T14:30:45.123Z"
+DateTime.formatIso(zoned)        // "2024-06-15T14:30:45.123Z" (zone ignored)
+
+// ISO offset — Utc→Z-equivalent, Zoned→wall with offset
+DateTime.formatIsoOffset(utc)    // "2024-06-15T14:30:45.123Z"
+DateTime.formatIsoOffset(zoned)  // "2024-06-15T15:30:45.123+01:00"
+
+// zoned ISO — only for Zoned; canonical form offset + [IANA]
+DateTime.formatIsoZoned(zoned) // "2024-06-15T15:30:45.123+01:00[Europe/London]"
+
+// date-only — zone-aware vs UTC
+DateTime.formatIsoDate(zoned)    // "2024-06-15" (wall date)
+DateTime.formatIsoDateUtc(zoned) // "2024-06-15" (UTC date; differ near midnight)
+
+// Intl — locale/option delegated to Intl.DateTimeFormat
+DateTime.format(zoned, { dateStyle: "full", timeStyle: "short", locale: "en-US" })
+DateTime.formatUtc(zoned, { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZoneName: "short" })
+DateTime.formatLocal(utc, { year: "numeric", month: "long", day: "numeric" })
+DateTime.formatIntl(zoned, new Intl.DateTimeFormat("de-DE", { timeZone: "Europe/Berlin" }))
+```
+
+| Formatter | Source of truth for zone | Output shape |
+|---|---|---|
+| `formatIso` | UTC always | `YYYY-MM-DDTHH:mm:ss.sssZ` |
+| `formatIsoOffset` | Utc→UTC, Zoned→zone offset | `...+HH:MM` or `Z` |
+| `formatIsoZoned` (Zoned only) | named zone | `...+HH:MM[Zone/Id]` |
+| `formatIsoDate` | zone-adjusted wall date | `YYYY-MM-DD` |
+| `formatIsoDateUtc` | UTC date | `YYYY-MM-DD` |
+| `format` / `formatLocal` / `formatUtc` / `formatIntl` | Intl; `format` auto-selects UTC vs zoned default | locale string |
+
+## Time zones deep dive
+
+### The zone taxonomy
+
+```ts title="src/datetime-zone-types.ts"
+import { DateTime, Option } from "effect"
+
+// Named — IANA, DST-aware, via Intl
+const london = DateTime.zoneMakeNamedUnsafe("Pacific/Auckland") // validates via Intl, throws on bad id
+const optLondon: Option.Option<DateTime.TimeZone.Named> = DateTime.zoneMakeNamed("Pacific/Auckland")
+const viaEffect = DateTime.zoneMakeNamedEffect("Pacific/Auckland") // Effect<Named, IllegalArgumentError>
+const fromString: Option.Option<DateTime.TimeZone> = DateTime.zoneFromString("Europe/London")
+DateTime.zoneToString(london) // "Pacific/Auckland"
+
+// Fixed offset — milliseconds from UTC, sign = direction
+const plus3h = DateTime.zoneMakeOffset(3 * 60 * 60 * 1000)  // +03:00
+const minus5 = DateTime.zoneMakeOffset(-5 * 60 * 60 * 1000) // -05:00
+DateTime.zoneToString(plus3h) // "+03:00"
+
+// Local — resolved from runtime's Intl default
+const local = DateTime.zoneMakeLocal() // e.g., "America/New_York" on a US host
+```
+
+| Type | Representation | DST | Construction | Example `zoneToString` |
+|---|---|---|---|---|
+| `TimeZone.Named` | IANA id + `Intl.DateTimeFormat` | yes | `zoneMakeNamed*` | `"Europe/London"` |
+| `TimeZone.Offset` | `number` millis | no | `zoneMakeOffset` | `"+03:00"` |
+
+### Attaching / switching zones
+
+```ts title="src/datetime-setzone.ts"
+import { DateTime, Effect, Option } from "effect"
+
+const utc = DateTime.makeUnsafe("2024-01-01T12:00:00Z")
+const londonTz = DateTime.zoneMakeNamedUnsafe("Europe/London")
+const aucklandTz = DateTime.zoneMakeNamedUnsafe("Pacific/Auckland")
+
+// pipe form — keep same instant, attach zone
+const london: DateTime.Zoned = utc.pipe(DateTime.setZone(londonTz))
+const auckland = DateTime.setZone(utc, aucklandTz, { adjustForTimeZone: false }) // same
+DateTime.zoneToString(london.zone) // "Europe/London"
+
+// string forms — validate IANA at call time, return Option or throw
+const opt: Option.Option<DateTime.Zoned> = DateTime.setZoneNamed(utc, "Europe/London")
+const strict: DateTime.Zoned = DateTime.setZoneNamedUnsafe(utc, "Europe/London")
+
+// adjustForTimeZone: re-anchor the wall clock (changes epoch)
+const wallAnchored = DateTime.setZone(utc, londonTz, {
+  adjustForTimeZone: true,         // 12:00Z reinterpreted as 12:00 London → 12:00+offset instant
+  disambiguation: "compatible"
+})
+
+// offset-specific sugar
+const offsetZoned = DateTime.setZoneOffset(utc, 60 * 60 * 1000) // +01:00 via number ms
+
+// via ambient CurrentTimeZone service (Effectful)
+const zonedViaCurrent: Effect.Effect<DateTime.Zoned, never, DateTime.CurrentTimeZone> =
+  DateTime.setZoneCurrent(utc)
+
+const program = DateTime.setZoneCurrent(utc).pipe(
+  DateTime.withCurrentZoneNamed("America/Chicago") // provides service inline
+)
+
+const utcReverted: DateTime.Utc = DateTime.toUtc(london) // strip zone, keep instant
+```
+
+:::note[Every "NamedUnsafe" has a safe twin]
+`zoneMakeNamed("x")` → `Option`, `zoneMakeNamedUnsafe("x")` → throws, `zoneMakeNamedEffect("x")` → `Effect`. Same triple for `setZoneNamed` / `setZoneNamedUnsafe` and `makeZoned` / `makeZonedUnsafe`. Use the `Option` form at boundaries, the `Unsafe` form for literals you control.
+:::
+
+### CurrentTimeZone — the ambient zone service
+
+`CurrentTimeZone` is a `Context.Service<CurrentTimeZone, TimeZone>` that supplies the zone for APIs like `nowInCurrentZone` and `setZoneCurrent`. Provide it locally with `withCurrentZone*` combinators or at the layer level:
+
+```ts title="src/datetime-current-zone.ts"
+import { DateTime, Effect } from "effect"
+
+const reportTime = Effect.gen(function* () {
+  const now = yield* DateTime.nowInCurrentZone
+  return `${DateTime.formatIsoZoned(now)} (${DateTime.zoneToString(now.zone)})`
+})
+
+// inline provision — per-effect overrides
+const withNamed = reportTime.pipe(DateTime.withCurrentZoneNamed("Europe/Berlin"))
+const withOffset = reportTime.pipe(DateTime.withCurrentZoneOffset(2 * 60 * 60 * 1000))
+const withLocal = reportTime.pipe(DateTime.withCurrentZoneLocal)
+const withZone = reportTime.pipe(
+  DateTime.withCurrentZone(DateTime.zoneMakeNamedUnsafe("Pacific/Auckland"))
+)
+
+// layer provision — for an entire app slice
+const LiveAuckland = DateTime.layerCurrentZoneNamed("Pacific/Auckland")
+const LiveOffset = DateTime.layerCurrentZoneOffset(9 * 60 * 60 * 1000)
+const LiveLocal = DateTime.layerCurrentZoneLocal
+
+const app = reportTime.pipe(Effect.provide(LiveAuckland))
+
+// reading the raw service
+const zoneName = Effect.gen(function* () {
+  const zone = yield* DateTime.CurrentTimeZone
+  return DateTime.zoneToString(zone)
+}).pipe(DateTime.withCurrentZoneNamed("Australia/Sydney"))
+```
+
+| Provider | Signature | Error |
+|---|---|---|
+| `withCurrentZone(zone)` | `Effect<A,E,R> => Effect<A,E,Exclude<R,CurrentTimeZone>>` | never |
+| `withCurrentZoneNamed(id)` | `=> Effect<A,E\|IllegalArgumentError, Exclude<R,CurrentTimeZone>>` | `IllegalArgumentError` |
+| `withCurrentZoneOffset(ms)` | — | never |
+| `withCurrentZoneLocal` | `Effect<A,E,R> => ...` (no args; reads runtime) | never |
+| `layerCurrentZone(zone)` | `Layer<CurrentTimeZone>` | never |
+| `layerCurrentZoneNamed(id)` | `Layer<CurrentTimeZone, IllegalArgumentError>` | `IllegalArgumentError` |
+| `layerCurrentZoneOffset(ms)` | `Layer<CurrentTimeZone>` | never |
+| `layerCurrentZoneLocal` | `Layer<CurrentTimeZone>` | never |
+
+`CurrentTimeZone` is *not* consulted by plain `DateTime.make` / `makeZoned` calls that receive an explicit `timeZone` argument. It only drives `nowInCurrentZone`, `setZoneCurrent`, and code that explicitly yields `CurrentTimeZone`.
+
+## Clock, Duration, and virtual time
+
+### Duration.Input — the string literal form
+
+Every sleep, timeout, schedule constructor, and `Clock` operation accepts `Duration.Input`:
+
+```ts title="src/duration-input.ts"
+import { Duration, Effect, Schedule } from "effect"
+
+// string forms — parsed by Duration.fromInputUnsafe
+Effect.sleep("10 seconds")
+Effect.sleep("500 millis")
+Effect.sleep("1 minutes")   // plural
+Effect.sleep("2 hours")
+Effect.sleep("Infinity")    // forever
+Schedule.spaced("30 seconds")
+Schedule.exponential("200 millis")
+Schedule.fixed("1 minutes")
+
+// number — milliseconds
+Effect.sleep(1500)          // 1500 ms
+Duration.millis(1500)       // explicit
+
+// Duration value — already decoded
+Duration.seconds(30)
+Duration.minutes(5)
+Duration.hours(2)
+Duration.days(1)
+Duration.weeks(1)
+Duration.infinity
+Duration.zero
+
+// object — Temporal-compatible
+Duration.fromInputUnsafe({ seconds: 30 })
+Duration.fromInputUnsafe({ days: 1, seconds: 1, nanoseconds: 500 })
+
+// helpers
+Duration.toMillis("10 seconds") // => 10000
+Duration.isZero(Duration.zero)  // true
+Duration.min(a, b), Duration.max(a, b), Duration.sum(a, b)
+```
+
+| Input shape | Example | Notes |
+|---|---|---|
+| `number` | `1500`, `0` | milliseconds |
+| `Duration` | `Duration.seconds(5)` | already a Duration |
+| `string` | `"10 seconds"`, `"500 millis"`, `"1 minute"`, `"Infinity"` | singular or plural unit name plus optional number; `"nanos"` / `"micros"` supported |
+| `DurationObject` | `{ seconds: 30 }`, `{ days: 1 }` | additive fields; `nanoseconds` as bigint |
+
+### Clock and TestClock
+
+`Clock` is the service behind `DateTime.now`, `Effect.sleep`, `Effect.timeout`, and schedule delays. In production the runtime provides the live wall/monotonic clocks. In tests you replace it:
+
+```ts title="src/clock-testclock.ts"
+import { Clock, DateTime, Duration, Effect, Schedule } from "effect"
+import { TestClock } from "effect/testing"
+
+// low-level clock operations
+const clockProgram = Effect.gen(function* () {
+  const nowMs = yield* Clock.currentTimeMillis     // Effect<number>
+  const nowNs = yield* Clock.currentTimeNanos      // Effect<bigint>
+  const mono  = yield* Clock.currentTimeMillis      // (monotonic via scheduler)
+  yield* Clock.sleep("2 seconds")                   // suspend, TestClock-controllable
+})
+
+// DateTime.now is just `Clock.currentTimeMillis` → DateTime
+// Effect.timeout is Clock.sleep + fiber interrupt
+
+// === deterministic test without wall-clock delays ===
+import { it, expect } from "vitest"
+
+it("advances time without waiting", () =>
+  Effect.gen(function* () {
+    let observed: number | undefined
+    const program = Effect.gen(function* () {
+      const start = yield* DateTime.now
+      yield* Effect.sleep("60 seconds")
+      observed = DateTime.toEpochMillis(yield* DateTime.now) - DateTime.toEpochMillis(start)
+    })
+
+    const fiber = yield* Effect.fork(program)
+    // move virtual time forward — all sleeps in the forked fiber advance
+    yield* TestClock.adjust("60 seconds")
+    yield* fiber.await
+
+    expect(observed).toBe(60_000)
+  }).pipe(Effect.provide(TestClock.layer()))
+)
+
+// layer variant for composition with other test layers
+const testProgram = clockProgram.pipe(Effect.provide(TestClock.layer()))
+```
+
+| Operation | Effect | TestClock control |
+|---|---|---|
+| `Clock.currentTimeMillis` | `Effect<number>` | frozen until `adjust`/`setTime` |
+| `Clock.currentTimeNanos` | `Effect<bigint>` | same |
+| `Clock.sleep(d)` | suspend with delay `d` | completes when virtual time reaches target |
+| `TestClock.adjust(d)` | `Effect<void>` | advance virtual clock by `d` |
+| `TestClock.setTime(ms)` | `Effect<void>` | jump to absolute `ms` |
+| `TestClock.layer()` | `Layer<TestClock>` | replaces `Clock` for the provided scope |
+
+:::tip[TestClock is the schedule test harness]
+Schedules ultimately `sleep` their computed delay. That means every retry, repeat, `Stream.tick`, and `Stream.fromSchedule` is deterministic under `TestClock`. Chapter 17's schedule test and chapter 28's testing chapter both use this — you never need `vi.useFakeTimers` inside Effect tests.
+:::
+
+:::caution[Don't mix live Date.now with virtual time]
+If a code path reads `Date.now()` directly instead of `DateTime.now` / `Clock.currentTimeMillis`, its time is not under `TestClock` control. Lint for bare `Date.now()` in Effect codebases — the `nowUnsafe` / `Effect.sleep` split exists precisely to make this auditable.
+:::
+
+## Worked feature — next business day at 9 am Auckland
+
+Spec: given an arbitrary `DateTime`, compute the *next business day* (Mon–Fri, skipping Sat/Sun) at **09:00 Pacific/Auckland wall time**, returning a `DateTime.Zoned`. If the anchor is already a weekday before 09:00 local, that same day qualifies; otherwise the following weekday.
+
+This exercises the exact palette above: IANA zones, wall-clock parts (weekday, hour), `add({ days })`, `startOf("day")` with `setParts`, and `adjustForTimeZone` semantics.
+
+```ts title="src/next-business-day-9am.ts"
+import { DateTime, Effect, Option, Schema } from "effect"
+
+class InvalidInput extends Schema.TaggedError<InvalidInput>()(
+  "InvalidInput", { message: Schema.String }
+) {}
+
+/**
+ * Next business day at 09:00 in `timeZone` (default Auckland).
+ * Wall-clock 09:00 in the target zone; returns a Zoned value.
+ */
+export const nextBusinessDayAt9 = Effect.fn("nextBusinessDayAt9")(
+  function* (
+    anchor: DateTime.DateTime,
+    timeZone = "Pacific/Auckland"
+  ): Effect.fn.Return<DateTime.Zoned, InvalidInput, DateTime.CurrentTimeZone> {
+    // ensure the zone is valid — surface as a typed error rather than throwing
+    const zone = yield* DateTime.zoneMakeNamedEffect(timeZone).pipe(
+      Effect.mapError(() => new InvalidInput({ message: `unknown zone: ${timeZone}` }))
+    )
+
+    // bring anchor into the target zone so weekday/hour read wall time
+    const anchorZoned = DateTime.setZone(anchor, zone)
+
+    // helper: DateTime for that wall-date's 09:00 in the same zone
+    const atNine = (dt: DateTime.Zoned): DateTime.Zoned =>
+      // startOf("day") is zone-aware; setParts keeps zone
+      dt.pipe(DateTime.startOf("day"), DateTime.setParts({ hour: 9 }))
+
+    // predicate helpers on wall parts
+    const isWeekend = (dt: DateTime.Zoned) => {
+      const wd = DateTime.getPart(dt, "weekDay") // 0=Sun .. 6=Sat (UTC day mapping, wall-adjusted)
+      return wd === 0 || wd === 6
+    }
+    const isBeforeNine = (dt: DateTime.Zoned) =>
+      DateTime.getPart(dt, "hour") < 9
+
+    // start from today's wall date
+    let candidate = anchorZoned
+
+    // if today is a weekend → skip forward
+    while (isWeekend(candidate)) {
+      candidate = candidate.pipe(DateTime.add({ days: 1 }), (dt) => DateTime.setZone(dt, zone))
+    }
+
+    // if today is weekday but at-or-after 09:00 wall, move forward one weekday
+    if (!isWeekend(candidate) && !isBeforeNine(candidate)) {
+      // "after" includes 09:00:00 exactly — interpret as needing next day
+      const afterNineStrictlyPast =
+        DateTime.getPart(candidate, "hour") > 9 ||
+        (DateTime.getPart(candidate, "hour") === 9 &&
+          (DateTime.getPart(candidate, "minute") > 0 ||
+           DateTime.getPart(candidate, "second") > 0 ||
+           DateTime.getPart(candidate, "millisecond") > 0))
+      if (afterNineStrictlyPast) {
+        candidate = candidate.pipe(DateTime.add({ days: 1 }), (dt) => DateTime.setZone(dt, zone))
+        while (isWeekend(candidate)) {
+          candidate = candidate.pipe(DateTime.add({ days: 1 }), (dt) => DateTime.setZone(dt, zone))
+        }
+      } else {
+        // exactly 09:00 → today qualifies (fall through)
+      }
+    }
+
+    // if weekday-before-09:00, today qualifies; else we already moved forward
+    if (!isWeekend(candidate) && isBeforeNine(candidate)) {
+      return atNine(candidate)
+    }
+
+    // catch-all for moved-forward or weekend→weekday path
+    // ensure we land on a weekday
+    while (isWeekend(candidate)) {
+      candidate = candidate.pipe(DateTime.add({ days: 1 }), (dt) => DateTime.setZone(dt, zone))
+    }
+    return atNine(candidate)
+  }
+)
+
+// ── usage ──
+
+const examples = Effect.gen(function* () {
+  // Friday 2026-06-05 08:30 Auckland — before 9, same day
+  const fridayMorning = DateTime.makeZonedUnsafe("2026-06-05T08:30:00", {
+    timeZone: "Pacific/Auckland", adjustForTimeZone: true
+  })
+  const r1 = yield* nextBusinessDayAt9(fridayMorning)
+  console.log(DateTime.formatIsoZoned(r1))
+  // => 2026-06-05T09:00:00.000+12:00[Pacific/Auckland]
+
+  // Friday 2026-06-05 11:00 Auckland — after 9, skips weekend to Monday
+  const fridayAfter = DateTime.makeZonedUnsafe("2026-06-05T11:00:00", {
+    timeZone: "Pacific/Auckland", adjustForTimeZone: true
+  })
+  const r2 = yield* nextBusinessDayAt9(fridayAfter)
+  console.log(DateTime.formatIsoZoned(r2))
+  // => 2026-06-08T09:00:00.000+12:00[Pacific/Auckland] (Monday)
+
+  // Saturday 2026-06-06 15:00 Auckland — weekend, next Monday
+  const saturday = DateTime.makeZonedUnsafe("2026-06-06T15:00:00", {
+    timeZone: "Pacific/Auckland", adjustForTimeZone: true
+  })
+  const r3 = yield* nextBusinessDayAt9(saturday)
+  console.log(DateTime.formatIsoZoned(r3))
+  // => 2026-06-08T09:00:00.000+12:00[Pacific/Auckland]
+}).pipe(Effect.provide(DateTime.layerCurrentZoneNamed("Pacific/Auckland")))
+```
+
+### Why each decision matters
+
+- **IANA zone string is user input.** Use `zoneMakeNamedEffect` → typed `InvalidInput` rather than `zoneMakeNamedUnsafe`. A config typo fails close to the caller.
+- **`setZone(anchor, zone)` before reading weekday.** `getPart` on a `Zoned` is wall-time. If you read `weekDay` on a `Utc`, you get the UTC weekday — Saturday in Auckland can still be Friday in UTC.
+- **`startOf("day")` + `setParts({ hour: 9 })` is zone-aware.** Midnight and 09:00 in `Zoned` respect DST. Doing `DateTime.add({ days: 1 })` then re-deriving 09:00 preserves the wall target; pure `addDuration("24 hours")` would drift across a DST boundary.
+- **Return `Zoned` (not `Utc`).** Callers that schedule a notification need to know the wall time *and* the offset at that instant; formatting or comparison in another zone is lossless from `Zoned`.
+
+:::note[Alternative — keep the anchor in CurrentTimeZone]
+If every caller already provides `CurrentTimeZone`, simplify by yielding `DateTime.nowInCurrentZone` instead of threading `timeZone` as a parameter and dropping the explicit `setZone` hops. The ambient zone pattern shines when the business domain ("all deadlines are Auckland business days") is application-wide.
+:::
+
+### Testing the feature without wall clocks
+
+```ts title="src/next-business-day-9am.test.ts"
+import { DateTime, Effect } from "effect"
+import { TestClock } from "effect/testing"
+import { it, expect } from "vitest"
+import { nextBusinessDayAt9 } from "./next-business-day-9am.js"
+
+it("resolves to same-day 9am when before cutoff", async () => {
+  const anchor = DateTime.makeZonedUnsafe("2026-06-05T08:00:00", {
+    timeZone: "Pacific/Auckland", adjustForTimeZone: true
+  })
+
+  const result = await Effect.runPromise(
+    nextBusinessDayAt9(anchor).pipe(
+      Effect.provide(DateTime.layerCurrentZoneNamed("Pacific/Auckland"))
+    )
+  )
+
+  expect(DateTime.formatIsoZoned(result)).toBe(
+    "2026-06-05T09:00:00.000+12:00[Pacific/Auckland]"
+  )
+})
+
+it("sleep plus clock check is deterministic", async () => {
+  const program = Effect.gen(function* () {
+    const runAt = yield* nextBusinessDayAt9(
+      DateTime.makeZonedUnsafe("2026-06-06T14:00:00", {
+        timeZone: "Pacific/Auckland", adjustForTimeZone: true
+      })
+    )
+    const delayMs = runAt.epochMilliseconds - Date.now()
+    yield* Effect.sleep(delayMs)
+    return yield* DateTime.now
+  })
+
+  // run under TestClock: heap of combinators plus DateTime math collapses
+  // to virtual sleeps; no real 48h wait
+  await Effect.runPromise(Effect.provide(program, TestClock.layer()))
+})
+```
+
+## Duration deep dive — one type, many spellings
+
+`Duration` is the shared currency across schedules, timeouts, caches, and the clock.
+
+```ts title="src/duration-deep.ts"
+import { Duration, Effect } from "effect"
+
+Duration.millis(500)
+Duration.seconds(30)
+Duration.minutes(2)
+Duration.hours(1)
+Duration.days(7)
+Duration.weeks(2)
+Duration.nanos(500n)
+Duration.zero
+Duration.infinity
+
+// decode + inspect
+Duration.fromInput("10 seconds").pipe(Option.isSome) // validate without throwing
+Duration.fromInputUnsafe("2 hours")
+Duration.toMillis("1 minutes") // 60000
+Duration.toSeconds(Duration.hours(1)) // 3600
+
+// combinators
+Duration.sum(Duration.seconds(30), Duration.millis(500)) // Duration.sum or Duration.sum
+Duration.min(a, b)
+Duration.max(a, b)
+Duration.times(Duration.seconds(1), 2.5) // scale
+Duration.isZero, Duration.isFinite
+
+// DurationInput shapes accepted everywhere
+const inputs: Array<Duration.DurationInput> = [
+  "500 millis",
+  "10 seconds",
+  "Infinity",
+  1000,                              // number = millis
+  Duration.seconds(10),              // Duration
+  { seconds: 1, nanoseconds: 500 },  // object
+  { minutes: 2 }
+]
+```
+
+See the input table earlier for canonical spellings — use the string form at APIs where readability matters (`Effect.sleep("30 seconds")`), and `Duration.*` constructors where arithmetic follows.
+
+## Cheat sheet
+
+| Need | Expression |
+|---|---|
+| Current time (testable) | `yield* DateTime.now` |
+| Current time as Zoned | `yield* DateTime.nowInCurrentZone` (requires `CurrentTimeZone`) |
+| Parse at boundary | `DateTime.make(s)` → `Option`; `makeUnsafe(s)` throws |
+| Zoned literal (trusted) | `DateTime.makeZonedUnsafe(instant, { timeZone: "Europe/London" })` |
+| Wall time literal | `DateTime.makeZoned(wall, { timeZone, adjustForTimeZone: true })` + handle Option |
+| Validate IANA | `DateTime.zoneMakeNamed(s)` → `Option`; `zoneMakeNamedEffect(s)` → `Effect` |
+| Switch zone, same instant | `dt.pipe(DateTime.setZone(zone))` |
+| Switch zone, re-anchor wall | `dt.pipe(DateTime.setZone(zone, { adjustForTimeZone: true }))` |
+| Attach by string | `DateTime.setZoneNamed(dt, "Europe/London")` → `Option` |
+| Day math (calendar) | `dt.pipe(DateTime.add({ days: 1, months: 2 }))` |
+| Elapsed math | `dt.pipe(DateTime.addDuration("90 minutes"))` |
+| Midnight / EOD | `dt.pipe(DateTime.startOf("day"))` / `endOf("day")` |
+| Epoch | `DateTime.toEpochMillis(dt)` |
+| Compare | `DateTime.Order(a,b)` / `isGreaterThan` / `between` / `distance(a,b)` |
+| Format UTC | `DateTime.formatIso(dt)` |
+| Format Zoned canonical | `DateTime.formatIsoZoned(zoned)` |
+| Provide zone locally | `effect.pipe(DateTime.withCurrentZoneNamed("Pacific/Auckland"))` |
+| Provide zone as layer | `Effect.provide(effect, DateTime.layerCurrentZoneNamed("Pacific/Auckland"))` |
+| Sleep | `Effect.sleep("10 seconds")` |
+| Virtual time in test | `TestClock.adjust("60 seconds")` inside `Effect.provide(program, TestClock.layer())` |
+
+## Next
+
+<LinkCard
+  title="19 · Streams — Effectful Sequences Over Time"
+  description="Pull-based, chunked streams — construction, transformation, consumption with Sinks, encoding channels (Ndjson/SchemaBinary), resource safety, and paginated pipelines."
+  href="/effect-ts/19-streams/"
+/>

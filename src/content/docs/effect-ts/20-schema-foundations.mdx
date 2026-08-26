@@ -1,0 +1,795 @@
+---
+title: Schema — Foundations
+description: The Codec model, elementary types, Struct/Tuple/Array/Record/Union mechanics, runners and error reporting, and a complete domain example.
+sidebar:
+  order: 20
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Schema is the single chokepoint where every untrusted byte enters your program, every typed error leaves your domain, and every serialization format collapses into one codec description. v4 rewrote it around a unified `Codec` abstraction — one schema describes parsing, validation, serialization, JSON Schema generation, and mock generation simultaneously. When you reach for `Schema` at the edge, you are not "validating" — you are *decoding* into your domain's types and *encoding* back to the wire, with services, transformations, and branding expressed in the same place.
+
+This chapter covers the model itself and the composite constructors you will use everywhere. The next two deepen it: [transformations & validation](/effect-ts/21-schema-transformations/) and [classes, opaque types & serialization](/effect-ts/22-schema-classes/).
+
+## Philosophy
+
+A schema in v4 is a *bidirectional codec* that knows how to:
+
+1. **Decode** wire data (`unknown` or a specific `Encoded`) into a domain type `T`.
+2. **Encode** a domain value back to its wire representation `E`.
+3. **Require services** on either direction (`RD` for decoding, `RE` for encoding) — dependencies like a key service or an async lookup become part of the codec's type.
+4. **Fail with structured issues** — not strings — so errors compose and the formatter can target Standard Schema, JSON Schema, or human-readable reporting.
+
+The payoff: describe `User` once, derive its JSON codec, its `Equivalence`, its `Arbitrary`, its formatter, its HTTP wire shape, and its form-data shape from the same value.
+
+:::note[Scope]
+Every example below uses `import { Schema, SchemaGetter, SchemaTransformation } from "effect"` unless noted otherwise. `Schema` is the root namespace; sub-namespaces like `Schema.Struct`, `Schema.Tuple`, `Schema.Record` are helpers, not separate imports.
+:::
+
+## The `Codec<T, E, RD, RE>` model
+
+Formally:
+
+```ts
+interface Codec<out T, out E = T, out RD = never, out RE = never> extends Schema<T> {
+  readonly "Type": T              // decoded / domain type
+  readonly "Encoded": E            // wire / serialized type
+  readonly "DecodingServices": RD  // services needed to decode
+  readonly "EncodingServices": RE  // services needed to encode
+  readonly "Iso": unknown          // round-trip intermediate type
+}
+```
+
+Mental model:
+
+<Mermaid title="Codec directions" height={320} code={`
+flowchart LR
+  E["Encoded (wire)<br/>E"] -->|"decode"| T["Type (domain)<br/>T"]
+  T -->|"encode"| E
+  subgraph services["Service requirements"]
+    RD["RD — decoding services"]
+    RE["RE — encoding services"]
+  end
+  RD -.-> T
+  RE -.-> E
+`} />
+
+| View | Meaning | When it appears |
+|---|---|---|
+| `T` | What your program holds after a successful decode | `Schema.decodeSync(User)(raw)` returns `User["Type"]` |
+| `E` | What you encode to / what the wire sends | `Schema.encodeSync(User)(user)` returns `User["Encoded"]` |
+| `RD` | `R` channel needed *to decode* | effectful lookups, async checks during decode |
+| `RE` | `R` channel needed *to encode* | async formatting during encode |
+| `Iso` | Internal isomorphism type for `toCodecIso` | rarely written directly |
+
+`Codec` extends `Schema<T>` so every codec is also a `Schema`. The extra parameters are phantom at runtime — they exist purely to track variance and requirements in the type system.
+
+```ts title="src/codec-model.ts"
+import { Effect, Schema } from "effect"
+
+// T = string, E = string, no services, trivial Iso
+const Name: Schema.Codec<string, string> = Schema.String
+
+// T = Date (domain), E = string (wire: ISO-8601), no services
+const DateFromString = Schema.String.pipe(
+  Schema.decodeTo(Schema.Date, SchemaTransformation.dateFromString)
+)
+// Inferred as Codec<Date, string>
+type D = typeof DateFromString.Type    // Date
+type E = typeof DateFromString.Encoded // string
+
+// Effectful codec that needs a service to decode
+declare class KeyService extends Effect.Service<KeyService>()("KeyService", {
+  succeed: { verify(key: string): Effect.Effect<boolean> }
+}) {}
+
+const VerifiedKey = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, {
+    decode: SchemaGetter.checkEffect((s) =>
+      Effect.flatMap(KeyService, (svc) => svc.verify(s)).pipe(
+        Effect.map((ok) => ok ? undefined : "invalid key")
+      )),
+    encode: SchemaGetter.passthrough()
+  })
+)
+// VerifiedKey["DecodingServices"] = KeyService
+```
+
+:::caution[Use `Codec` as a constraint, not a variable type]
+`Schema`/`Schema.Codec` expose many internal parameters (mutability, optionality, constructor defaults, annotations). Widening a value to `Schema.Codec<T, E>` erases derivation helpers like `.fields`, `.members`, `.mapFields`. Keep the inferred schema type in locals; use `Schema.Codec<T, E, RD, RE>` only as a function constraint:
+
+```ts
+function serialize<T>(codec: Schema.Codec<T, string>, value: T): string {
+  return Schema.encodeSync(codec)(value)
+}
+```
+:::
+
+Decoding is always `unknown → T` (or `E → T` when the encoded type is known); encoding is always `T → E`. The runtime runners are generic over `R` — any required services must be satisfied by the ambient `Context` when you `run` the effect.
+
+## Elementary types
+
+### Primitives
+
+| Schema | Decoded `T` | Encoded `E` | Notes |
+|---|---|---|---|
+| `Schema.String` | `string` | `string` | |
+| `Schema.Number` | `number` | `number` | full IEEE-754 including `NaN`, `±Infinity` |
+| `Schema.Finite` | `number` | `number` | rejects `NaN`/`±Infinity`; prefer over `Number` for business values |
+| `Schema.BigInt` | `bigint` | `bigint` | |
+| `Schema.Boolean` | `boolean` | `boolean` | |
+| `Schema.Symbol` | `symbol` | `symbol` | |
+| `Schema.Undefined` | `undefined` | `undefined` | |
+| `Schema.Null` | `null` | `null` | |
+| `Schema.Void` | `void` | `void` | single value `undefined`, but typed as `void` |
+| `Schema.Date` | `Date` | `Date` | rejects `Invalid Date` |
+| `Schema.Unknown` | `unknown` | `unknown` | optically neutral |
+| `Schema.Any` | `any` | `any` | escape hatch — avoid at boundaries |
+| `Schema.Object` | `object` | `object` | |
+
+```ts title="src/primitives.ts"
+import { Schema } from "effect"
+
+Schema.decodeUnknownSync(Schema.Finite)(42)        // 42
+Schema.decodeUnknownSync(Schema.Finite)(Infinity) // throws SchemaError — Infinity excluded
+
+Schema.decodeUnknownSync(Schema.Date)(new Date())          // ok
+Schema.decodeUnknownSync(Schema.Date)(new Date("oops"))    // throws — Invalid Date rejected
+```
+
+### Literals
+
+```ts title="src/literals.ts"
+import { Schema } from "effect"
+
+const Status = Schema.Literal("active", "inactive", 0, 1n, true)
+type Status = typeof Status.Type // "active" | "inactive" | 0 | 1n | true
+
+// Shorthand for union-of-literals encoded as strings
+const Color = Schema.Literals(["red", "green", "blue"])
+type Color = typeof Color.Type // "red" | "green" | "blue"
+
+Schema.decodeUnknownSync(Color)("red")   // ok
+// Schema.decodeUnknownSync(Color)("yellow") // throws
+```
+
+`Literal` accepts any mix of `string | number | bigint | boolean | null`. For a homogeneous string set, `Literals([...])` is shorter and preserves a named `literals` array on the schema.
+
+## String checks & transforms
+
+String codecs build via `.check(...)` — chained, type-preserving refinements:
+
+```ts title="src/string-checks.ts"
+import { Schema } from "effect"
+
+const Username = Schema.String.check(
+  Schema.isMinLength(3),
+  Schema.isMaxLength(20),
+  Schema.isPattern(/^[a-z0-9_]+$/)
+)
+
+const Email = Schema.String.check(
+  Schema.isPattern(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)
+)
+```
+
+Available string `Filter` values (pass one or many to `.check`):
+
+| Filter | JSON Schema | Notes |
+|---|---|---|
+| `isMinLength(n)` | `minLength` | |
+| `isMaxLength(n)` | `maxLength` | |
+| `isLengthBetween(min, max)` | `minLength` + `maxLength` | inclusive |
+| `isPattern(re)` | `pattern` | `re.source` emitted |
+| `isStartsWith(s)` | `pattern` `^s` | |
+| `isEndsWith(s)` | `pattern` `s$` | |
+| `isIncludes(s)` | `pattern` | substring |
+| `isTrimmed()` | `pattern` | no leading/trailing whitespace |
+| `isUUID(v?)` | `pattern` + `format: uuid` | pass `1`-`8` for version |
+| `isGUID()` | `pattern` | 8-4-4-4-12 hex |
+| `isULID()` | `pattern` | Crockford Base32 |
+| `isBase64()` / `isBase64Url()` | `pattern` | strict alphabet |
+| `isUppercased()` / `isLowercased()` | `pattern` | whole-string |
+| `isCapitalized()` / `isUncapitalized()` | `pattern` | first char |
+| `isNonEmpty()` | `minLength: 1` | alias for `isMinLength(1)` |
+| `isStringFinite()` | `pattern` | finite-looking numeric string |
+| `isStringBigInt()` | `pattern` | `^-?\d+$` |
+| `isStringSymbol()` | `pattern` | `Symbol(...)` |
+
+All check filters accept an optional `Annotations.Filter` (`{ message, identifier, ... }`) for custom error rendering.
+
+String *transformations* (normalizations) are applied via `Schema.decode(...)` or the decode-side `Getter` — covered fully in the next chapter — but one-liners exist on `SchemaTransformation`:
+
+```ts title="src/string-transforms.ts"
+import { Schema, SchemaTransformation } from "effect"
+
+const Trimmed = Schema.String.pipe(Schema.decode(SchemaTransformation.trim()))
+
+// trim on decode, passthrough on encode (not round-trippable if input had whitespace)
+Schema.decodeSync(Trimmed)("  hello  ") // "hello"
+
+// Other ready-made transforms: toLowerCase, toUpperCase, snakeToCamel, capitalize, etc.
+const Lowered = Schema.String.pipe(Schema.decode(SchemaTransformation.toLowerCase()))
+```
+
+## Number checks
+
+`Schema.Number` admits the full IEEE domain; `Schema.Finite` is usually what you want at boundaries.
+
+```ts title="src/number-checks.ts"
+import { Schema } from "effect"
+
+const Age = Schema.Finite.check(
+  Schema.isBetween({ minimum: 0, maximum: 150 }),
+  Schema.isInt()
+)
+
+const Score = Schema.Finite.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(100)
+)
+
+// Between is inclusive by default; exclusive variants also exist:
+Schema.Finite.check(Schema.isGreaterThan(0))
+Schema.Finite.check(Schema.isLessThan(10))
+Schema.Finite.check(Schema.isMultipleOf(0.5))
+Schema.Finite.check(Schema.isInt32()) // 32-bit int
+```
+
+| Filter | JSON Schema | Notes |
+|---|---|---|
+| `isBetween({ minimum, maximum })` | `minimum`/`maximum` (+ exclusive flags) | |
+| `isGreaterThan(n)` / `isGreaterThanOrEqualTo(n)` | `exclusiveMinimum` / `minimum` | |
+| `isLessThan(n)` / `isLessThanOrEqualTo(n)` | `exclusiveMaximum` / `maximum` | |
+| `isMultipleOf(n)` | `multipleOf` | |
+| `isInt()` / `isInt32()` / `isUint32()` | `type: integer` | |
+
+BigInt/BigDecimal/Date variants exist with explicit order arguments:
+
+```ts title="src/bigint-checks.ts"
+import { Order, Schema } from "effect"
+
+const BigRange = Schema.BigInt.check(
+  Schema.isBetweenBigInt({ minimum: 0n, maximum: 1_000_000n } as any)
+  // or via factory: Schema.makeIsBetween({ order: Order.BigInt })({ minimum: 0n, maximum: 1_000_000n })
+)
+```
+
+Prefer the dedicated `Schema.isBetweenBigInt`, `isGreaterThanDate`, etc., for those domains — they produce correct JSON Schema fragments and arbitrary generators.
+
+## Template literals
+
+Two constructors cover string interpolations:
+
+```ts title="src/template-literal.ts"
+import { Schema } from "effect"
+
+// Validation only — decoded stays string
+const Path = Schema.TemplateLiteral(["/user/", Schema.Number])
+Schema.decodeUnknownSync(Path)("/user/42")   // "/user/42"
+Schema.is(Path)("/user/oops") // false
+
+// Parser — decodes matched segments into a tuple
+const Parser = Schema.TemplateLiteralParser(["/user/", Schema.NumberFromString])
+Schema.decodeSync(Parser)("/user/42") // ["/user/", 42]
+type Parsed = typeof Parser.Type // readonly ["/user/", number]
+
+// Checks attach to interpolated schemas:
+// Each segment is validated where it matches
+const SemVer = Schema.TemplateLiteral([
+  Schema.Finite.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+  ".",
+  Schema.Finite.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+  ".",
+  Schema.Finite.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))
+])
+```
+
+`TemplateLiteral` produces a `string` codec; `TemplateLiteralParser` produces a `readonly [...tuple]` codec where literal segments appear as literal tuple elements.
+
+## Structs — the core composite
+
+### Basics
+
+```ts title="src/struct-basic.ts"
+import { Schema } from "effect"
+
+const Person = Schema.Struct({
+  name: Schema.String,
+  age: Schema.Finite,
+  email: Schema.optionalKey(Schema.String) // see table below
+})
+
+type Person = typeof Person.Type
+// { readonly name: string; readonly age: number; readonly email?: string }
+
+Schema.decodeUnknownSync(Person)({ name: "Ada", age: 30 }) // ok — email absent
+```
+
+`Schema.Struct({...})` is closed and exact: unknown keys are stripped by default (see `onExcessProperty`), and the decoded type is *readonly* over all fields.
+
+### Optionality variants
+
+This is where `exactOptionalPropertyTypes` matters — the four wrappers collapse into two semantics without that flag, and all four are distinct with it.
+
+| Wrapper | Decoded shape (`Type`) | Encoded shape | `make` input (`~type.make.in`) | Key absent | `undefined` as value |
+|---|---|---|---|---|---|
+| `Schema.optionalKey(S)` | `k?: S["Type"]` | same | may omit `k` | allowed | rejected (unless `S` allows `undefined`) |
+| `Schema.optional(S)` | `k?: S["Type"] \| undefined` | same | may omit or pass `undefined` | allowed | allowed — maps to `undefined` |
+| `Schema.optionalKey(Schema.NullOr(S))` | `k?: S["Type"] \| null` | same | may omit `k` | allowed, `null` allowed | rejected |
+| `Schema.optional(Schema.NullOr(S))` | `k?: S["Type"] \| null \| undefined` | same | may omit, `undefined`, or `null` | allowed | allowed |
+
+Guideline:
+
+- Default to `optionalKey` for "field may be absent". It is the only variant that *does not* introduce `undefined` into your domain type — it keeps absence as absence.
+- Use `optional` when a key may be absent *or* explicitly `undefined` (common when mirroring JSON `{ "field": undefined }`-never-happens vs missing subtlety).
+- Combine with `NullOr` when `null` is the API's absence sentinel.
+
+```ts title="src/optional-variants.ts"
+import { Schema } from "effect"
+
+const A = Schema.Struct({
+  a: Schema.optionalKey(Schema.String),                  // absent only
+  b: Schema.optional(Schema.String),                       // absent | undefined
+  c: Schema.optionalKey(Schema.NullOr(Schema.String)),   // absent | null
+  d: Schema.optional(Schema.NullOr(Schema.String)),      // absent | null | undefined
+})
+
+// Only A's key variants differ in DecodeUnknownSync behavior:
+Schema.decodeUnknownSync(A)({}) // all omitted → ok
+Schema.decodeUnknownSync(A)({ a: undefined } as any) // throws — a disallows undefined
+```
+
+### Excess properties
+
+```ts title="src/excess.ts"
+import { Schema } from "effect"
+
+const Strict = Schema.Struct({ name: Schema.String })
+// default onExcessProperty: "ignore" — unknown keys are stripped
+Schema.decodeUnknownSync(Strict)({ name: "Ada", extra: 123 } as any) // { name: "Ada" }
+
+// to error on unknown keys, pass via parse options on the runner:
+Schema.decodeUnknownSync(Strict)({ name: "Ada", extra: 123 } as any, { onExcessProperty: "error" }) // throws — UnexpectedKey
+Schema.decodeUnknownSync(Strict)({ name: "Ada", extra: 123 } as any, { onExcessProperty: "preserve" }) // { name: "Ada", extra: 123 }
+```
+
+At the AST level, `onExcessProperty` has three modes: `"ignore"` (strip), `"error"` (fail with `UnexpectedKey`), `"preserve"` (keep in output). Supply it per-invocation via the runner's `ParseOptions`; the schema default is `ignore`.
+
+### `mutableKey`
+
+Decoded struct values are `readonly` by default. Use `mutableKey` when a field must accept mutation in domain code (note: `Schema.Class` is usually a better fit for mutable domain objects):
+
+```ts title="src/mutable.ts"
+import { Schema } from "effect"
+
+const Counter = Schema.Struct({
+  value: Schema.mutableKey(Schema.Finite)
+})
+type Counter = typeof Counter.Type // { value: number }   — note: not readonly
+
+const c = Schema.decodeUnknownSync(Counter)({ value: 0 })
+c.value++ // ok
+```
+
+### `StructWithRest`
+
+When a struct must allow arbitrary extra keys with a known value schema, use `StructWithRest`:
+
+```ts title="src/struct-with-rest.ts"
+import { Schema } from "effect"
+
+const WithMeta = Schema.StructWithRest(
+  { name: Schema.String },                 // required known keys
+  [Schema.String, Schema.Unknown],         // rest: arbitrary string keys → unknown
+  // optional index signatures would go here depending on shape
+)
+```
+
+`StructWithRest` is the wire-typing for "known required fields + arbitrary metadata/sidecar fields" — common in webhook payloads.
+
+### Wire renaming: `encodeKeys`
+
+Maps *decoded* keys to *encoded* keys without changing the domain type:
+
+```ts title="src/encode-keys.ts"
+import { Schema } from "effect"
+
+const Person = Schema.Struct({ firstName: Schema.String, lastName: Schema.String })
+const Wire = Person.pipe(Schema.encodeKeys({ firstName: "first_name", lastName: "last_name" }))
+
+Schema.decodeUnknownSync(Wire)({ first_name: "Ada", last_name: "Lovelace" })
+// => { firstName: "Ada", lastName: "Lovelace" }
+
+Schema.encodeSync(Wire)({ firstName: "Ada", lastName: "Lovelace" })
+// => { first_name: "Ada", last_name: "Lovelace" }
+```
+
+If two decoded keys map to the same encoded key, construction throws (`Duplicate encoded keys`).
+
+### Derivation: `mapFields`
+
+`mapFields` re-derives a struct structurally, with field-level helper combinators (many live under `Schema.Struct` or free lambdas):
+
+```ts title="src/struct-derivation.ts"
+import { Schema } from "effect"
+import { Struct } from "effect"
+
+const Base = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  secret: Schema.String,
+  legacy: Schema.String
+})
+
+// Pick / omit / rename / evolve / extend via struct helpers
+const Public = Base.pipe(Schema.Struct.omit("secret", "legacy"))
+const WithRoles = Base.pipe(Schema.Struct.assign({ role: Schema.String }))
+// above helpers may also appear as Schema.Struct.pick/omit/assign variants
+
+// Evolve narrows specific fields
+const Evolved = Base.pipe(
+  Schema.Struct.evolve({
+    name: () => Schema.NonEmptyString
+  })
+)
+
+// Renaming many keys via evolveKeys / map / renameKeys patterns
+const Kebab = Schema.Struct({ firstName: Schema.String, lastName: Schema.String }).pipe(
+  Schema.Struct.renameKeys({ firstName: "first-name", lastName: "last-name" } as any)
+)
+
+// Full mapFields escape hatch
+const Derived = Base.mapFields((fields) => ({
+  id: fields.id,
+  displayName: fields.name, // rename by choosing a new key
+}))
+```
+
+Helpers available via struct derivation (check `Schema.Struct.*` or `Schema.*` for the exact import path in your rc — naming stabilizes per release):
+
+| Helper | Effect |
+|---|---|
+| `pick(...keys)` | keep only listed fields |
+| `omit(...keys)` | drop listed fields |
+| `assign(extra)` | add new fields |
+| `fieldsAssign(extra)` | lambda-friendly variant for use inside `mapMembers` etc. |
+| `evolve({ k: f })` | map individual field schemas |
+| `map(f)` | map every field schema |
+| `mapPick / mapOmit` | map then pick/omit |
+| `renameKeys(mapping)` | decoded → encoded style renames inside derivation |
+| `evolveKeys / evolveEntries` | key-level transforms |
+
+:::tip[Tagged constructors]
+`Schema.TaggedStruct("User", { name: Schema.String })` is `Struct({ _tag: Schema.Literal("User"), ...fields })` with correct narrowing. Prefer `TaggedUnion` / `toTaggedUnion("_tag")` for unions — next section.
+:::
+
+## `Tuple`, `Array`, `Record`
+
+### Tuple
+
+```ts title="src/tuple.ts"
+import { Schema } from "effect"
+
+const Pair = Schema.Tuple([Schema.String, Schema.Finite])
+Schema.decodeUnknownSync(Pair)(["hi", 42]) // ["hi", 42]
+
+const WithRest = Schema.TupleWithRest(
+  [Schema.String],   // required prefix
+  Schema.Number,   // rest elements
+  // optional trailing elements
+)
+Schema.decodeUnknownSync(WithRest)(["a", 1, 2, 3]) // ["a", 1, 2, 3]
+
+// Element-level derivation mirrors Struct.mapFields
+const Coerced = Pair.pipe(Schema.Tuple.mapElements(() => Schema.String as any))
+```
+
+Tuple elements honour `optionalKey`/`optional` on the tuple position type. `.mapElements` receives helpers analogous to struct helpers.
+
+### Array
+
+```ts title="src/array.ts"
+import { Schema } from "effect"
+
+const Tags = Schema.Array(Schema.NonEmptyString)
+const UniqueTags = Schema.UniqueArray(Schema.String) // Set semantics encoded as array, uniqueItems: true
+
+Schema.decodeUnknownSync(Tags)(["a", "b"]) // ok
+Schema.decodeUnknownSync(UniqueTags)(["a", "a"]) // throws — duplicate
+```
+
+`Schema.Array(S)` preserves `readonly` in the decoded type (`readonly S[]`). Non-empty variants and size checks use the filter/table from the string section with `isMinLength` etc. overloaded for arrays.
+
+### Record
+
+```ts title="src/record.ts"
+import { Schema } from "effect"
+
+// Record whose keys are canonicalized via a key schema
+const Scores = Schema.Record(Schema.String, Schema.Finite)
+Schema.decodeUnknownSync(Scores)({ alice: 10, bob: 20 }) // { alice: 10, bob: 20 }
+
+// Symbol-keyed variant (property keys are coerced via key schema)
+const BySymbol = Schema.Record(Schema.Symbol, Schema.String)
+
+// With key transformation (e.g. lowercase keys on wire → canonical form)
+const LowerRecord = Schema.Record(
+  Schema.String.pipe(Schema.decode(SchemaTransformation.toLowerCase())) as any,
+  Schema.Number
+)
+```
+
+The key schema must be a `PropertyKey` codec (`string | number | symbol` encoded as `PropertyKey`) and may itself carry transformations.
+
+## `Union`
+
+v4 requires **array form** — the variadic `Union(A, B)` signature from v3 is gone:
+
+```ts title="src/union.ts"
+import { Schema } from "effect"
+
+const A = Schema.Struct({ _tag: Schema.Literal("a"), a: Schema.String })
+const B = Schema.Struct({ _tag: Schema.Literal("b"), b: Schema.Number })
+
+const U = Schema.Union([A, B])
+Schema.decodeUnknownSync(U)({ _tag: "a", a: "hi" }) // { _tag: "a", a: "hi" }
+
+// Exclusive mode — fail when more than one member matches
+const Exclusive = Schema.Union([A, B], { mode: "oneOf" })
+
+// Tagged union utilities
+const Tagged = Schema.Union([A, B]).pipe(Schema.toTaggedUnion("_tag"))
+Tagged.cases.a // A
+Tagged.discriminants // ["a", "b"] in order
+Tagged.isAnyOf(["a"])({ _tag: "a", a: "x" }) // true
+Tagged.match({ _tag: "b", b: 42 }, {
+  a: (v) => `a:${v.a}`,
+  b: (v) => `b:${v.b}`
+}) // "b:42"
+
+// Shorthand builder for tagged unions from a record of fields
+const Shape = Schema.TaggedUnion({
+  Circle: { radius: Schema.Finite },
+  Square: { side: Schema.Finite }
+})
+Shape.cases.Circle // TaggedStruct("Circle", { radius: ... })
+```
+
+Member-level derivation:
+
+```ts title="src/union-map.ts"
+import { Schema } from "effect"
+
+const U2 = Schema.Union([
+  Schema.Struct({ a: Schema.String }),
+  Schema.Struct({ b: Schema.Number })
+]).pipe(
+  Schema.Union.mapMembers((members) => members.map(/* ... */) as any)
+)
+```
+
+:::caution[Exclusive unions and performance]
+`mode: "oneOf"` re-runs candidates to enforce exclusivity — correct for disjoint wire discriminators, slower for large unions. Default `mode: "anyOf"` (aka `"anyOf"` / default) succeeds on the first matching member, which is the fast path for tagged unions where only one member can match on `_tag`.
+:::
+
+## Runners & error handling
+
+Every schema can be run *effectful* (tracking `RD`/`RE`) or *sync* (when no services are required). Two naming axes: **input kind** (`Unknown` vs typed `Encoded`) and **result channel** (`Effect` vs `Sync` vs `Exit` vs `Option`).
+
+| Runner | Input | Result | `R` stayed? | Throws? |
+|---|---|---|---|---|
+| `Schema.decodeUnknownEffect(schema)(input)` | `unknown` | `Effect<T, SchemaError, RD>` | yes — must provide `RD` | never |
+| `Schema.decodeEffect(schema)(input)` | `E` (typed encoded) | `Effect<T, SchemaError, RD>` | yes | never |
+| `Schema.decodeUnknownSync(schema)(input)` | `unknown` | `T` | requires `RD = never` | throws `SchemaError` |
+| `Schema.decodeSync(schema)(input)` | `E` | `T` | `RD = never` | throws |
+| `Schema.decodeUnknownExit(schema)(input)` | `unknown` | `Exit<T, SchemaError>` | `RD = never` | never — check `Exit.isSuccess` |
+| `Schema.decodeUnknownOption(schema)(input)` | `unknown` | `Option<T>` | `RD = never` | never — erases error |
+| `Schema.encodeEffect(schema)(value)` | `T` | `Effect<E, SchemaError, RE>` | tracks `RE` | never |
+| `Schema.encodeSync(schema)(value)` | `T` | `E` | `RE = never` | throws |
+
+Additional exit/option/promise/result variants follow the same naming: `decodeUnknownResult`, `decodeUnknownPromise`, `encodeUnknownEffect`, etc.
+
+### `SchemaError` & `SchemaIssue`
+
+```ts title="src/errors.ts"
+import { Effect, Result, Schema } from "effect"
+
+const Person = Schema.Struct({ name: Schema.String, age: Schema.Finite })
+
+// Sync — throws SchemaError on failure
+try {
+  Schema.decodeUnknownSync(Person)({ name: "Ada", age: "oops" as any })
+} catch (e) {
+  if (Schema.isSchemaError(e)) {
+    console.log(e.issue._tag) // Structured Issue tree, not a string
+    console.log(e.message)    // Formatted human message
+  }
+}
+
+// Effect — failure is typed as SchemaError in the E channel
+const program = Schema.decodeUnknownEffect(Person)({ name: "Ada", age: "bad" as any })
+// Effect<..., SchemaError, never>
+
+// Result — preserves typed error without Effect
+const result = Schema.decodeUnknownResult(Person)("bad" as any)
+if (Result.isFailure(result)) {
+  console.log(result.failure.issue._tag)
+  console.log(result.failure.message)
+}
+
+// Options: enrich messages with the offending input (not sanitized — do not expose raw input to untrusted callers)
+Schema.decodeUnknownSync(Person)({ name: "Ada", age: "oops" as any }, { reportInput: true })
+// message will include the reported input slice
+```
+
+`SchemaError` (`Cause`-wrapped `SchemaIssue.Issue`) is data, not a string blob. Internally, issues nest via `Pointer`, `Composite`, `MissingKey`, `UnexpectedKey`, `InvalidType`, `InvalidValue`, `Forbidden`, `OneOf`, `Filter`, etc. The formatter renders them; Standard Schema surfaces them as `issues: [{ message, path }]` via `toStandardSchemaV1`.
+
+:::tip[Standard Schema interop]
+`Schema.toStandardSchemaV1(schema)` adds a `~standard.validate` method returning `Promise | { value } | { issues }`, with synchronous fast-path when no async checks or services are involved. Pair it with any Standard Schema consumer (tRPC, form libraries, AI SDKs).
+:::
+
+### `errors: "all"` & `reportInput`
+
+```ts title="src/parse-options.ts"
+import { Schema } from "effect"
+
+const S = Schema.Struct({
+  name: Schema.String.check(Schema.isMinLength(3)),
+  age: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 120 }))
+})
+
+// Default: short-circuits on first failure per-branch
+Schema.decodeUnknownSync(S)({ name: "Al", age: -5 }) // one issue
+
+// Collect every failure
+Schema.decodeUnknownSync(S)({ name: "Al", age: -5 } as any, { errors: "all" })
+// throws Composite issue covering both fields
+
+// Attach input to each issue's message — useful for debugging, risky for logging
+Schema.decodeUnknownEffect(S)({ name: "Al", age: -5 } as any, { reportInput: true })
+```
+
+## Runnable domain example: `User`
+
+A realistic, copy-pastable module demonstrating optionality variants, wire renaming, checks, and unions with full round-trip:
+
+```ts title="src/user.ts"
+import { Effect, Option, Schema, SchemaGetter, SchemaTransformation } from "effect"
+
+// Domain primitives
+const Email = Schema.String.check(
+  Schema.isPattern(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)
+)
+const UserId = Schema.String.check(Schema.isPattern(/^user_[a-z0-9]+$/))
+
+// Roles exclusive via oneOf is not needed here — tagged union covers it
+const Role = Schema.Literals(["admin", "member", "guest"])
+
+// Address — zip is a tagged discriminant via branded refinement, postal code accepts empty omission
+const Address = Schema.Struct({
+  street: Schema.NonEmptyString,
+  city: Schema.NonEmptyString,
+  zip: Schema.String.check(Schema.isPattern(/^\d{5}$/)),
+  country: Schema.optionalKey(Schema.String) // absent only
+})
+
+// User struct — wire uses snake_case for two keys, domain uses camelCase
+const UserStruct = Schema.Struct({
+  id: UserId,
+  email: Email,
+  displayName: Schema.NonEmptyString,
+  age: Schema.optionalKey(Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 150 }))),
+  role: Role,
+  address: Schema.optionalKey(Address),
+  tags: Schema.Array(Schema.String.check(Schema.isMinLength(1)))
+})
+
+// Wire renaming
+const User = UserStruct.pipe(Schema.encodeKeys({ displayName: "display_name" }))
+
+type User = typeof User.Type
+// { readonly id: string; readonly email: string; readonly displayName: string;
+//   readonly age?: number; readonly role: "admin"|"member"|"guest";
+//   readonly address?: { ... }; readonly tags: readonly string[] }
+
+// — Decoding (unknown → domain) —
+
+export const decodeUser = Schema.decodeUnknownEffect(User)
+export const decodeUserSync = Schema.decodeUnknownSync(User)
+
+// — Encoding (domain → wire) —
+
+export const encodeUser = Schema.encodeEffect(User)
+export const encodeUserSync = Schema.encodeSync(User)
+
+// Demo runner
+const rawWire = {
+  id: "user_abc123",
+  email: "ada@analytic.dev",
+  display_name: "Ada Lovelace",
+  role: "admin" as const,
+  tags: ["foundations", "schema"],
+  address: { street: "10 Analytical Way", city: "London", zip: "12345" }
+}
+
+const run = Effect.gen(function* () {
+  const user = yield* decodeUser(rawWire)
+  console.log("decoded", user.displayName) // Ada Lovelace
+
+  // Mutate in domain shape
+  const updated: User = { ...user, age: 36 }
+
+  const wire = yield* encodeUser(updated)
+  console.log("encoded", wire) // { display_name: "Ada Lovelace", ... }
+
+  // Error demo — collect all issues
+  const bad = { id: "bad!", email: "not-an-email", display_name: "", role: "admin", tags: [""] }
+  const exit = yield* Effect.exit(decodeUser(bad as any))
+  if (exit._tag === "Failure") {
+    // Cause.pretty or SchemaIssue formatters render the Composite
+    console.log("failed as expected")
+  }
+  return wire
+})
+
+Effect.runPromise(run).catch(console.error)
+
+// Sync path (no services, no async checks) — throws on failure
+decodeUserSync(rawWire) // ok
+try {
+  decodeUserSync({ ...rawWire, email: "bad" } as any)
+} catch (e) {
+  if (Schema.isSchemaError(e)) console.log("sync error:", e.message)
+}
+
+// Tagged union extension — add a discriminator to User variants
+const AdminUser = Schema.TaggedStruct("admin", UserStruct.fields)
+const GuestUser = Schema.TaggedStruct("guest", {
+  id: UserId,
+  displayName: Schema.NonEmptyString
+})
+const AnyUser = Schema.Union([AdminUser, GuestUser]).pipe(Schema.toTaggedUnion("_tag"))
+AnyUser.match({ _tag: "admin", ...UserStruct.fields } as any, {
+  admin: (u) => `admin:${u.displayName}`,
+  guest: (g) => `guest:${g.displayName}`
+})
+```
+
+Key design choices in this example:
+
+- `email` and `id` are refined *at the primitive level* — checks travel with the primitive wherever it is spread.
+- `address` is `optionalKey` so the domain type reads `address?: Address`, not `address?: Address | undefined`.
+- `encodeKeys` keeps the wire snake_case isolated to the schema, invisible to callers constructing `User` values.
+- `decodeUnknownEffect` vs `decodeUnknownSync` is a one-word swap — the same codec works in both sync and effectful contexts until a service or async check forces the effectful path.
+
+## Cheat sheet
+
+| Goal | API |
+|---|---|
+| Required struct field | `Schema.Struct({ k: Schema.String })` |
+| Field may be absent | `Schema.optionalKey(S)` |
+| Field may be absent or `undefined` | `Schema.optional(S)` |
+| Field `null` sentinel | `Schema.optional(Schema.NullOr(S))` etc. |
+| Mutable field | `Schema.mutableKey(S)` |
+| Rename wire keys | `Struct.pipe(Schema.encodeKeys({ decoded: "wire" }))` |
+| Derive struct | `Struct.mapFields(...)` + `Struct.pick/omit/assign/evolve/renameKeys` |
+| Tuple | `Schema.Tuple([A, B])`, `Schema.TupleWithRest([A], Rest)` |
+| Array | `Schema.Array(S)`, `Schema.UniqueArray(S)` |
+| Record | `Schema.Record(KeySchema, ValueSchema)` |
+| Union (array form!) | `Schema.Union([A, B])`, `{ mode: "oneOf" }` |
+| Tagged utilities | `Schema.Union([...]).pipe(Schema.toTaggedUnion("_tag"))` or `Schema.TaggedUnion({...})` |
+| Template literal | `Schema.TemplateLiteral([...])` / `Schema.TemplateLiteralParser([...])` |
+| Overlap excess? | parse option `{ onExcessProperty: "ignore" \| "error" \| "preserve" }` |
+| Decode (unknown) | `Schema.decodeUnknownEffect / Sync / Exit / Option` |
+| Encode | `Schema.encodeEffect / Sync / Exit / Option` |
+| Standard Schema | `Schema.toStandardSchemaV1(codec)` |
+
+## Next
+
+<LinkCard
+  title="21 · Schema — Transformations & Validation"
+  description="First-class Transformation and Getter pipelines: decodeTo/decode wiring, passthrough variants, optional-key transforms, defaults, custom filters with FilterGroup, effectful validation, and branding."
+  href="/effect-ts/21-schema-transformations/"
+/>

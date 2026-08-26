@@ -1,0 +1,473 @@
+---
+title: Context & Services
+description: The R channel made concrete — Context.Service classes, identifiers, access patterns, Context.Reference defaults, the Context map API, and how four v3 mechanisms collapsed into one.
+sidebar:
+  order: 9
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+Every `Effect<A, E, R>` carries a third channel. You've been ignoring it so far
+because the compiler inferred `never`, but `R` is where Effect keeps its most
+opinionated idea: **dependencies are part of the return type**. When a function
+claims `Effect<User, UserNotFound, Database>`, it is a compile-time confession —
+"I cannot run unless something hands me a working `Database`." Compare that with
+the TypeScript status quo, where a service is a constructor parameter you hope
+the caller remembers to pass, or worse, a module-level singleton imported behind
+your back. In Effect the requirement travels with the value, flows through every
+composition operator, and lands on whichever boundary finally provides it.
+
+This chapter covers the *what*: declaring services, accessing them, and the
+`Context` value they live in. The *who builds them and when* question belongs to
+layers — [Chapter 10](/effect-ts/10-layers/).
+
+## What `R` actually is
+
+Semantically, `R` is a set of service identifiers. At runtime, every fiber
+carries a `Context` — an immutable, hash-array-mapped map from identifier
+strings to implementations. Yielding a service asks the current fiber's context
+for its entry:
+
+| Channel | Promise equivalent | Checked by |
+|---|---|---|
+| `A` | resolve value | types |
+| `E` | *(nothing — promises reject with `any`)* | types |
+| `R` | *(nothing — closures capture whatever)* | types |
+
+The design consequence: adding a dependency to a leaf function changes its
+inferred signature, and every caller up the chain either satisfies it, passes it
+through, or pushes the requirement outward. There is no way to silently depend
+on global mutable state — well, there is, but Effect won't track it, and you've
+opted out of the entire benefit.
+
+:::note[Why not just pass arguments?]
+You can — plain function parameters remain the right tool for data. Services
+are for *capabilities*: connections, clients, clocks, feature flags, anything
+threaded through many layers unchanged. Arguments scale linearly with call-chain
+depth; the context channel threads them invisibly while keeping the compiler in
+charge.
+:::
+
+## Declaring a service: `Context.Service`
+
+v4 has exactly one way to declare a required service: `Context.Service`. The
+preferred, class-style form:
+
+```ts
+import { Context, Effect, Layer, Schema } from "effect"
+
+export class DatabaseError extends Schema.TaggedError<DatabaseError>()(
+  "DatabaseError",
+  { message: Schema.String }
+) {}
+
+export class Database extends Context.Service<Database, {
+  query(sql: string): Effect.Effect<Array<unknown>, DatabaseError>
+  transaction<A>(
+    body: Effect.Effect<A, DatabaseError>,
+  ): Effect.Effect<A, DatabaseError>
+}>()("myapp/db/Database") {
+  static readonly layer = Layer.effect(
+    Database,
+    Effect.gen(function* () {
+      const query = Effect.fn("Database.query")(function* (sql: string) {
+        // real driver calls go here — see Chapter 10
+        return []
+      })
+      const transaction = Effect.fn("Database.transaction")(
+        function* <A>(body: Effect.Effect<A, DatabaseError>) {
+          return yield* body
+        },
+      )
+      return Database.of({ query, transaction })
+    }),
+  )
+}
+
+export type DatabaseService = Database["Service"]
+```
+
+Anatomy, piece by piece — every element earns its place:
+
+1. **`extends Context.Service<Database, Shape>()`** — the two-stage call.
+   `Context.Service<Database, Shape>` captures the class itself (`Self`) and the
+   service interface (`Shape`). Calling it with `()` returns a class factory;
+   the second call receives the identifier string. This two-step dance exists
+   purely so the resulting class can be named `Database` and simultaneously act
+   as *both the type and the runtime key*.
+2. **`"myapp/db/Database"`** — the identifier string, the key under which the
+   implementation is stored in a `Context`. It is the service's *runtime
+   identity*: two keys with the same string occupy the same slot regardless of
+   their types. Namespacing (`myapp/db/`) is convention, not enforcement — adopt
+   it like you'd adopt reverse-DNS package names, because dependencies pulled
+   from multiple libraries share one context namespace.
+3. **The shape type** — the interface consumers may call. Methods returning
+   `Effect.Effect<...>` keep errors and further requirements flowing through the
+   channels instead of leaking into callbacks.
+4. **`static readonly layer`** — a default construction recipe attached to the
+   class. v4 generates **no** layers for you (more on this below); attaching a
+   `layer` static is the house convention so consumers can write
+   `Effect.provide(program, Database.layer)`.
+5. **`Database.of({ ... })`** — an identity function typed against the shape.
+   Its only job is autocomplete and excess-property checking while building the
+   implementation object.
+6. **`export type DatabaseService = Database["Service"]`** — extracts the shape
+   for signatures like `function migrate(db: DatabaseService)`. The `Key`
+   interface exposes both `Service` (the shape) and `Identifier` (the
+   requirement) as properties, so indexed access works everywhere. There's also
+   the namespace helper `Context.Service.Shape<typeof Database>` if you prefer.
+
+:::caution[The identifier string is load-bearing]
+Two unrelated services sharing a string will overwrite each other in a merged
+context with no type error — `Context.make` stores by string key. Give every
+service a namespaced unique id, and treat renaming one as a breaking change.
+:::
+
+### Function-style keys
+
+When you don't need a class (tests, scripts, quick internal services), the same
+constructor works directly:
+
+```ts
+import { Context } from "effect"
+
+export const ClockPort = Context.Service<{
+  now(): Effect.Effect<number>
+}>("myapp/time/ClockPort")
+
+// same operations exist on the returned value:
+// ClockPort.of, ClockPort.use, ClockPort.useSync, ClockPort.context
+```
+
+The value is both the key and the accessor object. Classes win when you want a
+place to attach the layer static and a nominal name in error messages; either
+way, the mechanics below are identical.
+
+## Accessing services
+
+Three ways to get a service out of the ambient context, each for a different
+situation:
+
+### `yield*` inside generator bodies (the default)
+
+Because a `Key` *is* an `Effect<Shape, never, Identifier>`, you yield it:
+
+```ts
+import { Effect } from "effect"
+import { Database } from "./database.ts"
+
+export const getUser = Effect.fn("getUser")(function* (id: string) {
+  const db = yield* Database
+  // real drivers take parameters — kept single-argument here for focus
+  return yield* db.query(`SELECT * FROM users WHERE id = '${id}'`)
+})
+```
+
+The yielded value binds once per invocation, so subsequent uses don't re-query
+the context. Reading the type: `getUser: (id: string) => Effect<User, DatabaseError, Database>`
+— the requirement propagates into the signature automatically.
+
+Yielding the class directly is why the class-style declaration pays off: there
+is no separate tag object to import alongside the type. One import gives you
+the key, the shape, and the layer.
+
+### `use` and `useSync` for one-liners outside generators
+
+```ts
+import { Effect } from "effect"
+import { Database } from "./database.ts"
+
+// use: the callback returns an Effect
+export const countUsers: Effect.Effect<number, DatabaseError, Database> =
+  Database.use((db) => db.query("SELECT count(*) FROM users"))
+
+// useSync: the callback is pure — zero added E/R from the callback
+export const hasPool: Effect.Effect<boolean, never, Database> =
+  Database.useSync((db) => "query" in db)
+```
+
+| Accessor | Callback returns | Adds to `E` | Adds to `R` | Use when |
+|---|---|---|---|---|
+| `yield* Service` | — (unwraps in place) | per method called | `Identifier` | inside any gen/fn body — the default |
+| `Service.use(f)` | `Effect<A, E, R>` | `E` from callback | `R \| Identifier` | composing without wrapping a whole gen block |
+| `Service.useSync(f)` | plain `A` | nothing | `Identifier` | pure reads of the service object |
+
+`useSync`'s guarantee is interesting: since the callback cannot suspend, its
+output carries *no additional error or requirement types*. It's the escape hatch
+for using services inside combinator pipelines that expect pure transforms.
+
+### Combinator style: `Effect.service` family
+
+```ts
+import { Effect, Option } from "effect"
+import { Database } from "./database.ts"
+
+// explicit retrieval, useful mid-pipe
+const dbEffect = Effect.service(Database)
+
+// optional retrieval — did anyone provide it?
+const maybeDb: Effect.Effect<Option.Option<Database>> =
+  Effect.serviceOption(Database)
+
+// the whole context at once
+const grabContext = Effect.gen(function* () {
+  const ctx = yield* Effect.context<never>()
+  return ctx
+})
+```
+
+`Effect.context<R>()` materializes the entire map, which is how generic
+middleware forwards "whatever the caller provided" downward. Reach for these
+when you're writing combinators rather than business logic.
+
+:::tip[Rule of thumb]
+Inside `Effect.gen` / `Effect.fn` bodies: `yield*`. In a one-expression pipeline:
+`use` / `useSync`. Writing library plumbing: `Effect.service` /
+`Effect.context`. If you find yourself calling `use` three levels deep, you
+probably wanted a gen body.
+:::
+
+## `Context.Reference` — services with defaults
+
+Requiring every consumer to provide every service is hostile for things like
+log levels, timeouts, or feature flags — knobs that deserve sane defaults but
+allow overrides. v4 models this with `Context.Reference`: a key that resolves to
+a lazily-computed, cached default when nobody provided a value:
+
+```ts
+import { Context, Effect } from "effect"
+
+export const LogLevelRef = Context.Reference<"info" | "warn" | "error">(
+  "myapp/LogLevel",
+  { defaultValue: () => "info" },
+)
+
+export const audit = Effect.fn("audit")(function* (event: string) {
+  const level = yield* LogLevelRef
+  if (level !== "error") {
+    yield* Effect.log(`[audit] ${event}`)
+  }
+})
+
+// runs with "info" — no provision needed anywhere
+await Effect.runPromise(audit("user.signup"))
+
+// one call site opts into quiet mode
+await Effect.runPromise(
+  audit("user.signup").pipe(
+    Effect.provideService(LogLevelRef, "error"),
+  ),
+)
+```
+
+Notes on semantics:
+
+- `defaultValue` is invoked lazily on first miss and cached on the reference —
+  cheap repeated reads.
+- References are fully yieldable (they implement `Symbol.iterator` over their
+  effect nature). Crucially, a reference **never appears in `R` at all**: its
+  type is `Service<never, Shape>` — the identifier channel is `never`, because
+  the default guarantees resolution. Overrides narrow behavior, they don't
+  change types.
+- Overriding is ordinary service provision: `Effect.provideService`,
+  `Context.add`, or a `Layer.succeed(LogLevelRef, "debug")` layer all work.
+
+This single mechanism replaced two v3 concepts at once: `Context.Reference<Self>`
+(the tagged-default pattern) and **all of `FiberRef`**. Where v3 had fiber-local
+storage as a special primitive, v4's runtime settings are just references read
+by the engine. The built-ins live in the `References` module —
+`References.MinimumLogLevel`, `References.CurrentLogAnnotations`,
+`References.Scheduler`, `References.MaxOpsBeforeYield`, and friends — and you
+override them identically:
+
+```ts
+import { Effect, References } from "effect"
+
+const noisy = Effect.gen(function* () {
+  yield* Effect.logDebug("visible here")
+})
+
+await Effect.runPromise(
+  noisy.pipe(Effect.provideService(References.MinimumLogLevel, "Warning")),
+)
+```
+
+:::note[v3 muscle memory]
+There is no `FiberRef.make`, no `FiberRef.local`, no `.get`/`.set`. State that
+used to be a `FiberRef` becomes a `Context.Reference` holding an immutable value
+(or a small interface with methods), scoped/provided with the same tools as any
+service. If you need *mutable* per-fiber state, hold a `Ref` inside the
+reference's value.
+:::
+
+References shine for feature flags, where the "default" is production behavior
+and tests or specific request handlers flip flags locally:
+
+```ts
+export const Features = Context.Reference<{
+  readonly newCheckout: boolean
+  readonly aiSummaries: boolean
+}>("myapp/Features", {
+  defaultValue: () => ({ newCheckout: false, aiSummaries: true }),
+})
+
+// dark-launch for one user segment
+export const withBetaCheckout = <A, E, R>(
+  self: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.provideService(self, Features, {
+    newCheckout: true,
+    aiSummaries: true,
+  })
+```
+
+## `Context` as a typed immutable map
+
+Beneath the ergonomic surface, a `Context<R>` is a persistent map from
+identifier strings to implementations, and the module gives you direct map
+operations. You rarely need them in applications, but they're the vocabulary for
+building middleware, test harnesses, and understanding what layers produce.
+
+```ts
+import { Context, Option } from "effect"
+import { Database } from "./database.ts"
+import { Cache } from "./cache.ts"
+
+const impl = { query: () => Effect.succeed([]) }
+
+// make — a one-service context
+const ctx1 = Context.make(Database, impl)
+
+// add — extend immutably (returns a NEW context)
+const ctx2 = ctx1.pipe(Context.add(Cache, { get: () => Option.none() }))
+
+// get — throws if missing (unless the key is a Reference)
+const db: typeof impl = Context.get(ctx2, Database)
+
+// getOption — total access
+const maybeCache = Context.getOption(ctx2, Cache) // Option.some({...})
+const missing = Context.getOption(Context.empty(), Cache) // Option.none()
+
+// merge / mergeAll — right side wins on conflicts
+const otherImpl = { query: () => Effect.succeed([{ fallback: true }]) }
+const ctx3 = Context.merge(ctx2, Context.make(Database, otherImpl))
+
+// pick / omit — project or subtract
+const justDb = ctx2.pipe(Context.pick(Database))
+const noCache = ctx2.pipe(Context.omit(Cache))
+```
+
+| Operation | Signature sketch | Failure mode |
+|---|---|---|
+| `Context.empty()` | `Context<never>` | — |
+| `Context.make(k, v)` | one-service context | — |
+| `Context.add(ctx, k, v)` | extended context | — |
+| `Context.get(ctx, k)` | `Shape` | dies if missing (safe for References) |
+| `Context.getOption(ctx, k)` | `Option<Shape>` | never fails |
+| `Context.getOrElse(ctx, k, f)` | `Shape` with fallback | never fails |
+| `Context.merge(a, b)` / `mergeAll(...)` | union of services | right wins on key clash |
+| `Context.pick(k...)` / `omit(k...)` | narrowed context | — |
+
+Two structural facts worth internalizing:
+
+1. **`Effect.provide(effect, context)` accepts a raw `Context`** — providing a
+   hand-built map is sometimes clearer than a layer when everything is already
+   in memory:
+
+   ```ts
+   const program = Effect.provide(handler, Context.make(Database, fakeDb))
+   ```
+
+2. **Services themselves can build contexts**: `Database.context(impl)` is
+   shorthand for `Context.make(Database, impl)`. Layers are the general story —
+   `Layer.succeedContext(context)` turns any context into a layer.
+
+:::note[Immutability is observable]
+`add`, `merge`, `pick`, `omit` return new contexts and leave the operand
+untouched — safe to stash snapshots in middleware. Equality is structural
+against the cache, and `Context.hasSameCache` exists for framework code that
+needs identity checks.
+:::
+
+## The v3 collapse
+
+If you learned services in v3, the bad news is there were five spellings and
+none of them survive intact. The good news is they all meant roughly the same
+thing, and v4 kept the best one:
+
+| v3 mechanism | What it was | v4 replacement |
+|---|---|---|
+| `Context.Tag<"id", Shape>()` | plain key value | `Context.Service<Shape>("id")` (function style) |
+| `GenericTag<Shape>("id")` | Tag without phantom id type | same — the id is just a string now |
+| `class X extends Effect.Tag<X>()("id", { ... })` | class key + static accessors + generated Default layer | `class X extends Context.Service<X, Shape>()("id")` — attach your own `layer` static |
+| `Effect.Service` (class + `Default` + `withoutLive`) | newer class sugar, auto-generated `.Default` layer | deleted; same replacement as above |
+| `Context.Reference<Self>()("id", { defaultValue })` | keyed default via descriptor | `Context.Reference<Shape>("id", { defaultValue })` |
+| `FiberRef` | fiber-local state primitive | `Context.Reference` + `References.*` builtins |
+
+Migration heuristics:
+
+- Every `Tag`/`GenericTag` becomes a function-style `Context.Service`; call
+  sites `yield* Tag` stay valid verbatim.
+- Every `Effect.Tag` / `Effect.Service` class loses its auto-generated
+  `.Default` / `.live` layers — write the layer yourself and attach it as a
+  static. This is deliberate: v3's magic layers hid construction requirements
+  from the type system, which bit everyone who tried to inject config into a
+  "Default" layer.
+- `tag.use(...)` call sites translate to `Service.use(...)` unchanged.
+- FiberRef-heavy code gets a mechanical rewrite: `FiberRef.make(default)`
+  → `Context.Reference(id, { defaultValue })`; `FiberRef.get` → `yield* ref`;
+  `local`/`set` → scoped `Effect.provideService`.
+
+## Swapping implementations: the testing payoff
+
+Everything above only pays off if provision is easy. It is — and it's the same
+story whether the provider is production infrastructure or a test double. Given
+our `Database` class, a test stub is just another layer satisfying the same key:
+
+```ts
+import { Effect, Layer } from "effect"
+import { Database, DatabaseError } from "./database.ts"
+
+const rows = [{ id: "u_1" }, { id: "u_2" }]
+
+export const DatabaseTest = Layer.succeed(
+  Database,
+  Database.of({
+    query: () => Effect.succeed(rows),
+    transaction: (body) => body,
+  }),
+)
+```
+
+Business code never changes — `getUser` still declares
+`Effect<User, DatabaseError, Database>`. Only the edge picks the implementation:
+
+```ts
+// production
+Effect.provide(program, Database.layer)
+
+// tests — see Chapter 28 for the full toolkit
+Effect.provide(program, DatabaseTest)
+```
+
+Because the stub was built with `Layer.succeed` (no construction effect, no
+scope), it shares nothing with production machinery and starts instantly. The
+general pattern: **declare requirements deep, decide implementations at the
+edge**. The next chapter formalizes the "decide at the edge" half — layers are
+how implementations get constructed, shared, torn down, and wired into graphs.
+
+One preview of the trick that makes large suites fast: since layers memoize
+within a run, providing `DatabaseTest` once around the whole runner means every
+call site that provides that *same layer value* resolves to one shared stub —
+no per-test pools, no cross-test state surprises (that's also exactly how you'd
+shoot yourself in the foot; [28 · Testing](/effect-ts/28-testing/) covers the
+isolation story). How memoization actually works — and how v4 changed it — is
+the centerpiece of the next chapter.
+
+## Next
+
+<LinkCard
+  title="10 · Layers & Composition"
+  description="Layers as memoized constructors: acquire/release lifetimes, the provide/provideMerge split pattern, shared memoization maps, LayerMap for per-tenant resources, and assembling a whole app."
+  href="/effect-ts/10-layers/"
+/>

@@ -1,0 +1,710 @@
+---
+title: Observability — Logs, Spans & Metrics
+description: Structured logging, distributed tracing, and metrics in Effect v4 — levels, annotations, log spans, logger layers, file and batched loggers, env-based selection, MinimumLogLevel, Effect.fn spans, OTLP export, resource attributes, and the "observability last" wiring pattern.
+sidebar:
+  order: 27
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Effect is a runtime. That means it can do work a library cannot: carry annotations across fibers, capture spans around any `Effect`, flush buffered writers on scope close, and route every log record through a programmable pipeline you provide at the edge. If you treat logging and tracing as an afterthought you will bolt an alien system onto that pipeline later. This chapter makes observability a first-class layer instead.
+
+## Why structured logs and tracing from day one
+
+A `console.log` string is a dead end. A structured log is a row:
+
+```ts
+{
+  message: ["order charged"],
+  level: "Info",
+  timestamp: "2026-03-18T09:12:04.417Z",
+  annotations: { service: "checkout-api", route: "POST /checkout", orderId: "ord_123" },
+  spans: { checkout: 47, "checkout.charge-card": 32 },
+  fiberId: "#14",
+  cause: { reasons: [] }
+}
+```
+
+That row composes with everything else in Effect:
+
+- **Annotations flow down.** `Effect.annotateLogs({ orderId })` attaches `orderId` to every log that effect and its children emit. No thread-local hack, no passing a `LoggerContext` object.
+- **Spans carry timing and identity.** Every `Effect.fn("name")` invocation and every `Effect.withSpan` block creates a span that appears on logs via `spans` and is exported to OTLP when you wire a tracer.
+- **Routing is a layer.** `Logger.layer([...])` decides *where* records go (pretty console, JSON stdout, file, batched HTTP batch). Swap it per environment without touching call sites.
+- **Filtering is a Reference.** `References.MinimumLogLevel` is a `Context.Reference<LogLevel>` — tune it with `Effect.provideService` or a layer, per region, per test, per request.
+
+Start here and observability later is just providing a different layer.
+
+## Logging
+
+### Levels and basic calls
+
+`effect/src/Effect.ts:13704` re-exports log constructors as tiny wrappers around `internal.logWithLevel`. All share the same variadic `(...message: unknown[])` signature — the message array lands on `Logger.Options.message`.
+
+| Helper | Level | Typical use |
+|---|---|---|
+| `Effect.log(...msgs)` | `Info` | Normal operation. The default you reach for. |
+| `Effect.logInfo(...msgs)` | `Info` | Alias that reads better next to the others. |
+| `Effect.logDebug(...msgs)` | `Debug` | Verbose, behind a level gate in prod. |
+| `Effect.logWarning(...msgs)` | `Warn` | Degraded but not failed (low inventory, retry). |
+| `Effect.logError(...msgs)` | `Error` | Failed or about to fail. Often paired with a `Cause`. |
+
+```ts
+import { Effect } from "effect"
+
+const checkoutFlow = Effect.gen(function* () {
+  yield* Effect.logDebug("loading checkout state")
+  yield* Effect.logInfo("validating cart")
+  yield* Effect.logWarning("inventory low for sku=ACME-42")
+  yield* Effect.logError("payment provider timeout")
+})
+```
+
+Levels are ordered `Trace < Debug < Info < Warn < Error < Fatal < None`. Filtering keeps entries whose level is **≥** the configured minimum.
+
+:::note[What is a log record?]
+`effect/src/Logger.ts:101` defines `Logger.Options<Message>`: `message`, `logLevel`, `cause`, `fiber`, `date`. A `Logger<Message, Output>` is simply `(options) => Output`. Formatters like `Logger.formatStructured` turn options into objects; `withConsoleLog` writes objects to `console.log`. Your program never touches this directly — you call `Effect.log` and the runtime hands the record to every installed logger.
+:::
+
+### Annotations — attaching facts to every line
+
+`Effect.annotateLogs` (`effect/src/Effect.ts:13944`) is dual and additive. It annotates **one** effect; children inherit the map until the effect completes.
+
+```ts
+import { Effect } from "effect"
+
+const handleCheckout = (orderId: string, route: string) =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo("starting checkout", { orderId })
+    yield* validateCart()
+    yield* chargeCard()
+  }).pipe(
+    Effect.annotateLogs({ service: "checkout-api", route }),
+    // or single-key form:
+    // Effect.annotateLogs("orderId", orderId)
+  )
+
+// Scoped variant — leaks into the current Scope, not just one effect:
+const scopedHandler = Effect.gen(function* () {
+  yield* Effect.annotateLogsScoped({ requestId: "req_abc" })
+  yield* Effect.logInfo("now every log in this scope carries requestId")
+})
+```
+
+Read the current map if you need it:
+
+```ts
+import { Effect, References } from "effect"
+
+const dump = Effect.gen(function* () {
+  const ann = yield* References.CurrentLogAnnotations
+  yield* Effect.logDebug("current log annotations", ann)
+})
+```
+
+:::tip[Prefer annotateLogsScoped for request middleware]
+In HTTP handlers you want one annotation site that covers all downstream services. Put `Effect.annotateLogsScoped({ requestId, userId })` in middleware and every `Effect.log` deeper in the stack carries those fields automatically.
+:::
+
+### Log spans — durations on every line
+
+`Effect.withLogSpan("checkout")` (`effect/src/Effect.ts:14061`) brackets an effect and adds a `spans: { checkout: <ms> }` entry to each log emitted inside. Nesting accumulates:
+
+```ts
+import { Effect } from "effect"
+
+const program = Effect.gen(function* () {
+  yield* Effect.logInfo("validating cart")
+  yield* Effect.sleep("15 millis")
+  yield* Effect.logInfo("cart validated")
+}).pipe(
+  Effect.annotateLogs({ service: "checkout-api", route: "POST /checkout" }),
+  Effect.withLogSpan("checkout")
+)
+// Each log line inside carries: spans: { checkout: 15 } (approx), annotations: { service, route }
+```
+
+From `ai-docs/src/08_observability/10_logging.ts:52`:
+
+```ts
+export const logCheckoutFlow = Effect.gen(function* () {
+  yield* Effect.logDebug("loading checkout state")
+  yield* Effect.logInfo("validating cart")
+  yield* Effect.logWarning("inventory is low for one line item")
+  yield* Effect.logError("payment provider timeout")
+}).pipe(
+  Effect.annotateLogs({ service: "checkout-api", route: "POST /checkout" }),
+  Effect.withLogSpan("checkout")
+)
+```
+
+Dual form also works: `Effect.withLogSpan(effect, "db-operation")`. Log spans are *not* tracing spans — they are cheap label + duration pairs purely for log enrichment. Tracing spans are heavier and exportable (next section).
+
+### Formatters and logger installation
+
+`effect/src/Logger.ts` ships formatters that are themselves `Logger`s producing strings or structured objects:
+
+| Formatter | Output | When to use |
+|---|---|---|
+| `Logger.formatSimple` | `timestamp=… level=INFO message=hello` | human-readable default for files |
+| `Logger.formatLogFmt` | logfmt `timestamp=… level=INFO …` | grep-friendly files |
+| `Logger.formatStructured` | `{ message, level, timestamp, annotations, spans, fiberId }` | structured pipeline input |
+| `Logger.formatJson` | `map(formatStructured, Formatter.formatJson)` | JSON line per entry |
+| `Logger.consoleLogFmt` | `withConsoleLog(formatLogFmt)` | logfmt to stdout |
+| `Logger.consoleStructured` | `withConsoleLog(formatStructured)` | structured to stdout |
+| `Logger.consoleJson` | `withConsoleLog(formatJson)` | JSON to stdout |
+| `Logger.defaultLogger` | pretty `[HH:MM:SS.mmm] INFO …` | dev default, colors when tty |
+| `Logger.tracerLogger` | span events on current trace | automatically in default set |
+
+Installing loggers:
+
+```ts
+import { Effect, Logger } from "effect"
+
+// One JSON line per entry — ideal for prod stdout collectors
+export const JsonLoggerLayer = Logger.layer([Logger.consoleJson])
+
+// Replace loggers entirely (default). Pass { mergeWithExisting: true } to append:
+export const AppendCollectorLayer = Logger.layer([myCustomLogger], { mergeWithExisting: true })
+```
+
+`Logger.layer` (`effect/src/Logger.ts:914`) is a `Layer<never, E, R>` that overwrites `CurrentLoggers`. Provide it like any other layer. Every `Effect.log` then fans out to all installed loggers.
+
+:::caution[Logger.layer replaces — intentionally]
+`Logger.layer` without `mergeWithExisting` discards the previous set. That is why the "observability last" pattern exists: build your app layer, then `Layer.provide(ObservabilityLayer)` once at the edge so you know exactly which loggers are active. See the full example at the end of this chapter.
+:::
+
+### Level filtering via `References.MinimumLogLevel`
+
+`References.MinimumLogLevel` (`effect/src/References.ts:349`) is a `Context.Reference<LogLevel>`. Set it anywhere a `Context` flows:
+
+```ts
+import { Layer, References } from "effect"
+import { Logger } from "effect"
+
+export const WarnAndAbove = Layer.succeed(References.MinimumLogLevel, "Warn")
+
+// Merge it into a logger layer so this logger only sees Warn and above:
+export const AppLoggerLayer = Logger.layer([appLogger]).pipe(
+  Layer.provideMerge(WarnAndAbove)
+)
+```
+
+You can also scope it locally without a layer:
+
+```ts
+import { Effect, References } from "effect"
+
+const noisyImport = Effect.gen(function* () {
+  yield* Effect.logDebug("row 1")
+  yield* Effect.logInfo("row 2")
+}).pipe(Effect.provideService(References.MinimumLogLevel, "Warn"))
+// Debug and Info lines are filtered before reaching any logger
+```
+
+Loggers above the threshold still see `Warn` and `Error`. Use `"Trace"` to see everything, `"None"` to silence.
+
+### File logging — needs `FileSystem` and `Scope`
+
+`Logger.toFile` (`effect/src/Logger.ts:1004`) is a scoped, batched writer. It opens the file once, buffers line writes, and flushes on close.
+
+```ts
+import { Effect, Layer, Logger } from "effect"
+import { NodeFileSystem } from "@effect/platform-node"
+
+export const FileLoggerLayer = Logger.layer([
+  Logger.toFile(Logger.formatSimple, "app.log") // Effect<Logger> requiring FileSystem + Scope
+]).pipe(
+  Layer.provide(NodeFileSystem.layer)
+)
+```
+
+Details:
+
+- First argument is a **string logger** — typically `Logger.formatSimple` or `Logger.formatLogFmt`. `formatJson` also qualifies (it produces a JSON string after mapping).
+- Second argument is the path. Optional third argument: `{ batchWindow: "1 second", flag, mode }`.
+- The effect is scoped: `Logger.layer` handles the `Scope` automatically, so you do not call `Effect.scoped` yourself.
+- Batching window defaults to 1000 ms; each flush appends `buffer.join("\n") + "\n"`.
+
+:::caution[Provide NodeFileSystem]
+`Logger.toFile` requires `FileSystem.FileSystem`. Without `NodeFileSystem.layer` (or another platform implementation) the layer will fail to build with a missing-service type error — caught at compile time.
+:::
+
+### Batched loggers — buffer and flush
+
+`Logger.batched` (`effect/src/Logger.ts:702`) wraps any `Logger<Message, Output>` with a time-windowed buffer and a flush function that runs on the layer's scope:
+
+```ts
+import { Effect, Layer, Logger } from "effect"
+
+export const appLogger = Effect.gen(function* () {
+  yield* Effect.logDebug("initializing app logger")
+
+  return yield* Logger.batched(Logger.formatStructured, {
+    window: "1 second",
+    flush: Effect.fn(function* (batch) {
+      // Send to external log service, or write to file
+      console.log(`Flushing ${batch.length} log entries`)
+    })
+  })
+})
+
+export const AppLoggerLayer = Logger.layer([appLogger]).pipe(
+  Layer.provideMerge(WarnAndAbove)
+)
+```
+
+That snippet is taken verbatim from `ai-docs/src/08_observability/10_logging.ts:23`. `appLogger` is itself an `Effect<Logger>` — `Logger.layer([appLogger])` will build it once, pin the background flusher fiber with `forkDetach`, and flush remaining entries when the scope closes (`Effect.addFinalizer` inside `batched`).
+
+Mermaid — logger pipeline:
+
+<Mermaid title="Logger pipeline" height={320} code={`
+flowchart LR
+  E["Effect.log('hello')"] --> R["Logger.Options<br/>message/level/cause/fiber/date"]
+  R --> F{"filter?"}
+  F -- "level >= MinimumLogLevel" --> LS["Logger set<br/>(CurrentLoggers)"]
+  F -- "below minimum" --> DROP["dropped"]
+  LS --> A["formatStructured<br/>formatJson / formatSimple"]
+  LS --> B["consoleJson<br/>consoleStructured"]
+  LS --> C["toFile(...)<br/>batched(...)"]
+  A --> O1["structured output"]
+  B --> O2["stdout"]
+  C --> O3["file / remote"]
+`} />
+
+### Env-branching — choose loggers by `Config`
+
+Same pattern as config-driven layer selection ([chapter 10](/effect-ts/10-layers/), [chapter 11](/effect-ts/11-config/)): read `Config`, return a `Layer`.
+
+```ts
+import { Config, Effect, Layer, Logger } from "effect"
+
+export const LoggerLayer = Layer.unwrap(Effect.gen(function* () {
+  const env = yield* Config.String("NODE_ENV").pipe(Config.withDefault("development"))
+  if (env === "production") {
+    return AppLoggerLayer // structured + batched, Warn and above
+  }
+  return Logger.layer([Logger.defaultLogger]) // pretty colors in dev
+}))
+```
+
+`Layer.unwrap` turns `Effect<Layer>` into `Layer`. No business code knows which branch was taken. This is the same `Layer.unwrap` you used for `CacheLayer` in chapter 10.
+
+:::tip[Gate chatty loggers by env inside the logger, not at call sites]
+Do not sprinkle `if (process.env.NODE_ENV === "production")` around `Effect.logDebug` calls. Install a different logger or raise `MinimumLogLevel` via layers — call sites stay unconditional and tests stay deterministic.
+:::
+
+## Tracing
+
+Logging answers "what happened." Tracing answers "where did time go, and which causal chain did this request belong to?" Effect's tracer is always present but does nothing until you provide an exporter.
+
+### Spans from `Effect.fn`, `withSpan`, and annotations
+
+Three sources create spans:
+
+| Source | Creates span? | Extra |
+|---|---|---|
+| `Effect.fn("name")(generator, ...combinators)` | yes — named `"name"` per invocation | synthetic stack frame pairing definition + call site |
+| `Effect.withSpan(effect, "label", options?)` | yes — wraps `effect` | `options.attributes`, `options.parent`, `options.links` |
+| `Effect.withSpanScoped` | yes — span lives for the scope | use inside a scoped layer when the span must outlive one effect |
+
+`Effect.fn` is preferred for service methods — tracing is free.
+
+Annotating spans:
+
+```ts
+import { Effect } from "effect"
+
+const charge = Effect.fn("checkout.charge-card")(function* (orderId: string) {
+  yield* Effect.annotateCurrentSpan({ orderId, provider: "acme-pay" })
+  yield* Effect.sleep("50 millis")
+  yield* Effect.logInfo("charged", { orderId })
+})
+
+// Or annotate a block after the fact:
+yield* Effect.sleep("50 millis").pipe(
+  Effect.withSpan("checkout.charge-card"),
+  Effect.annotateSpans({ "checkout.order_id": orderId, "checkout.provider": "acme-pay" })
+)
+```
+
+Verify in `effect/src/Effect.ts:7994`, `8036`, `8318`:
+
+- `Effect.annotateSpans(program, "user", "john")` or `(program, { key: value })` — adds attributes to **all** spans created by `program`.
+- `Effect.annotateCurrentSpan(key, value)` or `({ ... })` — mutates the *current* span (the one your fiber is inside).
+- `Effect.withSpan(program, "label", { attributes: { http: "GET" } })` — scoped span. The function also has the pipe-friendly dual form `Effect.withSpan("label")`.
+
+### Layer spans
+
+Layer construction deserves tracing too. Use `Layer.withSpan`:
+
+```ts
+import { Layer, Effect } from "effect"
+import { Checkout } from "./checkout.ts"
+
+const CheckoutTest = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const checkout = yield* Checkout
+    yield* checkout.processCheckout("ord_123")
+  }).pipe(Effect.withSpan("checkout-test-run"))
+).pipe(
+  Layer.withSpan("checkout-test"),
+  Layer.provide(Checkout.layer)
+)
+```
+
+`Layer.withSpan("checkout-test")` wraps the layer's build effect in a tracing span, so you can see slow migrations or pool acquisition in your trace UI under that span.
+
+:::note[Tracer toggle]
+`References.TracerEnabled` (`effect/src/References.ts:391`) is a `Context.Reference<boolean>` defaulting to `true`. `References.TracerTimingEnabled` controls duration capture. `Effect.withTracerEnabled(false)` locally disables span creation — useful for hot loops that would otherwise create overhead. Span propagation (`TracerSpanAnnotations`) is independent.
+:::
+
+### OTLP export — wiring the exporter
+
+Effect's observability package exports OTLP modules for traces and logs. Verified in `ai-docs/src/08_observability/20_otlp-tracing.ts`:
+
+```ts
+import { Context, Effect, Layer } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
+import { OtlpLogger, OtlpSerialization, OtlpTracer } from "effect/unstable/observability"
+
+// Span exporter
+export const OtlpTracingLayer = OtlpTracer.layer({
+  url: "http://localhost:4318/v1/traces",
+  resource: {
+    serviceName: "checkout-api",
+    serviceVersion: "1.0.0",
+    attributes: { "deployment.environment": "staging" }
+  }
+})
+
+// Log exporter — ships log records as OTLP LogRecords
+export const OtlpLoggingLayer = OtlpLogger.layer({
+  url: "http://localhost:4318/v1/logs",
+  resource: { serviceName: "checkout-api", serviceVersion: "1.0.0" }
+})
+
+// Both exporters need serialization + http client
+export const ObservabilityLayer = Layer.merge(OtlpTracingLayer, OtlpLoggingLayer).pipe(
+  Layer.provide(OtlpSerialization.layerJson),
+  Layer.provide(FetchHttpClient.layer)
+)
+```
+
+Details:
+
+- `OtlpTracer.layer` (`effect/src/unstable/observability/OtlpTracer.ts:126`) takes `{ url, resource? }`. `resource` surfaces as `ResourceSpans[].resource` in OTLP — use it to distinguish service, version, environment.
+- `OtlpLogger.layer` (`effect/src/unstable/observability/OtlpLogger.ts:121`) takes the same shape for log export.
+- Both layers require `OtlpSerialization` (`layerJson` or `layerProtobuf` from `effect/src/unstable/observability/OtlpSerialization.ts:37`) and an `HttpClient.HttpClient` — `FetchHttpClient.layer` from `effect/unstable/http` is the stdlib choice.
+- There is also `Otlp.layer({ baseUrl })` and `OtlpMetrics.layer*` if you want a unified base URL with trace/log/metric export in one go.
+
+Provide `ObservabilityLayer` last:
+
+```ts
+const Main = CheckoutTest.pipe(Layer.provide(ObservabilityLayer))
+Layer.launch(Main).pipe(NodeRuntime.runMain)
+```
+
+:::caution[Provide observability LAST]
+Layers provide dependencies inward (`Layer.provide(inner, dep)` builds `dep` first). If you provide tracing in the middle, layers built before it have no tracer. The canonical assembly piped in `ai-docs/src/08_observability/20_otlp-tracing.ts:86`:
+
+```ts
+const Main = CheckoutTest.pipe(Layer.provide(ObservabilityLayer))
+```
+
+Place this as the outermost layer so *all* spans — including `Layer.withSpan` and `Effect.fn` traces from deeper services — flow through the same exporter.
+:::
+
+Mermaid — observability wiring:
+
+<Mermaid title="Observability layer wiring" height={360} code={`
+flowchart TB
+  subgraph app["App (CheckoutTest)"]
+    CT["Checkout.processCheckout<br/>Effect.fn + withSpan"]
+    LT["Layer.withSpan('checkout-test')"]
+    LG["Effect.log / annotateLogs / withLogSpan"]
+  end
+  subgraph obs["ObservabilityLayer"]
+    Tracer["OtlpTracer.layer<br/>url: /v1/traces"]
+    LogExp["OtlpLogger.layer<br/>url: /v1/logs"]
+    Ser["OtlpSerialization.layerJson"]
+    HC["FetchHttpClient.layer"]
+  end
+  CT -.->|"spans"| Tracer
+  LT -.->|"span"| Tracer
+  LG -.->|"LogRecords"| LogExp
+  Tracer --> Ser --> HC -->|"HTTP POST"| OTLP["OTLP Collector"]
+  LogExp --> Ser --> HC --> OTLP
+  style obs fill:#f6f8ff,stroke:#4f46e5
+  style app fill:#fff
+`} />
+
+## Metrics
+
+Verified in `effect/src/Metric.ts` (since 2.0.0): `Metric` is a concurrent aggregation keyed by name and boundaries. Five primitives plus timers:
+
+| Constructor | Type | Updates |
+|---|---|---|
+| `Metric.counter("requests", { description?, incremental?, bigint? })` | `Counter<number \| bigint>` | `Metric.update(counter, 1)` increments |
+| `Metric.gauge("memory_usage", { description? })` | `Gauge<number \| bigint>` | `Metric.update(gauge, value)` sets current |
+| `Metric.frequency("status_codes")` | `Frequency` | `Metric.update(freq, "200")` counts occurrences |
+| `Metric.histogram("latency", { boundaries: Metric.linearBoundaries(...) })` | `Histogram` | bucketed observation |
+| `Metric.summary("response_time", { maxAge, maxSize, error })` | `Summary` | quantile summary |
+| `Metric.timer("api_request_duration")` | `Histogram` (time) | often with `Effect.track*` helpers |
+
+Update and read:
+
+```ts
+import { Effect, Metric } from "effect"
+
+const requestCounter = Metric.counter("http_requests_total", { description: "Total HTTP requests" })
+const memoryGauge = Metric.gauge("memory_usage_mb")
+const latencyHist = Metric.histogram("request_latency_ms", {
+  boundaries: Metric.linearBoundaries({ start: 0, width: 50, count: 10 })
+})
+
+const program = Effect.gen(function* () {
+  yield* Metric.update(requestCounter, 1)
+  yield* Metric.update(memoryGauge, 512)
+  yield* Metric.update(latencyHist, 47)
+
+  // Read state (needs a registry — tests provide one, prod exporters do)
+  const countState = yield* Metric.value(requestCounter)
+  // countState.count === total increments
+})
+
+// For duration tracking, wrap an effect:
+const tracked = Effect.gen(function* () {
+  yield* chargeCard()
+}).pipe(Effect.track(Metric.timer("checkout.charge_duration")))
+```
+
+Metrics require a registry. `Metric.MetricRegistry` is a `Context` holding the store. In tests you provide it:
+
+```ts
+await Effect.runPromise(Effect.provideService(program, Metric.MetricRegistry, new Map()))
+```
+
+In production they flow to OTLP via `OtlpMetrics.layer` (same serialization + http client pattern as traces/logs). This book mentions them briefly because the module is stable but most app teams choose OpenTelemetry or Prometheus integrations at the edge rather than hand-rolling dashboards from `Metric.value`.
+
+:::tip[When to use Metric vs logging a duration]
+If you need a *distribution* (p50/p99 over many requests) use `Metric.histogram`/`timer` — logs give you one sample, histograms give you quantiles. If you need per-request narrative (orderId, route) use structured logs + trace spans. The two complement each other.
+:::
+
+## The "observability last" provision pattern
+
+The single most important wiring rule in this chapter:
+
+```ts
+// ai-docs/src/08_observability/20_otlp-tracing.ts:86
+const Main = CheckoutTest.pipe(
+  // Provide the observability layer at the very end, so that all spans created
+  // by the app are exported.
+  Layer.provide(ObservabilityLayer)
+)
+
+Layer.launch(Main).pipe(NodeRuntime.runMain)
+```
+
+Why last? `Layer.provide` is right-to-left in build order: `self.pipe(Layer.provide(dep))` builds `dep` first and feeds it into `self`. If you sandwich `ObservabilityLayer` in the middle:
+
+```ts
+// Wrong: tracing only covers layers above it
+const Bad = Layer.merge(CheckoutTest, BackgroundWorker).pipe(
+  Layer.provide(ObservabilityLayer), // covers CheckoutTest
+  Layer.provide(SqlClient.layer)      // Sql spans not traced!
+)
+```
+
+By placing it outermost you guarantee every layer and effect span uses the same tracer and logger. This mirrors the config lesson from chapter 11: assemble the app graph, *then* provide cross-cutting concerns.
+
+## Full Checkout integration — putting it together
+
+Runnable example assembled from `ai-docs/src/08_observability/10_logging.ts` + `20_otlp-tracing.ts`. Copy-pastable module shape:
+
+```ts
+// src/observability.ts
+import { Config, Effect, Layer, Logger, References } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
+import { OtlpLogger, OtlpSerialization, OtlpTracer } from "effect/unstable/observability"
+import { NodeFileSystem } from "@effect/platform-node"
+
+// JSON logger for prod, batched writer example
+export const appLogger = Effect.gen(function* () {
+  yield* Effect.logDebug("initializing app logger")
+  return yield* Logger.batched(Logger.formatStructured, {
+    window: "1 second",
+    flush: Effect.fn(function* (batch) {
+      console.log(`Flushing ${batch.length} log entries`)
+    })
+  })
+})
+
+export const AppLoggerLayer = Logger.layer([appLogger]).pipe(
+  Layer.provideMerge(Layer.succeed(References.MinimumLogLevel, "Warn"))
+)
+
+export const WarnAndAbove = Layer.succeed(References.MinimumLogLevel, "Warn")
+
+export const FileLoggerLayer = Logger.layer([
+  Logger.toFile(Logger.formatSimple, "app.log")
+]).pipe(Layer.provide(NodeFileSystem.layer))
+
+// Env-branching logger
+export const EnvLoggerLayer = Layer.unwrap(Effect.gen(function* () {
+  const env = yield* Config.String("NODE_ENV").pipe(Config.withDefault("development"))
+  return env === "production" ? AppLoggerLayer : Logger.layer([Logger.defaultLogger])
+}))
+
+// OTLP tracing + logging bound to a collector
+export const OtlpTracingLayer = OtlpTracer.layer({
+  url: "http://localhost:4318/v1/traces",
+  resource: {
+    serviceName: "checkout-api",
+    serviceVersion: "1.0.0",
+    attributes: { "deployment.environment": "staging" }
+  }
+})
+
+export const OtlpLoggingLayer = OtlpLogger.layer({
+  url: "http://localhost:4318/v1/logs",
+  resource: { serviceName: "checkout-api", serviceVersion: "1.0.0" }
+})
+
+export const ObservabilityLayer = Layer.merge(OtlpTracingLayer, OtlpLoggingLayer).pipe(
+  Layer.provide(OtlpSerialization.layerJson),
+  Layer.provide(FetchHttpClient.layer)
+)
+```
+
+```ts
+// src/checkout.ts
+import { Context, Effect, Layer } from "effect"
+
+export class Checkout extends Context.Service<Checkout, {
+  processCheckout(orderId: string): Effect.Effect<void>
+}>()("acme/Checkout") {
+  static readonly layer = Layer.effect(
+    Checkout,
+    Effect.gen(function* () {
+      yield* Effect.logInfo("setting up checkout service")
+
+      return Checkout.of({
+        processCheckout: Effect.fn("Checkout.processCheckout")(function* (orderId: string) {
+          yield* Effect.logInfo("starting checkout", { orderId })
+
+          // Card charge — own trace span + annotations for provider selection
+          yield* Effect.sleep("50 millis").pipe(
+            Effect.withSpan("checkout.charge-card"),
+            Effect.annotateSpans({
+              "checkout.order_id": orderId,
+              "checkout.provider": "acme-pay"
+            })
+          )
+
+          // Persist — own span
+          yield* Effect.sleep("20 millis").pipe(
+            Effect.withSpan("checkout.persist-order")
+          )
+
+          yield* Effect.logInfo("checkout completed", { orderId })
+        })
+      })
+    })
+  )
+}
+```
+
+```ts
+// src/main.ts
+import { NodeRuntime } from "@effect/platform-node"
+import { Effect, Layer } from "effect"
+import { Checkout } from "./checkout.ts"
+import { EnvLoggerLayer, ObservabilityLayer, OtlpLoggingLayer, OtlpTracingLayer } from "./observability.ts"
+
+// A test/workload layer with its own span
+const CheckoutTest = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const checkout = yield* Checkout
+    yield* checkout.processCheckout("ord_123")
+  }).pipe(Effect.withSpan("checkout-test-run"))
+).pipe(
+  Layer.withSpan("checkout-test"),
+  Layer.provide(Checkout.layer)
+)
+
+// Centralize observability at the outermost provide — everything traced
+const Main = CheckoutTest.pipe(
+  Layer.provide(ObservabilityLayer)
+)
+
+// Keep pretty dev logging locally if you want it alongside OTLP:
+// const MainWithBoth = Main.pipe(Layer.provide(EnvLoggerLayer))
+
+Layer.launch(Main).pipe(NodeRuntime.runMain)
+```
+
+With separate trace + log export you can swap either:
+
+```ts
+// Only tracing, no log export
+const TracingOnly = OtlpTracingLayer.pipe(
+  Layer.provide(OtlpSerialization.layerJson),
+  Layer.provide(FetchHttpClient.layer)
+)
+
+// Only structured JSON to stdout, no OTLP at all
+import { Logger } from "effect"
+const StdoutOnly = Logger.layer([Logger.consoleJson])
+```
+
+### Log flow inside the example
+
+```ts
+import { Effect } from "effect"
+
+// Every line inside carries annotations + log span + trace span
+const program = Effect.gen(function* () {
+  yield* Effect.logInfo("validating cart")
+  yield* checkout.processCheckout("ord_789")
+}).pipe(
+  Effect.annotateLogs({ service: "checkout-api", route: "POST /checkout" }),
+  Effect.withLogSpan("checkout"),
+  Effect.withSpan("http.handle-checkout"),
+  Effect.annotateSpans({ "http.route": "POST /checkout" })
+)
+```
+
+- `annotateLogs` enriches logs.
+- `withLogSpan` enriches logs with timing.
+- `withSpan`/`annotateSpans` enrich traces.
+- Provide `ObservabilityLayer` outermost and both streams export together.
+
+## Quick reference
+
+| Need | Use |
+|---|---|
+| Log at a level | `Effect.log`, `logInfo`, `logDebug`, `logWarning`, `logError` |
+| Attach fields to logs | `Effect.annotateLogs({ k: v })`, `annotateLogsScoped` |
+| Time an operation on logs | `Effect.withLogSpan("name")` |
+| JSON stdout | `Logger.layer([Logger.consoleJson])` |
+| Simple file | `Logger.toFile(Logger.formatSimple, path)` + `NodeFileSystem.layer` |
+| Batch to remote | `Logger.batched(formatStructured, { window, flush: Effect.fn(...) })` |
+| Filter levels | `Layer.succeed(References.MinimumLogLevel, "Warn")` |
+| Env branch | `Layer.unwrap(Effect.gen(function* () { yield* Config.String("NODE_ENV") … }))` |
+| Span per call | `Effect.fn("name")(function* () { … })` |
+| Span around block | `effect.pipe(Effect.withSpan("label"), Effect.annotateSpans({ … }))` |
+| Annotate current span | `yield* Effect.annotateCurrentSpan({ key: value })` |
+| Layer build span | `layer.pipe(Layer.withSpan("init"))` |
+| Disable tracing locally | `effect.pipe(Effect.withTracerEnabled(false))` |
+| OTLP traces | `OtlpTracer.layer({ url, resource })` + `OtlpSerialization.layerJson` + `FetchHttpClient.layer` |
+| OTLP logs | `OtlpLogger.layer({ url, resource })` (same deps) |
+| Provide observability | `Main.pipe(Layer.provide(ObservabilityLayer))` — outermost |
+
+## Next
+
+<LinkCard
+  title="28 · Testing — Virtual Time & Layers"
+  description="The Effect testing pyramid: it.effect, parameterized and property tests, virtual time with TestClock, shared layer blocks, Ref-backed test doubles, and in-memory HttpApi testing."
+  href="/effect-ts/28-testing/"
+/>

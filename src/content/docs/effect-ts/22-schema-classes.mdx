@@ -1,0 +1,950 @@
+---
+title: Schema — Classes, Opaque Types & Serialization
+description: Constructible domain classes versus nominal opaques, TaggedClass/TaggedError with httpApiStatus, declaring existing types, canonical JSON/StringTree codecs, and generation tooling.
+sidebar:
+  order: 22
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Chapters 20 and 21 gave you structural codecs: `Struct`s whose decoded values are plain readonly objects, refined and transformed via pipelines. When your domain calls for *behavior*, nominal types, or identity — methods, `instanceof`, private fields, HTTP-mappable errors — structural objects run out of steam. This chapter gives you the ownership layer: `Class` for constructible, method-bearing domain objects, `Opaque` for nominal aliases without instances, `TaggedClass`/`TaggedError` for self-describing, platform-aware variants, plus the declaration kit for existing types and the canonical codecs that serialize everything you have built.
+
+## `Class` — validated domain objects with methods
+
+A `Class` is a `Struct` that has been materialized as a real JavaScript `class`. Its instances carry the decoded struct's fields as `readonly` properties plus any extra fields and methods you attach.
+
+```ts title="src/class-basic.ts"
+import { Effect, Option, Schema } from "effect"
+
+class Person extends Schema.Class<Person>("Person")({
+  name: Schema.NonEmptyString,
+  age: Schema.Finite
+}) {
+  // instance members live beside validated fields — they are not part of the wire schema
+  readonly species = "Homo sapiens" as const
+  readonly _display = "person" as const
+
+  greet() {
+    return `Hi, I'm ${this.name} (${this.age})`
+  }
+
+  isAdult() {
+    return this.age >= 18
+  }
+}
+
+// Three construction doors — all enforce validation:
+const a = new Person({ name: "Ada", age: 30 })          // constructor — throws SchemaError on failure
+const b = Person.make({ name: "Ada", age: 30 })         // static make — throws on failure (sync fast-path)
+const c = Effect.runSync(                               // effectful — typed SchemaError in E
+  Schema.decodeUnknownEffect(Person)({ name: "Ada", age: 30 })
+)
+
+// c is a Person instance, not a plain object:
+c instanceof Person   // true
+c.greet()             // "Hi, I'm Ada (30)"
+Person.is(c)          // type guard via declareConstructor predicate — equivalent to `instanceof Person` plus codec awareness
+```
+
+### Constructor shapes & `~type.make.in`
+
+A `Class`'s `make` argument tracks richer rules than `Type`:
+
+- Required fields: `~type.make` is the wire-constructor input type, accounting for constructor defaults (`withConstructorDefault`, `tag`, `tagDefaultOmit`).
+- Optional keys stay constructible as omitted; `mutableKey` fields stay writable if you used that (rare inside classes — prefer methods over mutable state).
+- Fields annotated with `withConstructorDefault`/`tag` become optional at construction:
+
+```ts title="src/class-make.ts"
+import { Schema } from "effect"
+
+class User extends Schema.Class<User>("User")({
+  id: Schema.String,
+  name: Schema.String,
+  // _tag auto-filled during make, never supplied by callers
+  _tag: Schema.tag("User"),
+  // optionalKey + withConstructorDefault also optional at make time
+  role: Schema.String.pipe(
+    Schema.optionalKey,
+    Schema.withConstructorDefault(Effect.succeed("member"))
+  )
+}) {
+  // you can still declare instance-side brand-like markers
+  declare readonly _brand: "User"
+}
+
+User.make({ id: "u_1", name: "Ada" }) // => { id: "u_1", name: "Ada", _tag: "User", role: "member" }
+// Missing required `id` is a type error; providing _tag explicitly is unnecessary but allowed
+```
+
+### `this` fields
+
+Because a Class *is* a class, you can declare non-schema fields — but remember construction is validated after `super` has wired the schema fields. Typical pattern:
+
+```ts title="src/class-this.ts"
+import { Schema } from "effect"
+
+class Counter extends Schema.Class<Counter>("Counter")({
+  initial: Schema.Finite
+}) {
+  // derived mutable state closed over the instance (not part of encoding!)
+  private _count = this.initial
+
+  inc() { this._count++ }
+  get count() { return this._count }
+}
+
+const c = new Counter({ initial: 0 })
+c.inc()
+c.count // 1
+// c.initial is readonly; c._count is not part of Schema.encodeSync(Counter)(c)
+```
+
+Encoding a `Class` instance strips non-schema fields — they are instance state, not wire state. If a field must round-trip, model it as a schema field.
+
+### `extend` — inheritance without duplication
+
+`Class` exposes `.extend` to derive a subclass whose constructor validates *both* parent and new fields. The original refinement checks from the base class remain attached unless `unsafePreserveChecks: false` was chosen.
+
+```ts title="src/class-extend.ts"
+import { Schema } from "effect"
+
+class Animal extends Schema.Class<Animal>("Animal")({
+  name: Schema.String,
+  age: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 50 }))
+}) {}
+
+class Dog extends Animal.extend<Dog>("Dog")({
+  breed: Schema.String,
+  tailWagsPerMinute: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
+}) {
+  bark() { return `${this.name} says woof` }
+}
+
+Schema.decodeUnknownSync(Dog)({ name: "Rex", age: 4, breed: "Labrador", tailWagsPerMinute: 30 })
+// Dog { name: "Rex", age: 4, breed: "Labrador", tailWagsPerMinute: 30 }
+// age's between check still runs
+
+// annotate with class-level metadata (identifier is the first string argument)
+class Tracked extends Animal.extend<Tracked>("Tracked")({
+  color: Schema.String
+}, { identifier: "tracked-animal" } as any) {}
+
+// DRY: supply whole struct schema too
+const BaseSchema = Schema.Struct({ x: Schema.Number, y: Schema.Number })
+class Point extends Schema.Class<Point>("Point")(BaseSchema) {
+  magnitude() { return Math.hypot(this.x, this.y) }
+}
+```
+
+The `identifier` string in `Schema.Class<Self>(identifier)` (or the second `.extend(...)(identifier, ...)` overload) is the schema's identity — it appears in issue paths, JSON Schema `$defs`, and formatters. Treat it like a fully-qualified type name.
+
+### Class-level `check`, annotations, and branded classes
+
+```ts title="src/class-check-brand.ts"
+import { Effect, Schema } from "effect"
+
+// Whole-class invariant — runs after all field codecs and field-level checks
+class Interval extends Schema.Class<Interval>("Interval")({
+  start: Schema.Finite,
+  end: Schema.Finite
+}) {
+  contains(n: number) { return n >= this.start && n <= this.end }
+}
+
+// Attach later via .check (returned rebuild type is still a Class)
+const ValidatedInterval = Interval.check(
+  Schema.makeFilter((o) => o.start <= o.end ? undefined : { path: ["end"], issue: "end must be >= start" })
+)
+
+// Branded class — nominalize without changing runtime shape
+class BrandedId extends Schema.Class<BrandedId, "UserId">("BrandedId")({
+  value: Schema.String
+}) {
+  // Brand<B> intersects value's Type with Brand<B>
+}
+type BrandedId = typeof BrandedId.Type // instance + Brand<"UserId">
+// Equivalent to Schema.Class.pipe(Schema.brand(...)) at class scope, with narrower Make
+
+// Annotate a class schema with metadata (identifier, title, description, etc.)
+class Annotated extends Schema.Class<Annotated>("Annotated")(
+  Schema.Struct({ value: Schema.String }),
+  { identifier: "MyAnnotated", title: "Annotated value" } as any
+)
+```
+
+The `Brand` type parameter on `Class<Self, Brand>` threads through the brand intersection the same way `Schema.brand("X")` does on free schemas — structural value, nominal type.
+
+## `Opaque` versus `Class` — when not to construct
+
+`Opaque<Self>()(inner)` wraps an *existing* struct (or any schema) and *replaces* its `Type` with a nominal `Self`. Unlike `Class`, it produces **no** JavaScript class, **no** `new`, **no** instance methods — just a branded-type alias that the decoder materializes as the inner wire decoding result cast to the nominal.
+
+```ts title="src/opaque.ts"
+import { Schema } from "effect"
+
+class PersonOpaque extends Schema.Opaque<PersonOpaque>()(
+  Schema.Struct({ name: Schema.String })
+) {}
+
+const person = Schema.decodeUnknownSync(PersonOpaque)({ name: "Alice" })
+// person: PersonOpaque — but at runtime it's literally { name: "Alice" }
+person.name // "Alice"
+PersonOpaque instanceof Function // still truthy — Opaque returns a schema value, not a class constructor
+
+// Optional brand marker generic:
+class UserId extends Schema.Opaque<UserId, "UserIdBrand">()(Schema.String) {}
+type _check = UserId extends string & { readonly _brand: unknown } ? true : false // conceptual
+```
+
+|  | `Schema.Class<Self>(id)(fields)` | `Schema.Opaque<Self>()(inner)` |
+|---|---|---|
+| Decoded value | real `instanceof Self` class instance | plain structural value branded as `Self` at the type level |
+| `new` / `.make` | yes — validates + constructs | **no** — use `Schema.decodeSync(Opaque)(raw)` or `.make` on the underlying struct |
+| Holds methods / private state | yes — instance members, getters, `this` refs | **no** — no prototype beyond plain object |
+| `extend` | `Base.extend<Child>(...)` | **no** |
+| Wire cost | same as struct (fields only) | same as inner schema |
+| Nominalize | via second generic `Brand` | via second generic `Brand` |
+| Best for | domain entities with behavior & identity | nominal type aliases shared across modules without introducing a class |
+
+Use `Opaque` when you want the type system to distinguish `UserId` from `string` (say, in service signatures) without committing every decode site to class instantiation — you can later migrate an opaque to a `Class` without changing wire shape.
+
+## `TaggedClass` & `TaggedError` — discriminator + protocol
+
+Tagged variants bake the classic `_tag` discriminator directly into the schema so unions know which branch to match and `Effect.catchTag` can dispatch.
+
+### `TaggedClass`
+
+```ts title="src/tagged-class.ts"
+import { Schema } from "effect"
+
+//identifier optional: TaggedClass<Self, Brand>(identifier?)
+//fields variant:
+class Circle extends Schema.TaggedClass<Circle>()("Circle", {
+  radius: Schema.Finite.check(Schema.isGreaterThan(0))
+}) {
+  area() { return Math.PI * this.radius ** 2 }
+}
+
+//struct variant:
+const BaseCircle = Schema.Struct({ radius: Schema.Finite, color: Schema.String })
+class ColoredCircle extends Schema.TaggedClass<ColoredCircle>()("Circle", BaseCircle) {
+  area() { return Math.PI * this.radius ** 2 }
+}
+
+Circle.make({ radius: 5 }) // { _tag: "Circle", radius: 5 } — make omits _tag via withConstructorDefault
+Schema.decodeUnknownSync(Circle)({ _tag: "Circle", radius: 2 }) // Circle instance
+// Schema.decodeUnknownSync(Circle)({ _tag: "Square", radius: 2 } as any) // fails — _tag literal mismatch
+```
+
+`TaggedClass` is just `Class` whose field map prepends `TaggedStruct("_tag", ...)`. The generated `_tag` is a `Literal` with `withConstructorDefault` so `make` and decoding synthesize it correctly.
+
+### `TaggedError` — yieldable, HTTP-aware errors
+
+`TaggedError` behaves like `TaggedClass` but also mixes in `Cause.YieldableError` so instances are directly `yield*`-fail-able inside generators.
+
+```ts title="src/tagged-error.ts"
+import { Effect, Schema } from "effect"
+
+// Minimal
+class NotFound extends Schema.TaggedError<NotFound>()("NotFound", {
+  id: Schema.String
+}) {}
+
+// With annotation — third argument is Annotations.Declaration
+// This is where httpApiStatus rides: the server's error mapper reads it to choose HTTP status
+class NotFoundAnnotated extends Schema.TaggedError<NotFoundAnnotated>()(
+  "NotFound",
+  { id: Schema.String },
+  { httpApiStatus: 404 } as any
+) {}
+
+class BadRequest extends Schema.TaggedError<BadRequest>()(
+  "BadRequest",
+  { detail: Schema.String },
+  { httpApiStatus: 400 } as any
+) {}
+
+class Unauthorized extends Schema.TaggedError<Unauthorized>()(
+  "Unauthorized",
+  { reason: Schema.String },
+  { httpApiStatus: 401 } as any
+) {}
+
+// Diverse error union — HttpApi will map each _tag to its status
+const AppError = Schema.Union([NotFoundAnnotated, BadRequest, Unauthorized])
+
+// Usage inside Effect.gen — generators understand Yieldable errors
+const getUser = (id: string) =>
+  Effect.gen(function* () {
+    if (id === "bad") return yield* new BadRequest({ detail: "malformed id" })
+    if (id === "ghost") return yield* new NotFoundAnnotated({ id })
+    return { id, name: "Ada" }
+  })
+// Effect<{ id: string; name: string }, BadRequest | NotFoundAnnotated>
+
+const handled = getUser("ghost").pipe(
+  Effect.catchTag("NotFound", (e) => Effect.succeed({ id: e.id, name: "unknown" })),
+  Effect.catchTag("BadRequest", (e) => Effect.fail(e)) // re-raise typed
+)
+
+// Class-level check works here too
+class IntervalError extends Schema.TaggedError<IntervalError>()("IntervalError", {
+  start: Schema.Finite,
+  end: Schema.Finite
+}) {}
+const CheckedIntervalError = IntervalError.check(
+  Schema.makeFilter((e) => e.start <= e.end ? undefined : { path: ["end"], issue: "end must be >= start" })
+)
+```
+
+The `httpApiStatus` annotation is deliberately free-form (`number | undefined`) on the schema side — the concrete HttpApi wiring lives in `effect/unstable/httpapi`. Until you provide a platform layer, this annotation is documentation that downstream chapters will consume:
+
+```ts title="src/http-api-status.ts"
+import { Schema } from "effect"
+
+// Valid  — server maps this to 404, client decodes it back to NotFound
+class DomainNotFound extends Schema.TaggedError<DomainNotFound>()(
+  "NotFound",
+  { id: Schema.String },
+  { httpApiStatus: 404 } as any
+)
+
+// Forward-reference is legal: annotations are data, the status resolver is lazy
+// Fetch the status via SchemaAST:
+// SchemaAST.resolveAt<number>("httpApiStatus")(DomainNotFound.ast)
+```
+
+:::caution[Status annotation belongs on the error schema, not the route]
+Placing `httpApiStatus` on a non-error `Class` does nothing — only `TaggedError` (and error-coercing decorations like `HttpApiSchema.withStatus`) consult it during error encoding. If an error must appear in multiple places, annotate the shared error union's members once, not each endpoint.
+:::
+
+### Combining into a tagged union
+
+```ts title="src/tagged-union-from-classes.ts"
+import { Schema } from "effect"
+
+class Cat extends Schema.TaggedClass<Cat>()("Cat", { meows: Schema.Boolean }) {}
+class Dog extends Schema.TaggedClass<Dog>()("Dog", { barks: Schema.Boolean }) {}
+
+const Pet = Schema.Union([Cat, Dog])
+// Augment with match/isAnyOf helpers like any union:
+const PetTagged = Schema.Union([Cat, Dog]).pipe(Schema.toTaggedUnion("_tag"))
+PetTagged.match({ _tag: "Cat", meows: true } as any, {
+  Cat: (c) => `cat:${c.meows}`,
+  Dog: (d) => `dog:${d.barks}`
+})
+
+// Alternative shorthand record form from Chapter 20:
+const Shape = Schema.TaggedUnion({
+  Circle: { radius: Schema.Finite },
+  Rectangle: { width: Schema.Finite, height: Schema.Finite }
+})
+```
+
+## Declaring schemas for existing types
+
+Not every validated value is constructed by Schema — sometimes the type already exists (`Date`, a library class, a parametric container) and you need a schema *around* it.
+
+### `instanceOf`
+
+```ts title="src/instance-of.ts"
+import { Schema } from "effect"
+
+class MyBuffer extends Uint8Array {}
+
+const DateSchema = Schema.instanceOf(Date)
+// DateSchema: Codec<Date, Date> — decode/encode are identity over instanceof Date (rejects Invalid Date)
+
+const BufferSchema = Schema.instanceOf(MyBuffer)
+Schema.decodeUnknownSync(DateSchema)(new Date())          // ok
+Schema.decodeUnknownSync(DateSchema)(new Date("bad"))     // throws — Invalid Date
+Schema.decodeUnknownSync(BufferSchema)(new MyBuffer(8))   // ok
+```
+
+`instanceOf` predicates are preserved through serialization only if you supply your own `toCodecJson`/`toCodecStringTree` branch — bare declarations fall back to `Json = unknown` on canonical encoding and may fail at encode/decode time if the value is not JSON-serializable. Supply the branch whenever the type must round-trip.
+
+### `declare` and `declareConstructor`
+
+`declare` wraps a predicate + optional codec hooks for *non-parametric* types; `declareConstructor` does the same for types with *type parameters* (`Box<A>`, `Tree<A, B>`, `HashMap<K, V>` ...). Both accept rich `annotations` including the four canonical codec hooks.
+
+```ts title="src/declare.ts"
+import { Effect, Option, Schema, SchemaAST } from "effect"
+import type { Brand } from "effect"
+
+// Non-parametric — nominal UserId type backed by a predicate
+type UserId = string & Brand<"UserId">
+const isUserId = (u: unknown): u is UserId => typeof u === "string" && u.startsWith("user_")
+
+const UserIdSchema = Schema.declare<UserId>(
+  isUserId,
+  {
+    identifier: "UserId",
+    description: "Ids prefixed with user_",
+    // Canonical branches (optional):
+    toCodecJson: () => Schema.String as any,
+    toJsonSchema: () => ({ type: "string", pattern: "^user_.*$" }),
+    arbitrary: () => (fc) => fc.string().filter(isUserId) as any
+  } as any
+)
+
+// Parametric — Box<A>
+type Box<A> = { readonly value: A }
+const Box = <A extends Schema.Codec<any, any>>(item: A) =>
+  Schema.declareConstructor<Box<A["Type"]>, Box<A["Encoded"]>>()(
+    ([itemCodec]) => ({
+      predicate: (u): u is Box<A["Type"]> =>
+        typeof u === "object" && u !== null && "value" in u,
+      // the annotation hook that lets Effect build canonical codecs per parameter
+      toCodec: ([value]) => value as any, // delegate to itemCodec's canonical form
+      toJsonSchema: ([value]) => ({ type: "object", properties: { value }, required: ["value"] }) as any
+    } as any),
+    { identifier: "Box" } as any
+  )
+
+// The crucial link for serialization:
+declare class Custom {}
+const CustomFromString = Schema.String.pipe(
+  Schema.decodeTo(
+    Schema.declare<Custom>((u): u is Custom => u instanceof Custom, {
+      // declare-level link: how Custom serializes to/from JSON
+      toCodecJson: () => Schema.String as any, // real impl would supply a Link
+      identifier: "Custom"
+    } as any),
+    SchemaTransformation.transform({
+      decode: (s) => new Custom(),
+      encode: (_c) => "custom"
+    })
+  )
+)
+```
+
+The canonical pattern for a custom Links-bearing declaration is to return a `SchemaAST.Link` via `Schema.link`:
+
+```ts title="src/declare-link.ts"
+import { Schema, SchemaGetter } from "effect"
+
+type OpaqueBytes = Uint8Array & { readonly _brand: "OpaqueBytes" }
+const isBytes = (u: unknown): u is OpaqueBytes => u instanceof Uint8Array
+
+const BytesFromBase64 = Schema.declare<OpaqueBytes>(
+  isBytes,
+  {
+    identifier: "OpaqueBytes",
+    toCodecJson: () =>
+      Schema.link<OpaqueBytes>()(Schema.String, {
+        decode: SchemaGetter.decodeBase64(),
+        encode: SchemaGetter.encodeBase64()
+      })
+  } as any
+)
+// toCodecJson(BytesFromBase64) now knows to encode as base64 string, not as array
+```
+
+Here `Schema.link<Decoded>()(EncodedSchema, { decode, encode })` reuses an *existing* schema's wire shape for the declaration's branch — `toCodecJson`, `toCodecStringTree`, `toCodecIso`, and the catch-all `toCodec` all share the same hook shape.
+
+## Serialization — the wire formats
+
+### JSON
+
+v4 distinguishes two JSON helpers by *generality*:
+
+| API | What it does | Decodes from | Encodes to |
+|---|---|---|---|
+| `Schema.UnknownFromJsonString` | `string ↔ unknown` (JSON text anywhere) | `string` (JSON text) | `string` |
+| `Schema.fromJsonString(schema, opts?)` | `string ↔ T` by parsing then validating against `schema` | `string` | `string` |
+| `Schema.toCodecJson(schema)` | canonical `Json` ↔ `T` derived from `schema`'s own structure | `Json` | `Json` |
+
+```ts title="src/json-serialization.ts"
+import { Effect, Schema } from "effect"
+
+const Person = Schema.Struct({ name: Schema.String, age: Schema.Finite })
+
+// 1. UnknownFromJsonString — raw JSON string ↔ Json
+Schema.decodeSync(Schema.UnknownFromJsonString)('{"name":"Ada","age":30}')
+// => { name: "Ada", age: 30 } typed as unknown
+Schema.encodeSync(Schema.UnknownFromJsonString)({ name: "Ada", age: 30 })
+// => '{"name":"Ada","age":30}'
+
+// 2. fromJsonString(schema) — JSON text ↔ T in one step
+const PersonFromJson = Schema.fromJsonString(Person, { space: 2 })
+Schema.decodeSync(PersonFromJson)('{"name":"Ada","age":30}') // Person
+Schema.encodeSync(PersonFromJson)({ name: "Ada", age: 30 }) // '{\n  "name": "Ada",\n  "age": 30\n}'
+
+// Equivalent older expansion:
+const ManualFromJson = Schema.String.pipe(
+  Schema.decodeTo(Person, SchemaTransformation.fromJsonString())
+)
+
+// 3. toCodecJson — derive a Json codec structurally from any schema
+const PersonJson = Schema.toCodecJson(Person)
+// PersonJson: Codec<Person, Json> — Json = string | number | boolean | null | Json[] | { [k: string]: Json }
+Schema.decodeSync(PersonJson)({ name: "Ada", age: 30 }) // Person
+Schema.encodeSync(PersonJson)({ name: "Ada", age: 30 }) // { name: "Ada", age: 30 } (plain Json clone)
+
+// Composing: parse JSON text then run structural codec
+const PersonTextThenJson = Schema.String.pipe(
+  Schema.decodeTo(PersonJson, SchemaTransformation.fromJsonString())
+)
+```
+
+### Base64 / hex / URI components
+
+`Schema` ships ready-made *string* codecs that transform on decode/encode:
+
+```ts title="src/string-serializers.ts"
+import { Schema } from "effect"
+
+// string ↔ string (decoded is UTF-8 after base64 decode, wire is base64)
+Schema.decodeSync(Schema.StringFromBase64)("aGVsbG8=")      // "hello"
+Schema.encodeSync(Schema.StringFromBase64)("hello")         // "aGVsbG8="
+
+Schema.decodeSync(Schema.StringFromBase64Url)("aGVsbG8")    // "hello" (no padding)
+Schema.decodeSync(Schema.StringFromHex)("68656c6c6f")       // "hello"
+Schema.decodeSync(Schema.StringFromUriComponent)("hello%20world") // "hello world"
+Schema.encodeSync(Schema.StringFromUriComponent)("hello world")   // "hello%20world"
+
+// Uint8Array variants via declare + Transformation:
+import { SchemaTransformation } from "effect"
+const BytesFromBase64 = Schema.String.pipe(
+  Schema.decodeTo(Schema.Uint8Array, SchemaTransformation.uint8ArrayFromBase64String)
+)
+Array.from(Schema.decodeSync(BytesFromBase64)("AQID")) // [1, 2, 3]
+Schema.encodeSync(BytesFromBase64)(new Uint8Array([1, 2, 3])) // "AQID"
+```
+
+The reversible siblings follow naming: `StringFromBase64` ↔ `StringFromBase64Url` ↔ `StringFromHex` ↔ `StringFromUriComponent` for `string ↔ string`; `Uint8Array` pairs use `SchemaTransformation.uint8ArrayFromBase64String` etc., or roll `SchemaTransformation.stringFromBase64String` when the desired decoded shape is itself a `string`.
+
+### `FormData` & `URLSearchParams`
+
+Both serializers operate via `StringTree` (`Tree<string | undefined>`) — the canonical string-leaf codec where every leaf becomes a string or `undefined` for absent leaves. StringTree preserves shape (`NaN` → `"NaN"`, `Infinity` → sentinel strings) and is built via `Schema.toCodecStringTree`.
+
+```ts title="src/form-serializers.ts"
+import { Schema } from "effect"
+
+// Schema defined in domain types
+const Pagination = Schema.Struct({
+  page: Schema.Finite.check(Schema.isGreaterThan(0)),
+  perPage: Schema.Finite.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
+  q: Schema.optionalKey(Schema.String)
+})
+
+// URLSearchParams ↔ Pagination via StringTree as the leaf codec
+// URLSearchParams(StringTree) → StringTree parsing collapses via bracket-path logic on decode
+const Search = Schema.fromURLSearchParams(Schema.toCodecStringTree(Pagination))
+// Equivalently, bypassing StringTree derivation:
+// const Search2 = Schema.fromURLSearchParams(Pagination) // also accepted — schema is internally wrapped
+
+const params = new URLSearchParams({ page: "2", perPage: "20", q: "ada" })
+Schema.decodeSync(Search)(params) // { page: 2, perPage: 20, q: "ada" }
+Schema.encodeSync(Search)({ page: 2, perPage: 20, q: "ada" }) // URLSearchParams { page: "2", perPage: "20", q: "ada" }
+
+// FormData ↔ domain via same shape
+const Form = Schema.fromFormData(Schema.toCodecStringTree(Pagination))
+const fd = new FormData()
+fd.append("page", "1")
+fd.append("perPage", "50")
+Schema.decodeSync(Form)(fd) // { page: 1, perPage: 50 }
+
+// Nested shapes via bracket-path: FormData key `user[name]` → { user: { name: ... } }
+const Nested = Schema.Struct({ user: Schema.Struct({ name: Schema.String }) })
+const NestedForm = Schema.fromFormData(Schema.toCodecStringTree(Nested))
+const fd2 = new FormData()
+fd2.append("user[name]", "Ada")
+Schema.decodeSync(NestedForm)(fd2) // { user: { name: "Ada" } }
+```
+
+:::tip[StringTree round-trips]
+`StringTree` preserves JSON-non-representable leaves (`NaN`, `Infinity`, `BigInt` as strings) that `Json` would merge or lose. Prefer `StringTree` for `FormData`/`URLSearchParams` boundaries; prefer `Json` (`toCodecJson`) for canonical JSON storage and `HttpApi` bodies.
+:::
+
+## Canonical codecs deep dive
+
+Three derivations produce *canonical* encodings for any schema — they ignore current `E`, re-derive it from structure and declaration hooks:
+
+| Derivation | Encoded `E` | Informal meaning | Typical use |
+|---|---|---|---|
+| `Schema.toCodecJson(schema)` | `Json` | canonical JSON value | storage, HttpApi bodies, `fromJsonString` inner codec |
+| `Schema.toCodecStringTree(schema)` | `StringTree` | every leaf is `string \| undefined` | forms, query strings, Config stringification |
+| `Schema.toCodecIso(schema)` | `Iso` | mid-representation isomorphism type | internal round-tripping / differ plumbing |
+| `Schema.toIso(schema)` | `Optic.Iso<T, Iso>` | optic over `Type ↔ Iso` | lens composition |
+| `Schema.toCodecArrayFromSingle(schema)` | array grouping helper | wraps single value as 1-element array | batch APIs |
+
+Notes on derivation:
+
+- Derivation **does not run transformations** — annotation links may be async and require services; the caller's parser decides execution mode.
+- Links cannot broaden service requirements beyond the input schema's `RD`/`RE` — the hooks are *not* allowed to widen the returned services. If your `toCodecJson` for a declaration needs a service, that service must already be declared on the schema.
+- Checks remain on the **source** node after an artificial link is added — source validation still runs after transformation canonicalization.
+
+```ts title="src/canonical-codecs.ts"
+import { Schema } from "effect"
+
+const Person = Schema.Struct({ name: Schema.String, age: Schema.Finite })
+
+// Json branch — falls back to `unknownToJson` for declarations lacking a hook
+const AsJson = Schema.toCodecJson(Person)
+// AsJson: Codec<Person, Json>
+Schema.encodeSync(AsJson)({ name: "Ada", age: 30 }) // → { name: "Ada", age: 30 } as Json
+
+// StringTree branch — every leaf canonicalized as string
+const AsTree = Schema.toCodecStringTree(Person)
+// AsTree: Codec<Person, StringTree>
+Schema.encodeSync(AsTree)({ name: "Ada", age: 30 }) // → { name: "Ada", age: "30" } StringTree
+
+// Iso — round-trip identity
+const AsIso = Schema.toCodecIso(Person)
+// AsIso: Codec<Person, Iso>  where Iso = Person.Type in this case (no internal divergence)
+```
+
+Custom declarations decide what each branch means by returning per-branch links — the StringTree leaf example from earlier generalizes:
+
+```ts title="src/custom-canonical.ts"
+import { Schema, SchemaGetter } from "effect"
+
+type Secret = string & { readonly _brand: "Secret" }
+const Secret = Schema.declare<Secret>(
+  (u): u is Secret => typeof u === "string",
+  {
+    // In canonical Json     — still a string
+    toCodecJson: () => Schema.String as any,
+    // In canonical StringTree — also a string (leaf already canonical)
+    toCodecStringTree: () => Schema.String as any,
+    // Iso — identity
+    toCodecIso: () => Schema.link<Secret>()(Schema.String as any, {
+      decode: SchemaGetter.transform((s) => s as Secret),
+      encode: SchemaGetter.transform((s) => s as string)
+    }) as any
+  } as any
+)
+```
+
+## Generation & tooling
+
+The same AST that drives decoding also drives synthesis. These helpers derive *new* artifacts deterministically:
+
+### `toJsonSchemaDocument`
+
+```ts title="src/json-schema.ts"
+import { Schema } from "effect"
+
+const Person = Schema.Struct({
+  name: Schema.NonEmptyString,
+  age: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 150 })),
+  email: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[^\s@]+@[^\s@]+$/))),
+  role: Schema.Literals(["admin", "member"])
+})
+
+const doc = Schema.toJsonSchemaDocument(Person)
+// doc.schema      — JSON Schema 2020-12 root
+// doc.definitions — shared $defs
+
+// Particulars:
+// - Checks emit JSON constraints: isMinLength → minLength, isPattern → pattern, isBetween → minimum/maximum
+// - Unions order by canonical priority (BigInt/Symbol first) for deterministic output
+// - Starlight-friendly: feed doc.definitions into $defs
+
+// Also exists as Standard JSON Schema adapter:
+const std = Schema.toStandardJSONSchemaV1(Person)
+// std["~standard"].jsonSchema.input({ target: "draft-2020-12" })
+// std["~standard"].jsonSchema.output({ target: "draft-07" })
+```
+
+Collection-level checks (`isUnique`, `isMinLength` on arrays etc.), key transforms, and exclusive union `mode: "oneOf"` all round-trip into the schema document with the same dialect choice.
+
+### `toEquivalence`
+
+```ts title="src/equivalence.ts"
+import { Schema } from "effect"
+
+const Point = Schema.Struct({ x: Schema.Finite, y: Schema.Finite })
+const eq = Schema.toEquivalence(Point)
+// Equivalence<Point>: uses structural equality for objects/arrays/Maps/Sets (v4 default), delegates to declaration hooks otherwise
+
+eq({ x: 1, y: 2 }, { x: 1, y: 2 }) // true
+eq({ x: 1, y: 2 }, { x: 1, y: 3 }) // false
+
+// Annotate custom equivalence:
+const Angled = Schema.Struct({ id: Schema.String })
+const withCustomEq = Schema.toEquivalence(Angled)
+// or via override: Angled.pipe(Schema.overrideToEquivalence(() => Equivalence.string))
+```
+
+### `toFormatter`
+
+```ts title="src/formatter.ts"
+import { Schema } from "effect"
+
+const Person = Schema.Struct({ name: Schema.String, age: Schema.Finite })
+const fmt = Schema.toFormatter(Person)
+fmt({ name: "Ada", age: 30 })
+// '{ name: "Ada", age: 30 }'  (Option → some(...)/none(), Maps/Sets/Chunk/HashMap/HashSet specialized)
+
+const WithHook = Schema.String.pipe(
+  Schema.overrideToFormatter(() => (s) => `<<${s}>>`)
+)
+```
+
+### `toIso` / `toIsoSource` / `toIsoFocus`
+
+```ts title="src/iso.ts"
+import { Schema } from "effect"
+
+const Person = Schema.Struct({ name: Schema.String, age: Schema.Finite })
+const iso = Schema.toIso(Person) // Optic.Iso<Person, Iso>
+const source = Schema.toIsoSource(Person) // Iso over Type → Type (structural)
+const focus = Schema.toIsoFocus(Person) // Iso over Iso → Iso
+```
+
+### `toDifferJsonPatch`
+
+Builds `Differ<T, JsonPatch>` — a bidirectional patch functor useful for CRDT / collaborative state / change streaming:
+
+```ts title="src/differ.ts"
+import { Schema } from "effect"
+
+const State = Schema.Struct({
+  name: Schema.String,
+  count: Schema.Finite
+})
+
+const differ = Schema.toDifferJsonPatch(State)
+// Differ<State, JsonPatch.JsonPatch>
+// differ.diff(old, next) → patch
+// differ.patch(patch)(old) → next    // combine is patch composition
+// Differ consumes Structural Patch representation — pair with HttpApi / Sync primitives
+
+// Also available as generic Differ derivation for non-Json patches on same schema through toDiffer if applicable
+```
+
+### `toStandardSchemaV1` — cross-library interop
+
+Covered in the prior chapter's runners section; its generated proxy honors async checks and required services: the fast path is sync when the codec needs none.
+
+### Generation via arbitrary hooks
+
+Arbitrary (test-data) generation from a schema flows via the pair (`toCodecArbitrary`, `toArbitrary` annotations) in declarations and leaf nodes — wiring a codec's shape into `fast-check` combinators. For built-ins, generators respect checks (`isBetween` → bounded range); for declared parametric constructors, the `toCodecArbitrary` link selects the appropriate member generators. The driver API lives beside the declaration mechanism (declare the `arbitrary` annotation per schema); upstream convention is to call `fc.assert` over generated samples derived from your domain schemas — shared codecs mean shared corpus.
+
+:::tip[One schema, many contexts]
+Define `User` as a `Class` with `TaggedError` failures once; then derive from it: wire + storage codecs via `toCodecJson`, mocks via `toArbitrary`, docs via `toJsonSchemaDocument`, human output via `toFormatter`, change sync via `toDifferJsonPatch`, and platform errors via `httpApiStatus`. The domain is the dependency.
+:::
+
+## End-to-end runnable: annotated classes
+
+A self-contained module that will typecheck and run under `effect@4.0.0-rc.*`, demonstrating constructors, extension, tagging, whole-class invariants, error status annotation, serialization, and generation — one file to keep open while building your next boundary.
+
+```ts title="src/classes-demo.ts"
+import { Effect, Option, Result, Schema, SchemaGetter, SchemaIssue, SchemaTransformation } from "effect"
+
+// — Domain —
+
+class Address extends Schema.Class<Address>("Address")({
+  street: Schema.NonEmptyString,
+  city: Schema.NonEmptyString,
+  zip: Schema.String.check(Schema.isPattern(/^\d{5}(-\d{4})?$/))
+}) {
+  format() { return `${this.street}, ${this.city} ${this.zip}` }
+}
+
+class User extends Schema.Class<User>("User")({
+  id: Schema.String.pipe(Schema.brand("UserId")),
+  name: Schema.String.pipe(
+    Schema.decode(SchemaTransformation.trim()),
+    Schema.decode(SchemaTransformation.toLowerCase()) as any
+  ).check(Schema.isMinLength(3)) as any,
+  email: Schema.String.check(Schema.isPattern(/^[^\s@]+@[^\s@]+$/)),
+  address: Schema.optionalKey(Address),
+  // default-on-decode field (absent on wire → 0)
+  loginCount: Schema.Finite.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0)))
+}) {
+  greet() { return `Hey ${this.name}` }
+}
+
+// Extend without re-declaring base fields
+class Admin extends User.extend<Admin>("Admin")({
+  level: Schema.Finite.check(Schema.isBetween({ minimum: 1, maximum: 10 }))
+}) {
+  isSuper() { return this.level >= 9 }
+}
+
+// Whole-class check (end-to-end invariant)
+const ValidAdmin = Admin.check(
+  Schema.makeFilter((a) =>
+    a.isSuper() || a.loginCount < 1000 ? undefined : "non-super admins must have loginCount < 1000"
+  )
+)
+
+// — Tagged errors (HTTP-aware) —
+
+class UserNotFound extends Schema.TaggedError<UserNotFound>()(
+  "NotFound",
+  { id: Schema.String },
+  { httpApiStatus: 404 } as any
+) {}
+
+class Forbidden extends Schema.TaggedError<Forbidden>()(
+  "Forbidden",
+  { reason: Schema.String },
+  { httpApiStatus: 403 } as any
+) {}
+
+const AppError = Schema.Union([UserNotFound, Forbidden])
+
+// — Opaque contrast —
+
+class OpaqueUserId extends Schema.Opaque<OpaqueUserId>()(Schema.String) {}
+// No `new OpaqueUserId` — materialize via decode:
+Schema.decodeSync(OpaqueUserId)("u_1") // opaque type at compile time, string at runtime
+
+// — Declaring an existing type so it round-trips through canonical codecs —
+
+class ExternalId {
+  constructor(readonly raw: string) {}
+}
+const isExternalId = (u: unknown): u is ExternalId => u instanceof ExternalId
+const ExternalIdSchema = Schema.declare<ExternalId>(
+  isExternalId,
+  {
+    identifier: "ExternalId",
+    toCodecJson: () =>
+      Schema.link<ExternalId>()(Schema.String, {
+        decode: SchemaGetter.transform((s) => new ExternalId(s)),
+        encode: SchemaGetter.transform((c) => c.raw)
+      }),
+    toJsonSchema: () => ({ type: "string" })
+  } as any
+)
+
+// — Serialization —
+
+const UserJson = Schema.toCodecJson(User) // Codec<User, Json>
+const UserTree = Schema.toCodecStringTree(User) // Codec<User, StringTree>
+const UserFromJsonText = Schema.fromJsonString(User) // Codec<User, string>
+const UserFromUrl = Schema.fromURLSearchParams(UserTree)
+const UserFromForm = Schema.fromFormData(UserTree)
+
+// Base64 field example:
+const TokenPayload = Schema.StringFromBase64 // Codec<string, string>
+
+// — Program —
+
+const program = Effect.gen(function* () {
+  // Make via Class constructor — methods available, validation runs, defaults apply
+  const ada = new User({
+    id: "user_1" as any,
+    name: "  Ada  ", // trimmed + lowercased via Getter pipeline on decode
+    email: "ada@analytic.dev",
+    address: new Address({ street: "10 Analytical Way", city: "London", zip: "12345" })
+  })
+  console.log(ada.greet()) // "Hey ada"
+  console.log(ada.loginCount) // 0 — default materialized
+  console.log(ada instanceof User) // true
+
+  // Encode to canonical Json (round-trips through structural hooks)
+  const json = Schema.encodeSync(UserJson)(ada) as any
+  console.log(json.name) // "ada" — normalized
+
+  // Serialize to JSON string via fromJsonString
+  const jsonText = Schema.encodeSync(UserFromJsonText)(ada)
+  console.log(typeof jsonText) // "string"
+
+  // Back through the text codec
+  const reparsed = Schema.decodeSync(UserFromJsonText)(jsonText)
+  console.log(reparsed instanceof User) // true
+
+  // Wire bypass via URLSearchParams (leaf = string per StringTree) — useful for testing query round-trips
+  const params = Schema.encodeSync(UserFromUrl)(ada) as unknown as URLSearchParams
+  void params
+
+  // FormData round-trip (nested via bracket paths if address present)
+  const form = Schema.encodeSync(UserFromForm)(ada) as unknown as FormData
+  void form
+
+  // Tagged error yielding + catching by tag:
+  const risky = (id: string) =>
+    Effect.gen(function* () {
+      if (id !== "u_1") return yield* new UserNotFound({ id })
+      return ada
+    })
+
+  const caught = yield* risky("ghost").pipe(
+    Effect.catchTag("NotFound", (e) => Effect.succeed(`missed ${e.id}`)),
+    Effect.catchTag("Forbidden", (e) => Effect.succeed(`forbidden ${e.reason}`))
+  )
+  console.log(caught) // "missed ghost"
+
+  // Generation artifacts — one call per concerned system:
+  const doc = Schema.toJsonSchemaDocument(User)
+  void doc.definitions // share with docs/OpenAPI shell
+
+  const equivalence = Schema.toEquivalence(User)
+  const fmt = Schema.toFormatter(User)
+  const iso = Schema.toIso(User)
+  const differ = Schema.toDifferJsonPatch(User)
+  // Non-exhaustive but structurally correct assertions that each was derived:
+  console.log(equivalence(ada, reparsed)) // true (structural, per derived Equivalence)
+  console.log(fmt(ada).length > 0) // true
+  console.log(iso.get(ada) === ada as any || typeof iso.get === "function") // optic identity varies if Iso diverges
+
+  // Anonymous checks + path pointers:
+  const bad = Schema.decodeUnknownResult(ValidAdmin)(
+    { id: "user_2", name: "bob", email: "bob@example.com", level: 2, loginCount: 2000 } as any
+  )
+  if (Result.isFailure(bad)) {
+    console.log("whole-class check failed:", bad.failure.message)
+  }
+
+  return ada
+})
+
+Effect.runPromise(program).catch((e) => {
+  // SchemaError is the only expected structured failure from decoders; Tag errors land in the cause too
+  if (Schema.isSchemaError(e)) console.error("schema:", e.message)
+  else console.error(e)
+})
+
+// — Showcase `Tag` / `tagDefaultOmit` constructors (make-only optionality) —
+
+import { Schema as _S } from "effect" // already imported — shown for context reuse
+class Circle extends Schema.TaggedClass<Circle>()("Circle", {
+  radius: Schema.Finite
+}) {
+  area() { return Math.PI * this.radius ** 2 }
+}
+class Rectangle extends Schema.TaggedClass<Rectangle>()("Rectangle", {
+  width: Schema.Finite, height: Schema.Finite
+}) {}
+
+const ShapeUnion = Schema.Union([Circle, Rectangle]).pipe(Schema.toTaggedUnion("_tag"))
+ShapeUnion.match({ _tag: "Circle", radius: 2 } as any, {
+  Circle: (c) => c.area(),
+  Rectangle: (r) => r.width * r.height
+})
+```
+
+## Cheat sheet
+
+| Goal | API |
+|---|---|
+| Method-bearing domain object | `class A extends Schema.Class<A>("A")({ f: Schema.String }) { m() {} }` |
+| Allowed missing keys at construction | use `Schema.optionalKey` + `withConstructorDefault`/`tag` |
+| Subclass with validation reuse | `Base.extend<Child>("Child")({ extra: ... })` |
+| Auto discriminator field | `Schema.TaggedClass<C>()("TagName", { ... })` — adds `_tag` |
+| Whole-class invariant | `MyClass.check(makeFilter((self) => ...))` or `.check(makeFilterGroup([...]))` |
+| Yieldable, catch-by-tag error | `class E extends Schema.TaggedError<E>()("E", { id: Schema.String }, { httpApiStatus: 404 })` |
+| Error union + dispatch | `Schema.Union([E1, E2]).pipe(Schema.toTaggedUnion("_tag"))` or `TaggedUnion({...})` |
+| No-class nominal alias | `class T extends Schema.Opaque<T>()(inner)` |
+| Wrap existing runtime class | `Schema.instanceOf(Date)` / `Schema.declare(predicate, { toCodecJson: ... })` |
+| Parametric existing type | `Schema.declareConstructor<Box<A>>()(( [item]) => ({ predicate, toCodec: ... }))` |
+| JSON text ↔ `T` | `Schema.fromJsonString(schema)` vs `Schema.UnknownFromJsonString` for `unknown` |
+| String leaf serializers | `Schema.StringFromBase64` / `Base64Url` / `Hex` / `UriComponent` |
+| Form / query wiring | `Schema.fromFormData(toCodecStringTree(S))`, `Schema.fromURLSearchParams(toCodecStringTree(S))` |
+| Canonical codecs | `Schema.toCodecJson`, `Schema.toCodecStringTree`, `Schema.toCodecIso`, `Schema.toIso` |
+| Generation | `Schema.toJsonSchemaDocument`, `Schema.toEquivalence`, `Schema.toFormatter`, `Schema.toDifferJsonPatch`, `Schema.toStandardSchemaV1` |
+| Give an error its HTTP status | third arg `{ httpApiStatus: 404 }` on `TaggedError` (`Annotations.Declaration`) |
+
+## Next
+
+<LinkCard
+  title="23 · HTTP Client"
+  description="Fetching with interruption: HttpClient, typed error unions for transport failures, dedup helpers, and putting Schema codecs around every boundary."
+  href="/effect-ts/23-http-client/"
+/>

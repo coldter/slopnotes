@@ -1,0 +1,219 @@
+---
+title: gen & fn — Writing Effect Daily
+description: Effect.gen drives your generator directly; Effect.fn wraps it with tracing and combinators-as-arguments. The idioms, the typing tricks (Effect.fn.Return), this-binding, and the official style rules.
+sidebar:
+  order: 3
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+There are two ways to sequence effects: combinators (`map`, `flatMap`,
+`andThen`…) and generators (`Effect.gen`). Upstream Effect guidance is blunt:
+**write `Effect.gen` / `Effect.fn` bodies, attach behavior with combinators
+around them.** Combinator-only style survives in small pipelines and library
+internals; business logic lives in generators.
+
+## How `Effect.gen` really works
+
+The implementation fits in a paragraph:
+
+```ts
+// simplified from packages/effect/src/internal/effect.ts
+export const gen = (...args) =>
+  suspend(() =>
+    fromIteratorUnsafe(args.length === 1 ? args[0]() : args[1].call(args[0].self))
+  )
+```
+
+On each execution it calls the generator function (fresh iterator), then the
+runtime drives `iterator.next(value)` manually: execute the yielded Effect;
+on success feed `A` back via `next(a)`; on failure resume so the `yield*`
+expression raises the typed error. Because the body function is invoked per
+execution, `gen` effects are trivially re-runnable, and there is no nesting —
+delegation flattens at the iterator level.
+
+What you may yield (`Y` channel):
+
+| Yieldable | Behavior when yielded |
+|---|---|
+| `Effect` | run it; success feeds back; `E` joins the error channel |
+| `Option<T>` | `Some(t)` yields `t`; `None` fails with `NoSuchElementError` |
+| `Result<E, A>` | success yields `A`; failure fails with its `E` |
+| `Config<T>` | reads config via current provider; failure is `ConfigError` |
+| `Context.Service` class | retrieves the service from context |
+
+Everything else that *used* to be yieldable in v3 (`Ref`, `Deferred`,
+`Fiber`, `Queue`) is a plain value now — call accessors explicitly:
+
+```ts
+const ref = yield* Ref.make(0)
+const value = yield* Ref.get(ref)        // NOT `yield* ref`
+
+const deferred = yield* Deferred.make<string>()
+yield* Deferred.done(deferred, Exit.succeed("done"))
+const msg = yield* Deferred.await(deferred)
+
+const fiber = yield* Effect.forkChild(task)
+const result = yield* Fiber.join(fiber)
+```
+
+Why: in v3 those types were structurally assignable to `Effect`, which made
+"holding a handle" and "having performed the operation" indistinguishable —
+`Effect.all([refA, refB])` would silently *read* refs instead of doing
+whatever you meant. v4's split contract (**Yieldable ≠ assignable**) turns
+that class of bug into a type error.
+
+## The body style
+
+```ts
+import { Effect } from "effect"
+
+class FileProcessingError extends Schema.TaggedError<FileProcessingError>()(
+  "FileProcessingError",
+  { message: Schema.String }
+) {}
+
+const processFile = Effect.gen(function* () {
+  yield* Effect.log("Starting the file processing...")
+  yield* Effect.log("Reading file...")
+  return yield* new FileProcessingError({ message: "Failed to read the file" })
+}).pipe(
+  Effect.catch((error) => Effect.logError(`An error occurred: ${error}`)),
+  Effect.withSpan("fileProcessing")
+)
+```
+
+Two conventions from the official guide baked in there:
+
+1. **Raise errors with `return yield* new SomeError(...)`.** The explicit
+   `return` tells TypeScript control flow ends here — narrowing after a
+   conditional raise works, and the generator's `R` stays accurate.
+2. **Attach cross-cutting behavior via `.pipe` around the gen block**, not
+   inline conditionals — retries, spans, logging annotations wrap the whole
+   unit.
+
+## `Effect.fn` — functions returning effects
+
+The moment you write a function returning an effect, use `Effect.fn`
+instead of a plain arrow around `Effect.gen`:
+
+```ts
+import { Effect } from "effect"
+
+export const getUser = Effect.fn("getUser")(
+  function* (id: string): Effect.fn.Return<User, UserNotFound, Database> {
+    yield* Effect.annotateCurrentSpan({ userId: id })
+    return yield* (yield* Database).findById(id)
+  },
+  // combinators as extra arguments — NOT .pipe
+  Effect.retry({ times: 3 }),
+  Effect.timeout("5 seconds"),
+  Effect.catchTag("UserNotFound", () => Effect.succeed(User.guest))
+)
+```
+
+What `Effect.fn("name")` gives you over `(…args) => Effect.gen(...)`:
+
+- **A tracing span per invocation** named `"getUser"` (it applies
+  `Effect.withSpan` internally), plus synthetic stack frames pairing the
+  definition site with the call site — production stack traces that make
+  sense.
+- **Combinators applied per call**: trailing arguments receive
+  `(effect, ...originalArgs)`, so retry/timeout/error-mapping wrap *every*
+  invocation with the right arguments in scope.
+- **Correct arity**: the produced function preserves its parameter count.
+- A body that can be a generator *or* a bare Effect.
+
+Without a name argument, `Effect.fn(body)` still improves stack traces (frame
+boundary) but creates no span. Use the named form for anything crossing a
+service boundary.
+
+### `Effect.fn.Return`
+
+Notice the body's return annotation:
+
+```ts
+function* (id: string): Effect.fn.Return<User, UserNotFound, Database> {
+```
+
+`Effect.fn.Return<A, E, R>` expands to
+`Generator<Effect<any, E, R>, A, any>` — it annotates what the *generator
+body returns* while leaving the produced function's full
+`Effect<User, UserNotFound, Database>` inferred. Use it when inference alone
+is ambiguous or when you want explicit signatures on exported APIs. It
+accepts the same type parameters as `Effect.Effect`.
+
+:::tip[Siblings]
+`Effect.fnUntraced(body, ...combinators)` — same shape without span/frame
+machinery, for hot inner helpers where tracing overhead matters.
+:::
+
+## `this` binding
+
+Classes holding generator methods bind `self` via an options object (v3's
+bare `Effect.gen(this, ...)` is gone):
+
+```ts
+import { Effect } from "effect"
+
+class Cart {
+  items: Array<string> = []
+
+  add = Effect.gen({ self: this }, function* () {
+    self.items.push("apple") // `this` correctly bound
+    return self.items.length
+  })
+}
+```
+
+That said, the idiomatic v4 shape for stateful components isn't classes with
+generator methods — it's services built in layers (next parts), closing over
+private state.
+
+## Control flow is just JavaScript
+
+Inside a generator body you use normal statements — `if`, `for`, `while`,
+`try/catch`, destructuring — against values you've already unwrapped:
+
+```ts
+const checkout = Effect.fn("checkout")(function* (cartId: string) {
+  const cart = yield* store.get(cartId)
+  if (cart.items.length === 0) {
+    return yield* new EmptyCartError({ cartId })
+  }
+  for (const item of cart.items) {
+    yield* inventory.reserve(item.sku, item.qty)
+  }
+  try {
+    return yield* payments.charge(cart.total)
+  } catch {
+    // prefer typed errors over raw try/catch in real code — shown for familiarity
+    return yield* new PaymentDeclinedError({ cartId })
+  }
+})
+```
+
+v3's loop helpers (`Effect.loop`, `Effect.iterate`, `while`-style combinators)
+are **removed** in v4 — write the loop yourself. The generator *is* the loop
+construct now.
+
+## Style checklist (from the upstream AGENTS.md)
+
+1. Prefer `Effect.gen`; use `Effect.fn("name")` for any exported
+   effect-returning function; never hand-roll `() => Effect.gen(...)`.
+2. Always `return` when raising an error inside a gen body.
+3. Attach behavior with `.pipe` (for standalone effects) or trailing
+   arguments (inside `Effect.fn`) — don't mix `.pipe` onto `Effect.fn`
+   results; pass combinators in.
+4. Name spans after functions; annotate with request-scoped facts
+   (`annotateCurrentSpan`).
+5. Define domain errors with `Schema.TaggedError` — they're decodable,
+   loggable, HTTP-mappable, and catchable by `_tag`.
+
+## Next
+
+<LinkCard
+  title="04 · Building Effects"
+  description="The constructor and combinator toolbox: succeed/fail/sync/try/callback, map/flatMap/tap families, zip/all/forEach, and pipe."
+  href="/effect-ts/04-building-effects/"
+/>

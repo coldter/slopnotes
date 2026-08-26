@@ -1,0 +1,530 @@
+---
+title: Fibers & Structured Concurrency
+description: The fiber as Effect's unit of concurrency — fork family with options, join/interrupt/await and Exit, cooperative interruption, structured child lifetimes, forkDetach escape hatch, races that clean up their losers, Deferred rendezvous, and bounded concurrency with semaphores.
+sidebar:
+  order: 13
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+A **fiber** is a running instance of an Effect: a lightweight, cancellable,
+observable execution with its own context and its own scope. Where `Promise`
+gives you a fire-and-forget token you can only `await` or forget, a fiber is a
+first-class handle you can join, interrupt, inspect, and attach to lifetimes.
+
+If you know Go: fibers are goroutines without preemption but *with* structured
+lifetimes. If you know Node: they are what `Promise` should have been — the
+same single-threaded cooperative scheduling model, but cancellation actually
+works and concurrency trees don't leak.
+
+## The mental model
+
+| Aspect | JS `Promise` | Go goroutine | Effect fiber |
+|---|---|---|---|
+| Created by | calling an async fn eagerly | `go f()` | `yield* Effect.forkChild(task)` |
+| Runs on | event loop | M:N OS threads | event loop (cooperative) |
+| Result access | `.then` / `await` | channel / shared memory | `Fiber.join` / `Fiber.await` |
+| Cancellation | none (only ignore) | `context.Context` convention | `Fiber.interrupt` — real, propagated |
+| Cleanup on cancel | none | `defer` + ctx checks | finalizers always run |
+| Lifetime | unattached ("floating") | unattached | attached to parent scope by default |
+| Errors | rejected with anything | panic/crash process | typed `E`, captured in `Exit` |
+| Observability | none | runtime traces | `Fiber.getCurrent`, spans, supervision |
+
+Two facts anchor everything else:
+
+1. **Fibers are cooperative.** A fiber only suspends or observes interruption at
+   yield points — every `yield*` of an Effect, every async boundary. Pure sync
+   stretches between checkpoints run to completion.
+2. **Fibers are structured.** `forkChild` attaches the new fiber to the parent
+   fiber's scope. When the parent terminates — normally, with failure, or by
+   interruption — children are interrupted too, and the parent's completion
+   waits for them to finish their finalizers. Upstream calls this "auto
+   supervision"; it is the same guarantee scoped resources gave you in
+   [chapter 12](/effect-ts/12-scopes-resources/), applied to concurrent work.
+
+That second fact is why Effect programs don't leak tasks the way floating
+promises do: concurrency forms a tree, and closing a subtree closes everything
+underneath it.
+
+## The fork family
+
+v4 renamed and consolidated forking. One options object across the family:
+
+```ts
+{
+  readonly startImmediately?: boolean   // run now vs enqueue after current message
+  readonly uninterruptible?: boolean | "inherit"
+}
+```
+
+| Function | Attaches to | Removed from R? | Use when |
+|---|---|---|---|
+| `Effect.forkChild(task)` | parent fiber's scope | — | default choice; dies with parent |
+| `Effect.forkScoped(task)` | current `Scope` (adds `Scope` to R) | no | lifetime = surrounding scope, not parent fiber |
+| `Effect.forkIn(task, scope)` | explicit scope you hold | no | request/session-scoped background work |
+| `Effect.forkDetach(task)` | global scope | — | true fire-and-forget; see cautions below |
+
+All return `Effect<Fiber<A, E>>` — forking never runs the task inline; you get
+the handle immediately.
+
+:::tip[startImmediately]
+By default a forked fiber is enqueued and begins after the current fiber
+yields. `Effect.forkChild(task, { startImmediately: true })` jumps the queue —
+rarely what you want (it reorders your own program), but useful when forking
+from a hot path that must not delay the child past a deadline. The
+`uninterruptible: "inherit"` option makes the child begin life in the same
+interruptibility region as its parent; the default is that children start
+interruptible.
+:::
+
+```ts
+import { Effect, Fiber } from "effect"
+
+const program = Effect.gen(function* () {
+  const child = yield* Effect.forkChild(fetchUser("42"))
+  const result = yield* Fiber.join(child)   // wait, propagate errors
+  return result
+})
+```
+
+:::note[v3 renames]
+`fork` → `forkChild`. `forkDaemon` → `forkDetach`. `forkIn`/`forkScoped`
+unchanged. `forkAll` is removed — use `Effect.forEach(tasks, Effect.forkChild)`
+plus `Fiber.joinAll` instead. `daemonChildren`/`Effect.disconnect` are gone;
+the only escape hatch is explicitly detaching at fork time.
+:::
+
+The difference between `forkChild` and `forkScoped` matters when the fork site
+is inside a function whose own fiber ends before the work should:
+
+- `forkChild` ties work to the *caller's fiber*: if the caller returns early,
+  the child is interrupted.
+- `forkScoped` ties work to the *surrounding scope*: the effect that forked can
+  complete while the child keeps running, until the enclosing
+  `Effect.scoped` block closes.
+
+## Joining, awaiting, interrupting
+
+The `Fiber` module exposes safe, Effect-based operations (fibers themselves are
+plain values in v4 — not yieldable):
+
+| Operation | Type | Behavior |
+|---|---|---|
+| `Fiber.join(fiber)` | `Effect<A, E>` | Wait for completion; success feeds back, failure fails, interruption interrupts the joiner |
+| `Fiber.await(fiber)` | `Effect<Exit<A, E>>` | Wait without propagating — you get the full `Exit` to inspect |
+| `Fiber.interrupt(fiber)` | `Effect<void>` | Signal interruption; returns once the fiber has finished its finalizers |
+| `Fiber.joinAll(fibers)` | joins an iterable of fibers | all must succeed |
+| `Fiber.interruptAll(fibers)` | interrupt many | waits for each to settle |
+| `Fiber.getCurrent()` | `Fiber \| undefined` | the current fiber, if any (sync, not an Effect) |
+
+`join` vs `await` is the "propagate or inspect" split. `await` returning an
+`Exit` is your tool for supervisory code — collect outcomes from a fleet of
+workers without letting one failure kill the supervisor:
+
+```ts
+import { Effect, Exit, Fiber } from "effect"
+
+const supervise = Effect.fn("supervise")(function* (jobs: Array<Effect.Effect<string>>) {
+  const fibers = yield* Effect.forEach(jobs, Effect.forkChild, { concurrency: "unbounded" })
+  const exits = yield* Effect.forEach(fibers, Fiber.await, { concurrency: "unbounded" })
+  const failed = exits.filter(Exit.isFailure)
+  if (failed.length > 0) yield* Effect.logWarning(`${failed.length} jobs failed`)
+  return exits.filter(Exit.isSuccess).map((e) => e.success)
+})
+```
+
+Interruption deserves its own section, because it is where Effect diverges
+sharply from both promises and raw `AbortController`.
+
+## Interruption mechanics
+
+Calling `Fiber.interrupt(fiber)` doesn't throw anything at the target. It sets
+a flag; the target notices at its **next checkpoint** (each yielded effect) and
+begins an orderly shutdown:
+
+1. The interrupted point behaves like a special failure — visible in the
+   `Cause` as an interrupt marker (see [chapter 6](/effect-ts/06-cause-exit/)).
+2. **Finalizers always run**, uninterruptibly, in LIFO order — scopes close,
+   `acquireRelease` releases, `onInterrupt` handlers fire.
+3. The fiber's *own* children are interrupted and waited for first
+   (structured teardown, bottom-up).
+4. Only then does the fiber report itself terminated. `Fiber.interrupt`
+   resolving means cleanup has *completed*, not merely been requested.
+
+This gives you what `AbortController` cannot: cancellation with guaranteed,
+ordered cleanup, even mid-`await`.
+
+### Where the checkpoints actually are
+
+Interruption latency equals distance-to-next-checkpoint, so know where they
+are:
+
+- Every `yield* someEffect` is a potential checkpoint — the runtime consults
+  the interrupt flag between operations.
+- Async boundaries (`Effect.promise`, `Effect.tryPromise`, sleeping) are
+  natural suspension points.
+- Long *synchronous* stretches inside one effect (a big `Effect.sync(() =>
+  heavyLoop())`) contain **zero** checkpoints — the fiber cannot be
+  interrupted until it yields. Split CPU-heavy sync work into chunks, or tune
+  the runtime's operation budget so long generator loops yield to the
+  scheduler ([chapter 14](/effect-ts/14-references/) covers
+  `Scheduler.MaxOpsBeforeYield`).
+- Inside `Effect.uninterruptible`, flags accumulate but nothing happens — by
+  design.
+
+The practical consequence: cancellation in Effect is *prompt but not
+instantaneous*, and you control the granularity.
+
+### Uninterruptible regions
+
+Some code must not be abandoned halfway — resource acquisition, multi-step
+state transitions, flush-on-shutdown. Wrap such regions:
+
+```ts
+const checkpoint = Effect.gen(function* () {
+  yield* Effect.sync(() => file.seek(0))          // interruptible
+  yield* Effect.uninterruptible(
+    Effect.gen(function* () {
+      yield* writeHeader(file)
+      yield* writePayload(file)
+      yield* writeChecksum(file)
+    })
+  )                                                // atomic: all or nothing
+  yield* Effect.sync(() => file.flush())           // interruptible again
+})
+```
+
+Inside an uninterruptible region the interrupt flag still gets set — it simply
+isn't acted upon until the region ends (unless you opt out entirely with
+`uninterruptibleMask((restore) => ...)` / `interruptibleMask`, which hand you a
+function to selectively restore interruptibility inside).
+
+:::caution[Don't make everything uninterruptible]
+An uninterruptible region containing an infinite loop is an uncancellable
+fiber. Keep regions small and side-effect-focused. If you need a timeout to be
+*enforceable*, the timed effect must contain interruptible checkpoints —
+`Effect.timeout` works by interrupting the loser.
+:::
+
+## Structured concurrency in practice
+
+Because `forkChild` binds children to the parent's scope, this program cannot
+leak work:
+
+```ts
+import { Effect } from "effect"
+
+const program = Effect.gen(function* () {
+  yield* Effect.forkChild(Effect.forever(Effect.log("background")))  // never-ending!
+  return "done"
+})
+
+await Effect.runPromise(program) // resolves; the "background" fiber was interrupted
+```
+
+The main fiber finishes → its scope closes → the forever-child is interrupted
+→ its finalizers run → the process exits cleanly. Compare to a floating
+`setInterval` promise in vanilla Node, which keeps the loop alive silently.
+
+Waiting semantics, precisely: a parent fiber **waits for all its children to
+complete before completing itself**. Even if you never call `join`, the parent
+cannot report termination until children have settled. If you want the opposite
+— proceed without waiting but still bound the lifetime — that's exactly
+`forkScoped` inside a longer-lived scope, or `Effect.awaitAllChildren(effect)`
+to force waiting at a chosen point.
+
+### The escape hatch: `forkDetach`
+
+Sometimes you genuinely want work to outlive the spawning fiber: metrics
+reporting, cache warming, a crash reporter that must survive the failing
+request that spawned it. `forkDetach` attaches the fiber to the **global
+scope** — nothing local will ever interrupt it:
+
+```ts
+import { Effect } from "effect"
+
+const fireAndForget = Effect.gen(function* () {
+  yield* Effect.forkDetach(uploadCrashDump(payload))
+})
+```
+
+Dangers, stated plainly:
+
+- A detached fiber is **uncancellable from your application code**. Nothing
+  short of process exit stops it. Long-running detached loops accumulate.
+- Detached fibers' failures vanish into the void unless you observe them
+  (`Fiber.await` somewhere, or log inside the task).
+- Every legitimate use has a safer shape: tie the work to a service layer's
+  scope (`Layer.launch`), or `forkIn(appScope)` where `appScope` closes on
+  shutdown.
+
+Treat `forkDetach` like `void promise` in strict lint configs: legal, rare,
+and worth a comment explaining why nothing should ever stop this work.
+
+<Mermaid title="Fiber tree: structured lifetimes vs detach" height={380} code={`
+flowchart TD
+  subgraph mainScope["main fiber scope"]
+    M["main fiber<br/>Effect.scoped(...)"]
+    M --> W1["worker₁ (forkChild)<br/>dies with parent"]
+    M --> W2["worker₂ (forkChild)"]
+    W2 --> G["grandchild (forkChild)"]
+    M -.->|"forkIn(reqScope)"| B["request job"]
+  end
+  subgraph reqScope["request scope (closes early)"]
+    B
+  end
+  D["detached fiber (forkDetach)<br/>global scope — outlives everything"]:::danger
+  M -->|"parent completes:<br/>interrupt children,<br/>wait for finalizers"| X["scope Closed"]
+  W1 -.-> X
+  W2 -.-> X
+  G -.-> X
+  classDef danger stroke:#b91c1c,color:#b91c1c
+`} />
+
+## Racing: losers get cleaned up automatically
+
+`race` runs two effects concurrently; the first to **complete** wins, and the
+loser is interrupted — which, per the mechanics above, means its finalizers
+run before `race` reports the winner:
+
+```ts
+import { Effect } from "effect"
+
+const fastest = Effect.race(primarySource, fallbackSource)
+
+// with an observer on the winning fiber
+const loggedRace = Effect.race(primarySource, fallbackSource, {
+  onWinner: ({ fiber }) => Effect.sync(() => console.log("winner", fiber)).pipe(Effect.asVoid)
+})
+```
+
+Variants worth knowing:
+
+| Combinator | Semantics |
+|---|---|
+| `Effect.race(a, b, opts?)` | first to complete (success **or** failure) wins; loser interrupted |
+| `Effect.raceAll([...])` | first success wins; all losers interrupted; fails only if *all* fail |
+| `Effect.raceAllFirst([...])` | first completion of any kind wins |
+| `Effect.raceFirst(a, b)` | like `race` but first *completion* (incl. failure) decides |
+| `Effect.timeout(eff, d)` | loser-by-clock: fails with `Cause.TimeoutError` after `d` |
+| `Effect.timeoutOption(eff, d)` | timeout surfaces as `Option.none()` instead of an error |
+
+Since timeouts interrupt, a timed-out DB query releases its connection —
+provided acquisition went through `acquireRelease` on some scope the query
+runs in. This is the payoff of chapters 12 + 13 compounding: **cancellation
+and cleanup compose**, so racing and timing out remote calls is safe by
+default rather than a resource-leak hazard.
+
+:::tip[Virtual time]
+Under `TestClock`, `Effect.sleep` durations are adjustable — race/timeout logic
+is testable deterministically without wall-clock sleeps. See
+[chapter 17](/effect-ts/17-schedule/).
+:::
+
+## Deferred: one-shot rendezvous
+
+`Deferred<A, E>` is a promise-like cell that one party completes and any number
+of parties await. In v4 it is a plain value (not yieldable); construction and
+completion go through explicit accessors:
+
+```ts
+import { Deferred, Effect, Exit } from "effect"
+
+const deferred = yield* Deferred.make<string, MyError>()  // Effect-returning constructor
+// or synchronously: Deferred.makeUnsafe<string>()
+
+yield* Deferred.await(deferred)                 // suspend until completed
+const first = yield* Deferred.succeed(deferred, "hi")  // => true
+const second = yield* Deferred.succeed(deferred, "again") // => false — already done
+```
+
+Completion API: `succeed`, `fail`, `failCause`, `die` (+ `*Sync` variants),
+`done(d, exit)` / dual `done(exit)(d)` from an existing `Exit`, `complete(d,
+effect)` (run an effect once, share result), `completeWith` (store the effect —
+each awaiter may run it), and unsafe variants (`makeUnsafe`, `doneUnsafe`) for
+sync contexts. All the safe completions return `boolean`: did *this call* win
+the race to complete?
+
+The classic pattern: a worker computes asynchronously; the orchestrator needs
+a rendezvous point that isn't tied to the worker fiber's own result channel.
+
+```ts
+import { Deferred, Effect, Fiber, Schema } from "effect"
+
+class RenderError extends Schema.TaggedError<RenderError>()(
+  "RenderError",
+  { stage: Schema.String }
+) {}
+
+const renderReport = Effect.fn("renderReport")(function* (docId: string) {
+  const done = yield* Deferred.make<string, RenderError>()
+
+  const worker = yield* Effect.forkScoped(
+    Effect.gen(function* () {
+      const html = yield* render(docId)
+      yield* Deferred.succeed(done, html)
+    }).pipe(
+      Effect.catchAll((error) => Deferred.fail(done, error)),
+      Effect.onInterrupt(() => Deferred.interrupt(done))
+    )
+  )
+
+  // main path can do other setup meanwhile...
+  const html = yield* Deferred.await(done)
+  yield* Fiber.interrupt(worker) // no-op if already finished
+  return html
+})
+```
+
+Note the `onInterrupt` bridge: if the worker fiber is interrupted before
+completing, the deferred is interrupted too — otherwise awaiters would hang
+forever. Whenever you hand a `Deferred` across a fiber boundary, decide who
+completes it on *every* exit path. Forgetting that is the fiber-era version of
+an unresolved promise.
+
+## Bounded concurrency: Semaphore
+
+Unbounded `forEach(..., {concurrency: "unbounded"})` against a rate-limited API
+is how you meet your provider's abuse team. `Semaphore.make(permits)` builds a
+counting semaphore; `withPermits` brackets effects with permit acquire/release
+(released on every exit path, including interruption):
+
+```ts
+import { Effect, Semaphore } from "effect"
+
+const program = Effect.gen(function* () {
+  const sem = yield* Semaphore.make(10)                       // max 10 in flight
+
+  yield* Effect.forEach(
+    userIds,
+    (id) => Semaphore.withPermits(sem, 1)(fetchProfile(id)),
+    { concurrency: "unbounded" }                              // semaphore does the bounding
+  )
+})
+```
+
+The dual/module-level form shown above is sugar over the method form
+(`sem.withPermits(n)(effect)`). Also available: `Semaphore.withPermit` (one
+permit), manual `take`/`release` pairs, `withPermitsIfAvailable` (skip instead
+of queue), `resize` (change total permits), `releaseAll`.
+
+### Per-key limits: PartitionedSemaphore
+
+When the limit is *per entity* rather than global — "max 3 concurrent jobs per
+tenant" — v4 ships `PartitionedSemaphore`: one shared permit pool, partitioned
+by key, with round-robin fairness across partitions:
+
+```ts
+import { Effect, PartitionedSemaphore } from "effect"
+
+const sem = yield* PartitionedSemaphore.make({ permits: 100 })
+
+yield* Effect.forEach(jobs, (job) =>
+  PartitionedSemaphore.withPermits(sem, job.tenantId, 3)(processJob(job))
+)
+```
+
+Total permits stay capped at 100 across all tenants, each tenant's concurrent
+jobs cap at 3, and no tenant can starve another (the release loop walks
+partitions fairly). This replaces a whole genre of hand-rolled
+`Map<key, Semaphore>` bookkeeping.
+
+:::note[Latch for barriers]
+Where semaphores *limit* concurrency, `Latch` coordinates phases: create with
+`Latch.make()`, workers `yield* latch.await` (suspend), the coordinator opens
+it (`latch.open` — wakes everyone, including future waiters), `latch.close`
+re-arms it for the next phase, and `latch.release` wakes only *current*
+waiters without opening. See [chapter 15](/effect-ts/15-queues-pubsub/) for a
+barrier example alongside queues.
+:::
+
+## Inspecting fibers while debugging
+
+Because fibers are values, dev tooling can observe them without disturbing the
+program:
+
+```ts
+import { Effect, Fiber } from "effect"
+
+const deepHelper = Effect.gen(function* () {
+  const current = Fiber.getCurrent()      // sync — undefined outside a fiber
+  if (current) {
+    yield* Effect.log("running inside a fiber")
+  }
+  // ...
+})
+```
+
+`Fiber.getCurrent()` is the hook for libraries that need the ambient fiber
+(specialized loggers, context snapshotting). For heavier diagnosis, remember
+the structural facts from this chapter: a hung program is almost always either
+a fiber parked on a `Deferred`/`Queue.take` nobody completes, or a scope that
+never closes. Log at fork sites and scope boundaries first; the tree shape
+makes the missing edge obvious.
+
+## Keeping the process alive
+
+One operational note that surprises people porting scripts from v3: the core
+runtime installs a reference-counted keep-alive timer while your program runs.
+`Runtime.makeRunMain` (what `NodeRuntime.runMain` uses) holds the host process
+open with a long interval for as long as the main fiber lives — including while
+child fibers it forked are still pending — and clears it when the fiber
+completes. A script that forks background fibers therefore no longer exits
+silently underneath them; either the work finishes or you interrupt it.
+
+Use `NodeRuntime.runMain(program)` for entry points: keep-alive plus signal
+handling plus exit-code mapping from your typed errors. `runPromise` remains
+for embedding Effect inside a larger host (see
+[chapter 29](/effect-ts/29-runtime-integration/)), where *you* own the
+process lifecycle.
+
+## Putting it together: parallel fetch with timeout and cleanup
+
+```ts
+import { Cause, Effect, Exit, Fiber, Schema } from "effect"
+
+class FetchError extends Schema.TaggedError<FetchError>()(
+  "FetchError",
+  { url: Schema.String }
+) {}
+
+const fetchWithTimeout = Effect.fn("fetchWithTimeout")(function* (url: string) {
+  return yield* httpGet(url).pipe(
+    // interruptible by construction: at timeout, this fiber is interrupted
+    // and fails with Cause.TimeoutError
+    Effect.timeout("3 seconds"),
+    Effect.catchIf(Cause.isTimeoutError, () => new FetchError({ url }))
+  )
+})
+
+const dashboard = Effect.fn("dashboard")(function* () {
+  const [user, orders] = yield* Effect.all(
+    [fetchWithTimeout("/user"), fetchWithTimeout("/orders")],
+    { concurrency: "unbounded" }
+  )
+
+  // speculative prefetch: joined later or cleaned up with the scope
+  const prefetch = yield* Effect.forkScoped(fetchWithTimeout("/recommendations"))
+
+  const exit = yield* Effect.exit(Fiber.join(prefetch))
+  if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.failure)) {
+    yield* Effect.logWarning("prefetch failed")
+  }
+
+  return { user, orders }
+}).pipe(Effect.scoped) // prefetched fiber interrupted here if still running
+```
+
+Every concurrent line in that function participates in the same story: racers
+and timeouts interrupt losers, the prefetched fiber dies with its scope, and
+any HTTP resources released through `acquireRelease` unwind LIFO regardless of
+which exit fires.
+
+## Next
+
+<LinkCard
+  title="14 · Context.References: Fiber-Local State"
+  description="FiberRef is gone — v4 unifies fiber-local state with services via Context.Reference: log levels, annotations, scheduler tuning, and request context that flow down fibers and restore on the way up."
+  href="/effect-ts/14-references/"
+/>

@@ -1,0 +1,612 @@
+---
+title: Batching & Caching — RequestResolver
+description: Kill N+1 without hand-rolled DataLoaders. Request.Class declarations, batched resolvers, entry.completeUnsafe with Exit, setDelay/withSpan/withCache tuning, concurrent deduplication, and when to reach for Cache vs resolver caching.
+sidebar:
+  order: 26
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Fetch a list of 20 orders, each referencing a user, then resolve the user for every order. The naive version issues 20 `SELECT`/`fetch` round trips — once per order. Add a second collection with the same users and the total multiplies. The symptom has a name from ORMs onward: **N+1**.
+
+Application-level DataLoader patterns hide the 20 calls behind a cache, but they scatter batching policy (delay window, max batch size, deduplication, parent-span linkage) across every caller. Effect inverts this: batching and caching live **at the data source**, expressed once as a `RequestResolver` over typed `Request.Class` declarations. Callers just write `Effect.forEach(orders, getUserById, { concurrency: "unbounded" })` — the runtime coalesces.
+
+This chapter builds that resolver from scratch, traces its execution, and maps when its built-in cache is enough vs when the broader `Cache` / `RcMap` / `RcRef` layers are the right tool.
+
+:::note[Module paths]
+```ts
+import { Context, Effect, Exit, Layer, Request, RequestResolver, Schedule, Schema, Tracer } from "effect"
+```
+`Request` and `RequestResolver` are stable (`effect` root). Drivers like `SqlResolver` reuse the same mechanism for SQL — keep that in mind when you meet it again in chapter 25's `makeRepository` internals.
+:::
+
+## N+1, illustrated
+
+<Mermaid title="N+1 vs batched" height={360} code={`
+flowchart TB
+  subgraph Naive["Naive — 4 calls, 4 round trips"]
+    direction LR
+    N0["orders[0] → getUser(1)"] --> R0["SELECT WHERE id=1"]
+    N1["orders[1] → getUser(2)"] --> R1["SELECT WHERE id=2"]
+    N2["orders[2] → getUser(1) dup"] --> R2["SELECT WHERE id=1 again"]
+    N3["orders[3] → getUser(3)"] --> R3["SELECT WHERE id=3"]
+  end
+
+  subgraph Batched["Batched — 4 calls, 1 resolver invocation"]
+    direction TB
+    Calls["Effect.forEach [1,2,1,3]<br/>concurrency unbounded"]
+    Calls --> Resolver["RequestResolver.make delay 10ms<br/>entries = [{id:1},{id:2},{id:3}]<br/>deduplicated"]
+    Resolver --> Single["Single lookup:<br/>SELECT WHERE id IN (1,2,3)"]
+    Single --> Complete["completeUnsafe × 3 entries<br/>(dup 1 shares result)"]
+  end
+
+  Naive -. latency × N .-> Batched
+`} />
+
+The runtime promise: **all `Effect.request` calls issued within the same microtask window (up to `setDelay`) are presented to the resolver as one `entries` array — deduplicated by request equality where applicable.** Number of fibers, size of the collection, and duplicate ids collapse into one external call.
+
+## `Request.Class` — model a single lookup
+
+A request class models the *shape of a single external lookup*, including its success, error, and requirement types — the same `A / E / R` triple that `Effect` carries.
+
+```ts title="src/requests.ts"
+import { Schema, Request } from "effect"
+
+export class User extends Schema.Class<User>("User")({
+  id: Schema.Int,
+  name: Schema.String,
+  email: Schema.String
+}) {}
+
+export class UserNotFound extends Schema.TaggedError<UserNotFound>()(
+  "UserNotFound",
+  { id: Schema.Int }
+) {}
+
+class GetUserById extends Request.Class<
+  { readonly id: number },   // payload shape carried by the request value
+  User,                      // A — success
+  UserNotFound,              // E — typed failure
+  never                      // R — requirements (if this lookup itself needs a service)
+> {}
+// usage: new GetUserById({ id: 1 })
+```
+
+| Type param | Meaning | Corresponds to |
+|---|---|---|
+| `Payload` (`{ readonly id: number }`) | data used to perform the lookup — stored in `entry.request` | method arguments |
+| `A` (`User`) | success value returned via `Exit.succeed(user)` | `A` in `Effect<A,E,R>` |
+| `E` (`UserNotFound`) | typed failure returned via `Exit.fail(e)` | `E` in `Effect<A,E,R>` |
+| `R` (`never`) | services the resolver itself needs (DB handle, token) | `R` in `Effect<A,E,R>` — surfaced on `Effect.request` |
+
+Equality and hashing derive from the payload's structural value — two `GetUserById({ id: 1 })` within the same batch deduplicate to one resolver entry when the request class's equality matches (the default for plain-object payloads via structural hashing from chapter 07).
+
+:::tip[Schema.Class vs plain Request.Class]
+Requests backed purely by primitives (`number`, `string`) need no `Schema`. Reach for `Schema.TaggedRequest` (a schema-aware request class) when the payload itself needs validation on the way in — then `Schema.decodeEffect` guards the boundary before batching does its work.
+:::
+
+## `RequestResolver.make` — the batch handler
+
+The resolver is a function over an array of entries. Each entry holds `entry.request` (the `GetUserById` value), `entry.context` (the fiber's `Context` at dispatch time — useful for tracing), and the single method that matters: `entry.completeUnsafe(Exit.succeed(...)/Exit.fail(...))`.
+
+```ts title="src/users-resolver.ts — resolver core (ai-docs/src/05_batching/10_request-resolver.ts:39)"
+import { Context, Effect, Exit, Layer, Request, RequestResolver, Schema, Tracer } from "effect"
+
+export class Users extends Context.Service<Users, {
+  getUserById(id: number): Effect.Effect<User, UserNotFound>
+}>()("app/Users") {
+  static readonly layer = Layer.effect(
+    Users,
+    Effect.gen(function* () {
+      class GetUserById extends Request.Class<{ readonly id: number }, User, UserNotFound, never> {}
+
+      const usersTable = new Map<number, User>([
+        [1, new User({ id: 1, name: "Ada Lovelace", email: "ada@acme.dev" })],
+        [2, new User({ id: 2, name: "Alan Turing", email: "alan@acme.dev" })],
+        [3, new User({ id: 3, name: "Grace Hopper", email: "grace@acme.dev" })]
+      ])
+
+      const resolver = yield* RequestResolver.make<GetUserById>(
+        Effect.fn(function* (entries) {
+          // entries: Array<{ request: GetUserById; context: Context; completeUnsafe(exit) }>
+          for (const entry of entries) {
+            const user = usersTable.get(entry.request.id)
+            const requestSpan = Context.getOption(entry.context, Tracer.ParentSpan)
+            console.log("Request span", requestSpan) // span that issued this specific request
+
+            if (user) {
+              entry.completeUnsafe(Exit.succeed(user))
+            } else {
+              entry.completeUnsafe(Exit.fail(new UserNotFound({ id: entry.request.id })))
+            }
+          }
+        })
+      ).pipe(
+        RequestResolver.setDelay("10 millis"),
+        RequestResolver.withSpan("Users.getUserById.resolver"),
+        RequestResolver.withCache({ capacity: 1024 })
+      )
+
+      const getUserById = (id: number) =>
+        Effect.request(new GetUserById({ id }), resolver).pipe(
+          Effect.withSpan("Users.getUserById", { attributes: { userId: id } })
+        )
+
+      return { getUserById } as const
+    })
+  )
+}
+```
+
+### Dispatch path — what each pipe does
+
+| Step | Symbol | Effect |
+|---|---|---|
+| `RequestResolver.make<GetUserById>(handler)` | batch constructor | handler receives `entries: ReadonlyArray<Entry<GetUserById>>`; must call `completeUnsafe` exactly once per entry |
+| `RequestResolver.setDelay("10 millis")` | temporal window | coalesce all `Effect.request` calls on this resolver issued within 10 ms of the first into one `entries` batch; lower = less latency, higher = larger batches but slower p50 |
+| `RequestResolver.withSpan("Users.getUserById.resolver")` | tracing wrapper | span around the entire resolver invocation + span links for each entry — traces fan-in visually |
+| `RequestResolver.withCache({ capacity: 1024 })` | deduplication cache | LRU of recent results by request key — identical ids reuse the cached `Exit` without re-running the handler; contrasts `Cache` module below |
+| `Effect.request(new GetUserById({id}), resolver)` | per-call dispatch | yield the request value and the resolver; runtime schedules the handler at the next delay boundary |
+
+:::note[`completeUnsafe` is unsafe only in name]
+The method is named `completeUnsafe` because calling it twice or not at all for an entry deadlocks or double-resolves the waiting fiber — the compiler cannot check this. Fail-closed is handled for you only if you forget: the runtime dies the pending fibers when the handler throws, but a forgotten `completeUnsafe` leaves them suspended. `Exit.succeed` / `Exit.fail` / `Exit.failCause` are the only arguments — never throw inside the handler.
+:::
+
+### Why `Effect.request` over a plain function call
+
+Calling `getUserById(1)` that returns `Effect<User, UserNotFound>` directly would execute the external lookup *now*, per call. Wrapping via `Effect.request(new GetUserById({ id }), resolver)` instead gives the runtime the chance to *schedule* the request, not execute it — suspend the fiber, collect siblings, run the resolver once, then resume every fiber with its `Exit`. The caller observes no difference — same `Effect<User, UserNotFound, never>` — only the execution topology changes.
+
+## Deduplication and concurrent coalescing — the demo
+
+The canonical correctness test lives in `ai-docs/src/05_batching/10_request-resolver.ts:82`:
+
+```ts
+export const batchedLookupExample = Effect.gen(function* () {
+  const { getUserById } = yield* Users
+
+  // Four callers, concurrent, two duplicate ids (1, 2)
+  yield* Effect.forEach([1, 2, 1, 3, 2], getUserById, {
+    concurrency: "unbounded"
+  })
+  // The resolver receives ONE batch of 3 entries: [{id:1}, {id:2}, {id:3}]
+  // (duplicates 1 and 2 share the same resolver invocation)
+})
+```
+
+What the runtime does across that call:
+
+1. **Concurrent launch** — `Effect.forEach(..., { concurrency: "unbounded" })` forks fibers for all 5 ids immediately.
+2. **Suspend** — each `Effect.request` suspends its fiber and registers the request with the shared `RequestResolver`'s pending queue. No handler runs yet.
+3. **Boundary** — after the first request plus `setDelay("10 millis")`, the resolver runs with `entries.length === 3` (unique ids). The 2 duplicates are coalesced to existing entries — both fibers wait on the same `Entry` object.
+4. **Complete** — handler calls `completeUnsafe(Exit.succeed(user))` per entry; every fiber awaiting that entry receives the same `Exit`. `user` value is equal by structure (chapter 07's structural default).
+
+Test that the batching happened — instrument `entries.length`:
+
+```ts
+let batches: Array<number> = []
+const resolver = yield* RequestResolver.make<GetUserById>(
+  Effect.fn(function* (entries) {
+    batches.push(entries.length)
+    // ... complete...
+  })
+)
+// after batchedLookupExample: batches === [3]
+```
+
+:::caution[`setDelay` and `concurrency: "unbounded"` are not interchangeable]
+`concurrency: "unbounded"` lets requests be *issued* concurrently — so they reach the resolver's queue within the same window. If you call `Effect.forEach(ids, getUserById)` with `concurrency: 1` (sequential), each `getUserById` completes before the next starts → 5 sequential resolver batches of 1 each. Batching is a concurrency artifact — use unbounded/bounded concurrency on the *consumer*, delay on the *resolver*.
+:::
+
+## Inspecting the parent span — causality in traces
+
+Each entry carries `entry.context` — the `Context` snapshot of the fiber that issued the request. The tracer stores the issuing span as `Tracer.ParentSpan`, an `Option<Span>`:
+
+```ts
+const requestSpan = Context.getOption(entry.context, Tracer.ParentSpan)
+console.log("Request span", requestSpan._tag) // Some(span) when inside a span, None otherwise
+```
+
+`withSpan` on the resolver also creates **span links** — the resolver span links back to every requesting span, so trace viewers render the fan-in (five `Users.getUserById` spans linking into one `Users.getUserById.resolver` span). This is how N+1 regressions become visually obvious: one resolver batch with 200 links is the smoking gun that the forEach loop is batching correctly; 200 resolver spans with 1 link each is the proof it isn't.
+
+## Requests as values: why equality matters
+
+`new GetUserById({ id: 42 })` is a *value*, not a call. Two such values with the same payload are `Equal.equals` — structural equality via `Data`/`Schema` semantics ([07 · Option/Result/Data](/effect-ts/07-option-result-data/)). The resolver's internal pending map keys on that equality, which is what makes deduplication free:
+
+```ts
+const r1 = new GetUserById({ id: 1 })
+const r2 = new GetUserById({ id: 1 })
+
+Equal.equals(r1, r2) // true — same id, same shape
+
+// so the pending queue collapses r1 and r2 to one Entry:
+// forEach [1,2,1] → entries [{id:1}, {id:2}]  (length 2, not 3)
+```
+
+Rules that follow:
+
+1. **Payload minimalism** — if the request class carried `new GetUserById({ id: 1, trace: Date.now() })`, two logically identical lookups with different timestamps would hash differently and *not* dedup. Keep the payload exactly the keys the data source will batch on — `id` for point lookups, `{ query: string; limit: number }` for search.
+2. **Request identity vs fiber identity** — deduplicated entries still have *two* waiting fibers, but they wait on the same `Entry`'s `completeUnsafe`. Both resumes see the same `Exit`; the resolver does not know or care how many fibers were coalesced.
+3. **Non-deduped requests** — use distinct `Request.Class` subclasses when lookups must never collapse. `GetUserById` and `RefreshUserById` with the same `{ id: 1 }` are different request types; different `RequestResolver`s may back them even if they hit the same table.
+
+:::tip[Branded payloads reuse the same hashing]
+Because `UserId = Schema.String.pipe(Schema.brand("UserId"))` still hashes by its string payload, brand has no cost against batching. Two `GetUserById({ id: UserId.make("...") })` dedup correctly — the brand is erased in `Hash`.
+:::
+
+## Batch size, partitioning, and backpressure
+
+A resolver with `setDelay("10 millis")` can accumulate hundreds of ids before the window fires — then the handler must turn `entries: Array<Entry>` into a single external call. Three production knobs:
+
+### 1. Let the DB handle the `IN` list
+
+```ts
+const resolver = yield* RequestResolver.make<GetUserById>(
+  Effect.fn(function* (entries) {
+    const ids = entries.map((e) => e.request.id)
+    // one statement, DB does the index lookup
+    const rows = yield* batchFetchUsers(ids) // SELECT WHERE id IN (...)
+    const byId = new Map(rows.map((u) => [u.id, u]))
+    for (const entry of entries) {
+      const hit = byId.get(entry.request.id)
+      entry.completeUnsafe(hit ? Exit.succeed(hit) : Exit.fail(new UserNotFound({ id: entry.request.id })))
+    }
+  })
+)
+```
+
+This is ideal when the source supports `IN (...)` and the batch is bounded by business invariant (page size, team roster). If `entries.length` can grow unbounded (public crawl, fan-out notifications), partition:
+
+### 2. Partition large batches
+
+```ts
+import { Array as Arr, Effect } from "effect"
+
+const MAX_IN = 200
+
+const resolver = yield* RequestResolver.make<GetUserById>(
+  Effect.fn(function* (entries) {
+    // entries.length may be 2000 — chunk the IN clauses to respect DB limits
+    const chunks = Arr.chunksOf(entries, MAX_IN)
+    for (const chunk of chunks) {
+      const ids = chunk.map((e) => e.request.id)
+      const rows = yield* batchFetchUsers(ids)
+      const byId = new Map(rows.map((u) => [u.id, u]))
+      for (const entry of chunk) {
+        const hit = byId.get(entry.request.id)
+        entry.completeUnsafe(hit ? Exit.succeed(hit) : Exit.fail(new UserNotFound({ id: entry.request.id })))
+      }
+    }
+  })
+)
+```
+
+`Array.chunksOf` is stable; `Effect.forEach(chunks, ..., { batching: true })` variant also exists for ordered reservation.
+
+### 3. Bound the consumer, not just the resolver
+
+If the batch consumer (the `forEach` that issues `Effect.request`s) fires 10,000 requests, resolver batching dedups but still allocates 10,000 suspended fibers. Cap concurrency at the *issuer* to apply backpressure upstream:
+
+```ts
+// issuer-side cap — at most 50 concurrent fibers suspended on requests
+yield* Effect.forEach(allUserIds, getUserById, { concurrency: 50 })
+```
+
+Batching reduces *external* calls; concurrency bounds reduce *in-flight* fibers. Use both.
+
+## Failure modes: per-entry vs per-batch
+
+The resolver API forces a choice that `Promise.all` hides: a batch may have *partial failures*. Two `UserNotFound` mixed into a batch of 100 successes must fail the two fibers while succeeding the other 98. Per-entry `Exit`:
+
+```ts
+// correct — per-entry Exit, partial success visible:
+for (const entry of entries) {
+  const user = usersTable.get(entry.request.id)
+  entry.completeUnsafe(user ? Exit.succeed(user) : Exit.fail(new UserNotFound({ id: entry.request.id })))
+}
+
+// wrong — whole batch fails on first miss (masks 99 successes):
+const anyMissing = entries.find((e) => !usersTable.has(e.request.id))
+if (anyMissing) return yield* Effect.fail(new UserNotFound({ id: anyMissing.request.id }))
+// runtime fallback: every entry receives the same defect — 100 fibers fail for one missing id
+```
+
+| Handler call | What fibers see |
+|---|---|
+| `entry.completeUnsafe(Exit.succeed(user))` per hit | those fibers succeed with `user` |
+| `entry.completeUnsafe(Exit.fail(new UserNotFound({id})))` per miss | those fibers fail typed `UserNotFound` — `catchTag` works per caller |
+| `Effect.fail(someError)` from handler (unstructured) | **every** pending entry receives the same defect — for use only when the data source itself (not one row) is down |
+| Throw inside handler | same as `Effect.die` — batch-wide defect |
+
+:::caution[Typed per-entry failures are the contract]
+If `getUserById(999)` should be a typed, catchable `UserNotFound`, it must arrive via `Exit.fail(new UserNotFound(...))` for that entry. A handler that `throw`s or `Effect.fail(sqlErr)` turns the per-entry typed failure into a batch-wide defect that no per-call `catchTag("UserNotFound")` will catch. Keep defects for source-down, `Exit.fail` for row-missing.
+:::
+
+## The forEach↔resolver↔trace symmetry
+
+When you `withSpan("Users.getUserById")` on the per-id wrapper and `withSpan("Users.getUserById.resolver")` on the resolver, the span tree becomes:
+
+```
+Users.getUserById  userId=1        ──┐
+Users.getUserById  userId=2        ──┼──► Users.getUserById.resolver  entries=3
+Users.getUserById  userId=1 dup   ──┘    links: [span1, span2, span3]
+```
+
+Each `Users.getUserById` leaf is a thin wrapper that immediately suspends; the resolver span is the only one that holds time (DB round trip). This makes two efficiency properties visible without instrumentation hacks:
+
+* **Batch utilization** — `span size entries` vs `number of leaf spans` in the window.
+* **Hot keys** — duplicate ids collapsed → same `Exit` re-used; resolver cache hits carry no resolver span at all (missing link = cached).
+
+Failure flows trace similarly: `Exit.fail(UserNotFound({ id: 999 }))` completes one leaf with a tagged error; the leaf span records it as an error event. Other leaves succeed. Batch-wide defects render on the resolver span; downstream impact reads off N defected leaf spans.
+
+## Caching vs batching — not the same thing
+
+| Concern | Mechanism | What it reuses | Lifetime / eviction |
+|---|---|---|---|
+| **Batching** | `RequestResolver.make` itself (before cache) | this tick's pending entries — dedup within one delay window | ephemeral — next window is a new batch |
+| **Resolver cache** | `.pipe(RequestResolver.withCache({ capacity: 1024 }))` | recent `Exit` values by request key, across ticks | LRU by insertion/MRU — `capacity` caps size; no TTL |
+| **`Cache` module** | `Cache.make({ capacity, timeToLive, lookup })` | entries keyed by arbitrary `K`, entries held as `Option<A>` with staleness | time-based TTL, size cap, concurrent lookup coalescing, fiber interrupt de-duplication — full memoize layer |
+| **`RcMap` / `RcRef`** | `RcMap.make`, `RcRef.make` | reference-counted resources keyed by id | per-key acquire/release, idle eviction (`idleTimeToLive` like `LayerMap`) |
+
+<Mermaid title="Cache choices" height={320} code={`
+flowchart LR
+  req["getUserById(1)"] --> which{"needs TTL /<br/>value cache?"}
+  which -- "no, just dedup<br/>across ticks" --> rc["RequestResolver.withCache<br/>LRU, no TTL"]
+  which -- "TTL / staleness<br/>costly lookup" --> cache["Cache.make<br/>timeToLive + lookup coalescing"]
+  which -- "resource per key<br/>pool / connection" --> rcmap["RcMap / LayerMap<br/>ref-count, idleTTL"]
+  which -- "single hot value<br/>shared readers" --> rcref["RcRef<br/>shared refresh"]
+`} />
+
+When to reach for which:
+
+| Situation | Choice | Why |
+|---|---|---|
+| Repeated reads of the same `id` across many `forEach` loops, same tick window + later ticks, correctness insensitive to TTL | `RequestResolver.withCache` | simplest — one pipe addition, no new service |
+| Cross-request, cross-span reuse with TTL (user cache fresh for 5 minutes, stale reads allowed) | `Cache.Cache` with `timeToLive: "5 minutes"` | full Cache is coherence-aware; resolver cache is not invalidatable |
+| Shared DB pool / HTTP client per tenant, per region — resource, not value | `RcMap` / `LayerMap` (chapter 10) | lifecycle, not just memoization — closing pools on idle |
+| Single expensive reference with concurrent readers + refresh on staleness | `RcRef` | `get` merges concurrent callers into one lookup, just like `RequestResolver` but for imperative call sites |
+
+:::tip[Resolver cache composes with batching, not against it]
+The cache sits *behind* the resolver — the handler still sees the unique entries, but cached hits never enter `entries`. This means cached paths skip the resolver span and DB query entirely. Trace accordingly — a hot cache shows few resolver invocations but many `withCache` lookups.
+:::
+
+## Composition with services — `Users.getUserById` as a war story
+
+In production, the table is not `Map` but a repository or `SqlResolver`. The shape does not change — only the handler body does:
+
+```ts title="src/users-full.ts"
+import { Context, Effect, Exit, Layer, Request, RequestResolver, Schema } from "effect"
+import { SqlResolver } from "effect/unstable/sql"
+
+export class Users extends Context.Service<Users, {
+  getUserById(id: number): Effect.Effect<User, UserNotFound>
+}>()("app/Users") {
+  static readonly layer = Layer.effect(
+    Users,
+    Effect.gen(function* () {
+      class GetUserById extends Request.Class<{ readonly id: number }, User, UserNotFound, never> {}
+
+      // Option A — hand-rolled batch via SqlResolver or plain resolver:
+      const resolver = yield* RequestResolver.make<GetUserById>(
+        Effect.fn(function* (entries) {
+          const ids = entries.map((e) => e.request.id)
+          // single round-trip: SELECT WHERE id IN (?, ?, ?)
+          const rows = yield* batchFetchUsers(ids)
+          const byId = new Map(rows.map((u) => [u.id, u]))
+          for (const entry of entries) {
+            const hit = byId.get(entry.request.id)
+            entry.completeUnsafe(hit ? Exit.succeed(hit) : Exit.fail(new UserNotFound({ id: entry.request.id })))
+          }
+        })
+      ).pipe(
+        RequestResolver.setDelay("5 millis"),
+        RequestResolver.withSpan("Users.getUserById.resolver"),
+        RequestResolver.withCache({ capacity: 4096 })
+      )
+
+      // Option B — same idea via SqlResolver.make for pg/sqlite:
+      // yield* SqlResolver.ordered(...)
+
+      const getUserById = (id: number) =>
+        Effect.request(new GetUserById({ id }), resolver).pipe(
+          Effect.withSpan("Users.getUserById", { attributes: { userId: id } })
+        )
+
+      return { getUserById } as const
+    })
+  )
+}
+
+// callers don't know a resolver exists — same API as chapter 24's Users service:
+const report = Effect.gen(function* () {
+  const users = yield* Users
+  const ids = [1, 2, 3, 1, 2]
+  const results = yield* Effect.forEach(ids, users.getUserById, { concurrency: "unbounded" })
+  // batches inside `getUserById` transparently — the report code is just business logic
+  yield* Effect.log(`fetched ${results.length} users`)
+})
+```
+
+Note `getUserById` returns `Effect<User, UserNotFound>` — not `Effect<User, UserNotFound, never>` with a request constraint leaking out. The `resolver`'s `R` is folded away when `Effect.request` threads it into the handler; the handler itself is internal. This is why a service boundary is the natural home for the resolver: construction-site complexity stays inside `Layer.effect`, callers see a plain method.
+
+:::note[`SqlResolver` — when you already live in SQL]
+`SqlResolver.ordered` / `SqlResolver.make` in `effect/unstable/sql` are the SQL-specialized variant of the same idea — their handler's rows-vs-ids join and ordering guarantees mirror `makeRepository`'s knowledge of `idColumn`. When the data source is already `SqlClient`, prefer `SqlResolver` for exactly the same cost reasons `SqlModel.makeRepository` preferred it over `sql` tag literals: model-aware codecs + tracing for free.
+:::
+
+### Tuning knobs at a glance
+
+| Knob | Default | When to move it |
+|---|---|---|
+| `setDelay("10 millis")` | `0` (batch at next microtask boundary — tiny batches) but most examples set `10 millis` | raise to `25–50 millis` for higher coalescence at cost of p50 latency; drop to `0 millis` under real-time constraints |
+| `withCache({capacity})` | no cache | add once read workload dominates writes and staleness is tolerable; eviction is LRU only — no TTL, no invalidation hook |
+| `withCache` capacity | `Infinity` when using the convenience factory; explicitly pass a cap in prod | cap to working set × 2, not universe size |
+| `withSpan(name)` | none | always — unlink fan-in without it |
+| `setDelayEffect(effect)` | — | dynamic delay (off-peak vs on-peak) computed from config/context — see `RequestResolver.setDelayEffect` JSDoc |
+
+:::caution[Don't wrap `resolver` handlers in `catchAll` without re-throwing entry-aware failures]
+If the handler effect itself fails (not via `completeUnsafe(Exit.fail(e))` but via a slipped `Effect.fail(sqlErr)`), the runtime's fallback completes every pending entry with that same defect — turning a per-request miss (`UserNotFound` for 1 id) into a batch-wide defect for 50 ids. Keep per-entry failures inside `Exit.fail`, reserve `Effect.fail` for "the whole batch's data source is down" only, and ensure partitioning does not mask partial successes. Pattern: decode rows, loop, `completeUnsafe` per entry — never bulk-fail the handler effect.
+:::
+
+## The forEach + RequestResolver symmetry with `Cache`
+
+Users ask "should I use the resolver cache or the Cache module?" Answer: они для разного.
+
+* **`Cache`** memoizes the *result* of an effect function keyed by an arbitrary `K` — useful when callers do `cache.get(key)` scattered across many code paths and lifetimes, and when staleness matters (TTL, `refresh`, `invalidate`).
+* **`RequestResolver.withCache`** memoizes the *request resolution* already keyed by the `Request` value's equality — useful when a single hot lookup is naturally expressed as requests batching + simple reuse.
+
+$Mermaid not rendered — textual fallback: $
+
+* **Value caches** (`Cache`) know time — they can expire a cached `User` after 5 minutes and refresh under the next `get`. **RequestResolver cache** knows neither time nor invalidation — it is indefinitely valid until evicted by LRU. Use `Cache` if expiry matters.
+
+The idiomatic stack for a real service threads them together:
+
+```ts
+// Cache<CachedUser> fronting the same resolver — effect layering, not either/or:
+const cachedGetUserById = (id: number) =>
+  Effect.request(new GetUserById({ id }), resolver)
+    .pipe(
+      (eff) => Cache.get(cache, id).pipe(Effect.flatMap(() => eff)) // sketch
+      // real integration is driver-dependent — see Cache docs for
+      // Cache.make({ lookup: (id) => Effect.request(...), ... })
+    )
+```
+
+Better yet, set `lookup: (id) => Effect.request(new GetUserById({ id }), resolver)` inside `Cache.make` — the single `lookup` is itself batch-capable because it issues requests concurrently under load.
+
+### When the Cache module is the right tool
+
+`Cache` shines where the resolver cache cannot — when results have a TTL or when callers are not syntactically `Request`-backed. The pattern:
+
+```ts title="src/cache-fronted-users.ts"
+import { Cache, Duration, Effect, Layer } from "effect"
+
+const makeUsersCache = Effect.gen(function* () {
+  const { getUserById } = yield* Users // the batch-backed service from above
+
+  const cache = yield* Cache.make({
+    capacity: 2048,
+    timeToLive: Duration.minutes(5),
+    lookup: (id: number) => getUserById(id)
+  })
+  // callers do:
+  // const user = yield* Cache.get(cache, 1)  // hit → cached, miss → lookup via resolver → batch
+  // invalidation per entry:
+  // yield* Cache.invalidate(cache, 1)
+  // whole-cache refresh after a write:
+  // yield* Cache.invalidateAll(cache)
+  return cache
+})
+```
+
+With this wiring, a thundering-herd of 100 fibers reading id=1 while the TTL is stale coalesces inside `Cache` into one `lookup`, which itself issues one `Effect.request` collapsed with other ids in the same tick via the resolver — two coalescing layers for free, without any caller knowing.
+
+### `RcRef` / `RcMap` — reference-counted neighbors
+
+When the cached thing is a *resource* (connection, subscription, file handle), not a value, ref-counting matters. `RcRef` holds a single shared resource refreshed on staleness and held while any fiber references it; `RcMap` holds one per key with idle eviction — the non-layered analogue of `LayerMap` from chapter 10:
+
+```ts
+import { Effect, RcRef, RcMap, Duration } from "effect"
+
+// single hot value, many concurrent get() callers coalesced
+const ref = yield* RcRef.make({
+  acquire: Effect.promise(() => fetchConfig()),
+  idleTimeToLive: Duration.minutes(10)
+})
+const cfg = yield* RcRef.get(ref) // concurrent gets → one acquire
+
+// per-key resources
+const pools = yield* RcMap.make({
+  lookup: (tenantId: string) => makePool(tenantId),
+  idleTimeToLive: Duration.minutes(1)
+})
+const pool = yield* RcMap.get(pools, "tenant-42")
+yield* RcMap.invalidate(pools, "tenant-42") // credential rotation
+```
+
+If your resolver handler guards a pool-per-key, `RcMap` can stand in for ad-hoc pending maps; if your lookup backs a resolver entry's DB fetch, `RcRef` often fits better at the caller. The tree at the top of this section is the decision.
+
+## Testing and observability
+
+### Testing a resolver-backed service
+
+Resolver-backed services have no special test harness — provide `Users.layer` and assert on behavior that batching is *transparent*:
+
+```ts
+import { assert, layer } from "@effect/vitest"
+import { Effect } from "effect"
+import { Users } from "../src/users-resolver.ts"
+
+layer(Users.layer)("Users (resolver)", (it) => {
+  it.effect("deduplicates repeated ids in a concurrent forEach", () =>
+    Effect.gen(function* () {
+      const { getUserById } = yield* Users
+      const users = yield* Effect.forEach([1, 2, 1, 3], getUserById, { concurrency: "unbounded" })
+      assert.strictEqual(users.length, 4)
+      assert.strictEqual(users[0].id, 1)
+      assert.strictEqual(users[2].id, 1) // dedup — same Exit, equal value
+    }))
+
+  it.effect("fails typed for missing ids without aborting siblings", () =>
+    Effect.gen(function* () {
+      const { getUserById } = yield* Users
+      const [a, b] = yield* Effect.all(
+        [getUserById(1), getUserById(999)],
+        { mode: "result", concurrency: "unbounded" }
+      ) as any
+      assert.isTrue(a._tag === "Success")
+      assert.isTrue(b._tag === "Failure" && b.error._tag === "UserNotFound")
+    }))
+
+  it.effect("withCache reuses without touching the resolver", () =>
+    Effect.gen(function* () {
+      const { getUserById } = yield* Users
+      const u1 = yield* getUserById(1)
+      const u2 = yield* getUserById(1) // sequential ticks — would be two batches without cache
+      assert.deepStrictEqual(u1, u2)
+    }))
+})
+```
+
+Batch-size invariants ("~N resolver invocations for M requests") are hard to assert without a probe layer — instrument `resolver`'s handler with a counter in `Layer.fresh` per test, not in prod code.
+
+### Observability
+
+Beyond `withSpan` + `ParentSpan` inspection, two patterns help diagnosis:
+
+* **Span attributes on `getUserById`** — the `Effect.withSpan("Users.getUserById", { attributes: { userId: id } })` wrapper makes filtering by `userId` in Jaeger/Honeycomb trivial.
+* **Handler-level structured logging** — inside the resolver handler, `Effect.annotateCurrentSpan({ batchSize: entries.length })` or `yield* Effect.logInfo("resolver batch", { batchSize: entries.length })` exposes when a single hot loop fans into one huge batch vs many small batches.
+
+## Cheat sheet
+
+| Goal | Code |
+|---|---|
+| Model a batchable lookup | `class GetUserById extends Request.Class<{id:number}, User, UserNotFound, never> {}` |
+| Define a batch handler | `yield* RequestResolver.make<GetUserById>(Effect.fn(function*(entries){ ... entry.completeUnsafe(Exit.succeed/fail(...)) }))` |
+| Set batch window | `.pipe(RequestResolver.setDelay("10 millis"))` / `.pipe(RequestResolver.setDelayEffect(effect))` |
+| Add resolver span + links | `.pipe(RequestResolver.withSpan("Users.getUserById.resolver"))` |
+| Add LRU cache | `.pipe(RequestResolver.withCache({ capacity: 1024 }))` |
+| Dispatch one request | `Effect.request(new GetUserById({ id }), resolver)` |
+| Wrap as a service method | `(id:number) => Effect.request(new GetUserById({id}), resolver).pipe(Effect.withSpan(...))` |
+| Batch N lookups | `Effect.forEach(ids, getUserById, { concurrency: "unbounded" })` → 1 resolver batch with N deduped |
+| Inspect caller span | `Context.getOption(entry.context, Tracer.ParentSpan)` |
+| Dynamic delay from config | `RequestResolver.setDelayEffect(Config.string("RESOLVER_DELAY"))` |
+| No-op resolver | `RequestResolver.never` |
+
+## Pitfalls
+
+| Pitfall | Symptom | Fix |
+|---|---|---|
+| `concurrency: 1` / sequential callers | `entries.length === 1` every time — no batching | use `concurrency: "unbounded"` or bounded but >1 on the consumer |
+| Missing `completeUnsafe` for an entry | fiber hangs forever | every path through the handler must call `completeUnsafe` exactly once per entry |
+| `Effect.fail` inside handler, not `Exit.fail` | entire batch fails with same defect — partial successes lost | loop entries and `completeUnsafe(Exit.fail(...))` per missing key |
+| No `withCache` but callers hammer same ids | resolver refires for identical sequential ticks | add `withCache` or front with `Cache` if TTL matters |
+| No `withSpan` | traces show `getUserById` leaves but no linking resolver | always `withSpan` |
+| Deduplication surprises via `Request` equality | two payloads with same `id` but different extra fields dedup wrongly | keep payload minimal — if metadata should not affect equality, exclude it from the request class |
+| Mixing request requirements `R` with handler requirements | handler's `R` leaks into caller | keep resolver's `R = never` and inject dependencies outside via service `Layer` closure |
+
+## Next
+
+<LinkCard
+  title="27 · Streams"
+  description="From pull to push: Stream as a lazy list of chunks, chunked combinators, composition with Queue/PubSub, stream-as-effect boundaries, and the bridging layer between batching and reactive pipelines."
+  href="/effect-ts/27-streams/"
+/>

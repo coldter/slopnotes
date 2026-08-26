@@ -1,0 +1,204 @@
+---
+title: The Effect Model
+description: What an Effect value actually is — a lazy description with typed success, failure, and requirements. The A/E/R triple decoded against Promise, execution entry points, and the v4 runtime.
+sidebar:
+  order: 2
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+## An Effect is a description
+
+```ts
+const program = Effect.gen(function*() {
+  yield* Effect.log("hello")
+  return 42
+})
+```
+
+Nothing has executed yet. `program` is an immutable data structure — a small
+AST of instructions — exactly like a `Function` is "code as a value", except
+Effects are *declarations* rather than closures. This is the single most
+important property, and everything else follows:
+
+- **Lazy**: constructing it does nothing. Running it executes it. Run the same
+  value twice and it runs twice (unless you explicitly memoize).
+- **Immutable & re-runnable**: descriptions compose into bigger descriptions
+  without side effects at composition time.
+- **Inspect-free by design**: you don't peek inside; you transform or run.
+
+Compare to `Promise`, which is an *outcome placeholder*: created hot,
+already running, memoizes its result, cannot be cancelled — only ignored.
+
+| Property | `Promise<A>` | `Effect<A, E, R>` |
+|---|---|---|
+| When created | starts immediately | inert |
+| Failure type | `any` (rejection reason untyped) | `E`, tracked in the type |
+| Requirements | none expressible | `R` — services needed from context |
+| Cancellation | impossible | first-class fiber interruption with cleanup |
+| Re-runnable | no — memoized outcome | yes — re-execute the description |
+| Sync support | no | `Effect.runSync` for pure-sync programs |
+| Composition | methods + `await` | combinators + generator syntax |
+
+## Decoding `Effect<A, E, R>`
+
+```ts
+export interface Effect<out A, out E = never, out R = never>
+  extends Pipeable, Inspectable {
+  readonly [TypeId]: Variance<A, E, R>
+  [Symbol.iterator](): EffectIterator<Effect<A, E, R>>
+}
+```
+
+Three things to notice, because they explain three design decisions:
+
+1. **It's an interface with phantom variance markers** (`Variance<A, E, R>`).
+   All three channels are covariant (`out`) — an `Effect<User>` is usable
+   anywhere an `Effect<unknown>` is expected. The markers exist so TypeScript
+   treats Effect as a proper HKT-style constructor for its combinator types
+   (this is what makes dual signatures like `Effect.map` infer correctly).
+
+2. **`[Symbol.iterator]`** — from the last chapter: this makes every Effect
+   *yieldable* with `yield*`. That's not sugar bolted on; it's part of the
+   core contract. Anything with this method can appear after `yield*` in an
+   `Effect.gen` body.
+
+3. **Defaults: `E = never`, `R = never`.** An effect that can't fail and needs
+   nothing is just `Effect<number>`. Types stay short until they need to be
+   long.
+
+### Reading triples fluently
+
+```ts
+declare const fetchUser: (id: string) => Effect.Effect<User, UserNotFound, Database>
+
+// read aloud:
+// "a computation producing a User,
+//  that may fail with UserNotFound,
+//  and requires a Database service in context"
+```
+
+The `R` channel is how Effect does dependency injection: functions don't take
+services as parameters; effects *require* them, and something upstream
+provides them. Until provided, `R` propagates up like a pending debt — and the
+compiler won't let you run a program that still owes services.
+
+## Creating your first effects
+
+```ts
+import { Effect } from "effect"
+
+// Succeed with a value — never fails
+const one: Effect.Effect<number> = Effect.succeed(1)
+
+// Fail with a typed error
+const boom: Effect.Effect<never, string> = Effect.fail("boom")
+
+// Die — unrecoverable defect (think: thrown bug), NOT in E
+const crash: Effect.Effect<never> = Effect.die(new Error("bug"))
+
+// Wrap a sync thunk that may throw
+const now: Effect.Effect<number, unknown> = Effect.try(() => Date.now())
+
+// Wrap a promise-returning API
+type FetchError = { readonly _tag: "FetchError"; cause: unknown }
+const data = Effect.tryPromise({
+  try: () => fetch("https://example.com").then((r) => r.json()),
+  catch: (cause) => ({ _tag: "FetchError", cause })
+})
+
+// Defer evaluation — the thunk runs on each execution
+let counter = 0
+const next = Effect.sync(() => ++counter)
+```
+
+:::note[Fail vs Die]
+`fail` puts a value in `E` — an *expected*, handled failure ("user not
+found"). `die` produces a **defect** — a bug or broken invariant ("this should
+never happen"). Defects skip the error channel, crash the fiber, and end up in
+`Cause.Die` reasons. Keeping that boundary clean is one of the highest-leverage
+habits in Effect codebases (see [05 Errors](/effect-ts/05-errors/) and
+[06 Cause & Exit](/effect-ts/06-cause-exit/)).
+:::
+
+## Executing: the `run*` family
+
+Descriptions become reality through four entry points:
+
+```ts
+import { Effect } from "effect"
+
+const program = Effect.succeed(42)
+
+// 1. Promise-based, async — rejects with a Cause-wrapped Failure on error/die/interrupt
+await Effect.runPromise(program)          // 42
+await Effect.runPromiseExit(program)      // Exit.Success(42) — never rejects
+
+// 2. Fully synchronous — throws on async operations
+const n = Effect.runSync(program)
+
+// 3. Fork — start a fiber, get a handle, keep going
+const fiber = Effect.runFork(program)     // Fiber<...>
+```
+
+Selection rules:
+
+- **Library code** almost never runs anything — it returns descriptions.
+- **Application entry** uses `runPromise` for scripts, or better,
+  `NodeRuntime.runMain(Layer.launch(appLayer))` for services (signals, exit
+  codes, teardown — see [29 Runtime Integration](/effect-ts/29-runtime-integration/)).
+- `runSync` only works if nothing suspends asynchronously; mixing it into
+  async contexts will throw.
+- `runPromise` rejects with a `Cause.Failure` wrapper containing the full
+  multi-reason cause — not the raw `E`.
+
+:::caution[v4 change: keep-alive]
+In v3, a suspended fiber didn't register as event-loop work — a program
+waiting on a `Deferred` could exit silently unless you used `runMain`. In v4
+the runtime holds a reference-counted keep-alive timer, so
+`Effect.runPromise(program)` keeps the process alive while fibers have pending
+work. `runMain` remains recommended for signal handling and exit codes, but no
+longer exists just to prevent premature exit.
+:::
+
+## Effects compose — lazily
+
+```ts
+import { Effect } from "effect"
+
+const parse = (input: string) =>
+  Effect.try({
+    try: () => JSON.parse(input) as { n: number },
+    catch: (cause) => new Error("bad json", { cause })
+  })
+
+const doubled = Effect.map(parse("[1,2]"), (v) => v.n * 2)
+const chained = Effect.flatMap(doubled, (n) => Effect.succeed(n + 1))
+```
+
+`parse(...)` was already "executed" conceptually — but nothing happened.
+Composition builds AST nodes. Only `run*` walks them. This is why you can
+build arrays of candidate strategies and try them later, why tests can run
+your whole program under a fake clock, and why providing dependencies after
+the fact works: `Effect.provide(program, layer)` is just wrapping a
+description in another description.
+
+## Where the runtime lives
+
+Under `run*`, each execution becomes a **fiber** — a lightweight virtual
+thread with its own stack (of continuations), interruption state, and
+context. Fibers cooperate through a scheduler that yields every N operations
+so tight loops can't starve the event loop. You'll meet fibers properly in
+[13 Fibers](/effect-ts/13-fibers/); for now the mental model is:
+
+- one root fiber per `run*` call
+- forks create child fibers whose lifetime is tied to their parent's scope
+- interruption is cooperative but guaranteed: cleanup always runs
+
+## Next
+
+<LinkCard
+  title="03 · gen & fn"
+  description="The daily ergonomics: Effect.gen mechanics, Effect.fn with attached combinators, and the house style for writing Effect."
+  href="/effect-ts/03-gen-and-fn/"
+/>

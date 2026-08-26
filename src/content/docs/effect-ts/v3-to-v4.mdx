@@ -1,0 +1,513 @@
+---
+title: v3 → v4 Migration Field Guide
+description: Who needs this, philosophy shifts, package consolidation and unstable paths, one-version rule, rewritten runtime and bundle size, the load-bearing rename table, services collapse, yieldable narrowing, new APIs, import maps, and an annotated porting diff — with links to MIGRATION.md and migration topic guides.
+sidebar:
+  order: 32
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+This chapter is for two audiences:
+
+- **You have a v3 codebase** and are planning the upgrade to `4.0.0-rc.*`.
+- **You have no v3 codebase** but you read blog posts, StackOverflow answers, or older library docs that speak v3 — you need to translate them on sight.
+
+v4 is not a codemod-and-done release. The phrasing is blunt in `MIGRATION.md` itself: the core programming model (`Effect`, `Layer`, `Schema`, `Stream`) is unchanged, but how packages are organized, versioned, and imported has changed significantly and many combinators were renamed. Plan for a deliberate, chapter-by-chapter migration rather than a flag day.
+
+:::note[Scope of this guide]
+This is the load-bearing mapping — the 20 percent of renames that cover 80 percent of a port. For the exhaustive file-by-file map, see [`migration/v3-to-v4.md`](https://github.com/Effect-TS/effect/blob/main/migration/v3-to-v4.md) and the topic guides under [`migration/*.md`](https://github.com/Effect-TS/effect/tree/main/migration) in the upstream repo. They are generated from the API diff and stay accurate between RCs.
+:::
+
+## Philosophy shifts in one page
+
+| Theme | v3 | v4 | Why you care |
+|---|---|---|---|
+| **Packages** | `effect` + `@effect/platform`, `@effect/rpc`, `@effect/cluster`, … | Consolidated into `effect`; platform drivers stay separate (`@effect/platform-node`, `@effect/sql-*`) | One install line per platform; fewer peerDeps |
+| **Unstable APIs** | mixed into their packages | Explicit `effect/unstable/*` import paths (`http`, `httpapi`, `sql`, `ai`, `observability`, `schema`, `sql`, …) | Minor releases **may** break `unstable` — the path tells you |
+| **Versioning** | independent per package (`effect@3.x`, `@effect/platform@0.x`) | One version for the whole ecosystem (`effect@4.0.0-rc.112` pairs with `@effect/platform-node@4.0.0-rc.112`) | No more "which platform matches which core?" |
+| **Runtime** | rewritten? No — large, bit-flag `RuntimeFlags` + `Runtime<R>` bundle you carried | **Rewritten** for memory/speed. No flags. `Context<R>` *is* the runtime; behavior via `References`. Minimal bundle ≈ 6 KB gz (~15 KB with Schema). `Micro` deleted — core is already micro. | Simpler mental model, faster startup, less to import |
+| **Tree-shaking** | partial | Aggressive — minimal program ≈ 6.3 KB min+gz | Matters for edge/serverless |
+
+:::tip[Read `unstable` as "beta surface, stable contract shape"]
+`effect/unstable/http`, `effect/unstable/httpapi`, `effect/unstable/sql`, `effect/unstable/observability` are not toys. They are production-used and documented in `ai-docs/src`. The path merely signals that minor versions may carry breaking changes while the top-level `effect/*` follows semver strictly. As modules stabilize, they graduate to `effect/*` (historical examples: `FileSystem`, `Path` already did).
+:::
+
+## The load-bearing rename table
+
+This is the diff you will retype most often. Roughly ordered by frequency in a typical codebase.
+
+| v3 | v4 | Detail |
+|---|---|---|
+| `Either<L,R>` | **`Result<E, A>`**, error-first (`Result<E, A>` not `Result<A, E>`) | Right → Success, Left → Failure, `Either.Do → Result.Do`, `getLefts → getFailures`, `array.liftEither → liftResult` |
+| `Effect.catchAll(handler)` | **`Effect.catch(handler)`** | shortened — typed failure `E` |
+| `Effect.catchAllCause(handler)` | **`Effect.catchCause(handler)`** | full `Cause<E>` |
+| `Effect.catchAllDefect(handler)` | `Effect.catchDefect(handler)` | defects only |
+| `Effect.catchSome(pf)` | **`Effect.catchFilter(Filter, handler)`** | `Option`-returning partial function → `Filter` module |
+| `Effect.catchSomeCause(pf)` | `Effect.catchCauseFilter(Filter, handler)` | filtered cause |
+| `Effect.fork(effect)` | **`Effect.forkChild(effect)`** | structured child; dies with parent |
+| `Effect.forkDaemon(effect)` | **`Effect.forkDetach(effect)`** | global-scope fire-and-forget |
+| `Effect.forkAll(effects)` | `Effect.forEach(effects, Effect.forkChild) + Fiber.joinAll` | or a higher concurrency combinator |
+| `Effect.disconnect(effect)` | `Effect.forkDetach(…)` + await decision | explicit detachment |
+| `Effect.daemonChildren` | `Effect.awaitAllChildren` | structured child waiting |
+| `FiberRef` / `FiberRefs` | **`Context.Reference` in `References` module** | per-fiber state is a defaulted service key; only `Effect.provideService` mutation, lexically scoped |
+| `Runtime<R>` | **`Context<R>` is the runtime** | Removed; services + references *are* the runtime bundle. Use `Effect.context` + `Effect.run*With`. `RuntimeFlags` deleted — behavior via `References` |
+| `Scope.extend` | **`Scope.provide`** | renamed; same data-first + curried forms |
+| `Layer.scoped(service, acquire)` | **`Layer.effect(service, acquire)`** | Merged — `Layer.effect` now supplies and excludes `Scope` automatically (`Exclude<R, Scope>`). Same for `scopedContext → effectContext`, `scopedDiscard → effectDiscard` |
+| `Equal.Data` / `Data.struct / array / tuple / case` | **Structural equality by default** | `Data.Class` remains for class syntax; plain objects/arrays/Maps/Sets compare structurally without wrapping. `Data.case/struct/tuple/array` no longer needed. |
+| `Effect.all` / `Effect.zip` | retained | no rename; `Either` → `Result` param flip is the gotcha inside doubles |
+| `STM`, `TRef`, `TQueue`, `TMap`, … | **`TxRef`, `TxQueue`, `TxHashMap`, `TxHashSet`, `TxDeferred`, `TxSemaphore`, `TxSubscriptionRef`, `TxPriorityQueue`, `TxPubSub`, `TxReentrantLock`** | prefix `Tx` (transaction) |
+| `Effect.supervised` | `FiberSet` | track explicitly forked fibers in a scoped `FiberSet` |
+| `pipe` | **Still exists** | But this course uses `flow` occasionally for point-free `pipe` chains — style note, not API removal |
+| `Effect.either` | `Effect.result` | materializes `Result<E,A>` |
+| `Channel.catchAll` / `catchAllCause` | `Channel.catch` / `catchCause` | same rename as `Effect` |
+| `Layer.catchAll` / `catchAllCause` | `Layer.catch` / `catchCause` | same |
+| `Layer.setScheduler` | `Layer.succeed(Scheduler.Scheduler, scheduler)` | scheduler is now a `Context.Reference` |
+
+Other error handling that stayed:
+
+| v3 | v4 |
+|---|---|
+| `Effect.catchTag` | **unchanged** (now widens to multiple tags) |
+| `Effect.catchTags` | **unchanged** |
+| `Effect.catchIf` | **unchanged** |
+| `Effect.catchSomeDefect` | *removed* — branch explicitly with `Effect.catchDefect` and re-`die` unhandled defects |
+
+:::caution[`filter` vs `Filter`]
+v3 `catchSome` took `E => Option<Effect>`. v4 `catchFilter` takes `Filter<E, E2>`. `Filter.fromPredicate`, `Filter.tag("MyError")`, and other constructors live in the new `Filter` module (`effect/Filter`). Rewrite `Option.some(effect)`/`Option.none()` conditionals into filter predicates.
+:::
+
+## Services collapse — four ways became one
+
+v3 had four service key shapes; v4 has one, plus a sibling for defaults:
+
+| v3 | v4 |
+|---|---|
+| `Context.Tag` | `Context.Service` |
+| `Context.GenericTag` | `Context.Service` |
+| `Effect.Tag` | `Context.Service` |
+| `Effect.Service` | `Context.Service` |
+| `Context.TagUnify` etc. | deleted |
+| Per-service variance | `Context.Service<T>` (single arg) + `Context.Service<Self, Shape>(id)` class form |
+
+Definition — flipped identifier order:
+
+```ts
+// v3
+class UserRepo extends Context.Tag("app/UserRepo")<UserRepo, { findById(id): Effect<User> }>() {}
+// or GenericTag / Effect.Service variants
+
+// v4 — identifier is the second call argument; shape optional
+export class UserRepo extends Context.Service<UserRepo, {
+  findById(id: string): Effect.Effect<User, NotFound>
+}>()("app/UserRepo") {}
+```
+
+`Context.Reference` adds a mandatory default for fiber-local state:
+
+```ts
+export class CurrentTenant extends Context.Reference<CurrentTenant>()("app/CurrentTenant", {
+  defaultValue: () => "public"
+}) {}
+```
+
+`FiberRef.make(initial)` → `Context.Reference(id, { defaultValue: () => initial })`. `Effect.locally(effect, ref, value)` → `Effect.provideService(effect, ref, value)`. `FiberRef.get/set` → `yield* ref` read; no imperative write — provisioning scopes value lexically.
+
+:::note[Migration guide: `migration/services.md`]
+The full service migration including `GenericTag`, `Effect.Service`, variance annotations, and `Context.TagClassShape` is in [`migration/services.md`](https://github.com/Effect-TS/effect/blob/main/migration/services.md).
+:::
+
+## Yieldable narrowing — `Ref`, `Deferred`, `Fiber`, `Queue` are no longer effects
+
+In v3 those types were structurally assignable to `Effect`, so `yield* ref` was legal — `Effect.all([refA, refB])` accidentally *read* refs instead of pairing handles. The contract split:
+
+| Type | v3 `yield*` | v4 `yield*`? | Correct accessor |
+|---|---|---|---|
+| `Effect<A,E,R>` | yes | **yes** | — |
+| `Option<T>` | yes | **yes** (`None` fails with `NoSuchElementError`) | — |
+| `Result<E,A>` | n/a (`Either`) | **yes** | — |
+| `Config<T>` | yes | **yes** | — |
+| `Context.Service` | yes (via Tag) | **yes** (`Context.Key`) | — |
+| `Ref<A>` | yes | **no** | `yield* Ref.get(ref)` |
+| `Deferred<A,E>` | yes | **no** | `yield* Deferred.await(d)` |
+| `Fiber<A,E>` | yes | **no** | `yield* Fiber.join(fiber)` |
+| `Queue<A>` | yes | **no** | `yield* Queue.take(q)` |
+| `SynchronizedRef`, `SubscriptionRef`, `FiberMap`, … | yes | **no** | explicit method |
+
+Rule: **Yieldable ≠ assignable.** If you hold a handle, you hold a plain value. To run the operation, call the accessor. This turned a class of silent v3 bugs into compile errors.
+
+```ts
+// v3 — compiles, wrong
+const wrong = Effect.all([refA, refB])
+
+// v4 — type error, fix:
+const right = Effect.gen(function* () {
+  const [a, b] = yield* Effect.all([Ref.get(refA), Ref.get(refB)])
+  return [a, b]
+})
+```
+
+## New APIs worth adopting immediately
+
+| API | Replaces / adds | One-liner |
+|---|---|---|
+| `Effect.catchFilter(Filter, handler)` | `catchSome` | Filtered recovery without `Option` |
+| `Effect.catchReason(tag, reasonTag, handler)` | new | Peel a `reason` variant inside a tagged error without losing the parent wrapper |
+| `Effect.catchReasons` / `catchTags` extensions | new | Multi-tag/ multi-reason in one call |
+| `Filter` module | new for `catchFilter` | `Filter.fromPredicate`, `Filter.tag("Err")`, combinators |
+| `Reason`-errors | new error architecture | `Schema.TaggedError` carrying `{ reason }`, typed `catchReason` support |
+| `Tx*` renames | STM renames | `TxRef`, `TxQueue`, `TxHashMap`, … |
+| Keep-alive | **built into core** | No manual hold — `Layer.launch` + fibers keep process open until interrupted |
+| `Schedule.min` / `Schedule.max` | `Schedule.union` / `intersect` / intervals | `max` = intersect (slower wins), `min` = union (faster wins); `ScheduleIntervals` / `ScheduleInterval` deleted |
+| `Schedule.modifyDelay((meta) => Duration)` | new clamping | `Schedule.modifyDelay(s, ({ delay }) => Duration.min(delay, "10 seconds"))` |
+| `Effect.withTracerEnabled(false)` | new | Locally disable span creation; complement to `TracerEnabled` reference |
+| `Layer.withSpan("init")` | new | Trace layer construction spans |
+| `Stream` methods | `Stream.groupByKey(f); GroupBy.evaluate` | Ch. piping differences — see `migration/v3-to-v4.md` under `Stream` |
+| `Cache` / `ScopedCache` | `TestClock.adjust` helpers unchanged | But invalidation now uses `Ref` semantics; see `migration/*` |
+
+## Import map — highlights
+
+The exhaustive map is `migration/v3-to-v4.md` "Import Map". These are the imports you will fix first:
+
+| v3 import | v4 import |
+|---|---|
+| `effect/Either` | `effect/Result` (and `Either → Result`, `Left → Failure`) |
+| `@effect/platform/FileSystem` | `effect/FileSystem` |
+| `@effect/platform/Path` | `effect/Path` |
+| `@effect/platform/Terminal` | `effect/Terminal` |
+| `@effect/platform/HttpClient` | `effect/unstable/http/HttpClient` |
+| `@effect/platform/HttpRouter` | `effect/unstable/http/HttpRouter` |
+| `@effect/platform/HttpApi` | `effect/unstable/httpapi/HttpApi` |
+| `@effect/platform/HttpApiBuilder` | `effect/unstable/httpapi/HttpApiBuilder` |
+| `@effect/opentelemetry/OtlpTracer` | `effect/unstable/observability/OtlpTracer` |
+| `@effect/opentelemetry/OtlpLogger` | `effect/unstable/observability/OtlpLogger` |
+| `@effect/sql/SqlClient` | `effect/unstable/sql/SqlClient` |
+| `@effect/sql/SqlResolver` | `effect/unstable/sql/SqlResolver` |
+| `effect/FiberRef` | `effect/References` (as `Context.Reference`) |
+| `effect/TRef` | `effect/TxRef` |
+| `effect/TestClock` | `effect/testing/TestClock` |
+| `effect/JSONSchema` | `effect/JsonSchema` (barrel) |
+| `@effect/platform-node/NodeContext` | `@effect/platform-node` (re-export) + `NodeRuntime.runMain` |
+| `effect/Runtime` | deleted — `Context` *is* runtime |
+
+:::tip[Bulk rename order]
+1. `Either → Result` (and `left/right`, `getLefts/getRights` call sites).
+2. `catchAll → catch`, `catchAllCause → catchCause`, `catchSome → catchFilter`.
+3. `fork → forkChild`, `forkDaemon → forkDetach`.
+4. `TRef → TxRef` / other `Tx*`.
+5. Service definitions → `Context.Service(id)`.
+6. Only then run your import codemod — fewer broken lines per file.
+:::
+
+## Porting a file — annotated diff
+
+A real file before and after. Annotations call out each load-bearing change. Comments are `// v3:` / `// v4:` inline; no other semantics change.
+
+```ts
+// ============ v3 — src/mailer.ts ============
+import { Context, Effect, Layer, FiberRef, STM, TRef } from "effect"
+import { FileSystem } from "@effect/platform"
+import * as Either from "effect/Either"
+import { SqlClient } from "@effect/sql"
+
+export class LogLevel extends FiberRef.Tag("app/LogLevel")<LogLevel, string>() {
+  static readonly initial = "Info"
+}
+
+export const currentLogLevel = FiberRef.make("Info")
+
+export class Mailer extends Context.Tag("app/Mailer")<Mailer, {
+  send(to: string): Effect.Effect<void, Error>
+}>() {}
+
+export const MailerLive = Layer.scoped(
+  Mailer,
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const logLevel = yield* FiberRef.get(currentLogLevel) // v3: get returns value directly, yieldable
+    const counter = yield* TRef.make(0)                    // v3: yieldable TRef
+    const body: Either.Either<Error, string> = Either.right("hello")
+    yield* Effect.locally(Effect.log("sending"), currentLogLevel, "Debug")
+    yield* STM.commit(STM.update(counter, (n) => n + 1))
+    return Mailer.of({
+      send: (to) => Effect.gen(function* () {
+        const c = yield* STM.commit(STM.get(counter)) // v3 STM
+        yield* Effect.catchAll(() => Effect.void)(Effect.fail(new Error("oops")))
+        yield* Effect.fork(Effect.void)                // v3 fork = forkChild
+        yield* Effect.forkDaemon(Effect.void)
+      })
+    })
+  })
+)
+```
+
+```ts
+// ============ v4 — src/mailer.ts ============
+import { Context, Effect, Layer, TxRef } from "effect"                  // v4: FiberRef → References, TRef → TxRef
+import { FileSystem } from "effect"                                      // v4: platform consolidated into effect
+import * as Result from "effect/Result"                                  // v4: Either → Result
+import { SqlClient } from "effect/unstable/sql"                          // v4: sql is unstable path
+import { References } from "effect"                                      // v4: MinimumLogLevel etc. live here
+
+// v4: LogLevel is just a Context.Reference with defaultValue — FiberRef.Tag deleted
+export class LogLevel extends Context.Reference<LogLevel>()("app/LogLevel", {
+  defaultValue: () => "Info" as const
+})
+
+// v4: Context.Service — not Tag; identifier is second call
+export class Mailer extends Context.Service<Mailer, {
+  send(to: string): Effect.Effect<void, Error>
+}>()("app/Mailer") {}
+
+// v4: Layer.scoped → Layer.effect (Scope is automatic, Exclude<R,Scope>)
+export const MailerLive = Layer.effect(
+  Mailer,
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    // v4: FiberRef.get removed — read the Reference via yield* ref, or Effect.service
+    const level: string = yield* LogLevel
+    // v4: TxRef is a plain value — not yieldable; call accessors explicitly
+    const counter = yield* TxRef.make(0)
+    // v4: Result<E,A> is error-first; succeed is Result.succeed, Right → Success
+    const body: Result.Result<string, Error> = Result.succeed("hello")
+    // v4: FiberRef locally → Effect.provideService for References — lexically scoped
+    yield* Effect.provideService(Effect.log("sending"), LogLevel, "Debug")
+    // v4: STM → TxRef atomically (or Effect.transaction for multi-ref tx)
+    yield* TxRef.update(counter, (n) => n + 1)
+    return Mailer.of({
+      send: (to) => Effect.gen(function* () {
+        const c = yield* TxRef.get(counter) // v4: explicit get
+        // v4: catchAll → catch
+        yield* Effect.catch(() => Effect.void)(Effect.fail(new Error("oops")))
+        // v4: fork → forkChild ; forkDaemon → forkDetach
+        yield* Effect.forkChild(Effect.void)
+        yield* Effect.forkDetach(Effect.void)
+      })
+    })
+  })
+)
+
+// Additional mechanical port that would appear elsewhere in the file set:
+// Scope.extend → Scope.provide
+// Layer.setScheduler(s) → Layer.succeed(Scheduler.Scheduler, s)
+// @effect/platform/HttpClient → effect/unstable/http/HttpClient
+// OtlpTracer: @effect/opentelemetry/OtlpTracer → effect/unstable/observability/OtlpTracer
+// Data.struct({a:1}) → {a:1}  (plain objects now structurally equal)
+// Array.liftEither(f) → Array.liftResult(f)
+// Effect.either → Effect.result
+// Effect.optionFromOptional → Effect.catchTag("NoSuchElement", () => Option.none)
+```
+
+What changed in the diff, summarized:
+
+1. **`effect/FiberRef → effect/References + Context.Reference`** — declaration, defaultValue, and `provideService` mutation.
+2. **`effect/Either → effect/Result`** with param flip `Either<L,R> → Result<E,A>`; constructors `right/left → succeed/fail`, extractors `getLefts → getFailures`.
+3. **`@effect/platform/* → effect/FileSystem` + `effect/unstable/*`** — two destinations: core (`FileSystem`, `Path`) into `effect` barrel; protocol modules (`http`, `sql`, `observability`, `ai`) into `effect/unstable/*`.
+4. **`TRef → TxRef`** + all STM combinators; broader `STM → Tx*` rename.
+5. **`Layer.scoped → Layer.effect`** — drop `Layer.scoped` entirely; `Scope` is auto-excluded.
+6. **`Scope.extend → Scope.provide`**.
+7. **`Effect.catchAll → catch`**, **`catchAllCause → catchCause`**, **`fork → forkChild`**, **`forkDaemon → forkDetach`**.
+8. **Structural equality** — remove `Data.struct/array/tuple` wrappers; plain literals are structurally compared (with `NaN === NaN` semantics; use `Equivalence.strictEqual` only if you need `NaN !== NaN`).
+
+:::caution[One gotcha per file]
+`Result` param flip inverts `Effect.all` error inference: v3 `Either<Error, string>` at `A` position becomes v4 `Result<string, Error>` at `A` position. Search for `Either.` first and fix `Result` types before fixing `catch` handlers that pattern-match on `Error`.
+:::
+
+## Bundle size — why `Micro` is gone
+
+From `MIGRATION.md`: a minimal Effect program tree-shakes to **~6.3 KB min+gz** (~**15 KB with Schema**). Because the rewritten core runtime *is* the lightweight runtime, the separate `Micro` namespace was deleted entirely (`Micro` → `Effect`, `Micro.TaggedError → Data.TaggedError`). If you used `Micro.forkScoped/forkIn/schedule*` for small lambdas, the same combinators now live on `Effect` with the same semantics.
+
+## Schedule redesign — `min`/`max`/`while`
+
+The old interval-set abstraction (`ScheduleInterval`, `ScheduleIntervals`) was removed. Schedules now express only a relative `Duration` per step via `Schedule.fromStep`, and standard policy composition is:
+
+- **Intersect** (recur while both recur, wait for slower): `Schedule.max(a, b)` (v3 `intersect`)
+- **Union** (recur while either recurs, wait for faster): `Schedule.min(a, b)` (v3 `union`)
+- **Clamp**: `Schedule.modifyDelay(schedule, ({ delay }) => Duration.min(delay, "10 seconds"))`
+
+`ScheduleDecision`: deleted. `Schedule.Decision`: likewise — use `Schedule.fromStep`.
+
+## Keep-alive, runtime, and memoization — the invisible shifts
+
+Three changes that never appear in your editor's red squiggles but change production behavior.
+
+### Keep-alive is now automatic
+
+In v3 a program that `fork`ed background work and then completed its main fiber would **exit underneath** that work unless the main called `runMain` plus manual reference holding. v4 installs a reference-counted keep-alive timer in core (chapter 13 note, `migration/fiber-keep-alive.md`): as long as any fiber lives — including `forkChild` background tasks — the process stays open.
+
+```ts
+// v3 — exits before background log appears unless runMain held the process:
+await Effect.runPromise(Effect.gen(function* () {
+  yield* Effect.forkChild(Effect.forever(Effect.log("background")))
+}))
+
+// v4 — same code keeps the process open until you interrupt it.
+// Layer.launch + NodeRuntime.runMain still gives you SIGINT/SIGTERM handling,
+// but you no longer need runMain solely to stay alive.
+```
+
+Rule: `runPromise` now keeps alive (via core timer); `runMain` adds **signals and exit codes**. Embeddings via `ManagedRuntime` keep alive while the runtime is not `dispose()`d.
+
+### `Runtime<R>` is deleted — `Context<R>` is the runtime
+
+v3:
+
+```ts
+import { Runtime } from "effect"
+const rt: Runtime<MyServices> = yield* Effect.runtime()
+await Runtime.runPromise(rt)(Effect.service(MyServices).pipe(Effect.flatMap((s) => s.doThing())))
+```
+
+v4:
+
+```ts
+import { Context, Effect } from "effect"
+const ctx: Context.Context<MyServices> = yield* Effect.context<MyServices>()
+await Effect.runPromise(Effect.service(MyServices).pipe(Effect.flatMap((s) => s.doThing())).pipe(
+  Effect.provide(ctx) // or Effect.runPromiseWith(ctx)(effect)
+))
+// Also: Effect.runForkWith(ctx), runSyncWith, runCallbackWith
+```
+
+`RuntimeFlags` (bitfield controlling time, tracing toggles) are gone — those behaviors live as `References` (`TracerEnabled`, `TracerTimingEnabled`, `MinimumLogLevel`, `Scheduler.MaxOpsBeforeYield`, `Scheduler.Scheduler`). Tune them with `Effect.provideService`.
+
+### Layer memoization across provides (v4 is shared)
+
+Chapter 10's demo compressed to the migration lesson:
+
+```ts
+// v3 — builds twice, logs twice, TWO pools (the "why do I have five pools?" bug):
+const program = Effect.gen(function* () {
+  const a = yield* Effect.provide(useA, MyServiceLayer)
+  const b = yield* Effect.provide(useB, MyServiceLayer)
+})
+await Effect.runPromise(program) // builds === 2
+
+// v4 — builds once (ambient MemoMap), logs once, ONE pool:
+await Effect.runPromise(program) // builds === 1
+
+// Opt-out when you need freshness (per-test isolation):
+yield* Effect.provide(useA, Layer.fresh(MyServiceLayer)) // always new
+yield* Effect.provide(useA, MyServiceLayer, { local: true }) // share within this provide only
+```
+
+If your v3 code worked around duplication by threading a single `MemoMap` manually, delete that workaround — it is now default behavior. Only pass `MemoMap` explicitly for cross-`ManagedRuntime` sharing (chapter 29).
+
+## Equality — structural by default
+
+v3 compared plain objects and arrays by reference. v4 compares them **structurally**, including nested Maps/Sets, using structural hashing. `NaN === NaN` for this comparison (use `Equivalence.strictEqual` if you need `NaN !== NaN`).
+
+What to delete:
+
+| v3 | v4 |
+|---|---|
+| `Data.struct({ a: 1 })` | `{ a: 1 }` |
+| `Data.unsafeStruct({ a: 1 })` | `{ a: 1 }` |
+| `Data.array([1,2])` | `[1,2]` or `[...xs]` |
+| `Data.tuple(1, "a")` | `[1, "a"]` |
+| `Data.case({ _tag: "A", x: 1 })` | `{ _tag: "A" as const, x: 1 }` |
+| `new Data.Class({ a: 1 })` | still works — class syntax stays |
+| `Data.TaggedEnum` | stays — discriminated union helpers remain |
+| `Equal.equals(a, b)` on plain objects | now structural — usually just `a === b` is insufficient; prefer `Equal.equals` for deep equality |
+| `Hash.hash(obj)` | structural hash |
+
+Keep `Data.Class` when you want a named constructor with a codec; drop `Data.struct/array/tuple` when you held plain data. See `migration/equality.md`.
+
+## `Micro` is gone — core is already micro
+
+`Micro` (`effect/Micro`) was v3's lightweight runtime (≈ 20 combinators). v4's core rewrite hit the same memory/speed targets, so `Micro` was deleted with no replacement. Map:
+
+| v3 `Micro` | v4 |
+|---|---|
+| `Micro.succeed / fail / sync / try / promise` | `Effect.succeed / fail / sync / try / promise` |
+| `Micro.gen / Micro.fn("name")` | `Effect.gen / Effect.fn("name")` |
+| `Micro.TaggedError` | `Data.TaggedError` (from `effect/Data`) |
+| `Micro.forkDaemon` | `Effect.forkDetach` |
+| `Micro.scheduleExponential(n)` | `Schedule.exponential(Duration)` |
+| `Micro.CurrentScheduler` | `References.Scheduler` / `Scheduler.Scheduler` |
+| `Micro.MaxOpsBeforeYield` | `References.MaxOpsBeforeYield` |
+
+If you imported `Micro` for bundle size, remove the import and use `Effect` directly — the bundler now tree-shakes the same 6 KB.
+
+## Step-by-step upgrade recipe
+
+Adapted from `MIGRATION.md` guidance, ordered for minimal churn:
+
+1. **Bump versions together.** `pnpm add effect@4.0.0-rc.112 @effect/platform-node@4.0.0-rc.112 @effect/sql-sqlite-node@4.0.0-rc.112 …` — one RC across all `@effect/*`. Do not mix v3 packages.
+2. **Fix `Either → Result` first.** Search `Either`. Rename package import, swap `Either<Either.Left → Result.Failure, Right → Success>`, fix `getLefts → getFailures`, `liftEither → liftResult`, param flip from `Either<L,R>` to `Result<E,A>`. Type errors here clarify `catch` handlers next.
+3. **Fix `catchAll → catch` family.** Global search `catchAll` → `catch`, `catchSome → catchFilter` (and introduce `Filter` imports), `either → result`, `optionFromOptional → catchTag`.
+4. **Fix `fork` family.** `fork\b → forkChild`, `forkDaemon → forkDetach`. Add `{ startImmediately?: boolean, uninterruptible?: boolean | "inherit" }` options only if you had custom interruption logic.
+5. **Fix `TRef → TxRef` / `STM`.** Search `TRef`, `TQueue`, `TMap`. Prefix `Tx`.
+6. **Collapse services.** Search `Context.Tag`, `GenericTag`, `Effect.Tag`, `Effect.Service`. Replace with `Context.Service(id)` class form. Flip identifier order. Delete `Context.TagUnify`.
+7. **Fix `FiberRef → Reference`.** Search `FiberRef`, `FiberRefs`. Introduce `Context.Reference(id, { defaultValue })` + `Effect.provideService` for overrides.
+8. **Delete `Runtime` / `Scope.extend` / `Layer.scoped` shims.** `Runtime → Context`, `Scope.extend → Scope.provide`, `Layer.scoped → Layer.effect` (drop `Scope` from `R` after).
+9. **`Data` shims.** Delete `Data.struct/array/tuple/case/unsafe*` wrappers — keep `Data.Class` and `Data.TaggedError`.
+10. **Imports.** Run the import map step: `@effect/platform/FileSystem → effect/FileSystem`, `@effect/platform/HttpClient → effect/unstable/http/HttpClient`, `@effect/opentelemetry/* → effect/unstable/observability/*`, `@effect/sql/* → effect/unstable/sql/*`. Many editors' auto-import can finish this once barrel renames are in place.
+11. **Run tests in virtual time again.** `it.effect` still resets `TestClock` per test. If a test that sleeped in v3 now hangs, it missed `TestClock.adjust` pairing (`forkChild → adjust → join`).
+12. **Provide observability last.** If you had custom `RuntimeFlags` to gate tracing, move that to `References.TracerEnabled` / `Effect.withTracerEnabled`.
+
+:::tip[Upgrade file-at-a-time against the same lockfile]
+Because v4's cross-provide memoization shares layers more aggressively than v3, a half-migrated codebase with some services still on `Context.Tag` and some on `Context.Service` will not memoize correctly (keys differ). Migrate one service module at a time but keep its `static readonly layer` signature identical externally so callers can flip. One service, one commit, one `pnpm test`.
+:::
+
+## Common compilation errors and what they mean
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Type 'Ref<number>' is not assignable to 'Effect<…>'` | Yielding a handle where an Effect is expected | Replace `yield* ref` with `yield* Ref.get(ref)` (and `Queue.take`, `Deferred.await`, `Fiber.join` likewise) |
+| `Property 'catchAll' does not exist on type 'typeof Effect'` | v3 name | Use `Effect.catch` / `catchCause` / `catchFilter` |
+| `Property 'scoped' does not exist on type 'typeof Layer'` | v3 name | Use `Layer.effect` / `effectContext` / `effectDiscard` |
+| `Cannot find module '@effect/platform/FileSystem'` | Re-homed | `from "effect"` (barrel) |
+| `Cannot find module 'effect/Either'` | Removed | `from "effect/Result"` + param flip |
+| `Property 'either' does not exist` | v3 name | `Effect.result` |
+| `No overload matches 'Effect.fork'` | Renamed | `Effect.forkChild(eff)` or `Effect.forkDetach(eff)` |
+| `Argument of type 'typeof MyService' not providing` | Still using `Context.Tag` | Migrate to `Context.Service("id")` and `yield* MyService` |
+| `Type 'TRef<number>' is not assignable…` | v3 name | `TxRef` + `TxRef.get/update` |
+| `FiberRefs` / `FiberRef` errors | Deleted | `Context.Reference` + `Effect.provideService` |
+| `Runtime<…>` errors | Deleted | `Context<…>` + `Effect.context` / `provide` |
+
+## Where each v3 pattern now lives in this course
+
+| You learned in v3 as … | Re-read here as … |
+|---|---|
+| `Effect.gen` + combinators | [ch 03](/effect-ts/03-gen-and-fn/) — `Effect.fn("name")` and `Effect.fn.Return` |
+| Typed errors + `catchAll` | [ch 05](/effect-ts/05-errors/) — reason errors, `Filter`, `catchReason` |
+| `Cause` trees | [ch 06](/effect-ts/06-cause-exit/) — flat `Cause { reasons: Reason[] }` |
+| `Option`/`Either`/`Data` | [ch 07](/effect-ts/07-option-result-data/) — `Option`, `Result<E,A>`, `Data.Class` |
+| `Context.Tag` / `GenericTag` | [ch 09](/effect-ts/09-context-services/) — `Context.Service` |
+| `Layer` + `Layer.scoped` | [ch 10](/effect-ts/10-layers/) — `Layer.effect` with auto Scope, memoization |
+| `Config` + providers | [ch 11](/effect-ts/11-config/) — unchanged shape, tighter path typing |
+| `Scope` + `acquireRelease` | [ch 12](/effect-ts/12-scopes-resources/) — `Scope.provide` |
+| `Fiber`, `fork`, `race` | [ch 13](/effect-ts/13-fibers/) — `forkChild`/`forkDetach`, structured lifetimes |
+| `FiberRef` | [ch 14](/effect-ts/14-references/) — `Context.Reference` |
+| `Schedule` intervals | [ch 17](/effect-ts/17-schedule/) — `min`/`max`/`while` redesign |
+| `Stream` methods | [ch 18](/effect-ts/18-streams/) — channel-backed, same `Stream` surface |
+| `Schema` as validation | [Schema track / ch 20+](/effect-ts/19-schema-basics/) — single source + arbitraries |
+| `HttpApi`, `HttpClient` | [ch 24](/effect-ts/24-http-apis/) — `effect/unstable/httpapi`, status-annotated errors |
+| `SqlClient`, `Migrator` | [ch 25](/effect-ts/25-sql/) — `effect/unstable/sql` + driver packages |
+| `TestClock`, `it.effect` | [ch 28](/effect-ts/28-testing/) — same `it.effect`/`TestClock` shape |
+
+## Further reading — upstream migration docs
+
+These live alongside the code and are the canonical reference as RCs advance:
+
+| Document | Covers |
+|---|---|
+| [`MIGRATION.md`](https://github.com/Effect-TS/effect/blob/main/MIGRATION.md) | Philosophy, package consolidation, unstable system, versioning, bundle |
+| [`migration/v3-to-v4.md`](https://github.com/Effect-TS/effect/blob/main/migration/v3-to-v4.md) | Exhaustive import + API rename map (generated diff) |
+| [`migration/services.md`](https://github.com/Effect-TS/effect/blob/main/migration/services.md) | `Context.Tag → Context.Service` detail |
+| [`migration/cause.md`](https://github.com/Effect-TS/effect/blob/main/migration/cause.md) | Flat `Cause` vs recursive tree |
+| [`migration/error-handling.md`](https://github.com/Effect-TS/effect/blob/main/migration/error-handling.md) | `catch*` renames + `Filter` + `catchReason` |
+| [`migration/forking.md`](https://github.com/Effect-TS/effect/blob/main/migration/forking.md) | `fork → forkChild`, `forkDaemon → forkDetach`, options |
+| [`migration/yieldable.md`](https://github.com/Effect-TS/effect/blob/main/migration/yieldable.md) | Yieldable narrowing contract |
+| [`migration/fiber-keep-alive.md`](https://github.com/Effect-TS/effect/blob/main/migration/fiber-keep-alive.md) | Keep-alive timer, `runMain` vs `runPromise` |
+| [`migration/layer-memoization.md`](https://github.com/Effect-TS/effect/blob/main/migration/layer-memoization.md) | Cross-provide memo map sharing |
+| [`migration/fiberref.md`](https://github.com/Effect-TS/effect/blob/main/migration/fiberref.md) | `FiberRef → Context.Reference` |
+| [`migration/runtime.md`](https://github.com/Effect-TS/effect/blob/main/migration/runtime.md) | `Runtime<R>` removal |
+| [`migration/scope.md`](https://github.com/Effect-TS/effect/blob/main/migration/scope.md) | `Scope` refinements, `extend → provide` |
+| [`migration/equality.md`](https://github.com/Effect-TS/effect/blob/main/migration/equality.md) | Structural-by-default, `Data` shims removed |
+
+<LinkCard
+  title="Cheatsheet"
+  description="Back to the fast lookup — every module, constructor, and combinator in one sheet for day-to-day use."
+  href="/effect-ts/cheatsheet/"
+/>

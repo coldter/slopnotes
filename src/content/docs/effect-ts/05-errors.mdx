@@ -1,0 +1,522 @@
+---
+title: Typed Errors
+description: The E channel end to end — Schema.TaggedError domains, the renamed catch family (catch, catchTag, catchTags, catchIf, catchFilter), the reason-error pattern with catchReason/catchReasons/unwrapReason, error mapping, and the failures-vs-defects taxonomy.
+sidebar:
+  order: 5
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+`Promise<T>` rejects with `any`. That single fact is why most TypeScript
+services have an unspoken contract that errors are shaped correctly and every
+caller remembers to check. Effect's second type parameter makes the contract
+compile-checked — but a typed channel is only as good as the discipline you
+put into it. This chapter is that discipline: how to define errors, raise them,
+handle them exhaustively, and where the boundary between "expected failure"
+and "defect" belongs.
+
+## What the E channel promises
+
+```ts
+declare const loadProfile: (id: string) => Effect.Effect<Profile, ProfileError>
+```
+
+Read as: *this computation either produces a `Profile` or fails with a
+`ProfileError`*. Three properties follow, none of which hold for rejections:
+
+1. **Exhaustiveness** — handlers must account for every member of the union.
+2. **Composition** — sequencing effects widens `E` to the union of both sides;
+   nothing hides.
+3. **Recoverability by default** — typed errors are data; catching one is a
+   normal value transformation.
+
+Defects (from `Effect.die`, or thrown inside `Effect.sync` bodies, or promise
+rejections under `Effect.promise`) deliberately bypass this channel. More on
+that in [the taxonomy](#expected-failures-vs-defects).
+
+## Defining domain errors
+
+The house style is `Schema.TaggedError`: a class whose props are declared as a
+Schema struct. You get three things at once:
+
+```ts title="src/domain/errors.ts"
+import { Schema } from "effect"
+
+export class UserNotFound extends Schema.TaggedError<UserNotFound>()(
+  "UserNotFound",
+  { id: Schema.String }
+) {}
+
+export class PaymentDeclined extends Schema.TaggedError<PaymentDeclined>()(
+  "PaymentDeclined",
+  { cardLast4: Schema.String, code: Schema.Literal("insufficient_funds", "blocked", "expired") }
+) {}
+```
+
+- **Decodable/encodable**: instances validate against the struct, so the same
+  declaration drives HTTP response bodies, RPC payloads, and log redaction.
+- **Loggable**: the runtime renders them structurally instead of dumping
+  internals.
+- **Yieldable & tagged**: they implement `Cause.YieldableError`, which means
+  both `Effect.fail(new UserNotFound({ id }))` and — inside generators —
+  `return yield* new UserNotFound({ id })`.
+
+The `yield*` trick works because yieldable errors carry their own
+`[Symbol.iterator]`: yielding one *fails the generator* with that error. The
+explicit `return` before it tells TypeScript control flow ends here, so
+narrowing after a conditional raise works:
+
+```ts
+import { Effect } from "effect"
+
+declare function findUser(id: string): Effect.Effect<User | null>
+
+const getOrRaise = (id: string) =>
+  Effect.gen(function* () {
+    const user = yield* findUser(id)
+    if (user === null) {
+      return yield* new UserNotFound({ id })
+    }
+    return user // narrowed to User
+  })
+```
+
+:::tip[Lightweight alternative]
+For errors that never cross a wire, `Data.TaggedError("Tag")<{...}>` gives the
+same tagged, yieldable, structurally-equal behaviour without pulling in
+Schema. Reach for `Schema.TaggedError` whenever the error will be serialised,
+decoded from input, or mapped to an HTTP status.
+:::
+
+## Raising
+
+Three equivalent-ish forms; use each where it reads best:
+
+```ts
+import { Effect } from "effect"
+
+declare const quota: number
+
+// 1. Constructor — outside generators
+const a = Effect.fail(new UserNotFound({ id: "u_1" }))
+
+// 2. Yielded error class — inside gen bodies (preferred)
+const b = Effect.gen(function* () {
+  if (quota <= 0) return yield* new PaymentDeclined({ cardLast4: "4242", code: "blocked" })
+})
+
+// 3. filterOrFail — guard an existing success value
+const c = Effect.succeed(quota).pipe(
+  Effect.filterOrFail(
+    (q) => q > 0,
+    () => new PaymentDeclined({ cardLast4: "4242", code: "blocked" })
+  )
+)
+```
+
+`filterOrFail` without a second argument fails with `NoSuchElementError` —
+handy for "predicate didn't hold" guards during prototyping.
+
+## The catch family
+
+v3→v4 renames first, because half the stale blog posts on the internet use the
+old names:
+
+| v3 | v4 | Catches |
+|---|---|---|
+| `catchAll` | **`Effect.catch`** | all typed errors |
+| `catchAllCause` | **`Effect.catchCause`** | everything: errors, defects, interrupts |
+| `catchSome` | **`Effect.catchIf`** / **`Effect.catchFilter`** | matching errors only |
+| `catchTag` / `catchTags` | unchanged | by `_tag` |
+| — (new) | **`catchReason` / `catchReasons` / `unwrapReason`** | nested reason-errors |
+| — | **`catchDefect`** | defects only |
+
+All of them share two properties worth internalising:
+
+- The handler returns an effect; its `E` joins the surrounding channel.
+- Except for `catchCause`, none touch defects or interruption. A caught error
+  stays gone; a defect keeps crashing upward.
+
+### `Effect.catch` — the total fallback
+
+```ts
+import { Effect } from "effect"
+
+declare const program: Effect.Effect<string, UserNotFound | PaymentDeclined>
+
+const recovered = program.pipe(
+  Effect.catch((error) => Effect.succeed(`handled: ${error._tag}`))
+)
+// Effect<string> — E fully discharged
+```
+
+Note the handler receives the *union*, so anything beyond `_tag` needs
+narrowing. For unions of tagged classes, prefer the tag-based combinators —
+you keep the types.
+
+### `Effect.catchTag` — one tag, kept types
+
+```ts
+const guest = program.pipe(
+  Effect.catchTag("UserNotFound", (e) =>
+    Effect.succeed(`guest (${e.id})`))
+)
+// Effect<string, PaymentDeclined> — handled tag removed from E
+```
+
+The array form handles several tags with one handler when they share shape:
+
+```ts
+const handled = program.pipe(
+  Effect.catchTag(["UserNotFound", "PaymentDeclined"], (e) =>
+    // e: UserNotFound | PaymentDeclined — both share `_tag`
+    Effect.succeed(`recoverable: ${e._tag}`))
+)
+// Effect<string> — both tags discharged
+```
+
+For one-tag handling with a fallback for everything else, the optional third
+argument receives the remainder:
+
+```ts
+const withFallback = program.pipe(
+  Effect.catchTag(
+    "UserNotFound",
+    (e) => Effect.succeed(`missing ${e.id}`),
+    (rest) => Effect.fail(rest) // rest: PaymentDeclined
+  )
+)
+```
+
+### `Effect.catchTags` — the exhaustive switch
+
+The object form is your `switch (error._tag)` replacement, with compiler
+enforcement on keys:
+
+```ts title="src/handle-payment.ts"
+import { Data, Effect } from "effect"
+
+class UserNotFound extends Data.TaggedError("UserNotFound")<{ id: string }> {}
+class PaymentDeclined extends Data.TaggedError("PaymentDeclined")<{ code: string }> {}
+
+type CartError = UserNotFound | PaymentDeclined
+
+const describe = (program: Effect.Effect<string, CartError>) =>
+  program.pipe(
+    Effect.catchTags({
+      UserNotFound: (e) => Effect.succeed(`no user ${e.id}`),
+      PaymentDeclined: (e) => Effect.succeed(`declined: ${e.code}`)
+    })
+  )
+// Effect<string> — exhaustive, no fallback needed
+```
+
+Two typing details make this pattern robust:
+
+- Keys not present in `E` are rejected (`never`) — typos and drift become
+  compile errors.
+- Omitting a tag leaves it in `E`; add the optional second argument `orElse`
+  to discharge the remainder explicitly.
+
+That gives the canonical exhaustive-handling idiom: handle known tags in the
+table, funnel the unknown rest into logging + rethrow:
+
+```ts
+const resilient = program.pipe(
+  Effect.catchTags({
+    UserNotFound: (e) => Effect.succeed(`fallback for ${e.id}`)
+  }),
+  Effect.catch((unmatched) =>
+    Effect.logWarning(`unexpected: ${unmatched._tag}`).pipe(Effect.as("generic-failure"))
+  )
+)
+```
+
+### `Effect.catchIf` & `Effect.catchFilter` — predicates and filters
+
+`catchIf` takes a predicate (handler keeps `E`) or a refinement (handler gets
+the narrowed type), plus optional `orElse`:
+
+```ts
+import { Effect } from "effect"
+
+declare class ApiError { readonly status: number }
+declare const attemptOnce: Effect.Effect<string, ApiError>
+declare const isRetryable: (e: ApiError) => boolean
+
+// handler runs when the predicate holds; orElse receives the rest
+const withRetry = attemptOnce.pipe(
+  Effect.catchIf(
+    isRetryable,
+    () => Effect.succeed("retrying elsewhere"),
+    (other) => Effect.fail(other) // non-retryable errors pass through
+  )
+)
+```
+
+`catchFilter` upgrades the predicate to a `Filter` — a function
+`(input: E) => Result<Pass, Fail>` that can also *transform* while matching.
+The `Filter` module ships constructors for the common cases:
+
+| Filter constructor | Passes when |
+|---|---|
+| `Filter.fromPredicate(pred)` | predicate holds (value unchanged) |
+| `Filter.make(fn → Result)` | custom logic |
+| `Filter.tagged("Tag")` | `_tag` matches; narrows to that member |
+| `Filter.equals(value)` | structurally equal (chapter 07's equality!) |
+| `Filter.string` / `number` / ... | refinement filters |
+
+```ts
+import { Data, Effect, Filter } from "effect"
+
+class NotFound extends Data.TaggedError("NotFound")<{ id: string }> {}
+
+const program = Effect.fail(new NotFound({ id: "u_9" }))
+
+const viaFilter = program.pipe(
+  Effect.catchFilter(
+    Filter.tagged("NotFound"),
+    (e) => Effect.succeed(`missing:${e.id}`),
+    (rest) => Effect.fail(rest) // non-matching failures land here
+  )
+)
+```
+
+Think of `Filter` as a reusable, composable match arm: build it once, share it
+across call sites, compose with `Filter.or`. It replaces v3's `Refinement`
+gymnastics in `catchSome`.
+
+## Reason-errors: one parent tag, many causes
+
+Real domains accumulate failure variants fast. A naive union —
+`RateLimit | QuotaExceeded | ContextTooLong | ContentFiltered | ...` — leaks
+into every signature downstream and every `catchTags` table upstream. The
+v4 pattern is a **parent error carrying a discriminated `reason` field**, with
+dedicated combinators that operate on the nesting:
+
+```ts title="src/domain/ai.ts"
+import { Schema } from "effect"
+
+export class RateLimit extends Schema.TaggedError<RateLimit>()("RateLimit", {
+  retryAfterSeconds: Schema.Number
+}) {}
+
+export class QuotaExceeded extends Schema.TaggedError<QuotaExceeded>()("QuotaExceeded", {
+  limit: Schema.Number
+}) {}
+
+export class ContextTooLong extends Schema.TaggedError<ContextTooLong>()("ContextTooLong", {
+  tokens: Schema.Number
+}) {}
+
+/** Every way an AI provider call can disappoint. */
+export type AiReason = RateLimit | QuotaExceeded | ContextTooLong
+
+/** The one error callers see. */
+export class AiError extends Schema.TaggedError<AiError>()("AiError", {
+  model: Schema.String,
+  reason: Schema.Union([RateLimit, QuotaExceeded, ContextTooLong])
+}) {}
+```
+
+Raising looks like wrapping; handling has three tiers:
+
+### `catchReason` — one reason, precisely
+
+```ts
+import { Effect } from "effect"
+
+declare const complete: Effect.Effect<string, AiError>
+
+const politeBackoff = complete.pipe(
+  Effect.catchReason(
+    "AiError",
+    "RateLimit",
+    (reason, error) =>
+      Effect.succeed(`retry after ${reason.retryAfterSeconds}s (${error.model})`)
+  )
+)
+// Effect<string, AiError> — other reasons still fail with AiError
+```
+
+The handler receives `(reason, error)` — the unwrapped reason *and* the parent,
+so context like `model` stays available. An optional fourth argument handles
+non-matching reasons.
+
+### `catchReasons` — the table form
+
+```ts
+const message = complete.pipe(
+  Effect.catchReasons("AiError", {
+    RateLimit: (r) => Effect.succeed(`slow down, retry in ${r.retryAfterSeconds}s`),
+    QuotaExceeded: (r) => Effect.succeed(`quota done: ${r.limit}`),
+    ContextTooLong: (r) => Effect.succeed(`trim ${r.tokens} tokens`)
+  })
+)
+// exhaustive over reasons; AiError fully discharged
+```
+
+Same rules as `catchTags`: unknown reason keys are compile errors, omitted
+reasons remain in `E`, trailing `orElse` discharges the rest.
+
+### `unwrapReason` — flatten when the caller should decide
+
+Sometimes the *callee* wants the tidy single-tag API but the *caller* wants
+the full union. `unwrapReason` promotes reasons into the error channel,
+replacing the parent:
+
+```ts
+const flattened = complete.pipe(Effect.unwrapReason("AiError"))
+// Effect<string, RateLimit | QuotaExceeded | ContextTooLong>
+```
+
+Use it at layer boundaries: services expose `AiError` internally, then unwrap
+once where callers need per-reason recovery.
+
+## Mapping errors
+
+When you're not recovering — just reshaping — use the mapping family:
+
+```ts
+import { Effect } from "effect"
+
+declare const raw: Effect.Effect<number, string>
+
+const labelled = raw.pipe(Effect.mapError((msg) => new Error(msg)))
+// Effect<number, Error>
+
+const both = raw.pipe(
+  Effect.mapBoth({
+    onFailure: (msg) => new Error(msg),
+    onSuccess: (n) => n * 2
+  })
+)
+// Effect<number, Error>
+```
+
+`mapError` cannot recover (the effect still fails); it only relabels. If you
+find yourself wanting conditional relabelling, you want `catchTag`, not
+string-matching inside `mapError`.
+
+## Expected failures vs defects
+
+The taxonomy from chapter 04, now operationalised:
+
+| Question | Answer → tool |
+|---|---|
+| Could a caller plausibly recover? | yes → typed error in `E` |
+| Is it a bug / impossible state? | yes → `Effect.die` (defect) |
+| Third-party threw something you don't understand? | leave it a defect — log at the boundary |
+| Should the process die loudly? | defect |
+
+Two consequences:
+
+**1. Demote at the edges with `orDie`.** Inside a service whose errors are all
+"impossible by construction", stop threading `E` through every internal
+signature — collapse it once:
+
+```ts
+const parseConfig = Effect.try({
+  try: () => JSON.parse(rawConfig) as Config,
+  catch: (cause) => new Error("config corrupted", { cause })
+}).pipe(Effect.orDie)
+// Effect<Config> — a broken config is a crash, not a feature
+```
+
+**2. Promote at the boundaries with `catchDefect`.** Server frameworks do this
+for you (defects become 500s). In library code, capture defects only where you
+can genuinely add value — usually reporting:
+
+```ts
+import { Effect } from "effect"
+
+declare const task: Effect.Effect<number>
+declare const fallbackValue: number
+
+const guarded = task.pipe(
+  Effect.catchDefect((defect) =>
+    Effect.logError("unexpected defect", { defect }).pipe(Effect.as(fallbackValue))
+  )
+)
+```
+
+Everything else in between: typed errors, all the way down.
+
+## Built-in typed errors
+
+The core library ships a small set of yieldable errors, all living in the
+`Cause` module (v3 names in parens — several were renamed):
+
+| Error | Raised by |
+|---|---|
+| `NoSuchElementError` (was `NoSuchElementException`) | `Option.getOrThrow`, `Effect.fromNullishOr`, yielding `Option.none`, `Effect.head`, `filterOrFail` without a message |
+| `TimeoutError` (was `TimeoutException`) | `Effect.timeout` |
+| `UnknownError` (was `UnknownException`) | bare `Effect.try` / `Effect.tryPromise` forms |
+| `IllegalArgumentError` (was `IllegalArgumentException`) | argument-contract violations in core APIs |
+| `ExceededCapacityError` (was `ExceededCapacityException`) | bounded structures pushed past capacity |
+| `AsyncFiberError` | running an async effect under `runSync` |
+
+Notes for v3 veterans:
+
+- `RuntimeException` is **gone** — there's no catch-all "runtime broke"
+  pseudo-error anymore; genuine breakage is a defect, full stop.
+- `InterruptedException` is **gone** — interruption is represented as an
+  `Interrupt` *reason* in the cause, not as an error value in `E`. Chapter 06
+  covers the mechanics.
+
+Each ships with a runtime guard (`Cause.isNoSuchElementError(u)`,
+`Cause.isUnknownError(u)`, ...) for the rare places you inspect untyped
+values. Because they're yieldable, you can also raise them yourself:
+
+```ts
+import { Cause, Effect } from "effect"
+
+const requirePositive = (n: number) =>
+  n > 0 ? Effect.succeed(n) : Effect.fail(new Cause.IllegalArgumentError("must be positive"))
+```
+
+## Designing an error taxonomy
+
+Rules distilled from production Effect codebases:
+
+1. **One file per bounded context exporting its errors.** Callers import
+   `AiError` and never learn about the reasons unless they opt in via
+   `catchReason(s)`/`unwrapReason`.
+2. **Data, not strings.** `new RateLimit({ retryAfterSeconds: 30 })` carries
+   structure a handler can act on; `"rate limited"` invites regex parsing.
+3. **Narrow unions at API borders.** If a public function can only ever fail
+   with `UserNotFound`, don't type it `UserNotFound | InternalError` "just in
+   case" — route the impossible case to a defect instead.
+4. **Serialisable payloads.** Anything crossing HTTP/RPC must survive
+   JSON round-trips: schema fields, no functions, no class hierarchies beyond
+   the tagged error itself.
+5. **Reserve `UnknownError` for the true unknown.** If you control the throw
+   site, replace the bare `try`/`tryPromise` form with `{ try, catch }` and a
+   real error class.
+
+## Cheat sheet
+
+| Goal | Code |
+|---|---|
+| Raise in a generator | `return yield* new MyError({...})` |
+| Raise outside a generator | `Effect.fail(new MyError({...}))` |
+| Guard a success value | `Effect.filterOrFail(pred, makeError)` |
+| Handle everything typed | `Effect.catch(e => ...)` |
+| Handle by tag | `Effect.catchTag("Tag", handler)` |
+| Exhaustive switch | `Effect.catchTags({ TagA: h, TagB: h })` (+ `orElse`) |
+| Predicate/refinement | `Effect.catchIf(refinement, handler)` |
+| Reusable match arm | `Effect.catchFilter(Filter.tagged("T"), handler)` |
+| One nested reason | `Effect.catchReason("Parent", "Reason", (r, err) => ...)` |
+| Reason table | `Effect.catchReasons("Parent", { Reason: h })` |
+| Flatten reasons up | `Effect.unwrapReason("Parent")` |
+| Relabel without recovery | `Effect.mapError(f)` |
+| Errors → defects at edges | `Effect.orDie` |
+| Capture defects | `Effect.catchDefect(d => ...)` |
+
+## Next
+
+<LinkCard
+  title="06 · Cause & Exit"
+  description="What actually happens when things go wrong: the flat Cause model, Fail/Die/Interrupt reasons, multiple simultaneous failures, the Exit type, and pretty-printing causes."
+  href="/effect-ts/06-cause-exit/"
+/>

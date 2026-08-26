@@ -1,0 +1,428 @@
+---
+title: Context.References — Fiber-Local State
+description: FiberRef is gone in v4. Fiber-local state is now Context.Reference — service keys with defaults. Defining refs, reading them, scoped overrides via provideService, restore semantics under nesting and forking, the built-in catalog, and how this replaces AsyncLocalStorage.
+sidebar:
+  order: 14
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+Some state should follow the *flow of execution* rather than live in a global
+or get threaded through every function parameter: the log level for this
+request, trace annotations for this transaction, the scheduler budget for this
+CPU-heavy region, the authenticated user for everything downstream of the
+auth middleware. Different concurrent tasks want different values
+simultaneously — which is exactly what thread-local storage solved on threads,
+and what `AsyncLocalStorage` hacks onto Node's event loop.
+
+Effect v4 has one primitive for this, and the interesting part is *which*
+primitive: **fiber-local state is a service**. `FiberRef` is gone entirely;
+what replaced it is `Context.Reference` — the same key type as
+`Context.Service` from [chapter 9](/effect-ts/09-context-services/), with one
+difference: a mandatory default value.
+
+## The unification, and why
+
+In v3 there were two parallel mechanisms:
+
+- `Context.Tag` / services: values you must **provide** or the effect won't
+  run. Missing = compile error.
+- `FiberRef`: mutable per-fiber cells with initial values. Always readable,
+  never required, mutated imperatively (`FiberRef.set`) by whoever runs.
+
+v4 collapsed them. A `Context.Reference<Service>` is declared like a service
+but carries `defaultValue`; reading it always succeeds (falls back to the
+default when nothing was provided), while providing an override scopes that
+value to a region:
+
+```ts
+import { Context } from "effect"
+
+class RequestId extends Context.Reference<RequestId>()("RequestId", {
+  defaultValue: () => "unset"
+}) {}
+```
+
+The rationale is sound once you see the consequences:
+
+1. **One mental model.** "Read a capability from context" is now one operation
+   (`yield* SomeKey`) whether the key is mandatory (`Service`) or defaulted
+   (`Reference`). Same variance, same composition, same layering tools.
+2. **Imperative mutation is gone — deliberately.** v3's `FiberRef.set`
+   mutated the *current fiber*, meaning the write leaked upward past your
+   function into code you don't own. In v4 the only way to change a reference
+   is `Effect.provideService(effect, ref, value)` — the override lives exactly
+   as long as `effect`, then the previous value is restored. Writes are
+   lexically scoped, like everything else in this course so far.
+3. **Runtime configuration became ordinary DI.** Log levels, schedulers,
+   tracing toggles are just references the runtime consults — so tuning them
+   per-region uses the same API as injecting a database pool.
+
+:::note[Migration map]
+v3 `FiberRef.make(initial)` → declare `Context.Reference(key,
+{ defaultValue: () => initial })`. v3 `Effect.locally(effect, ref, value)` →
+`Effect.provideService(effect, ref, value)`. v3 `FiberRef.get/set` → read with
+`yield* ref`; writes only through provision. `Differ`, `FiberRefs`, and
+`FiberRefsPatch` are deleted — there is no patch/merge machinery because there
+is no imperative mutation to patch.
+:::
+
+## Reading and overriding
+
+Reading is a yield, exactly like reading a service:
+
+```ts
+import { Context, Effect } from "effect"
+
+interface TenantInfo {
+  readonly id: string
+  readonly tier: "free" | "premium"
+}
+
+class Tenant extends Context.Reference<TenantInfo>()("Tenant", {
+  defaultValue: () => ({ id: "public", tier: "free" })
+}) {}
+
+const quotaFor = (tenant: TenantInfo) => (tenant.tier === "free" ? 10 : 1000)
+
+const handler = Effect.gen(function* () {
+  const tenant = yield* Tenant          // default if nothing was provided
+  yield* Effect.log(`serving tenant ${tenant.id} (quota ${quotaFor(tenant)})`)
+})
+```
+
+Overriding is provision — data-flow style first argument, or pipe style:
+
+```ts
+const premiumRequest = Effect.provideService(handler, Tenant, {
+  id: "acme",
+  tier: "premium"
+})
+// equivalent: handler.pipe(Effect.provideService(Tenant, { id: "acme", tier: "premium" }))
+```
+
+### Restore semantics
+
+This is where the fiber-local behavior emerges from plain context mechanics:
+
+- **Region-scoped.** While `provideService` runs its inner effect, the fiber's
+  context contains the override. The moment the inner effect exits — success,
+  failure, interruption — the previous context resumes. Nested overrides
+  shadow outer ones and unwind correctly:
+
+```ts
+const nested = Effect.provideService(
+  Effect.provideService(handler, Tenant, { id: "outer", tier: "paid" }),
+  Tenant,
+  { id: "inner", tier: "paid" }
+)
+// handler sees "inner"; after nested completes, callers still see their own value
+```
+
+- **Inherited at fork time.** Fibers forked inside the region capture the
+  current context — including reference overrides. This is the documented
+  contract: *"providing a new value changes behavior for the provided effect
+  and the fibers it starts."* So a request-scoped annotation propagates into
+  every worker you spawn mid-request, but does **not** leak back into the
+  parent or sibling requests.
+
+```ts
+const program = Effect.gen(function* () {
+  const child = yield* Effect.forkChild(Effect.gen(function* () {
+    return yield* Tenant        // sees "acme" — captured at fork
+  }))
+  return yield* Fiber.join(child)
+}).pipe(Effect.provideService(Tenant, { id: "acme", tier: "premium" }))
+// imports for this snippet: Effect, Fiber (from "effect")
+```
+
+- **Not visible across independent fibers.** Provision affects descendants,
+  not peers. Two concurrent requests each providing different `Tenant` values
+  are fully isolated — no locking, no cross-talk. This is the property
+  `AsyncLocalStorage` approximates with async-hook plumbing; here it's just
+  immutable contexts flowing down a tree.
+
+:::caution[No escape hatch]
+If you're searching for v4's `FiberRef.set`, stop — it doesn't exist, and the
+patterns that depended on it need restructuring. "Accumulate state downward"
+(e.g., a current-span stack) is served by references the *runtime itself*
+manages (like `References.CurrentLogSpans`). For application-level mutable
+state use `Ref` (global) or pass values explicitly; reach for a `Reference`
+when the defining trait is *defaulted, overridable, inherited-by-descendants*.
+:::
+
+## Defining your own: patterns
+
+A reference can carry anything. Two shapes cover most needs:
+
+**Simple value with default:**
+
+```ts
+import { Context } from "effect"
+
+class FeatureFlags extends Context.Reference<FeatureFlags>()("FeatureFlags", {
+  defaultValue: () => ({ newCheckout: false, darkMode: true })
+}) {}
+```
+
+**Request context bundle** — one reference replacing five parameters:
+
+```ts
+import { Context, Effect } from "effect"
+
+interface RequestCtx {
+  readonly requestId: string
+  readonly userId: string | undefined
+  readonly startedAt: number
+}
+
+class Request extends Context.Reference<RequestCtx>()("Request", {
+  defaultValue: () => ({
+    requestId: "no-request",
+    userId: undefined,
+    startedAt: Date.now()
+  })
+}) {}
+
+export const withRequest = (ctx: RequestCtx) => <A, E, R>(eff: Effect.Effect<A, E, R>) =>
+  Effect.provideService(eff, Request, ctx)
+
+// deep in the codebase, no parameters needed:
+const auditLog = Effect.fn("auditLog")(function* (action: string) {
+  const req = yield* Request
+  yield* Effect.log(`[${req.requestId}] user=${req.userId} ${action}`)
+})
+```
+
+The middleware boundary provides once; everything downstream reads. Compare
+with the explicit alternative — threading `req` through every signature — and
+the trade-off is clear: implicit flow buys ergonomics at the cost of
+visibility in types. Note that unlike a mandatory `Context.Service`, the `R`
+channel doesn't grow: defaulted references are always satisfiable.
+
+## The built-in catalog
+
+The runtime itself runs on references. The `References` module (plus
+`Scheduler` and `Tracer` modules for a few low-level keys) exposes the knobs:
+
+| Reference | Type | Controls |
+|---|---|---|
+| `CurrentLogLevel` | `Severity` | level assigned to logs emitted in region |
+| `MinimumLogLevel` | `LogLevel` | threshold below which logs are dropped |
+| `UnhandledLogLevel` | `Severity \| undefined` | severity used when reporting unhandled errors |
+| `CurrentLogAnnotations` | `ReadonlyRecord<string, unknown>` | metadata attached to every log line |
+| `CurrentLogSpans` | `ReadonlyArray<[label, timestamp]>` | active span labels attached to logs |
+| `CurrentStackFrame` | `StackFrame \| undefined` | synthetic frame for traces |
+| `CurrentLoggers` | `ReadonlySet<Logger>` | which logger sinks receive output |
+| `LogToStderr` | `boolean` | mirror logs to stderr |
+| `TracerEnabled` | `boolean` | span registration on/off |
+| `TracerTimingEnabled` | `boolean` | duration recording on/off |
+| `TracerSpanAnnotations` | `ReadonlyRecord<string, unknown>` | annotations applied to spans |
+| `TracerSpanLinks` | `ReadonlyArray<SpanLink>` | links attached to spans |
+| `CurrentTraceLevel` | trace level | default level for spans created in region |
+| `MinimumTraceLevel` | trace level | sampling threshold — spans below aren't exported |
+| `DisablePropagation` | — | mark tracing work non-propagating (local spans only) |
+| `MaxOpsBeforeYield` | `number` (default `2048`) | op budget before a fiber yields to the scheduler |
+| `PreventSchedulerYield` | `boolean` | bypass yield checks entirely (throughput mode) |
+| `CurrentErrorReporters` | `ReadonlySet<ErrorReporter>` | sinks for reported errors |
+
+### Practical examples
+
+**Raise verbosity for one flaky region** — no global log-level fiddling:
+
+```ts
+import { Effect, LogLevel, References } from "effect"
+
+const debugSync = Effect.provideService(
+  syncEngine,
+  References.MinimumLogLevel,
+  LogLevel.Debug
+)
+```
+
+**Annotate every log line in a request** — the structured-logging workhorse:
+
+```ts
+import { Effect, References } from "effect"
+
+const serve = Effect.gen(function* () {
+  yield* handleRequest            // every log inside carries these fields
+}).pipe(
+  Effect.provideService(References.CurrentLogAnnotations, {
+    requestId: ctx.requestId,
+    route: "/checkout",
+    tenant: tenant.id
+  })
+)
+```
+
+Because annotations ride the context, they propagate to forked workers and
+into queued jobs that capture the context — your log pipeline gets consistent
+correlation without passing a logger around.
+
+**Tune the scheduler for a CPU-bound batch** — fewer yields, more throughput,
+bounded to the batch:
+
+```ts
+import { Effect, Scheduler } from "effect"
+
+const crunch = heavyBatch.pipe(
+  Effect.provideService(Scheduler.MaxOpsBeforeYield, 16384)
+)
+// other fibers keep the default 2048-op budget and stay responsive
+```
+
+**Silence tracing for health checks** (spans cost allocations):
+
+```ts
+healthEndpoint.pipe(Effect.provideService(References.TracerEnabled, false))
+```
+
+### The two log-level references (and friends)
+
+`CurrentLogLevel` and `MinimumLogLevel` sound redundant; they're different
+axes. `MinimumLogLevel` is a **filter** — messages below the threshold are
+dropped before any sink sees them. `CurrentLogLevel` is the **severity
+assigned** to messages that don't specify one explicitly (default `"Info"`),
+which matters when sinks route by severity — send warnings to Sentry, info to
+stdout. Together they give you region-scoped verbosity *and* routing without
+touching logger configuration:
+
+```ts
+import { Effect, LogLevel, References } from "effect"
+
+// verbose in here, and everything untagged counts as Debug for routing
+const noisyRegion = effectUnderTest.pipe(
+  Effect.provideService(References.MinimumLogLevel, LogLevel.All),
+  Effect.provideService(References.CurrentLogLevel, "Debug" as const)
+)
+```
+
+A few more worth knowing by name:
+
+- **`UnhandledLogLevel`** (`Severity | undefined`, default `"Error"`) — what
+  severity unhandled-failure reports get; set `undefined` to silence them.
+- **`LogToStderr`** (`boolean`) — mirrors log output to stderr regardless of
+  configured loggers; handy in dev shells.
+- **`CurrentLoggers`** (`ReadonlySet<Logger>`) — which sinks receive output;
+  provision an empty set to mute logging entirely within a region.
+- **`TracerSpanAnnotations`** / **`TracerSpanLinks`** — like log annotations,
+  but applied to spans created in the region; this is how you get
+  request-correlated traces without touching span construction code.
+- **`DisablePropagation`** — marks spans created inside as non-propagating
+  (local bookkeeping only); useful for internal fan-out you don't want
+  polluting downstream trace parents.
+
+:::note[fiberCached]
+Some built-in references are declared with an internal `fiberCached: true`
+flag (`MaxOpsBeforeYield`, `PreventSchedulerYield`, `CurrentLogLevel`,
+`MinimumLogLevel`, ...). It's a performance hint — the runtime caches the
+resolved value on the fiber instead of re-reading context per operation.
+You can pass it for your own hot-path references; it changes nothing about
+semantics, only lookup cost.
+:::
+
+## Composing with Layers
+
+References participate in layers like any context entry, which turns runtime
+configuration into a buildable graph instead of scattered `locally` calls.
+Two idioms:
+
+**Config layer providing defaults app-wide:**
+
+```ts
+import { Context, Effect, Layer, References } from "effect"
+
+const RuntimeDefaults = Layer.succeedContext(
+  Context.make(References.MinimumLogLevel, LogLevel.Warning).pipe(
+    Context.add(References.LogToStderr, true)
+  )
+)
+
+// every effect provided with RuntimeDefaults runs under these values,
+// and the values flow into any fibers those effects fork
+```
+
+**A service that internally narrows a reference** for its operations — e.g.,
+a job runner that guarantees quiet logs for cron noise:
+
+```ts
+import { Effect, Layer, LogLevel, References } from "effect"
+
+const JobRunnerLive = Layer.effect(JobRunner, Effect.gen(function* () {
+  const run = (job: Job) =>
+    job.work.pipe(
+      Effect.provideService(References.MinimumLogLevel, LogLevel.Warning)
+    )
+  return { run }
+}))
+```
+
+Since layers are built within scopes ([chapter 12](/effect-ts/12-scopes-resources/)),
+and reference provisions are just context extensions, the two compose without
+ceremony: build a service whose every method operates under specific
+reference values, hand the service out as a normal dependency.
+
+:::tip[Reference vs Service vs Ref — choosing]
+- **`Context.Service`**: a capability the program cannot run without. Missing
+  = type error. (Database, auth.)
+- **`Context.Reference`**: same shape but with a sensible default; readers
+  shouldn't be forced to demand it. Behavior/config knobs, ambient context.
+- **`Ref`**: genuinely mutable shared cell for algorithms that need
+  read-modify-write across fibers. Not ambient, not inherited — you hand it to
+  whom needs it.
+If you find yourself wanting to *mutate* a Reference from inside a gen body,
+you've outgrown references — reach for `Ref` or restructure with provision.
+:::
+
+## For Node folks: vs AsyncLocalStorage
+
+`AsyncLocalStorage` solves the same problem with async-hooks sorcery: a store
+bound to the async execution chain, retrieved synchronously anywhere. The
+comparison explains both the appeal and the cost:
+
+| Aspect | `AsyncLocalStorage` | `Context.Reference` |
+|---|---|---|
+| Scope of visibility | any code running in the async chain (even sync helpers) | only effects that `yield*` the ref |
+| Propagation mechanism | async-hooks internals, patched contexts | immutable context copied at each step/fork |
+| Restoration on exit | manual (`als.run` callback ends) | automatic, lexical — provision unwinds |
+| Works outside Effect | yes, everywhere | effects only |
+| Cost model | hidden map lookups per async resource | part of context the runtime already threads |
+| Failure modes | lost store across unpatched callbacks/libraries; "where did my context go?" | none within Effect; boundary = where you leave Effect |
+
+The honest summary: ALS covers *more* surface (plain promise code) with
+*weaker* guarantees (stores silently vanish across certain boundaries;
+restoration is your job). References cover less surface but with structural
+guarantees — inheritance is by-value copying down the fiber tree, restoration
+is lexical, and nothing depends on runtime monkey-patching. Inside Effect
+programs, prefer references; at the boundary, bridge once — read ALS in your
+HTTP adapter, provide it as a reference, and let it stop there:
+
+```ts
+import { Context, Effect } from "effect"
+
+class RequestId extends Context.Reference<RequestId>()("RequestId", {
+  defaultValue: () => "unset"
+}) {}
+
+const runWithRequestId = (
+  als: AsyncLocalStorage<{ readonly requestId: string }>,
+  handler: Effect.Effect<void>
+) =>
+  Effect.promise(() => als.getStore()).pipe(
+    Effect.flatMap((store) => Effect.succeed(store?.requestId ?? "unset")),
+    Effect.flatMap((id) => Effect.provideService(handler, RequestId, id))
+  )
+```
+
+One extraction at the adapter, one provision — nothing below it imports
+`async_hooks`, and the rest of the app reads `yield* RequestId` like any other
+reference.
+
+## Next
+
+<LinkCard
+  title="15 · Queues, PubSub & Coordination"
+  description="Queue's producer/consumer views and backpressure strategies, PubSub fan-out with replay, the event-bus service pattern, Latch barriers, and how to choose between Queue, PubSub, and Stream."
+  href="/effect-ts/15-queues-pubsub/"
+/>

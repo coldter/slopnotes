@@ -1,0 +1,534 @@
+---
+title: Cheatsheet
+description: Fast lookup — Effect triple and constructors, combinators, error handling, Cause, Scope, fibers, concurrency primitives, Context/Layer, Config, Schedule, DateTime, Stream, Schema, HTTP, SQL, batching, observability, testing, runtime, and import maps.
+sidebar:
+  order: 31
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+This is the scan sheet for the entire course. Every row is a one-liner you can copy. For prose and full examples, follow the chapter links in the last column.
+
+## The `Effect<A, E, R>` triple
+
+```ts
+interface Effect<out A, out E = never, out R = never> // A success, E failure, R requirements
+```
+
+`A` flows through `map`/`flatMap`, `E` through `catch*`, `R` through `provide`. An effect is inert data until run.
+
+| Need | Use | Notes |
+|---|---|---|
+| Run & get promise | `Effect.runPromise(eff)` | caller keeps process alive |
+| Run & get exit | `Effect.runPromiseExit(eff)` | `Exit<A, E>` without throwing |
+| Run synchronously | `Effect.runSync(eff)` | effect must be sync |
+| Run as fiber | `Effect.runFork(eff)` → `Fiber<A,E>` | manage `Fiber.join/interrupt` |
+| Fork in current fiber | `yield* Effect.forkChild(eff)` | structured, dies with parent |
+| `R` stayed? | type error on `runPromise` | provide via `Layer` / `Effect.provide` |
+
+## Constructors
+
+| Constructor | Signature sketch | Use for |
+|---|---|---|
+| `Effect.succeed(a)` | `A → Effect<A>` | pure value |
+| `Effect.fail(e)` | `E → Effect<never, E>` | typed failure |
+| `Effect.die(defect)` | `unknown → Effect<never, never>` | untyped defect |
+| `Effect.sync(() => a)` | thunk → `Effect<A>` | lazy sync, may throw → defect |
+| `Effect.suspend(() => effect)` | `() → Effect` → `Effect` | lazy effect |
+| `Effect.try(() => a)` | `() => A` → `Effect<A, UnknownException>` | sync try → typed error |
+| `Effect.tryPromise(() => Promise<A>)` | try async | async boundary |
+| `Effect.promise(() => Promise<A>)` | `() → Promise<A>` → `Effect` | memoizes per-run? no — each run re-calls |
+| `Effect.async(cb => …)` | `(Callback) → Effect` | callback bridging |
+| `Effect.gen(function* () { yield* … })` | generator → Effect | daily business logic |
+| `Effect.fn("name")(function* (args) { … })` | named traced function | service methods (span + combinators) |
+| `Effect.fnUntraced(body, …)` | untraced variant | hot path without span overhead |
+
+## Combinators (value channel)
+
+| Combinator | Type shift | Purpose |
+|---|---|---|
+| `Effect.map(eff, f)` | `A → B` | transform success |
+| `Effect.flatMap(eff, f)` | `A → Effect<B>` | sequence |
+| `Effect.andThen(eff, next)` | `Effect<B>` | run `next` after `eff`, ignore `A` if not needed |
+| `Effect.tap(eff, f)` | `A → Effect<_, _>` side effect | inspect without changing `A` |
+| `Effect.as(eff, b)` / `asVoid` | replace `A` | discard value |
+| `Effect.zip(a, b)` | `[A, B]` | pair (siblings) |
+| `Effect.all([a,b])` / `{a,b}` | tuple/struct | all must succeed |
+| `Effect.forEach(items, f, { concurrency })` | iterable | map sequentially or bounded |
+| `Effect.match(eff, { onSuccess, onFailure })` | folds both | exhaustive fold into one value |
+
+## Error handling (E channel)
+
+| Combinator | Catches | Leaves |
+|---|---|---|
+| `Effect.catch(eff, handler)` | `E` (all) | handler's `E2` remains |
+| `Effect.catchTag("Tag", handler)` | `E & { _tag: "Tag" }` | other tags remain |
+| `Effect.catchTags({ Tag: handler })` | many tags | remainder stays |
+| `Effect.catchFilter(Filter, handler)` | predicate/Filter | rest stays (v4 `catchSome` replacement) |
+| `Effect.catchCause(handler)` | full `Cause<E>` | defects + interrupts |
+| `Effect.catchCauseFilter` | filtered cause | filtered + rest |
+| `Effect.catchReason("Err", "ReasonTag", handler)` | reason variant inside a reason-error | outer error unwrapped per-variant (ch 05/30) |
+| `Effect.catchIf(predicate, handler)` | conditional | non-matching remains |
+| `Effect.catchDefect(handler)` | defects only | typed failures remain |
+| `Effect.mapError(f)` | re-tags `E → E2` | transform error |
+| `Effect.orDie` | `E → defect` | typed failure becomes die |
+| `Effect.flip` | `A ↔ E` swap | assert on `_tag` in tests |
+| `Effect.result` | `Effect<Result<E,A>>` | materialize Either-like result |
+| `Effect.option` | `Effect<Option<A>>` | `Some(A)` vs `None` for `E` |
+| `Effect.exit` | `Effect<Exit<A,E>>` | supervisory inspect without propagating |
+
+:::note[Renames from v3]
+`catchAll → catch`, `catchAllCause → catchCause`, `catchSome → catchFilter` (uses `Filter` module), `either → result`, `Either → Result` (error-first). See [v3 → v4 guide](/effect-ts/v3-to-v4/).
+:::
+
+## `Cause` — flat reasons model (v4)
+
+```ts
+interface Cause<E> { readonly reasons: ReadonlyArray<Reason<E>> }
+type Reason<E> = Fail<E> | Die<unknown> | Interrupt | Timeout
+// (Sequential/Parallel tree was removed — v4 is flat)
+```
+
+| Inspect | Use |
+|---|---|
+| `Cause.isFail(c)` / `isDie` / `isInterrupt` / `isTimeoutError` | reason guards |
+| `Cause.hasInterruptsOnly(cause)` | only interrupt? |
+| `Cause.isTimeoutError(cause)` | `Effect.timeout` hit? |
+| `Cause.reasons(cause)` | array of `Reason` |
+| `Cause.pretty(cause)` / `Cause.prettyErrors` | pretty string |
+| `Exit.match(exit, { onSuccess, onFailure })` | fold |
+| `Exit.isSuccess / isFailure` | guards |
+
+`Effect.catchCause` sees the whole cause; `Effect.catch` sees the `Fail<E>` payload; `Effect.catchDefect` sees the `Die` payload.
+
+## `Scope` — finalizers
+
+```ts
+import { Effect, Scope } from "effect"
+
+const resource = Effect.acquireRelease(
+  Effect.sync(() => open()),
+  (handle) => Effect.sync(() => handle.close())
+) // Needs Scope — provide via Layer.effect or Effect.scoped
+
+const scopedProgram = Effect.scoped(Effect.gen(function* () {
+  const h = yield* resource
+  yield* use(h)
+})) // LIFO finalizers on success/failure/interrupt
+
+Effect.addFinalizer(() => Effect.log("cleanup"))
+Effect.addFinalizerExit((exit) => Effect.log(`exit ${exit._tag}`))
+Scope.provide(effect, scope) // was Scope.extend in v3
+```
+
+`Layer.effect` automatically excludes `Scope` from `RIn` — acquisition is scoped to the layer's lifetime.
+
+## Fibers — fork family & lifetime
+
+| Function | Attaches to | Use when |
+|---|---|---|
+| `Effect.forkChild(task)` | parent fiber scope | default — dies with parent |
+| `Effect.forkScoped(task)` | current `Scope` | lives until `Effect.scoped` block closes |
+| `Effect.forkIn(task, scope)` | explicit `Scope` you hold | request/session work |
+| `Effect.forkDetach(task)` | global scope | fire-and-forget (`forkDaemon` in v3) |
+
+| Operation | Type | Behavior |
+|---|---|---|
+| `Fiber.join(fiber)` | `Effect<A, E>` | wait, propagate errors, interrupt joiner if fiber interrupts |
+| `Fiber.await(fiber)` | `Effect<Exit<A,E>>` | wait without propagating |
+| `Fiber.interrupt(fiber)` | `Effect<void>` | signal; returns when finalizers finished |
+| `Fiber.joinAll(fibers)` | join many | all must succeed |
+| `Fiber.interruptAll(fibers)` | interrupt many | wait for each |
+| `Fiber.getCurrent()` | `Fiber \| undefined` (sync) | ambient fiber |
+| `FiberHandle` / `FiberSet` / `FiberMap` | collections | supervisory tracking of many fibers |
+
+Interruption is cooperative — flag checked at every `yield*` effect boundary. Long sync loops have zero checkpoints; chunk or rely on `Scheduler.MaxOpsBeforeYield` (chapter 13).
+
+| Racing/timeout | Semantics |
+|---|---|
+| `Effect.race(a, b)` | first **completion** wins — failure also wins; loser interrupted |
+| `Effect.raceAll([...])` | first success wins; fails only if all fail |
+| `Effect.timeout(eff, "3 seconds")` | fails with `Cause.TimeoutError` after delay |
+| `Effect.timeoutOption(eff, d)` | `Option.none` on timeout instead of error |
+
+## Concurrency primitives — one-liners
+
+| Module | Make | Core ops | When to use |
+|---|---|---|---|
+| **`Semaphore`** | `Semaphore.make(n)` | `withPermits(sem, n)(eff)`, `withPermit`, `take/release`, `resize` | bound concurrent work |
+| **`PartitionedSemaphore`** | `PartitionedSemaphore.make({ permits })` | `withPermits(sem, key, n)(eff)` | per-key limits, fairness |
+| **`Latch`** | `Latch.make()` | `await`, `open`, `close`, `release` | barrier phases |
+| **`Queue`** | `Queue.bounded(n)`, `unbounded`, `sliding`, `dropping` | `offer`, `take`, `poll`, `shutdown` | producer/consumer, backpressure |
+| **`PubSub`** | `PubSub.bounded`, `unbounded`, `sliding`, `dropping` | `publish`, `subscribe` → `Queue` per subscriber | fan-out broadcast |
+| **`Deferred`** | `Deferred.make<A,E>()` | `succeed/fail/done/complete`, `await` | one-shot rendezvous across fibers |
+| **`Ref`** | `Ref.make(a)` | `get/set/update/modify/getAndUpdate` | shared mutable cell (sync) |
+
+All references are to `effect/<Module>`.
+
+## `Context` services & layers
+
+```ts
+// Define
+export class Mailer extends Context.Service<Mailer, { send(x): Effect<void> }>()("app/Mailer") {}
+
+// Use
+const program = Effect.gen(function* () { const mailer = yield* Mailer; yield* mailer.send(x) })
+
+// Build layers
+Mailer.layerNoDeps = Layer.effect(Mailer, Effect.gen(function* () { /* acquireRelease */ return Mailer.of({ send }) }))
+Mailer.layer       = Mailer.layerNoDeps.pipe(Layer.provide(SqlClient.layer))
+Layer.succeed(Mailer, impl) / Layer.sync(Mailer, () => impl) / Layer.effect(Mailer, eff) / Layer.effectDiscard(eff) / Layer.effectContext(eff)
+
+// Compose
+Layer.provide(self, dep) // dep builds first, feeds self — self's RIn satisfied, re-exposed: only self
+Layer.provideMerge(self, dep) // dep feeds self BUT dep's services also exposed
+Layer.merge(a, b) / Layer.mergeAll(a,b,c) // siblings concurrently, union ROut
+Layer.unwrap(Effect<Layer>) // config-driven selection
+Layer.suspend(() => cond ? a : b) // deferred without effect
+Layer.effectDiscard(Effect.forkScoped(loop)) // background worker for app lifetime
+Layer.launch(layer) → Effect<never> // entrypoint holding scope open
+```
+
+| Provide variant | Shares type graph | Typical call |
+|---|---|---|
+| `Effect.provide(eff, layer)` | `R` after | per-effect injection |
+| `Effect.provide(eff, layer, { local: true })` | only within this provide | isolate one composition site |
+| `Layer.fresh(layer)` | fresh instance | per-test pools |
+| `Layer.provide(self, dep)` / `provideMerge` | graph wiring | see above |
+| `ManagedRuntime.make(layer, { memoMap })` | memo map shared across runtimes | Hono/Express bridge (ch 29) |
+
+Memoization (v4): default shares across `Effect.provide` calls at same level; `{ local: true }` opts out; `Layer.fresh` always fresh. Key is layer identity — define one `static readonly layer` and pass the reference.
+
+## `Config` & providers
+
+```ts
+import { Config, ConfigProvider } from "effect"
+
+yield* Config.String("HOST")              // required string
+yield* Config.Number("PORT")              // coerced number
+yield* Config.Boolean("DEBUG")            // "true"/"1" etc.
+yield* Config.Integer("RETRIES")
+yield* Config.Date("SINCE")
+yield* Config.Duration("TIMEOUT")         // "5 seconds"
+yield* Config.LogLevel("LOG_LEVEL")
+yield* Config.Array(Config.String("TAG"), ",")
+yield* Config.String("HOST").pipe(Config.withDefault("localhost"))
+yield* Config.Number("PORT").pipe(Config.withDefault(8080))
+yield* Config.String("HOST").pipe(Config.nested("APP")) // path ["APP","HOST"]
+yield* Config.Redacted("SECRET")          // Redacted<string> — doesn't print
+Config.all({ host: Config.String("HOST"), port: Config.Number("PORT") })
+Config.all([Config.String("A"), Config.String("B")])
+Config.schema(Schema.Struct({ port: Schema.Number }), "APP") // Schema validation
+
+// Providers
+ConfigProvider.fromEnv()                  // process.env (default ambient)
+ConfigProvider.fromJson({ APP: { PORT: 3000 } })
+ConfigProvider.fromDotEnv(".env")
+ConfigProvider.constantCase / kebabCase
+Effect.withConfigProvider(effect, provider) // scoped override
+```
+
+`Config<A>` is itself `Effect<A, ConfigError>` with no `R` — `yield*` anywhere.
+
+## `Schedule` — retries & delays
+
+```ts
+import { Schedule } from "effect"
+
+Schedule.recurs(3)                        // N times
+Schedule.spaced("100 millis")             // fixed delay
+Schedule.exponential("100 millis")        // 100,200,400…
+Schedule.fibonacci("100 millis")
+Schedule.linear("100 millis")
+
+Schedule.max(scheduleA, scheduleB)        // intersect: wait for slower (andBoth)
+Schedule.min(scheduleA, scheduleB)        // union: wait for faster (orElse)
+Schedule.intersect // alias: max ; union alias: min (v3 names gone)
+Schedule.compose // sequential
+Schedule.andThen
+
+Schedule.modifyDelay(schedule, ({ delay }) => Duration.min(delay, "10 seconds")) // clamp
+
+Effect.retry(effect, { schedule: Schedule.exponential("100 millis").pipe(Schedule.recurs(5)) })
+Effect.repeat(effect, Schedule.spaced("1 second"))
+Effect.schedule(effect, schedule)         // produce schedule output
+```
+
+| Decision | Schedule |
+|---|---|
+| Three retries no delay | `Schedule.recurs(3)` |
+| Backoff capped at 10s | `Schedule.exponential("100 millis").pipe(Schedule.modifyDelay(({ delay }) => Duration.min(delay,"10s")))` |
+| Retry while both say yes, slower wins | `Schedule.max(a,b)` |
+| Retry while either says yes, faster wins | `Schedule.min(a,b)` |
+
+(v3 `ScheduleIntervals` / `ScheduleInterval` were removed — only relative `Duration`.)
+
+## `DateTime`
+
+```ts
+import { DateTime } from "effect"
+
+DateTime.now // Effect<DateTime.Utc>
+DateTime.make({ year: 2026, month: 3, day: 18 }) // or from string / Date / Instant
+DateTime.toDateUtc(dt) ; DateTime.toDate(dt)
+DateTime.formatIso(dt)
+DateTime.add(dt, { hours: 2 }) ; DateTime.subtract(dt, { days: 1 })
+DateTime.distanceDuration(dtA, dtB) // Duration
+DateTime.isPast(dt) ; DateTime.isFuture(dt)
+DateTime.compare(a,b) // -1/0/1
+DateTime.clamp(dt, { minimum, maximum })
+DateTime.match(dt, { onUtc, onZoned })
+// TimeZones: DateTime.zoneMake("Europe/Rome"), zone handling for Zoned variants
+```
+
+In `it.effect` tests, `DateTime.now` reads virtual `TestClock`.
+
+## `Stream`
+
+```ts
+import { Stream } from "effect"
+
+Stream.succeed(1) ; Stream.fail("e") ; Stream.fromIterable([1,2,3])
+Stream.fromEffect(Effect.succeed(1)) ; Stream.repeatValue(1) ; Stream.tick("1 second")
+Stream.range(1,100) ; Stream.unfold(0, (n) => n < 10 ? Option.some([n, n+1]) : Option.none())
+
+stream.pipe(Stream.map(f), Stream.filter(pred), Stream.flatMap(f), Stream.tap(f))
+stream.pipe(Stream.take(10), Stream.drop(5), Stream.grouped(10), Stream.buffer({ capacity: 16 }))
+stream.pipe(Stream.zip(other)) ; Stream.merge(a,b) ; Stream.concat(a,b)
+stream.pipe(Stream.retry(Schedule.recurs(3)))
+
+Stream.runCollect(stream) // Effect<Chunk<A>>
+Stream.runCount(stream) ; Stream.runForEach(stream, f) ; Stream.runFold(stream, 0, (acc,a) => acc+a)
+stream.pipe(Stream.toPullScoped) // scoped Pull Effect
+```
+
+`Stream` is pull-based `Channel` + concurrency aware; cancellation is fiber interruption.
+
+## `Schema` — fast lookup
+
+```ts
+import { Schema } from "effect"
+
+// Elementary
+Schema.String ; Schema.Number ; Schema.Boolean ; Schema.Null ; Schema.Unknown
+Schema.Literal("a","b") ; Schema.Enums({ A: "a", B: "b" })
+Schema.TemplateLiteral(Schema.String, Schema.Number) // branded string codec
+Schema.Int ; Schema.NonEmptyString ; Schema.DateTimeUtc ; Schema.Date // variants
+Schema.String.pipe(Schema.minLength(1), Schema.maxLength(100), Schema.brand("Email"))
+Schema.Number.pipe(Schema.between(0,100), Schema.finite(), Schema.int())
+
+// Composite
+Schema.Struct({ name: Schema.String, age: Schema.Number })
+Schema.Array(Schema.String) ; Schema.NonEmptyArray(Schema.Number)
+Schema.Record({ key: Schema.String, value: Schema.Number })
+Schema.Tuple(Schema.String, Schema.Number)
+Schema.Union(Schema.String, Schema.Number) // via TaggedUnion for discriminated
+Schema.optional(Schema.String) ; Schema.optionalWith(Schema.String, { default: () => "" })
+Schema.NullOr(Schema.String) ; Schema.UndefinedOr(Schema.String)
+
+// Checks & refinements
+Schema.filter((s) => s.length > 3) ; Schema.minLength / maxLength / pattern / between / greaterThan
+
+// Transform
+Schema.transform(Schema.String, Schema.Number, { decode: Number, encode: String })
+Schema.decodeTo(Schema.Number, { decode: (s) => Number(s), encode: String })
+Schema.brand("MyBrand") ; Schema.fromBrand
+
+// Class (preferred for domain models)
+class User extends Schema.Class<User>("User")({ id: Schema.String, name: Schema.String }) {}
+User.jsonCreate // example variant defined as separate Class.make({...})
+Schema.decodeUnknown(User)(input) // Effect<User, ParseError>
+Schema.decodeUnknownSync(User)(input) // throws on failure — use at HTTP edge
+Schema.encodeUnknown(User)(user) ; Schema.encodeUnknownSync(User)(user)
+Schema.validateSync(User)(input) ; Schema.is(User)(input)
+Schema.Arbitrary.make(User) // for property tests
+
+// Errors
+class MyError extends Schema.TaggedError<MyError>()("MyError", { reason: Schema.String }) {}
+```
+
+:::tip[Schemas ARE codecs]
+One `Schema` is decode (unknown → A) + encode (A → unknown) + arbitrary + JSON Schema. Defining one `Schema.Class` in `src/domain/Task.ts` gave us DB row, JSON DTO variants, and property-test generators — one source of truth.
+:::
+
+## HTTP — client & HttpApi
+
+```ts
+// Client (effect/unstable/http)
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+const client = yield* HttpClient.HttpClient
+yield* HttpClientRequest.get("https://api.example.com/users").pipe(client.execute, HttpClientResponse.json)
+
+// HttpApi — schema-first server & typed client (effect/unstable/httpapi)
+import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiBuilder, HttpApiClient, HttpApiMiddleware, HttpApiSecurity } from "effect/unstable/httpapi"
+
+export class UsersApi extends HttpApiGroup.make("users")
+  .add(HttpApiEndpoint.get("list", "/", { query: { search: Schema.optional(Schema.String) }, success: Schema.Array(User.json) })
+  .add(HttpApiEndpoint.get("getById", "/:id", { params: { id: UserId }, success: User.json, error: UserNotFound.pipe(HttpApiSchema.asNoContent({ decode: () => new UserNotFound() })) }))
+  .middleware(Authorization)
+  .prefix("/users")
+
+export class Api extends HttpApi.make("user-api").add(UsersApi)
+
+export const Handlers = HttpApiBuilder.group(Api, "users", (handlers) => Effect.gen(function* () {
+  const users = yield* Users
+  return handlers.handle("list", ({ query }) => users.list(query.search))
+}))
+
+// Serve
+import { NodeHttpServer } from "@effect/platform-node"; import { createServer } from "node:http"
+HttpApiBuilder.api(Api).pipe(Layer.provide(Handlers), Layer.provide(NodeHttpServer.layer(createServer, { port: 3000 })))
+HttpApiBuilder.toWebHandler(Handlers) // any fetch-compatible host
+
+// Docs & typed client
+import { HttpApiScalar, HttpApiSwagger } from "effect/unstable/httpapi"
+HttpApiScalar.layer({ path: "/docs" }) // Scalar UI
+HttpApiSwagger.layer({ path: "/openapi.json" })
+HttpApiTest.groups(Api, ["users"]) // Effect<TypedClient> — in-memory, no HTTP
+
+// Middleware
+export class Authorization extends HttpApiMiddleware.Tag<Authorization>()("Authorization", {
+  failure: Schema.TaggedError<Authorization>()("Unauthorized", {}),
+  provides: Context.Service<Authorization, { userId: string }>(),
+  security: HttpApiSecurity.bearer
+})
+HttpApiMiddleware.layerClient(Authorization, ({ next, request }) => next(HttpClientRequest.bearerToken(request, token)))
+```
+
+## SQL & `SqlModel`
+
+```ts
+import { SqlClient, SqlModel, SqlSchema } from "effect/unstable/sql"
+import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node"
+
+const SqlLayer = SqliteClient.layer({ filename: ":memory:" }) // or PgClient.layer({ url })
+const MigratorLayer = SqliteMigrator.layer({ loader: SqliteMigrator.fromRecord({ "0001_create": Effect.gen(...) }) })
+
+const repo = yield* SqlModel.makeRepository(User, { tableName: "users", spanPrefix: "Users", idColumn: "id" })
+yield* repo.findById(id) ; yield* repo.insert(user) ; yield* repo.update(user) ; yield* repo.delete(id)
+
+const findAll = SqlSchema.findAll({ Request: Schema.Void, Result: User, execute: () => sql`SELECT * FROM users` })
+yield* sql`SELECT * FROM users WHERE id = ${id}` // raw tag
+```
+
+## `RequestResolver` & batching
+
+```ts
+import { Request, RequestResolver } from "effect"
+
+class GetUser extends Request.Class<GetUser, User, UserNotFound>()({ id: Schema.String }) {}
+const resolver = RequestResolver.makeBatched((requests: Array<GetUser>) => Effect.gen(function* () {
+  // one batched fetch for all requests
+  const users = yield* batchFetch(requests.map((r) => r.id))
+  requests.forEach((req, i) => Request.succeed(req, users[i]))
+}))
+// Use via: Effect.request(GetUser({ id: "42" }), resolver) — auto-batched within a tick
+```
+
+## Observability
+
+```ts
+import { Effect, Logger, References } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
+import { OtlpLogger, OtlpSerialization, OtlpTracer } from "effect/unstable/observability"
+
+yield* Effect.log("hello") ; yield* Effect.logInfo("info") ; yield* Effect.logDebug("debug")
+yield* Effect.logWarning("warn") ; yield* Effect.logError("error")
+yield* Effect.annotateLogs({ service: "api", route: "/" }) ; yield* Effect.annotateLogsScoped({ requestId })
+yield* Effect.withLogSpan("checkout")
+
+Logger.layer([Logger.consoleJson]) // JSON line
+Logger.layer([Logger.toFile(Logger.formatSimple, "app.log")]).pipe(Layer.provide(NodeFileSystem.layer))
+Logger.batched(Logger.formatStructured, { window: "1 second", flush: Effect.fn(function* (batch) { /* send */ }) })
+Layer.succeed(References.MinimumLogLevel, "Warn") // Level filter
+Layer.unwrap(Effect.gen(function* () { const env = yield* Config.String("NODE_ENV"); return env==="production" ? prodLogger : devLogger }))
+
+yield* Effect.annotateCurrentSpan({ orderId }) ; yield* Effect.annotateSpans({ key: "value" })
+Effect.fn("name")(function* () { }) // span per call
+effect.pipe(Effect.withSpan("label"), Effect.annotateSpans({ ... }))
+Layer.withSpan(layer, "init")
+
+OtlpTracer.layer({ url: "http://localhost:4318/v1/traces", resource: { serviceName, serviceVersion, attributes: { "deployment.environment": "staging" } } })
+OtlpLogger.layer({ url: "http://localhost:4318/v1/logs", resource: { serviceName } })
+Layer.merge(OtlpTracingLayer, OtlpLoggingLayer).pipe(Layer.provide(OtlpSerialization.layerJson), Layer.provide(FetchHttpClient.layer))
+// Provide observability LAST: Main.pipe(Layer.provide(ObservabilityLayer))
+
+Effect.withTracerEnabled(false) // locally disable tracing
+```
+
+## Testing
+
+```ts
+import { assert, describe, it, layer } from "@effect/vitest"
+import { TestClock, TestConsole } from "effect/testing"
+
+it.effect("name", () => Effect.gen(function* () { assert.deepStrictEqual(...)}))
+it.effect.each([{ input, expected }])("name %#", ({ input }) => Effect.gen(function* () {}))
+it.effect.prop("invariant", [Schema.String], ([value]) => Effect.gen(function* () {}))
+it.live("real clock", () => Effect.gen(function* () { yield* Effect.sleep(1) }))
+
+yield* TestClock.adjust("60 seconds") // or 60_000
+yield* TestClock.adjust(60_000)
+const fiber = yield* Effect.forkChild(Effect.sleep(60_000).pipe(Effect.as("done"))); yield* TestClock.adjust(60_000); yield* Fiber.join(fiber)
+
+TestConsole.logLines ; TestConsole.errorLines // Effect<ReadonlyArray<string>>
+
+layer(Layer.mergeAll(HandlersLayer, HttpServer.layerServices))("Block", (it) => {
+  it.effect("first", () => Effect.gen(function* () { const client = yield* makeClient }))
+  it.effect("second shares store", () => Effect.gen(function* () {}))
+})
+Effect.provide(testEffect, layerTest) // per-test isolation
+
+// HttpApi in-memory
+const makeClient = HttpApiTest.groups(Api, ["users"])
+layer(Layer.mergeAll(HandlersLayer, HttpServer.layerServices))("UsersApi", (it) => {
+  it.effect("creates", () => Effect.gen(function* () { const c = yield* makeClient; yield* c.users.create({ payload: { … } }) }).pipe(Effect.provide(AuthorizationMiddlewareGood)))
+})
+```
+
+## Runtime & integration
+
+```ts
+import { NodeRuntime } from "@effect/platform-node"; import { BunRuntime } from "@effect/platform-bun"
+
+const Worker = Layer.effectDiscard(Effect.gen(function* () { yield* Effect.forkScoped(loop) }))
+Layer.launch(Worker).pipe(NodeRuntime.runMain) // signal handling + keep-alive + exit codes
+NodeRuntime.runMain(program, { disableErrorReporting: true })
+BunRuntime.runMain(program)
+
+import { ManagedRuntime } from "effect"
+const memoMap = Layer.makeMemoMapUnsafe()
+const runtime = ManagedRuntime.make(TodoRepo.layer, { memoMap })
+await runtime.runPromise(TodoRepo.use((repo) => repo.getAll))
+runtime.runSync(effect) ; runtime.runCallback(effect, { onSuccess, onFailure })
+process.once("SIGINT", () => { void runtime.dispose() })
+```
+
+## Imports — where things live in v4
+
+| What | Import path |
+|---|---|
+| `Effect`, `Layer`, `Context`, `Scope`, `Cause`, `Exit`, `Fiber`, `Queue`, `Ref`, `Deferred`, `Schedule`, `Duration`, `Stream`, `Schema`, `Logger`, `Metric`, `Config`, `DateTime`, `Result`, `Option`, `Chunk`, `HashMap` | `from "effect"` |
+| `FileSystem`, `Path`, `Terminal`, `PlatformError` | `from "effect"` (was `@effect/platform`) |
+| `TestClock`, `TestConsole`, `TestSchema` | `from "effect/testing"` |
+| `FastCheck` | `from "effect/testing/FastCheck"` |
+| `HttpClient`, `HttpRouter`, `HttpServer`, `FetchHttpClient`, `UrlParams` | `from "effect/unstable/http"` |
+| `HttpApi`, `HttpApiGroup`, `HttpApiEndpoint`, `HttpApiBuilder`, `HttpApiClient`, `HttpApiMiddleware`, `HttpApiTest`, `HttpApiScalar`, `OpenApi` | `from "effect/unstable/httpapi"` |
+| `SqlClient`, `SqlModel`, `SqlSchema`, `Migrator` | `from "effect/unstable/sql"` |
+| Drivers (`SqliteClient`, `PgClient`, …) | `from "@effect/sql-sqlite-node"` / `@effect/sql-pg` etc. — **not** consolidated |
+| `OtlpTracer`, `OtlpLogger`, `OtlpSerialization`, `Otlp` | `from "effect/unstable/observability"` |
+| `NodeRuntime`, `NodeFileSystem`, `NodeHttpServer` | `from "@effect/platform-node"` |
+| `BunRuntime`, `BunFileSystem` | `from "@effect/platform-bun"` |
+| `@effect/vitest` helpers (`it`, `describe`, `layer`) | `from "@effect/vitest"` |
+
+:::note[One version, one line]
+All `effect` plus `@effect/*` packages now share a single version. `effect@4.0.0-rc.112` pairs with `@effect/platform-node@4.0.0-rc.112`, `@effect/sql-sqlite-node@4.0.0-rc.112`, etc.
+:::
+
+## Next
+
+<LinkCard
+  title="v3 → v4 Migration Field Guide"
+  description="Porting code and reading legacy posts — renames, philosophy shifts, the load-bearing mapping table, service model collapse, yieldable narrowing, and annotated diffs."
+  href="/effect-ts/v3-to-v4/"
+/>

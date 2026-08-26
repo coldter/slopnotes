@@ -1,0 +1,556 @@
+---
+title: Scopes & Resource Safety
+description: Why try/finally leaks under concurrency, how Scope turns lifetimes into values, acquireRelease's uninterruptible-acquisition guarantee, LIFO finalizer ordering, exit-aware cleanup, and leak-free resource graphs in Layers.
+sidebar:
+  order: 12
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Every long-lived process accumulates things that must be closed: sockets, file
+handles, DB connections, subscriptions, locks, temp directories. In plain
+TypeScript the tools for this are `try/finally` and — since the disposal
+proposals landed — `Symbol.dispose`/`using`. Both work fine for *synchronous,
+lexical* lifetimes: the resource is opened and closed inside one function body.
+
+They fall apart the moment lifetimes become **dynamic**: a connection opened in
+one function but used until an HTTP request finishes, a subscription that lives
+as long as a websocket, a pool shared by N concurrent tasks and torn down when
+the last user leaves. At that point you are manually threading cleanup
+callbacks through your architecture, and every code path you forgot is a leak.
+
+This chapter builds up Effect's answer from first principles: the `Scope`.
+
+## The problem with manual cleanup
+
+Consider the canonical TS pattern for "use this thing while this request runs":
+
+```ts
+// The boilerplate everyone writes by hand
+async function handleRequest(req: Request): Promise<Response> {
+  const controller = new AbortController()
+  req.signal.addEventListener("abort", () => controller.abort())
+  const conn = await pool.acquire()
+  try {
+    return await query(conn, req, controller.signal)
+  } finally {
+    pool.release(conn)
+  }
+}
+```
+
+Three independent failure modes live in those eight lines:
+
+1. **Early returns and throws between `acquire` and `try`.** Move one line and
+   the `finally` no longer covers acquisition. Any code that can fail *between*
+   obtaining the resource and entering the guarded block leaks it.
+2. **Cancellation has no story.** If the request is aborted mid-query, does the
+   underlying driver stop? Does `finally` even get a chance to run before the
+   event loop tears down? `AbortController` gives you a *signal*, not a
+   lifecycle — every resource gets its own ad-hoc listener wiring.
+3. **Composition doesn't scale.** A function that needs two resources must
+   nest two try/finally blocks; a resource whose lifetime outlives the function
+   needs a callback parameter or a registry of "things to close later" that
+   someone, someday, must remember to drain.
+
+The root issue: **the lifetime is implicit**. Nothing in the type system says
+"this value requires a surrounding cleanup boundary", so nothing forces you to
+provide one.
+
+## `Scope`: a lifetime as a value
+
+A `Scope` is a container of finalizers. You register cleanup effects on it;
+closing it runs them, handing each one the `Exit` value that ended the work:
+
+```ts
+import { Effect, Exit, Scope } from "effect"
+
+const program = Effect.gen(function* () {
+  // create a closeable scope (not yet in context — just a value)
+  const scope = yield* Scope.make()
+
+  yield* Scope.addFinalizer(scope, Effect.sync(() => console.log("cleanup")))
+  console.log("work")
+
+  // closing runs finalizers with whatever Exit you pass
+  yield* Scope.close(scope, Exit.succeed("done"))
+})
+
+Effect.runSync(program)
+// work
+// cleanup
+```
+
+Three properties matter:
+
+- **Finalizers run in LIFO order** — last registered, first run. This mirrors
+  nested `defer`/destructors and makes dependent resources compose correctly
+  (the thing acquired second, which may depend on the first, is released
+  first).
+- **Finalizers are exit-aware.** `Scope.close(scope, exit)` records the exit
+  value; each finalizer can inspect whether the scope ended in success,
+  failure, or interruption.
+- **Adding to a closed scope is safe.** If the scope is already `Closed`, the
+  finalizer runs immediately with the stored exit. There is no
+  "register-after-close" race where cleanup silently never happens.
+
+A scope also carries a **finalization strategy**, chosen at construction:
+
+```ts
+const seq = yield* Scope.make()                  // "sequential" (default)
+const par = yield* Scope.make("parallel")        // finalizers run concurrently
+```
+
+`"sequential"` runs finalizers one at a time in reverse registration order.
+`"parallel"` forks them concurrently — useful when teardown is I/O-bound and
+independent (close 50 connections at once). Failures from finalizers are
+aggregated into the close result either way.
+
+:::note[Scope state is inspectable]
+A scope exposes `scope.state`: `"Empty"` (no finalizers yet), `"Open"`
+(accepting registrations), or `"Closed"` (with its exit value). You rarely need
+this in application code, but it makes debugging lifecycle bugs concrete — log
+it, and you know exactly which phase failed.
+:::
+
+### The `Scope` service
+
+Most code shouldn't construct scopes by hand. Instead, a scope travels in the
+**context** like any other service, and effects that need to register cleanup
+simply require it:
+
+```ts
+import { Effect, Scope } from "effect"
+
+// R = Scope — visible in the type
+const useResource = Effect.gen(function* () {
+  const scope = yield* Scope.Scope          // or: yield* Effect.scope
+  yield* Scope.addFinalizer(scope, Effect.sync(() => console.log("released")))
+  return "value"
+})
+```
+
+Requiring `Scope` in `R` is the *type-level declaration of dynamic lifetime*:
+"This effect creates resources that will need cleanup from whoever runs it."
+The caller cannot forget — the program won't type-check until someone provides
+a scope boundary.
+
+## Opening boundaries: `Effect.scoped` and friends
+
+`Effect.scoped` is the workhorse: open a fresh scope, run the effect inside it,
+close the scope when the effect exits — with the same `Exit`, so finalizers
+observe success/failure/interruption:
+
+```ts
+import { Effect } from "effect"
+
+const result = yield* Effect.scoped(useResource)
+// R no longer contains Scope — the requirement was discharged
+```
+
+When you need the scope itself (to hand to `forkIn`, register extra finalizers,
+or build child scopes), `scopedWith` passes it as a value without putting it in
+context:
+
+```ts
+import { Effect, Scope } from "effect"
+
+const program = Effect.scopedWith((scope) =>
+  Effect.gen(function* () {
+    yield* Scope.addFinalizer(scope, Effect.sync(() => console.log("bye")))
+    return 42
+  })
+)
+```
+
+Two more primitives complete the picture:
+
+| Function | Behavior |
+|---|---|
+| `Effect.scoped(effect)` | Fresh scope opened + closed around `effect`; removes `Scope` from `R` |
+| `Effect.scopedWith((scope) => eff)` | Same, but hands you the scope instead of placing it in context |
+| `Scope.provide(scope)(effect)` | Runs `effect` inside an *existing*, caller-managed scope; removes `Scope` from `R` but does **not** close it |
+| `Scope.use(closeable)(effect)` | Like `Scope.provide` but closes the scope when `effect` exits |
+| `Scope.fork(scope, strategy?)` | Creates a child scope registered with the parent; closing parent closes child, closing child detaches it |
+
+The distinction between `Effect.scoped` and `Scope.provide` is the ownership
+boundary. `Effect.scoped` says "resources die when this block ends".
+`Scope.provide` says "run inside *my* lifetime" — used to attach resources to a
+long-lived scope you control elsewhere (a request scope, a session scope).
+
+```ts
+import { Effect, Exit, Scope } from "effect"
+
+const attachToRequest = Effect.gen(function* () {
+  const requestScope = yield* Scope.make()
+
+  // resource lives exactly as long as requestScope
+  yield* Scope.provide(requestScope)(openSubscription)
+
+  // ...serve requests...
+
+  yield* Scope.close(requestScope, Exit.void)
+})
+```
+
+:::caution[provide ≠ scoped]
+`Scope.provide` deliberately does not close anything. If you use it and never
+close the scope yourself, you have built a leak with excellent types. Reach for
+`Scope.use` when you want the auto-close behavior with a scope you created.
+:::
+
+## `acquireRelease`: the bracket, done right
+
+`Effect.acquireRelease(acquire, release)` pairs acquisition with a release
+function and registers the release on the current scope:
+
+```ts
+import { Cause, Effect, Schema } from "effect"
+
+class ConnectionError extends Schema.TaggedError<ConnectionError>()(
+  "ConnectionError",
+  { reason: Schema.String }
+) {}
+
+interface Conn { readonly id: number }
+
+const connect = Effect.gen(function* () {
+  yield* Effect.log("opening")
+  return { id: 1 } satisfies Conn
+}).pipe(
+  Effect.timeout("5 seconds"),
+  // timeouts surface as Cause.TimeoutError — map to your domain error here
+  Effect.catchIf(Cause.isTimeoutError, () =>
+    new ConnectionError({ reason: "connect timeout" }))
+)
+
+const conn = Effect.acquireRelease(
+  connect,
+  (conn, exit) => Effect.sync(() => console.log(`closed ${conn.id}`))
+)
+```
+
+Read the signature carefully — v4 changed it in a way that matters:
+
+```ts
+Effect.acquireRelease<A, E, R, R2>(
+  acquire: Effect<A, E, R>,
+  release: (a: A, exit: Exit<unknown, unknown>) => Effect<unknown, never, R2>,
+  options?: { readonly interruptible?: boolean }
+): Effect<A, E, R | R2 | Scope>
+```
+
+The release function receives **both** the acquired resource *and* the `Exit`
+the scope closed with. That single detail replaces an entire category of
+"was I cancelled?" plumbing: a connection release can send a graceful
+`BYE` frame on success, an `RST` on failure, and nothing on interruption.
+
+Three guarantees make this safe under concurrency, and they are worth internalizing because they're what plain `try/finally` *cannot* give you:
+
+1. **Acquisition runs uninterruptibly by default.** Once `acquireRelease`
+   starts executing the acquire effect, it cannot be interrupted halfway. The
+   runtime treats "acquiring" as atomic: the resource is fully obtained, or
+   acquisition never began. Without this, an interrupt landing between "socket
+   opened" and "registered in scope" leaks the socket — precisely the bug class
+   brackets exist to prevent.
+
+2. **Release runs only if acquisition succeeded**, and then *always*: success,
+   failure of subsequent code, interruption of the whole fiber — all paths
+   funnel into the scope close, which runs the registered finalizer.
+
+3. **Release itself runs uninterruptibly.** Cleanup is never abandoned
+   halfway. (If your release needs to perform interruptible work — e.g. wait on
+   another service with a timeout — wrap the relevant part explicitly.)
+
+If acquisition is genuinely long and you accept partial-state cleanup on
+interrupt (say, acquiring a lease where aborting mid-handshake just means the
+server expires it), opt in:
+
+```ts
+const lease = Effect.acquireRelease(
+  acquireLease,                       // may be interrupted mid-flight
+  releaseLease,
+  { interruptible: true }             // allow interrupts during acquisition
+)
+```
+
+:::tip[Disposable resources]
+For values already implementing `Symbol.dispose` / `Symbol.asyncDispose`,
+v4 adds `Effect.acquireDisposable(acquire)` — same scoping behavior, disposal
+protocol instead of an explicit release function. Handy when bridging to
+libraries built around `using`.
+:::
+
+## Custom resources with `addFinalizer`
+
+`acquireRelease` covers the common shape. When the "resource" is really a set
+of cleanups, or acquisition interleaves with usage, drop to `addFinalizer`,
+which registers directly on the ambient scope:
+
+```ts
+import { Cause, Effect, Exit, Schema } from "effect"
+
+class TempDirError extends Schema.TaggedError<TempDirError>()(
+  "TempDirError",
+  { path: Schema.String }
+) {}
+
+const withTempDir = Effect.gen(function* () {
+  const dir = `/tmp/job-${Date.now()}`
+  yield* Effect.tryPromise({
+    try: () => fs.mkdir(dir, { recursive: true }),
+    catch: () => new TempDirError({ path: dir })
+  })
+
+  // exit-aware: knows whether the job finished, failed, or got cancelled
+  yield* Effect.addFinalizer((exit) =>
+    Effect.sync(() => {
+      if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.failure)) {
+        console.log(`preserving ${dir} for post-mortem`)
+      } else {
+        fs.rmSync(dir, { recursive: true })
+      }
+    })
+  )
+
+  return dir
+})
+```
+
+`Effect.addFinalizer` requires `Scope` — the type system now insists that
+whoever runs `withTempDir` provides a cleanup boundary. Wrap it:
+`yield* Effect.scoped(withTempDir)`.
+
+The `(exit) => ...` shape unlocks behavior impossible with `finally`:
+
+- **Distinguish interruption** (`Exit.isInterrupted`) — preserve debug state on
+  cancel, clean up on normal paths.
+- **Inspect failures** — a finalizer can log the cause that killed the scope.
+- **Compensate differently per outcome** — commit a marker row on success,
+  roll back on failure.
+
+Sibling combinators for attaching behavior to a specific effect rather than the
+surrounding scope: `Effect.onExit` (runs with the `Exit`),
+`Effect.onError` (failures only, gets the `Cause`),
+`Effect.onInterrupt` (interruption only), and `Effect.ensuring`
+(unconditional). Use `addFinalizer`/`acquireRelease` for resources; use these
+for logging and metrics hooks.
+
+## Ordering: why LIFO is load-bearing
+
+Real systems acquire *graphs* of resources, not singletons: a pool depends on a
+config service; a consumer depends on the pool; a health-checker depends on all
+of it. LIFO finalization means dependencies tear down in exact reverse order of
+construction — the consumer's finalizer still has a working pool to flush into.
+
+```ts
+import { Effect } from "effect"
+
+const events: Array<string> = []
+
+const program = Effect.scoped(Effect.gen(function* () {
+  yield* Effect.acquireRelease(
+    Effect.sync(() => events.push("acquire config")),
+    () => Effect.sync(() => events.push("release config"))
+  )
+  yield* Effect.acquireRelease(
+    Effect.sync(() => events.push("acquire pool")),
+    () => Effect.sync(() => events.push("release pool"))
+  )
+  yield* Effect.acquireRelease(
+    Effect.sync(() => events.push("acquire consumer")),
+    () => Effect.sync(() => events.push("release consumer"))
+  )
+  return "ready"
+}))
+
+Effect.runSync(program)
+// acquire config -> acquire pool -> acquire consumer
+// release consumer -> release pool -> release config
+```
+
+Manual cleanup makes you maintain that ordering by hand across every call site.
+Scopes make it structural. And because each layer's resources were registered
+on the same scope, an interruption at any point unwinds exactly what was
+acquired so far — nothing more, nothing less.
+
+<Mermaid title="Scope lifetime: acquire, work, unwind" height={340} code={`
+sequenceDiagram
+  participant C as Caller
+  participant S as Scope
+  participant R1 as Config
+  participant R2 as Pool
+  C->>S: Effect.scoped(...)
+  Note over S: state = Open
+  C->>R1: acquire (uninterruptible)
+  C->>S: register release₁(config)
+  C->>R2: acquire (uninterruptible)
+  C->>S: register release₂(pool)
+  C->>C: business logic (interruptible)
+  alt success / failure / interrupt
+    C->>S: scope closes with Exit
+    S-->>R2: release₂(pool, exit)
+    S-->>R1: release₁(config, exit)
+    Note over S: state = Closed (LIFO, uninterruptible)
+  end
+`} />
+
+## Scopes inside Layers
+
+Layers (chapter 10) are scopes wearing a dependency-injection hat. A
+`Layer.effect(Service, buildEffect)` runs `buildEffect` inside the layer's own
+scope — and the signature shows it:
+
+```ts
+Layer.effect<Service, E, R>(service, effect): Layer<Service, E, Exclude<R, Scope>>
+```
+
+That `Exclude<R, Scope>` is the tell: any `Scope` requirement the build effect
+had is satisfied by the layer and removed from what users of the layer need.
+Resources acquired during construction are finalized automatically when the
+layer's memoized lifetime ends (usually via `Layer.launch`, `MemoMap` teardown
+at shutdown, or `Effect.scoped(Layer.build(layer))`).
+
+```ts
+import { Context, Effect, Layer } from "effect"
+
+class Pool extends Context.Service<
+  Pool,
+  { readonly query: (sql: string) => Effect.Effect<string> }
+>()("Pool") {}
+
+const connect = Effect.sync(() => ({ id: 1 }))
+const disconnect = () => Effect.sync(() => console.log("pool: disconnected"))
+
+export const PoolLive = Layer.effect(
+  Pool,
+  Effect.gen(function* () {
+    const conn = yield* Effect.acquireRelease(connect, disconnect)
+    return {
+      query: (sql) => Effect.succeed(`result of ${sql} via ${conn.id}`)
+    }
+  })
+)
+// PoolLive: Layer<Pool, never> — no Scope leaked to consumers
+```
+
+The composition rule falls straight out of scope semantics: layers built from
+other layers acquire their dependencies' resources first, and everything tears
+down in reverse construction order when the memo map closes. You get
+dependency-ordered startup and shutdown for free because underneath, it's one
+big LIFO scope.
+
+## Leak-freedom: comparing the models
+
+The guarantees, side by side:
+
+| Concern | `try/finally` | `AsyncDisposable` / `using` | `AbortController` | Effect `Scope` |
+|---|---|---|---|---|
+| Cleanup on early return/throw | Yes (if block entered correctly) | Yes | No | Yes, structurally |
+| Cleanup on cancellation | Not guaranteed to run | Not guaranteed | Signal only, no lifecycle | Guaranteed, finalizers uninterruptible |
+| Dynamic lifetime (outlives function) | Manual callbacks | Manual (pass the disposable around) | Manual listeners | `Scope.provide` / `forkIn`, typed in `R` |
+| Resource acquired after guard begins | Leaks | Leaks | Leaks | Impossible — registration is part of acquisition |
+| Knows why it ended (success/fail/cancel) | No | No | Partially (signal reason) | Yes — finalizers receive the `Exit` |
+| Ordering across dependencies | Hand-maintained nesting | Hand-maintained | None | LIFO, automatic |
+| Type-level proof a boundary exists | No | No | No | Yes — `R` contains `Scope` until discharged |
+
+The last row is the quiet revolution. In vanilla TS, "does this function leak
+if misused?" is a code-review question. With scopes, it's a compile error:
+an effect with `Scope` in `R` simply cannot run without a boundary.
+
+:::caution[Scopes don't fix blocking]
+All of this machinery coordinates *when* cleanup effects run. It cannot make a
+synchronous blocking call cancellable, nor conjure a release for a native
+handle that lacks one. Wrap blocking work with `Effect.try` and give the
+underlying library its own shutdown hook if it has one.
+:::
+
+## A complete resource graph
+
+Tying it together — three dependent resources, exit-aware releases, composed
+into a layer, consumed in a scoped block:
+
+```ts
+import { Context, Effect, Layer, Schema } from "effect"
+
+class Bus extends Context.Service<
+  Bus,
+  { readonly publish: (msg: string) => Effect.Effect<void> }
+>()("Bus") {}
+class Cache extends Context.Service<
+  Cache,
+  { readonly get: (k: string) => Effect.Effect<string | undefined> }
+>()("Cache") {}
+
+const BusLive = Layer.effect(
+  Bus,
+  Effect.gen(function* () {
+    yield* Effect.acquireRelease(
+      Effect.sync(() => console.log("bus: connected")),
+      (_conn, exit) =>
+        Effect.sync(() =>
+          console.log(`bus: closed (${exit._tag})`)
+        )
+    )
+    return { publish: (msg) => Effect.sync(() => console.log(`bus: ${msg}`)) }
+  })
+)
+
+const CacheLive = Layer.effect(
+  Cache,
+  Effect.gen(function* () {
+    const bus = yield* Bus
+    const store = new Map<string, string>()
+
+    const flush = Effect.sync(() => {
+      // runs while the bus is still open — LIFO guarantees it
+      for (const [k, v] of store) console.log(`bus: flush ${k}=${v}`)
+      console.log(`cache: flushed ${store.size} entries`)
+    })
+
+    yield* Effect.addFinalizer(() => flush)
+
+    return {
+      get: (k) =>
+        Effect.sync(() => {
+          store.set(k, `value:${k}`)   // pretend this was a cache miss fill
+          return store.get(k)
+        })
+    }
+  })
+).pipe(Layer.provide(BusLive))
+
+const program = Effect.gen(function* () {
+  const cache = yield* Cache
+  yield* cache.get("user:42")
+}).pipe(Effect.provide([BusLive, CacheLive]))
+
+await Effect.runPromise(program.pipe(Effect.scoped))
+// bus: connected
+// bus: flush user:42=value:user:42
+// cache: flushed 1 entries
+// bus: closed (Success)
+```
+
+Note what did *not* appear anywhere: try/finally blocks, cleanup registries,
+abort listeners, shutdown flags. The lifetimes are declared once, in the right
+order, and the runtime enforces them on every exit path — including the ones
+nobody tested.
+
+:::tip[Debugging tip]
+When tracking down a suspected leak, remember the invariant: **every
+registration happens on some scope, and every scope closes exactly once**. Log
+`scope.state._tag` transitions, or place a development-only finalizer that logs
+at scope close — leaks almost always turn out to be a scope that nobody closes
+(a `Scope.provide` without `close`, or fibers detached via `forkDetach`, see
+the next chapter).
+:::
+
+## Next
+
+<LinkCard
+  title="13 · Fibers & Structured Concurrency"
+  description="Fork/join, interruption mechanics, structured child lifetimes, races with automatic cleanup, Deferred rendezvous, and semaphores — fibers tie directly into the scopes from this chapter."
+  href="/effect-ts/13-fibers/"
+/>

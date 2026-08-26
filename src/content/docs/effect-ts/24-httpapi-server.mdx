@@ -1,0 +1,720 @@
+---
+title: HttpApi — Schema-First Servers
+description: Define once, get a server, OpenAPI, and a typed client. Domain models, status-annotated errors, groups, middleware, handlers, serving, and in-memory testing in Effect v4's HttpApi.
+sidebar:
+  order: 24
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+`HttpClient` (chapter 23) solved calling *someone else's* API. `HttpApi` solves the opposite: defining *your own* API once — as `Schema` + endpoint declarations — and deriving everything else. Server routes with typed handlers, OpenAPI JSON, interactive docs, and a fully typed client come from the same declaration. Rename a field, change a status code, or add a middleware requirement, and the compiler catches the drift on both sides.
+
+This is Effect's answer to the FastAPI contract you met in the Python track: a Pydantic model is the parser, validator, and docs — `HttpApi` brings the same single-source-of-truth promise to TypeScript, layered on the tracing, retries, and dependency story you already know.
+
+:::note[Module paths]
+All symbols below are `effect/unstable/*` — explicitly unstable per semver. The course pins `4.0.0-rc.112`; re-check `packages/effect/src/unstable/httpapi/` after upgrades.
+
+```ts
+import { HttpApi, HttpApiBuilder, HttpApiClient, HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiScalar, HttpApiSchema, HttpApiSecurity, OpenApi } from "effect/unstable/httpapi"
+import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
+import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
+```
+:::
+
+## The promise: one definition, three artifacts
+
+```ts
+// packages/effect/ai-docs/src/51_http-server/fixtures/api/Api.ts
+import { HttpApi, OpenApi } from "effect/unstable/httpapi"
+import { SystemApi } from "./System.ts"
+import { UsersApiGroup } from "./Users.ts"
+
+export class Api extends HttpApi.make("user-api")
+  .add(UsersApiGroup)
+  .add(SystemApi)
+  .annotateMerge(OpenApi.annotations({ title: "Acme User API" }))
+{}
+```
+
+From this `Api` value:
+
+| Artifact | How it is derived | Where it lives |
+|---|---|---|
+| **Server routes** | `HttpApiBuilder.group(Api, "users", ...)` + `HttpApiBuilder.layer(Api, { openapiPath })` | Node, Bun, or `toWebHandler` for serverless |
+| **OpenAPI spec** | `OpenApi.annotations` on `Api` / groups / endpoints + `/openapi.json` | served as JSON, consumed by Scalar at `/docs` |
+| **Typed client** | `HttpApiClient.make(Api, { transformClient })` | any runtime with an `HttpClient` — shares the same schemas, so wire mismatches are type errors |
+
+<Mermaid title="HttpApi single source" height={240} code={`
+flowchart LR
+  def["HttpApi.make<br/>+ HttpApiGroup + HttpApiEndpoint<br/>(Schema payloads, errors, params)"]
+  def --> server["HttpApiBuilder<br/>typed handlers"]
+  def --> openapi["OpenAPI JSON<br/>+ Scalar /docs"]
+  def --> client["HttpApiClient<br/>typed methods"]
+  server -.-> openapi
+  client -.-> server
+`} />
+
+Everything downstream is mechanically derived — no hand-maintained OpenAPI YAML, no separate client stub to codegen offline.
+
+## Domain models: `Model.Class` dual variants, reused
+
+The HTTP layer reuses the same `Model.Class` you met in chapter 25 (SQL). One field declaration fans out into database and JSON shapes — the API consumes the JSON variants:
+
+```ts title="src/domain/User.ts"
+import { Schema } from "effect"
+import { Model } from "effect/unstable/schema"
+
+export const UserId = Schema.String.pipe(Schema.brand("UserId"))
+export type UserId = typeof UserId.Type
+
+export class User extends Model.Class<User>("User")({
+  id: Model.UuidV4Insert(UserId),
+  name: Schema.String,
+  email: Schema.String,
+  createdAt: Model.DateTimeInsert,
+  updatedAt: Model.DateTimeUpdate
+}) {}
+```
+
+`Model.UuidV4Insert(UserId)` means: store a branded string, generate a `v4` UUID when constructing via `User.insert.makeEffect`, omit `id` from `jsonCreate` / `jsonUpdate` so clients can never set it. `DateTimeInsert` / `DateTimeUpdate` behave analogously — set on insert, refreshed on update, excluded from client-writable variants. The variants in play:
+
+| Variant | When it is used |
+|---|---|
+| `User` (select) | DB reads, handler return values decoded from rows |
+| `User.insert` | `repo.insert` — id + timestamps generated via `Effect` clock |
+| `User.update` | `repo.update` — id required, `updatedAt` refreshed |
+| `User.json` | success responses (`Schema.Array(User.json)`, `User.json` per endpoint) |
+| `User.jsonCreate` | `POST /` payload — only client-writable fields |
+| `User.jsonUpdate` | `PATCH /:id` payload — partial, no id/timestamps |
+
+When an API response should expose `User.json` directly, the success schema is `Schema.Array(User.json)` or `User.json`; when the repository inserts, it uses `User.insert`. `Model` keeps them in sync — rename `email` once, both sides move.
+
+## Errors with HTTP semantics
+
+### Status-annotated leaf errors
+
+Each leaf error carries its HTTP status inline — third argument to `Schema.TaggedError`:
+
+```ts title="src/domain/UserErrors.ts"
+import { Schema } from "effect"
+
+export class UserNotFound extends Schema.TaggedError<UserNotFound>()(
+  "UserNotFound",
+  {},
+  { httpApiStatus: 404 }
+) {}
+
+export class SearchQueryTooShort extends Schema.TaggedError<SearchQueryTooShort>()(
+  "SearchQueryTooShort",
+  {},
+  { httpApiStatus: 422 }
+) {
+  static readonly minimumLength = 2
+}
+```
+
+`httpApiStatus` is an annotation on the schema AST (see `HttpApiSchema.ts:25`). The server uses it to choose the response status; the OpenAPI generator documents it; the client maps that status back to a typed error variant. A top-level `422` becomes `SearchQueryTooShort` on the client, not a generic `Error`.
+
+This is the same pattern as `Unauthorized` in the middleware:
+
+```ts
+export class Unauthorized extends Schema.TaggedError<Unauthorized>()(
+  "Unauthorized",
+  { message: Schema.String },
+  { httpApiStatus: 401 }
+) {}
+```
+
+`httpApiStatus` defaults to `500` when omitted — deliberate errors annotate, unmodeled crashes fall to 500.
+
+### The reason-wrapper
+
+Individual leaves are useful, but service methods in chapter 25 collapse them into one service error so signatures stay small:
+
+```ts
+export class UsersError extends Schema.TaggedError<UsersError>()(
+  "UsersError",
+  { reason: Schema.Union([UserNotFound, SearchQueryTooShort]) }
+) {}
+```
+
+This is Effect's **reason-error** pattern (chapter 05): `UsersError` with a `reason` union keeps "which thing went wrong" as data while the error channel remains one type. Handlers unwrap the reason selectively (shown under handlers).
+
+Endpoints that surface a subset of the union narrow via `HttpApiSchema` helpers so the generated OpenAPI / client reflects exactly the advertised status codes:
+
+```ts
+// inside an endpoint's error: option
+SearchQueryTooShort.pipe(
+  HttpApiSchema.asNoContent({ decode: () => new SearchQueryTooShort() })
+)
+```
+
+## Endpoint anatomy
+
+Every endpoint is `HttpApiEndpoint.{get,post,put,patch,del}(name, path, config)`. The shape is uniform; only `payload`'s wire encoding changes with the method:
+
+```ts title="src/api/Users.ts — endpoint slice"
+import { Schema } from "effect"
+import { HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
+import { User, UserId } from "../domain/User.ts"
+import { SearchQueryTooShort, UserNotFound } from "../domain/UserErrors.ts"
+import { Authorization } from "./Authorization.ts"
+
+export class UsersApiGroup extends HttpApiGroup.make("users")
+  .add(
+    HttpApiEndpoint.get("list", "/", {
+      query: { search: Schema.optional(Schema.String) },
+      success: Schema.Array(User.json)
+    }),
+    HttpApiEndpoint.get("search", "/search", {
+      payload: { search: Schema.String },           // GET → query string
+      success: [
+        Schema.Array(User.json),
+        Schema.String.pipe(HttpApiSchema.asText({ contentType: "text/csv" }))
+      ],
+      error: [
+        SearchQueryTooShort.pipe(HttpApiSchema.asNoContent({ decode: () => new SearchQueryTooShort() })),
+        HttpApiError.RequestTimeoutNoContent
+      ]
+    }),
+    HttpApiEndpoint.get("getById", "/:id", {
+      params: { id: UserId },
+      success: User.json,
+      error: UserNotFound.pipe(HttpApiSchema.asNoContent({ decode: () => new UserNotFound() }))
+    }),
+    HttpApiEndpoint.post("create", "/", {
+      payload: User.jsonCreate,                     // POST → JSON body
+      success: User.json
+    }),
+    HttpApiEndpoint.patch("update", "/:id", {
+      params: { id: UserId },
+      payload: User.jsonUpdate,
+      success: User.json,
+      error: UserNotFound.pipe(HttpApiSchema.asNoContent({ decode: () => new UserNotFound() }))
+    }),
+    HttpApiEndpoint.get("me", "/me", {
+      success: User.json,
+      error: UserNotFound.pipe(HttpApiSchema.status(404))
+    })
+  )
+  .middleware(Authorization)
+  .prefix("/users")
+  .annotateMerge(OpenApi.annotations({ title: "Users", description: "User management endpoints" }))
+{}
+```
+
+| Slot | Where it lands on the wire | Schema options |
+|---|---|---|
+| `params` | path segments `/:id` — coerced from strings via `Schema.toCodecStringTree` | branded IDs, `Schema.IntFromString`, etc. all work |
+| `query` | `?search=...` URL params | `Schema.optional(...)` for optional; each leaf decoded from `string \| undefined` |
+| `headers` | request headers | fields shorthand or Schema; `undefined` leaves omitted |
+| `payload` | GET → query string; POST/PUT/PATCH/DELETE → request body (default JSON) | `HttpApiSchema.asText`, `asMultipart`, etc. override body codec; `asNoContent` means empty response with decoder |
+| `success` | response body (default 200) | single schema, `[SchemaA, SchemaB]` union for content-negotiated responses (`Array<Todo>` as JSON vs `string` as CSV), `HttpApiSchema.NoContent` (204), `HttpApiSchema.WithHeaders`, or `StreamSse` for SSE |
+| `error` | discriminated by status (from `httpApiStatus`) | `Schema.TaggedError` (+ `HttpApiError.*`), unions with `asNoContent` / `status(404)` overrides |
+
+:::tip[Status vs endpoint config — two places, one meaning]
+Prefer `httpApiStatus` annotations on error classes when the status is intrinsic ("not found is 404 everywhere"). Use `HttpApiSchema.status(404)` / `asNoContent` / `asText` per-endpoint when the mapping is endpoint-specific ("this GET returns the error as 204 no-content so the client treats it as absence," vs "that PATCH returns it as text/csv"). The ai-docs `Users.ts` fixture uses both styles on purpose.
+:::
+
+### Success unions and content negotiation
+
+`search` declares two success schemas: `[Schema.Array(User.json), Schema.String.pipe(HttpApiSchema.asText({contentType:"text/csv"}))]`. The client chooses via `Accept`; the server handler returns either variant and `HttpApiBuilder` handles the codec. Introduce `asJson` / `asFormUrlEncoded` / `asUint8Array` for other media types — all verified in `HttpApiSchema.ts:832`.
+
+### Built-in error helpers
+
+`HttpApiError` ships common HTTP errors (`RequestTimeout`, `BadRequest`, …) as `Schema.TaggedError` classes with pre-annotated status. The `NoContent` variants (`HttpApiError.RequestTimeoutNoContent`, `HttpApiSchema.NoContent`) produce 204 / 408 with no body; per-endpoint `asNoContent({ decode })` preserves a decoded client value while encoding as `void` — the canonical trick for mapping an absent body back to a domain error on the client.
+
+## Groups and root `Api`
+
+### Top-level vs prefixed groups
+
+```ts
+// ai-docs/src/51_http-server/fixtures/api/System.ts — topLevel: true → client.health()
+import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/unstable/httpapi"
+
+export class SystemApi extends HttpApiGroup.make("system", { topLevel: true }).add(
+  HttpApiEndpoint.get("health", "/health", { success: HttpApiSchema.NoContent })
+) {}
+
+// ai-docs/src/51_http-server/fixtures/api/Api.ts — root composition
+import { HttpApi, OpenApi } from "effect/unstable/httpapi"
+import { SystemApi } from "./System.ts"
+import { UsersApiGroup } from "./Users.ts"
+
+export class Api extends HttpApi.make("user-api")
+  .add(UsersApiGroup)   // → client.users.list / getById / create / update / me / search
+  .add(SystemApi)       // → client.health()  (not client.system.health)
+  .annotateMerge(OpenApi.annotations({ title: "Acme User API" }))
+{}
+```
+
+| Group option | Effect |
+|---|---|
+| `HttpApiGroup.make("users")` + `.prefix("/users")` | routes under `/users/*`, client at `client.users.*` |
+| `{ topLevel: true }` | no group prefix in client — top-level methods like `client.health()` |
+| `.middleware(Authorization)` | every endpoint in the group requires + runs the middleware (per-endpoint `.middleware(Authorization)` also works) |
+| `.annotateMerge(OpenApi.annotations({title,description}))` | merges into the generated spec for this group; root-level annotations cover the whole API |
+
+:::caution[Path uniqueness across groups]
+Two endpoints in different groups may still clash if their prefixed paths overlap (`/users/:id` vs `/users/me` order matters — the static segment must be registered before the param). `HttpApi` validates this at builder construction; pretty error messages point at the colliding declaration.
+:::
+
+## Middleware: `HttpApiMiddleware.Service`
+
+Middleware declares the service it *provides* to downstream handlers and the service it *requires* from upstream, plus how credentials are decoded and which client-side implementation is mandatory:
+
+```ts title="src/api/Authorization.ts"
+import { Context, Schema } from "effect"
+import { HttpApiMiddleware, HttpApiSecurity } from "effect/unstable/httpapi"
+import type { User } from "../domain/User.ts"
+
+export class CurrentUser extends Context.Service<CurrentUser, User>()(
+  "acme/HttpApi/Authorization/CurrentUser"
+) {}
+
+export class Unauthorized extends Schema.TaggedError<Unauthorized>()(
+  "Unauthorized",
+  { message: Schema.String },
+  { httpApiStatus: 401 }
+) {}
+
+export class Authorization extends HttpApiMiddleware.Service<Authorization, {
+  provides: CurrentUser
+  requires: never
+}>()("acme/HttpApi/Authorization", {
+  requiredForClient: true,
+  security: { bearer: HttpApiSecurity.bearer },
+  error: Unauthorized
+}) {}
+```
+
+Anatomy:
+
+| Slot | Meaning |
+|---|---|
+| `provides: CurrentUser` | handlers and later middleware may `yield* CurrentUser` — the user injected by this middleware |
+| `requires: never` | this middleware needs no prior middleware; chain with `requires: SomeOtherMiddleware` when ordering matters |
+| `requiredForClient: true` | generated clients must provide a `layerClient` for this middleware — unconfigured clients fail to compile |
+| `security: { bearer: HttpApiSecurity.bearer }` | token decoded from `Authorization: Bearer …`; rendered into OpenAPI `securitySchemes` automatically; available as `{ credential: Redacted<string> }` in the impl |
+| `error: Unauthorized` | middleware may `yield* new Unauthorized(...)` — declared here so OpenAPI documents 401 |
+
+The impl lives separately — never co-located with the API definition (so server secrets don't leak into clients):
+
+```ts title="src/server/Authorization.ts"
+import { DateTime, Effect, Layer, Redacted } from "effect"
+import { Authorization, CurrentUser, Unauthorized } from "../api/Authorization.ts"
+import { User, UserId } from "../domain/User.ts"
+
+const fixedTimestamp = DateTime.makeUnsafe("2026-01-01T00:00:00Z")
+const devUser = new User({
+  id: UserId.make("bf3dbe33-0ad2-4c9c-9c9e-733e57bdcbee"),
+  name: "Dev User",
+  email: "dev@acme.com",
+  createdAt: fixedTimestamp,
+  updatedAt: fixedTimestamp
+})
+
+export const AuthorizationLayer = Layer.effect(
+  Authorization,
+  Effect.gen(function* () {
+    yield* Effect.logInfo("Starting Authorization middleware")
+    return Authorization.of({
+      bearer: Effect.fn(function* (httpEffect, { credential }) {
+        const token = Redacted.value(credential)
+        if (token !== "dev-token") {
+          return yield* new Unauthorized({ message: "Missing or invalid bearer token" })
+        }
+        return yield* Effect.provideService(httpEffect, CurrentUser, devUser)
+      })
+    })
+  })
+)
+```
+
+The shape `Authorization.of({ bearer: Effect.fn((httpEffect, { credential }) => ...) })` mirrors the `security` map — each key becomes a handler that receives `(httpEffect, credentials)` and must either fail with `Unauthorized` or continue with the downstream effect augmented with the provided services via `Effect.provideService`.
+
+:::note[Why `Redacted`]
+Credentials are wrapped in `Redacted<string>` so accidental `console.log` or span attribute serialization does not leak tokens. Call `Redacted.value(credential)` only at the verification boundary, and prefer `Effect.fn` with explicit attributes to avoid putting the raw token into telemetry.
+:::
+
+## Handlers: `HttpApiBuilder.group` + `handleAll`
+
+Handlers map endpoint names → implementations. The builder exposes a fluent `handleAll` that is exhaustively checked — miss an endpoint and TypeScript complains.
+
+```ts title="src/server/Users/http.ts — handlers"
+import { Effect, Layer } from "effect"
+import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
+import { Api } from "../../api/Api.ts"
+import { CurrentUser } from "../../api/Authorization.ts"
+import { AuthorizationLayer } from "../Authorization.ts"
+import { Users } from "../Users.ts"
+
+export const UsersApiHandlersNoDeps = HttpApiBuilder.group(
+  Api, "users",
+  Effect.fn(function* (handlers) {
+    const users = yield* Users
+    return handlers.handleAll({
+      list: ({ query }) =>
+        users.list(query.search).pipe(Effect.orDie),
+      search: Effect.fn(function* ({ payload }) {
+        if (payload.search === "bad-request") {
+          return yield* new HttpApiError.RequestTimeout()
+        }
+        return yield* users.list(payload.search).pipe(
+          Effect.catchReason("UsersError", "SearchQueryTooShort", Effect.fail, Effect.die)
+        )
+      }),
+      getById: ({ params }) =>
+        users.getById(params.id).pipe(
+          Effect.catchReasons("UsersError", { UserNotFound: (e) => Effect.fail(e) }, Effect.die)
+        ),
+      create: ({ payload }) =>
+        users.create(payload).pipe(Effect.orDie),
+      update: ({ params, payload }) =>
+        users.update(params.id, payload).pipe(
+          Effect.catchReasons("UsersError", { UserNotFound: (e) => Effect.fail(e) }, Effect.die)
+        ),
+      me: () => CurrentUser
+    })
+  })
+)
+
+export const UsersApiHandlers = UsersApiHandlersNoDeps.pipe(
+  Layer.provide([Users.layer, AuthorizationLayer])
+)
+```
+
+### Reason-unwrapping: `catchReason` / `catchReasons`
+
+Service methods fail with `UsersError({ reason: UserNotFound | SearchQueryTooShort })`. Endpoints typically want to expose only a subset — say `getById` should produce a 404 `UserNotFound`, not a 422 `SearchQueryTooShort`. Three primitives handle this without manual destructuring:
+
+| Combinator | Shape | Use when |
+|---|---|---|
+| `Effect.catchReason("UsersError", "SearchQueryTooShort", Effect.fail, Effect.die)` | select one reason, fail with it | singly-branched narrowing (e.g., `search`) |
+| `Effect.catchReasons("UsersError", { UserNotFound: e => Effect.fail(e) }, Effect.die)` | map several reasons at once | multi-tag narrowing (e.g., `getById`) |
+| `Effect.unwrapReason("UsersError")` + `Effect.catchTags` | move `reason` to top-level channel | when downstream logic already branches on `_tag` |
+
+The non-selected reason is passed to the second callback — `Effect.die` turns it into a defect → `500` → loud in logs. This is the discipline: expected modeled errors become typed HTTP errors; impossible-at-this-endpoint errors crash. The choice is visible in the handler, not buried in the service.
+
+:::tip[When to `orDie`]
+`list` uses `Effect.orDie` because the endpoint declares no `error` — the service's `UsersError` is treated as unrecoverable at the HTTP edge. If you later decide the endpoint *should* surface a status, add the error to the declaration and switch to `catchReason` — the compiler will force you.
+:::
+
+### `NoDeps` vs full layers — the split pattern revisited
+
+The pattern repeats chapter 10's `layerNoDeps` / `layer` split, now at the HTTP seam:
+
+| Layer | Provides | Requires | Used for |
+|---|---|---|---|
+| `UsersApiHandlersNoDeps` | nothing (needs `Users` + `Authorization`) | `Users \| Authorization` | tests — `Layer.provide(Users.layerMemory)` |
+| `UsersApiHandlers` | `{ users handlers }` (built-in) | nothing (after `Layer.provide([Users.layer, AuthorizationLayer])`) | production `HttpApiBuilder.layer` |
+
+`HttpApiBuilder.group(...)` itself returns a `Layer` — treat it like any `Layer.effect`. Merging several `HttpApiBuilder.group` layers is how an API with many groups wires without a central "register everything" file.
+
+The trick that makes suites fast: because `HttpApiBuilder.group` layers are just values, a test can `Layer.mergeAll(UsersApiHandlersNoDeps, HttpServer.layerServices)` once and reuse the same `makeClient` across cases — memoization from chapter 10 applies.
+
+## Serving
+
+### Node (or Bun) — `HttpRouter` + `NodeHttpServer`
+
+```ts title="src/server/main.ts"
+import { createServer } from "node:http"
+import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
+import { Effect, Layer } from "effect"
+import { HttpApiBuilder, HttpApiScalar } from "effect/unstable/httpapi"
+import { HttpRouter } from "effect/unstable/http"
+import { Api } from "./api/Api.ts"
+import { Authorization } from "./api/Authorization.ts"
+
+const SystemApiHandlers = HttpApiBuilder.group(
+  Api, "system",
+  Effect.fn(function* (handlers) {
+    return handlers.handleAll({ health: () => Effect.void })
+  })
+)
+
+const ApiRoutes = HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
+  Layer.provide([UsersApiHandlers, SystemApiHandlers])
+)
+
+const DocsRoute = HttpApiScalar.layer(Api, { path: "/docs" })
+
+const AllRoutes = Layer.mergeAll(ApiRoutes, DocsRoute)
+
+export const HttpServerLayer = HttpRouter.serve(AllRoutes).pipe(
+  Layer.provide(NodeHttpServer.layer(createServer, { port: 3000 }))
+)
+
+Layer.launch(HttpServerLayer).pipe(NodeRuntime.runMain)
+```
+
+`HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" })` mounts both the derived routes and the spec endpoint — skip `openapiPath` to disable JSON exposure in prod. `HttpApiScalar.layer(Api, { path: "/docs" })` serves the Scalar reference UI — swap for `HttpApiSwagger` if you prefer Swagger. `Layer.launch(HttpServerLayer)` holds the scope alive until SIGINT; finalizers (connection pools, layer-scoped workers) run on shutdown.
+
+### Serverless / `fetch` handlers — `toWebHandler`
+
+When the runtime is not Node's `createServer` (Cloudflare Workers, Deno Deploy, Next.js route handlers), derive a WHATWG `fetch` handler:
+
+```ts
+import { HttpRouter, HttpServer } from "effect/unstable/http"
+
+export const { handler, dispose } = HttpRouter.toWebHandler(
+  AllRoutes.pipe(Layer.provide(HttpServer.layerServices))
+)
+// handler: (request: Request) => Promise<Response>
+// dispose: () => Promise<void> — drain + close scopes
+```
+
+`HttpServer.layerServices` provides the platform services the router expects when there is no `NodeHttpServer.layer` — the shared seam for in-memory tests too (see below).
+
+### OpenAPI annotations that travel
+
+Params, payloads, successes, and errors can all carry docs:
+
+```ts
+import { OpenApi, HttpApiSchema } from "effect/unstable/httpapi"
+import { Schema } from "effect"
+
+HttpApiEndpoint.get("getById", "/:id", {
+  params: { id: UserId },
+  success: User.json,
+  error: UserNotFound.pipe(HttpApiSchema.asNoContent({ decode: () => new UserNotFound() }))
+}).annotateMerge(OpenApi.annotations({ summary: "Fetch a user by id", description: "Returns 404 if absent" }))
+```
+
+`Api` / group / endpoint annotations merge deeply — nested `annotateMerge` append.
+
+## The typed client — middleware/client symmetry
+
+The client mirrors the middleware declaration. If the server requires `Authorization` with `bearer`, the client must supply a `layerClient` for `Authorization` — enforced by `requiredForClient: true`:
+
+```ts title="src/client.ts"
+import { Context, Effect, flow, Layer, Schedule } from "effect"
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { HttpApiClient, HttpApiMiddleware } from "effect/unstable/httpapi"
+import { Api } from "./api/Api.ts"
+import { Authorization } from "./api/Authorization.ts"
+
+export const AuthorizationClient = HttpApiMiddleware.layerClient(
+  Authorization,
+  Effect.fn(function* ({ next, request }) {
+    return yield* next(HttpClientRequest.bearerToken(request, "dev-token"))
+  })
+)
+
+export class ApiClient extends Context.Service<ApiClient, HttpApiClient.ForApi<typeof Api>>()(
+  "acme/ApiClient"
+) {
+  static readonly layer = Layer.effect(
+    ApiClient,
+    HttpApiClient.make(Api, {
+      transformClient: (client) =>
+        client.pipe(
+          HttpClient.mapRequest(flow(HttpClientRequest.prependUrl("http://localhost:3000"))),
+          HttpClient.retryTransient({ schedule: Schedule.exponential(100), times: 3 })
+        )
+    })
+  ).pipe(
+    Layer.provide(AuthorizationClient),
+    Layer.provide(FetchHttpClient.layer)
+  )
+}
+
+export const callApi = Effect.gen(function* () {
+  const client = yield* ApiClient
+  yield* client.health()                                        // SystemApi (topLevel)
+  const created = yield* client.users.create({ payload: { name: "Ada", email: "ada@acme.dev" } })
+  const again = yield* client.users.getById({ params: { id: created.id } })
+  yield* Effect.log(`round-tripped ${again.name}`)
+}).pipe(Effect.provide(ApiClient.layer))
+```
+
+| Client concept | Server mirror |
+|---|---|
+| `HttpApiMiddleware.layerClient(Authorization, ({next, request}) => next(bearerToken(request,...)))` | `Layer.effect(Authorization, ... bearer: (httpEffect, {credential}) => ...)` |
+| `transformClient: (client) => client.pipe(mapRequest(prependUrl...), retryTransient(...))` | `HttpClient.mapRequest` / `retryTransient` in chapter 23's `JsonPlaceholder` service |
+| `HttpApiClient.ForApi<typeof Api>` | `HttpApi.make("user-api")` |
+| `client.users.create({payload})` / `client.health()` | `handlers.handleAll({ create: ({payload}) => ..., health: () => ... })` |
+| `FetchHttpClient.layer` (or Node/Bun variants) | `NodeHttpServer.layer(createServer, {port})` |
+
+Method signatures are derived: `params`, `query`, `headers`, `payload`, `urlParams` arguments correspond to the endpoint slots — optional slots become optional argument keys; required ones become required keys. Rename `email` to `emailAddress` in `User` and every call site breaks at compile time on both sides.
+
+## Testing with `HttpApiTest` — no server, no network
+
+`HttpApiTest` builds a typed client wired directly to handlers — same codecs, same routing, same middleware decoding — but without opening a socket. Select the groups you want the client to see:
+
+```ts title="test/users.test.ts"
+import { assert, layer } from "@effect/vitest"
+import { Effect, Layer } from "effect"
+import { HttpClientRequest, HttpServer } from "effect/unstable/http"
+import { HttpApiMiddleware, HttpApiTest } from "effect/unstable/httpapi"
+import { Api } from "../src/api/Api.ts"
+import { Authorization } from "../src/api/Authorization.ts"
+import { UserId } from "../src/domain/User.ts"
+import { AuthorizationLayer } from "../src/server/Authorization.ts"
+import { Users } from "../src/server/Users.ts"
+import { UsersApiHandlersNoDeps } from "../src/server/Users/http.ts"
+
+const HandlersLayer = UsersApiHandlersNoDeps.pipe(
+  Layer.provide(Users.layerMemory),
+  Layer.provideMerge(AuthorizationLayer)
+)
+
+const AuthorizationMiddlewareGood = HttpApiMiddleware.layerClient(
+  Authorization,
+  ({ next, request }) => next(HttpClientRequest.bearerToken(request, "dev-token"))
+)
+
+const AuthorizationMiddlewareBad = HttpApiMiddleware.layerClient(
+  Authorization,
+  ({ next, request }) => next(request) // no token
+)
+
+const makeClient = HttpApiTest.groups(Api, ["users"])
+
+layer(Layer.mergeAll(HandlersLayer, HttpServer.layerServices))("UsersApi", (it) => {
+  it.effect("lists, fetches, and creates users", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const created = yield* client.users.create({
+        payload: { name: "Alice", email: "alice@acme.dev" }
+      })
+      assert.strictEqual(created.name, "Alice")
+
+      const fetched = yield* client.users.getById({ params: { id: created.id } })
+      assert.deepStrictEqual(fetched, created)
+
+      const all = yield* client.users.list({ query: {} })
+      assert.isTrue(all.some((u) => u.id === created.id))
+    }).pipe(Effect.provide(AuthorizationMiddlewareGood)))
+
+  it.effect("returns 404 for a missing user", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const error = yield* client.users.getById({
+        params: { id: UserId.make("019845e1-682f-4b02-a706-3b2422d13aec") }
+      }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "UserNotFound")
+    }).pipe(Effect.provide(AuthorizationMiddlewareGood)))
+
+  it.effect("rejects requests without a valid bearer token", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const error = yield* client.users.list({ query: {} }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "Unauthorized")
+    }).pipe(Effect.provide(AuthorizationMiddlewareBad)))
+})
+```
+
+### Testing patterns worth internalizing
+
+1. **Pick `layerMemory` for the domain.** The `Users` service from chapter 25 exposes `layerMemory` (Map-backed) alongside `layer` (SQL-backed). `HttpApiTest` does not know or care which one — it exercises the full HTTP pipeline without a database.
+2. **Select middleware per test.** `AuthorizationMiddlewareGood` vs `Bad` is exactly where auth coverage lives — the same tests that prove the happy path with a dev token prove 401s without it.
+3. **`Effect.flip` for error assertions.** Typed clients fail with the *union of declared errors* — `Effect.flip` swaps `A/E` so the happy value is now the error, making tagged assertions natural. ([04 · Building Effects](/effect-ts/04-building-effects/) on converters.)
+4. **`makeClient = HttpApiTest.groups(Api, ["users"])`** scopes the client to a subset of groups — useful when an API has 10 groups and the file only exercises one. Use `HttpApiTest.client(Api)` for the full API when top-level routes must also be covered.
+
+:::caution[Don't reuse `layerMemory` across `it` blocks without isolation]
+`Users.layerMemory` holds mutable `Map` state — if two `it.effect` cases share the same layer value without `Layer.fresh` or Vitest's per-test lifecycle scoping, records created in one case leak into the next. Either create the layer inside `layer(...)` per describe block (as above) or wrap tests with `Layer.fresh`. Memoization reuse from chapter 10 is feature, not bug, until isolation matters.
+:::
+
+## Wiring diagram — the user API, end to end
+
+<Mermaid title="User API wiring" height={560} code={`
+flowchart TB
+  subgraph Domain["Domain"]
+    UserModel["User extends Model.Class<br/>User / insert / update<br/>json / jsonCreate / jsonUpdate"]
+    UserErr["UserNotFound 404<br/>SearchQueryTooShort 422<br/>UsersError reason wrapper"]
+    UserIdT["UserId branded"]
+  end
+
+  subgraph ApiDef["API definition (shared)"]
+    UsersGroup["HttpApiGroup.make users<br/>6 endpoints + middleware Authorization<br/>+ prefix /users + OpenApi annotations"]
+    SystemGroup["HttpApiGroup.make system topLevel"]
+    ApiNode["HttpApi.make user-api<br/>.add UsersApiGroup .add SystemApi<br/>.annotateMerge OpenApi"]
+  end
+
+  subgraph Middleware["Middleware"]
+    AuthMW["Authorization<br/>HttpApiMiddleware.Service<br/>provides CurrentUser<br/>security bearer requiredForClient"]
+    AuthLayer["AuthorizationLayer<br/>Layer.effect bearer -> Redacted check<br/>provideService CurrentUser"]
+    AuthClient["AuthorizationClient<br/>layerClient bearerToken dev-token"]
+  end
+
+  subgraph Service["Service (chapter 25)"]
+    UsersSvc["Users<br/>SqlModel.makeRepository(User)<br/>layerNoDeps / layer / layerMemory"]
+  end
+
+  subgraph Handlers["Handlers"]
+    NoDeps["UsersApiHandlersNoDeps<br/>HttpApiBuilder.group Api users<br/>handleAll + catchReason"]
+    FullHandlers["UsersApiHandlers<br/>NoDeps + Users.layer<br/>+ AuthorizationLayer"]
+  end
+
+  subgraph Serving["Serving & Docs"]
+    ApiRoutes["HttpApiBuilder.layer Api openapiPath"]
+    Docs["HttpApiScalar.layer Api /docs"]
+    AllRoutes["Layer.mergeAll ApiRoutes Docs"]
+    NodeServe["HttpRouter.serve AllRoutes<br/>+ NodeHttpServer.layer port 3000"]
+    WebHandler["HttpRouter.toWebHandler<br/>+ HttpServer.layerServices"]
+  end
+
+  subgraph ClientSide["Typed client"]
+    ApiClientSvc["ApiClient extends Context.Service<br/>ForApi<typeof Api><br/>transformClient prependUrl + retry"]
+    Call["client.users.create / getById<br/>client.health"]
+  end
+
+  subgraph Testing["Testing"]
+    HandlersForTest["HandlersLayer<br/>NoDeps + Users.layerMemory + AuthLayer"]
+    TestClient["HttpApiTest.groups Api users<br/>Good/Bad auth middleware<br/>Effect.flip asserts"]
+  end
+
+  UserModel --> UsersGroup
+  UserErr --> UsersGroup
+  UserIdT --> UsersGroup
+  UsersGroup --> ApiNode
+  SystemGroup --> ApiNode
+  AuthMW --> UsersGroup
+  AuthLayer -.-> FullHandlers
+  UsersSvc -.-> FullHandlers
+  NoDeps --> FullHandlers
+  ApiNode --> NoDeps
+  ApiNode --> ApiRoutes
+  ApiNode --> Docs
+  ApiRoutes --> AllRoutes
+  Docs --> AllRoutes
+  AllRoutes --> NodeServe
+  AllRoutes --> WebHandler
+  ApiNode --> ApiClientSvc
+  AuthClient -.-> ApiClientSvc
+  ApiClientSvc --> Call
+  NoDeps --> HandlersForTest
+  HandlersForTest --> TestClient
+  ApiNode --> TestClient
+`} />
+
+The flow to read aloud: domain models + errors → groups + middleware-annotated endpoints → `Api` root → handlers that `yield*` services and unwrap reasons → layers that wire production vs in-memory dependencies → routes + Scalar docs merged into one layer → served via Node or as a `fetch` handler. A sibling pipeline mirrors the middleware as a `layerClient` to produce the typed client. Tests replace `Users.layer` with `Users.layerMemory` and choose a good/bad `AuthorizationClient` to cover both auth branches.
+
+## Pitfalls
+
+| Pitfall | Symptom | Fix |
+|---|---|---|
+| `middleware(Authorization)` on group, but error type missing from group config | `Unauthorized` never appears in OpenAPI; client does not know 401 is possible | Declare `error: Unauthorized` on the middleware service (already done in fixture) |
+| `asNoContent({ decode })` decoder returns `void` | typed client receives `void` where you expected the domain error | decoder must `() => new UserNotFound()` — the value that lands in `Effect`'s error channel |
+| `params: { id: UserId }` but route is `/users` without `:id` | compile passes; runtime 404 | path param names must match `/:id` placeholders — the builder validates |
+| Sorting of `/search` vs `/:id` | `/search` request routed to `/:id` with `id = "search"` | register static `/search` before `/:id` — `HttpApiGroup` add order matters; or use `/by-id/:id` |
+| `HttpApiTest` without `HttpServer.layerServices` | test hangs or dies with missing `HttpServer` service | merge `HttpServer.layerServices` alongside handler layers in `layer(...)` |
+| Schema change without rebuilding server layer | OpenAPI stale, client out of sync but types still pass | derive client/server from the same `Api` value — no separate codegen step to forget |
+
+## When HttpApi is not the tool
+
+| Context | Better fit |
+|---|---|
+| Calling an external API you don't own (Stripe, JsonPlaceholder) | `HttpClient` (chapter 23) — no shared spec |
+| One-off webhook receiving, raw `multipart/form-data` with streaming | raw `HttpRouter` + `HttpServerResponse` — bypass the `HttpApi` codec |
+| Business logic with no HTTP surface (batch jobs, queue consumers) | plain `Effect` + `Layer` — add HTTP only at the adapter edge |
+
+## Next
+
+<LinkCard
+  title="25 · SQL — Model, Migrations & Repositories"
+  description="The other half of the platform stack: schema-backed domain models with database/JSON variant derivation, driver-swapped SqlClient, migrations, and SqlModel repositories with traced, test-swappable layers."
+  href="/effect-ts/25-sql/"
+/>

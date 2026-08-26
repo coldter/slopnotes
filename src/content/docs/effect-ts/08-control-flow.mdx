@@ -1,0 +1,491 @@
+---
+title: Control Flow & Concurrency Primitives
+description: Branching (if/else in gen bodies, Effect.when, filterOrFail), loops as plain JavaScript, iterating with bounded concurrency, Semaphores, racing and timeouts, and value-level pattern matching with the Match module.
+sidebar:
+  order: 8
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+By now the pattern should feel familiar: Effect doesn't replace JavaScript's
+control flow — it adds a *typed, composable* layer for the parts that involve
+failure, concurrency, or time. This chapter covers that layer end to end:
+decisions, loops, fan-out, racing, deadlines, and pattern matching on values.
+
+## Branching
+
+### The default: plain `if`
+
+Inside a generator body, branching is just JavaScript. You've already
+unwrapped values; decide with them:
+
+```ts title="src/checkout.ts"
+import { Data, Effect } from "effect"
+
+class EmptyCart extends Data.TaggedError("EmptyCart")<{ readonly cartId: string }> {}
+
+declare const cartOf: (id: string) => Effect.Effect<{ items: Array<string> }>
+declare const charge: (total: number) => Effect.Effect<Receipt>
+
+interface Receipt { total: number }
+
+const checkout = Effect.fn("checkout")(function* (cartId: string) {
+  const cart = yield* cartOf(cartId)
+  if (cart.items.length === 0) {
+    return yield* new EmptyCart({ cartId })
+  }
+  return yield* charge(cart.items.length * 10)
+})
+```
+
+Prefer this over combinator gymnastics whenever the branch depends on values
+you already hold. Combinators earn their keep when the *condition itself* is
+effectful or when you're composing pipelines outside a generator.
+
+### `Effect.when` — effectful conditions
+
+`when` runs an effect only if an effectful boolean holds. Both arms are lazy;
+the skipped case is represented explicitly as `Option.none`:
+
+```ts
+import { Effect, Option } from "effect"
+
+declare const needsRefresh: Effect.Effect<boolean>
+declare const revalidateCache: Effect.Effect<string>
+
+const maybeFresh = revalidateCache.pipe(
+  Effect.when(needsRefresh)
+)
+// Effect<Option<string>, ...> — None means "skipped"
+```
+
+The condition must be an `Effect<boolean>`; wrap constants with
+`Effect.succeed(flag)`. If you don't care about distinguishing skipped from
+ran-with-undefined, `Option.isSome` tells you which happened.
+
+:::note[v4 removal]
+v3 had `Effect.unless` (the inverted twin) and `Effect.if`. Both are gone.
+Invert the condition yourself (`Effect.when(negativeCond)`), or branch with
+plain `if` inside a generator body — which is what you should be doing most of
+the time anyway.
+:::
+
+### `Effect.filterOrFail` — guards
+
+When the branch outcome is "proceed or fail", a guard reads better than both
+alternatives:
+
+```ts
+import { Effect } from "effect"
+
+const withdraw = (balance: number, amount: number): Effect.Effect<number, string> =>
+  Effect.succeed(balance - amount).pipe(
+    Effect.filterOrFail(
+      (remaining) => remaining >= 0,
+      () => `insufficient funds`
+    )
+  )
+```
+
+Omitting the second argument fails with `NoSuchElementError` — acceptable in
+throwaway code, sloppy in production. Name your failure.
+
+## Loops
+
+The v3 loop helpers (`Effect.loop`, `Effect.iterate`) are removed. In their
+place:
+
+- **`for...of` / `while` inside gen bodies** — sequential iteration over
+  values you've unwrapped.
+- **`Effect.forEach`** — mapping a collection through an effectful function,
+  with optional concurrency (below).
+- **`Effect.whileLoop`** — a low-level primitive kept for library authors
+  building higher-level iteration (it avoids stack growth for very long
+  loops); application code almost never touches it.
+
+```ts title="src/poll.ts"
+import { Effect } from "effect"
+
+declare const pollOnce: Effect.Effect<{ done: boolean; value?: number }>
+
+const pollUntilDone: Effect.Effect<number, string> = Effect.gen(function* () {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const result = yield* pollOnce
+    if (result.done && result.value !== undefined) {
+      return result.value
+    }
+    if (attempt < 9) yield* Effect.sleep("500 millis")
+  }
+  return yield* Effect.fail("gave up after 10 attempts")
+})
+```
+
+Every `yield*` inside a loop is a suspension point — other fibers run, the
+loop can be interrupted between iterations, and each `Effect.sleep` is virtual
+time under tests.
+
+## Iterating with concurrency
+
+Recap from chapter 04 with the concurrency dial turned up:
+
+| Tool | Shape | On failure | Concurrency |
+|---|---|---|---|
+| `Effect.all(list)` | tuple/array of results | first failure wins, siblings interrupted | sequential by default |
+| `Effect.all(list, { mode: "result" })` | per-item results | never fails | same |
+| `Effect.forEach(items, f)` | mapped array | first failure wins | `{ concurrency }` |
+| `Effect.validate(items, f)` | all successes or **all** failures | collects every error | `{ concurrency }` |
+| `Effect.partition(items, f)` | `[failures, successes]` | never fails | `{ concurrency }` |
+
+`concurrency` accepts a positive integer or `"unbounded"`. Choosing:
+
+- **Sequential** (default): ordered side effects, backpressure for free, safe
+  against rate limits.
+- **Bounded** (`{ concurrency: 8 }`): the workhorse — saturate I/O without
+  melting upstreams.
+- **Unbounded**: only when the collection is small and trusted (config
+  lookups, not user input).
+
+The short-circuit vs collect decision maps directly onto what your caller
+needs: fail-fast for request handling; `validate` for form/batch feedback;
+`partition` when partial success is meaningful.
+
+## Bounded concurrency beyond forEach: Semaphore
+
+`forEach`'s concurrency applies to *one call*. When different parts of your
+program share a budget — one connection pool, N permits against a rate-limited
+API — use `Semaphore`. The verified signatures:
+
+```ts
+Semaphore.make(permits: number): Effect<Semaphore>
+
+Semaphore.withPermits(self: Semaphore, permits: number):
+  <A, E, R>(effect: Effect<A, E, R>) => Effect<A, E, R>
+```
+
+`make` returns an effect (construct it inside a gen body or a layer); the
+data-last form of `withPermits` takes the semaphore plus a permit count and
+returns an effect-to-effect wrapper:
+
+```ts title="src/rate-limit.ts"
+import { Effect, Semaphore } from "effect"
+
+interface Api { call: (q: string) => Effect.Effect<string> }
+
+export const makeApi = Effect.gen(function* () {
+  const sem = yield* Semaphore.make(5)
+
+  const call = (q: string) =>
+    Semaphore.withPermits(sem, 2)(
+      Effect.logDebug(`calling ${q}`).pipe(Effect.as(`result:${q}`))
+    )
+
+  const api: Api = { call }
+  return api
+})
+
+export const fanOut = Effect.gen(function* () {
+  const api = yield* makeApi
+  // 20 calls queued; at most 2 hold permits at once; results in input order
+  return yield* Effect.forEach(["a", "b", "c"], api.call, { concurrency: 20 })
+})
+```
+
+Two layers of throttling compose: `forEach({ concurrency })` bounds *how many*
+tasks start; `withPermits` bounds *how many* cross the shared resource at
+once. Manual acquire/release exists (`Semaphore.take`, `Semaphore.release`)
+for non-bracketed patterns, and `withPermitsIfAvailable` runs only when
+permits are free (returning `Option.none` otherwise) — but prefer
+`withPermits`: release-on-interrupt is handled for you.
+
+Racing, timeouts, and everything fiber-shaped continues below; the full fiber
+model — scopes, structured fork trees, interruption cascades — is chapter 13.
+
+## Folding an outcome: Effect.match
+
+Before racing, one branching primitive deserves its own section because it
+closes the loop with chapter 06: `Effect.match` folds success and failure into
+a plain value. Unlike `catch`, it *must* handle both sides, and the result
+never fails:
+
+```ts title="src/render.ts"
+import { Effect } from "effect"
+
+declare const task: Effect.Effect<number, string>
+
+const rendered = task.pipe(
+  Effect.match({
+    onSuccess: (value) => `value: ${value}`,
+    onFailure: (error) => `failed: ${error}`
+  })
+)
+// Effect<string> — cannot fail; both channels discharged
+```
+
+`matchCause` is the same fold with the failure handler receiving the full
+`Cause<E>` (so you can distinguish defects from typed errors in the branch);
+`matchEager` skips fiber scheduling when the outcome is already resolved.
+Reach for these when you want a total function over an outcome — rendering,
+status mapping, metric buckets — rather than recovery.
+
+## Racing
+
+### `Effect.race` — first success wins
+
+Both effects run concurrently; whichever succeeds first wins, the loser is
+interrupted (its finalizers still run):
+
+```ts title="src/mirror.ts"
+import { Effect } from "effect"
+
+declare class FetchError { readonly status: number }
+declare const primary: Effect.Effect<string, FetchError>
+declare const replica: Effect.Effect<string, FetchError>
+
+const fastest = primary.pipe(Effect.race(replica))
+// Effect<string, FetchError>
+```
+
+Failure semantics need care:
+
+- If one side **fails** before the other completes, the race continues with
+  the survivor — a failure alone doesn't lose the race unless *both* have
+  failed (then their causes combine).
+- If one side is interrupted externally, that propagates normally.
+
+An `onWinner` callback exposes which branch won — useful for metrics:
+
+```ts
+declare const recordWinner: (index: number) => void
+
+const tracked = primary.pipe(
+  Effect.race(replica, {
+    // plain void callback; index is 0 for `primary`, 1 for `replica`
+    onWinner: ({ fiber, index, parentFiber }) => recordWinner(index)
+  })
+)
+```
+
+### Variants
+
+- **`Effect.raceAll(effects)`** — race an array; first success wins.
+- **`Effect.firstSuccessOf(iterable)`** — sequential fallback ladder: try each
+  in order, move on on failure, succeed with the first success. Despite the
+  name similarity, this is *not* concurrent racing; it's retry-with-alternatives.
+
+```ts
+declare interface Config {}
+declare const loadFromConsul: Effect.Effect<Config, unknown>
+declare const loadFromEnvFile: Effect.Effect<Config, unknown>
+declare const defaults: Config
+
+const config = Effect.firstSuccessOf([
+  loadFromConsul,
+  loadFromEnvFile,
+  Effect.succeed(defaults)
+])
+```
+
+## Timeouts
+
+```ts title="src/deadlines.ts"
+import { Cause, Effect, Option } from "effect"
+
+interface Row {}
+declare class QueryError { readonly query: string }
+declare const slowQuery: Effect.Effect<Array<Row>, QueryError>
+
+// 1. Timeout as a typed error
+const strict = slowQuery.pipe(Effect.timeout("3 seconds"))
+// Effect<Array<Row>, QueryError | Cause.TimeoutError>
+
+// 2. Timeout as absence
+const lenient = slowQuery.pipe(Effect.timeoutOption("3 seconds"))
+// Effect<Option<Array<Row>>, QueryError> — None = ran out of time
+```
+
+`timeout` adds `Cause.TimeoutError` to the error channel — handle it by tag:
+
+```ts
+const resilient = strict.pipe(
+  Effect.catchTag("TimeoutError", () => Effect.succeed<Array<Row>>([]))
+)
+```
+
+On deadline, the losing computation is **interrupted**, not abandoned —
+cleanup finalizers run. For "try A briefly, then fall back", combine the two:
+
+```ts
+declare const serveCached: Effect.Effect<Array<Row>, never>
+
+const fastOrFallback = Effect.timeoutOption(slowQuery, "3 seconds").pipe(
+  Effect.flatMap((rows) =>
+    Option.isSome(rows) ? Effect.succeed(rows.value) : serveCached
+  )
+)
+```
+
+There's also `Effect.timeoutOrElse` (run a fallback effect on timeout). Deadlines
+interact with retries via schedules — chapter 17 owns that combination.
+
+## Interruption semantics, previewed
+
+Everything above leans on one guarantee: **losers, timed-out computations, and
+short-circuited siblings are interrupted, and interruption always runs cleanup.**
+Regions can opt out (`Effect.uninterruptible`) for critical sections like
+audit writes. The mechanics — interrupt signals, `Fiber.interrupt`, masking,
+finalizer ordering — get their own chapter (13). Until then, two rules:
+
+1. Never assume a sibling keeps running after `all` short-circuits.
+2. Any resource acquired via `acquireRelease` releases under interruption.
+
+## Pattern matching on values: Match
+
+Chapter 05 handled errors by tag with `catchTags`. For *values* — domain
+objects, API responses, parsed ASTs — v4 ships the `Match` module: type-safe
+structural pattern matching with exhaustiveness checking.
+
+The shape: create a matcher from a type (or a concrete value), add cases, then
+finish with either `Match.exhaustive` (compiler-enforced totality) or
+`Match.orElse` (fallback).
+
+```ts title="src/render-shape.ts"
+import { Match } from "effect"
+
+type Shape =
+  | { readonly kind: "circle"; readonly radius: number }
+  | { readonly kind: "rect"; readonly w: number; readonly h: number }
+  | { readonly kind: "triangle"; readonly base: number; readonly h: number }
+
+const area = Match.type<Shape>().pipe(
+  Match.when({ kind: "circle" }, ({ radius }) => Math.PI * radius ** 2),
+  Match.when({ kind: "rect" }, ({ w, h }) => w * h),
+  Match.when({ kind: "triangle" }, ({ base, h }) => (base * h) / 2),
+  Match.exhaustive
+)
+
+area({ kind: "circle", radius: 1 }) // ~3.14159
+area({ kind: "hexagon" })           // ✗ compile error — no case matches
+```
+
+Key members of the module surface:
+
+| Constructor / combinator | Purpose |
+|---|---|
+| `Match.type<I>()` | matcher over an input type |
+| `Match.value(v)` | match a concrete value immediately |
+| `Match.when(pattern, f)` | structural pattern + handler |
+| `Match.whenOr(p1, p2, f)` | any-of patterns, shared handler |
+| `Match.whenAnd(p1, p2, f)` | all-of patterns |
+| `Match.not(pattern, f)` | negation |
+| `Match.tag("Tag", f)` | `_tag`-discriminated unions (like `when`, shorter) |
+| `Match.discriminator(...)` / `tags` / `discriminatorsExhaustive` | tag-family helpers |
+| `Match.orElse(f)` | fallback arm |
+| `Match.exhaustive` | compile-time totality check |
+| refinements (`string`, `number`, `instanceOf`, ...) | predicate arms |
+
+Patterns nest — `{ address: { city: "Berlin" } }` matches deep structure, and
+handlers receive the narrowed input. Tagged unions (including Schema-tagged
+errors) get the terse form:
+
+```ts
+import { Data, Match } from "effect"
+
+type Event =
+  | { readonly _tag: "Click"; readonly x: number }
+  | { readonly _tag: "Key"; readonly code: string }
+
+const describe = Match.type<Event>().pipe(
+  Match.whenOr({ _tag: "Click" }, { _tag: "Key" }, () => "input event"),
+  Match.exhaustive
+)
+```
+
+Where does `Match` fit relative to what you know?
+
+| Situation | Use |
+|---|---|
+| Handling *errors* of an effect | `catchTags` (chapter 05) |
+| Branching on values *inside* a gen body | plain `if` / `switch` |
+| Reusable total function over a union | `Match.type` + `exhaustive` |
+| One-off fold over a literal value | `Match.value` |
+| Matching on computed selector args | `Match.fn(selector)` |
+
+That last row: `Match.fn` builds a reusable matcher whose cases also receive
+the selector's original arguments — handy for formatters parameterised by
+locale or prefix.
+
+```ts
+import { Match } from "effect"
+
+type Status = "idle" | "running" | "done" | "failed"
+
+const render = Match.fn((_s: Status, colour: boolean) => _s).pipe(
+  Match.when("idle", (_v, colour) => (colour ? "grey dot" : "idle")),
+  Match.when("running", (_v, colour) => (colour ? "amber dot" : "running")),
+  Match.whenOr("done", "failed", (_v, colour) => (colour ? "green/red dot" : "finished")),
+  Match.exhaustive
+)
+
+render("idle", true) // "grey dot"
+```
+
+## Putting it together
+
+A resilient fetch that composes this chapter's tools — a shared rate-limit
+budget, a deadline, and a cache fallback:
+
+```ts title="src/resilient-fetch.ts"
+import { Effect, Semaphore } from "effect"
+
+interface Article {}
+declare class FetchError { readonly url: string }
+declare const fetchJson: (url: string) => Effect.Effect<Article, FetchError>
+declare const cachedArticle: Effect.Effect<Article, never>
+
+export const getArticle = Effect.gen(function* () {
+  const sem = yield* Semaphore.make(4)
+
+  const attempt = (url: string) =>
+    Semaphore.withPermits(sem, 1)(
+      fetchJson(url).pipe(Effect.timeout("2 seconds"))
+    )
+
+  return yield* attempt("https://primary.example/a").pipe(
+    Effect.catchTag("TimeoutError", () => cachedArticle),
+    Effect.orDie // at this boundary we've decided nothing else is recoverable
+  )
+})
+```
+
+Read the guarantees off the type: an `Article`, needing nothing, never failing
+— because timeout falls back to cache and everything else was declared
+unrecoverable. Whether that last decision is right is exactly the kind of
+conversation the error channel forces teams to have.
+
+## Cheat sheet
+
+| Goal | Code |
+|---|---|
+| Branch on held values | `if (...) { ... }` in the gen body |
+| Effectful condition | `eff.pipe(Effect.when(condEff))` → `Option<A>` |
+| Guard clause | `Effect.filterOrFail(pred, makeError)` |
+| Sequential loop | `for` / `while` in the gen body |
+| Map with cap | `Effect.forEach(items, f, { concurrency: n })` |
+| Collect all errors | `Effect.validate(items, f)` |
+| Shared concurrency budget | `Semaphore.make(n)` + `Semaphore.withPermits(sem, k)(work)` |
+| First success wins | `a.pipe(Effect.race(b))` / `Effect.raceAll(list)` |
+| Fallback ladder | `Effect.firstSuccessOf([...])` |
+| Deadline as error | `Effect.timeout("3 seconds")` → `TimeoutError` |
+| Deadline as absence | `Effect.timeoutOption("3 seconds")` → `Option` |
+| Total value matching | `Match.type<T>().pipe(Match.when(...), Match.exhaustive)` |
+
+Schedules — retry policies, repetition, jitter, exponential backoff — turn
+most hand-rolled polling loops above into one-liners. That's chapter 17.
+
+## Next
+
+<LinkCard
+  title="09 · Context & Services"
+  description="The R channel made concrete: Context.Service declarations, accessing services, building test doubles, and how requirements propagate and get provided."
+  href="/effect-ts/09-context-services/"
+/>

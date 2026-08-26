@@ -1,0 +1,711 @@
+---
+title: Building Effects
+description: The constructor and combinator toolbox in full — succeed/fail/die/sync/suspend/try/tryPromise/promise/callback, the map/flatMap/tap/zip family, Effect.all vs forEach vs validate/partition, outcome converters, pipe & flow, and the laziness gotchas that bite people coming from Promise.
+sidebar:
+  order: 4
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+Chapter 02 introduced the triple (`Effect<A, E, R>`) and the run entry points.
+Chapter 03 gave you the daily authoring style. This chapter is the toolbox
+itself: every constructor you'll reach for, when to use each, how collections
+map (or don't map) onto `Promise.all` intuitions, and the laziness traps that
+catch everyone exactly once.
+
+## The constructor decision table
+
+Every constructor answers one question: *what kind of computation am I
+wrapping?* Pick by shape of the thing you have:
+
+| You have... | Constructor | Resulting type |
+|---|---|---|
+| A value | `Effect.succeed(a)` | `Effect<A>` |
+| An error to raise | `Effect.fail(e)` | `Effect<never, E>` |
+| A bug / broken invariant | `Effect.die(defect)` | `Effect<never>` |
+| A sync thunk that can't throw | `Effect.sync(() => ...)` | `Effect<A>` |
+| A sync thunk that may throw | `Effect.try(() => ...)` | `Effect<A, Cause.UnknownError>` |
+| Same, with a mapped error | `Effect.try({ try, catch })` | `Effect<A, E>` |
+| Deferred construction | `Effect.suspend(() => eff)` | same as `eff` |
+| A promise that won't reject | `Effect.promise(() => p)` | `Effect<A>` |
+| A promise that may reject | `Effect.tryPromise(() => p)` | `Effect<A, Cause.UnknownError>` |
+| Same, with a mapped error | `Effect.tryPromise({ try, catch })` | `Effect<A, E>` |
+| A callback API | `Effect.callback((resume) => ...)` | whatever you resume with |
+| A nullable value | `Effect.fromNullishOr(v)` | `Effect<NonNullable<A>, NoSuchElementError>` |
+| Absence as a success | `Effect.succeedNone` / `Effect.succeedSome(a)` | `Effect<Option<A>>` |
+
+Two constructors need no argument at all: `Effect.void` (succeeds with
+`undefined`) and `Effect.never` (never completes — the moral equivalent of
+`while(true) {}` without the wasted cycles).
+
+```ts title="src/constructors.ts"
+import { Effect } from "effect"
+
+const a: Effect.Effect<number> = Effect.succeed(1)
+const b: Effect.Effect<never, string> = Effect.fail("nope")
+const c: Effect.Effect<void> = Effect.void
+```
+
+### fail vs die: the discipline
+
+This was flagged in chapter 02 and it's worth restating with more force,
+because it's the habit that separates maintainable Effect codebases from
+painful ones:
+
+- **`fail`** puts a value in `E`. It's an *expected* outcome your domain knows
+  about: user not found, validation rejected, upstream returned 429. Handlers
+  downstream are *obligated* to deal with it — the compiler enforces it via the
+  error channel.
+- **`die`** produces a **defect**. It skips `E` entirely, crashes the fiber,
+  and lands in the cause as a `Die` reason. Use it for broken invariants:
+  impossible states, corrupt configuration, "this branch should be
+  unreachable".
+
+The rule of thumb: if a handler could plausibly *recover*, it belongs in `E`.
+If the only sane response is "log it loudly and crash", it's a defect. When in
+doubt, start on the `E` side — demoting an error to a defect later is easy;
+promoting a swallowed defect back into the type system is archaeology.
+
+:::caution[Don't model "the network was down" as a defect]
+A transient failure your code must retry or report to a user is expected — put
+it in `E`. Defects are for *programmer* errors, not *world* errors. Chapter 05
+builds a full taxonomy around this distinction.
+:::
+
+### `sync` and `suspend`: the two lazy thunks
+
+`Effect.sync(thunk)` defers a side-effecting synchronous computation to run
+time. `Effect.suspend(f)` defers *construction of an effect itself*. The
+difference matters whenever building the effect captures state:
+
+```ts
+import { Effect } from "effect"
+
+declare const task: Effect.Effect<number>
+
+// WRONG: `started` is captured NOW, when the pipeline is built.
+// If you run this effect an hour later (or twice), both runs report
+// time elapsed since construction, not since they began.
+const started = Date.now()
+const stampedWrong = task.pipe(
+  Effect.tap(() => Effect.log(`done after ${Date.now() - started}ms`))
+)
+
+// RIGHT: nothing is captured until the effect actually runs,
+// and each execution gets a fresh timestamp.
+const stampedRight = Effect.suspend(() => {
+  const start = Date.now()
+  return task.pipe(Effect.tap(() => Effect.log(`done after ${Date.now() - start}ms`)))
+})
+```
+
+`suspend` is also the escape hatch whenever a combinator argument would
+otherwise be evaluated eagerly — think of it as `() =>` protection for effect
+values, the same way `LazyArg` protects plain values.
+
+### `try` / `tryPromise`: mapping the untyped world
+
+Both accept either a bare function (failures become `Cause.UnknownError`) or a
+`{ try, catch }` object where you decide what lands in `E`:
+
+```ts title="src/json.ts"
+import { Effect } from "effect"
+
+class JsonParseError extends Error {
+  readonly _tag = "JsonParseError"
+  constructor(readonly input: string, override readonly cause: unknown) {
+    super(`failed to parse: ${input.slice(0, 20)}`)
+  }
+}
+
+// E = UnknownError — fine at prototyping, weak at boundaries
+const parseLoose = (input: string) => Effect.try(() => JSON.parse(input))
+
+// E = JsonParseError — typed, catchable by tag
+const parseStrict = (input: string) =>
+  Effect.try({
+    try: () => JSON.parse(input),
+    catch: (cause) => new JsonParseError(input, cause)
+  })
+```
+
+The same dual shape applies to `tryPromise`. The `try` thunk receives an
+`AbortSignal` that the runtime aborts if the fiber is interrupted — pass it
+down to `fetch` and cancellation becomes real instead of best-effort:
+
+```ts title="src/http.ts"
+import { Effect } from "effect"
+
+export class FetchError extends Error {
+  readonly _tag = "FetchError"
+  constructor(readonly url: string, override readonly cause: unknown) {
+    super(`fetch failed: ${url}`)
+  }
+}
+
+export const fetchJson = (url: string): Effect.Effect<unknown, FetchError> =>
+  Effect.tryPromise({
+    try: (signal) =>
+      fetch(url, { signal }).then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      }),
+    catch: (cause) => new FetchError(url, cause)
+  })
+```
+
+Two documented gotchas, both worth internalizing:
+
+1. If the thunk throws *before* returning the promise, that throw is captured
+   too — `tryPromise` doesn't care whether the failure was sync or async.
+2. If your `catch` function itself throws, the thrown value becomes a
+   **defect**, not an error. Return the error value; never throw inside
+   `catch`.
+
+### `promise`: the trust-me constructor
+
+`Effect.promise(() => p)` has error type `never`. If `p` rejects, the rejection
+is treated as a **defect**. Reach for it when rejection is genuinely
+impossible (a promise you constructed yourself from known-good values), or when
+you've already handled rejections upstream. It also receives an `AbortSignal`
+for interruption propagation.
+
+### `callback`: wrapping Node-style APIs
+
+v3's `Effect.async` is gone. The replacement is `Effect.callback`, and its
+shape is different in an important way: you **resume with an effect**, not with
+a raw value, which keeps the runtime in control of scheduling:
+
+```ts title="src/callback.ts"
+import { Effect } from "effect"
+
+const waitMs = (ms: number): Effect.Effect<void> =>
+  Effect.callback((resume) => {
+    const id = setTimeout(() => resume(Effect.void), ms)
+    // optional cleanup on interruption
+    return Effect.sync(() => clearTimeout(id))
+  })
+```
+
+The register function receives `(resume, signal)` and may return a finalizer
+effect that runs if the fiber is interrupted before `resume` fires. This makes
+callback wrapping interruption-correct by default — something the raw
+`new Promise` pattern never gives you.
+
+### `fromNullishOr` and friends
+
+Nullable-to-effect conversion fails with `Cause.NoSuchElementError`:
+
+```ts
+import { Effect } from "effect"
+
+declare const maybeId: string | null
+
+const program = Effect.gen(function* () {
+  const id = yield* Effect.fromNullishOr(maybeId)
+  yield* Effect.log(`id: ${id}`) // id narrowed to string
+})
+```
+
+Pair it with `Effect.catchNoSuchElement` (chapter 07 covers this pattern in
+depth) when absence should degrade to `Option.none()` rather than propagate as
+an error.
+
+## Transformation combinators
+
+| Task | Combinator | Promise analogue |
+|---|---|---|
+| Transform success | `Effect.map(self, f)` | `.then(f)` |
+| Sequence + transform | `Effect.flatMap(self, f)` | `.then(x => p2(x))` |
+| Sequence, discard result | `Effect.andThen(self, next)` | `.then(() => p2)` |
+| Observe without changing | `Effect.tap(self, f)` | `.then(x => (f(x), x))` |
+| Replace success | `Effect.as(self, b)` | `.then(() => b)` |
+| Erase success | `Effect.asVoid(self)` | `.then(() => undefined)` |
+| Combine two into a tuple | `Effect.zip(a, b)` | `Promise.all([a, b])` |
+
+All exist in three syntactic positions — data-first, data-last for `pipe`,
+and (where the type allows) as methods. They're the same function:
+
+```ts
+import { Effect, pipe } from "effect"
+
+declare const self: Effect.Effect<number>
+declare const f: (n: number) => Effect.Effect<string>
+
+Effect.flatMap(self, f)
+self.pipe(Effect.flatMap(f))
+pipe(self, Effect.flatMap(f))
+```
+
+House style: prefer `.pipe(...)` chains around small pipelines, and generator
+bodies (`Effect.gen` / `Effect.fn`) for anything with more than two or three
+steps. `andThen` accepts an effect, a function returning either, or a plain
+value — it's `flatMap` without having to decide which variant you need:
+
+```ts
+import { Effect } from "effect"
+
+const program = Effect.succeed(1).pipe(
+  Effect.andThen((n) => n + 1),          // function returning a value
+  Effect.andThen(Effect.log("stepped")), // then run an effect, discard its void
+  Effect.as("finished")                  // replace the final value
+)
+
+Effect.runSync(program) // => "finished"
+```
+
+`zip` runs both effects **sequentially by default**; pass `{ concurrent: true }`
+to overlap them. Its error channel is the union of both sides.
+
+## Collections: all, forEach, validate, partition
+
+This is where Promise intuition needs recalibrating, because Effect splits
+"run many things" into four distinct functions based on two questions:
+*what do you want back*, and *what should happen to failures*?
+
+### The mental map
+
+| JS idiom | Effect equivalent | Failure behaviour |
+|---|---|---|
+| `await p1; await p2` in sequence | `Effect.all([e1, e2])` | short-circuits on first failure |
+| `Promise.all([...])` | `Effect.all([...], { concurrency: "unbounded" })` | short-circuits, siblings interrupted |
+| `Promise.allSettled([...])` | `Effect.all([...], { mode: "result" })` | never fails; per-item results |
+| `[..].forEach` with awaits | `Effect.forEach(items, f)` | short-circuits on first failure |
+| collect successes + failures | `Effect.partition(items, f)` | never fails; both lists |
+| assert everything succeeded | `Effect.validate(items, f)` | collects **all** failures |
+
+### `Effect.all` — tuples, iterables, records
+
+`all` preserves the shape of its input: array in, tuple out; record in, record
+out; iterable in, array out. Three options control everything else:
+
+```ts title="src/all-shapes.ts"
+import { Effect } from "effect"
+
+declare const user: Effect.Effect<{ id: number }>
+declare const posts: Effect.Effect<Array<string>>
+declare const settings: Effect.Effect<{ theme: string }>
+
+// tuple in → tuple out, sequential
+const t = Effect.all([user, posts])
+
+// record in → record out (names preserved!)
+const r = Effect.all({ user, posts, settings })
+
+// concurrent with a cap of 10
+const c = Effect.all([user, posts], { concurrency: 10 })
+
+// fire-and-forget semantics: succeed with void
+const d = Effect.all([user, posts], { discard: true })
+```
+
+`concurrency` accepts a positive integer or `"unbounded"` — the default is
+sequential. On the first failure, remaining work is **interrupted**, not
+abandoned mid-flight: cleanup finalizers run. That's the structural-concurrency
+guarantee `Promise.all` lacks.
+
+The option worth knowing cold is `mode: "result"`:
+
+```ts title="src/all-result.ts"
+import { Effect, Result } from "effect"
+
+declare const riskyA: Effect.Effect<number, string>
+declare const riskyB: Effect.Effect<number, string>
+
+const outcomes = Effect.all([riskyA, riskyB], { mode: "result" })
+
+const program = Effect.gen(function* () {
+  const [ra, rb] = yield* outcomes
+  // ra: Result.Result<number, string>
+  if (Result.isSuccess(ra)) yield* Effect.log(`A ok: ${ra.success}`)
+})
+```
+
+The resulting effect **cannot fail** (`E = never`) — each slot holds a
+`Result<A, E>` instead. This is v4's direct replacement for the old
+`Effect.allWith`/`exit` dance, and it maps one-to-one onto
+`Promise.allSettled`.
+
+### `Effect.forEach` — mapping with control
+
+`forEach` is `all` specialised to a mapper function over an iterable. It comes
+in data-first and data-last forms, and `discard: true` skips collecting
+results:
+
+```ts title="src/foreach.ts"
+import { Effect } from "effect"
+
+declare const fetchUser: (id: number) => Effect.Effect<User, FetchError>
+
+interface User { id: number }
+
+// data-first: sequential
+const seq = Effect.forEach([1, 2, 3], (id) => fetchUser(id))
+
+// data-last in a pipe, bounded to 5 concurrent requests
+const bounded = Effect.forEach(
+  (id: number) => fetchUser(id),
+  { concurrency: 5 }
+)([1, 2, 3, 4, 5, 6, 7, 8])
+
+// side-effects only
+const logged = Effect.forEach([1, 2, 3], (n) => Effect.log(`n=${n}`), {
+  discard: true
+})
+```
+
+Note the type of `bounded`'s output: `Effect<Array<User>, FetchError>` — order
+is preserved regardless of completion order, exactly like `Promise.all`.
+
+### `Effect.validate` — collect every failure
+
+`validate` runs every element even after failures, and if any failed, the error
+is a **non-empty array** of them all. Successes are discarded in the failing
+case:
+
+```ts title="src/validate.ts"
+import { Effect } from "effect"
+
+type Field = { name: string; value: string }
+
+const check = (f: Field): Effect.Effect<Field, string> =>
+  f.value.trim().length === 0
+    ? Effect.fail(`${f.name} is required`)
+    : Effect.succeed(f)
+
+const fields: Array<Field> = [
+  { name: "email", value: "" },
+  { name: "name", value: "Ada" },
+  { name: "phone", value: "" }
+]
+
+const program = Effect.validate(fields, check)
+
+const exit = await Effect.runPromiseExit(program)
+// Exit.fail(["email is required", "phone is required"])
+```
+
+This is form-validation semantics: the user deserves *every* error, not just
+the first. The error type `NonEmptyArray<E>` encodes "at least one thing went
+wrong" at the type level.
+
+### `Effect.partition` — keep both sides
+
+When you want to continue with whatever succeeded and handle the rest
+separately, `partition` returns `[excluded, satisfying]` and never fails:
+
+```ts title="src/partition.ts"
+import { Effect } from "effect"
+
+declare const process: (id: string) => Effect.Effect<string, Error>
+
+const program = Effect.partition(["a", "bad", "c"], process)
+// Effect<[excluded: Array<Error>, satisfying: Array<string>]>
+```
+
+`validate` and `partition` differ only in what they do with the collected
+failures: `validate` *fails* with them, `partition` *returns* them.
+
+## Converting outcomes
+
+Sometimes you need to move a failure out of the error channel and into the
+success channel — usually at API boundaries, logging layers, or when storing
+results. Four converters, all of which produce effects that **cannot fail**:
+
+| Converter | Success becomes | Failure becomes |
+|---|---|---|
+| `Effect.exit(self)` | `Exit.succeed(a)` | `Exit.fail(cause)` — full cause, defects included |
+| `Effect.result(self)` | `Result.succeed(a)` | `Result.fail(e)` — typed errors only |
+| `Effect.option(self)` | `Option.some(a)` | `Option.none()` — any failure, details erased |
+| `Effect.flip(self)` | swaps channels entirely | |
+
+Plus two "collapse" operators:
+
+- `Effect.orDie(self)` — converts typed errors into defects. Use at the edges
+  of programs whose error type you've decided is unrecoverable.
+- `Effect.ignore(self)` — swallows everything (errors *and* defects) and
+  succeeds with `void`. Pass `{ log: true }` to log what was ignored.
+
+```ts title="src/convert.ts"
+import { Effect, Option, Result } from "effect"
+
+declare const load: Effect.Effect<number, string>
+
+const asOption = load.pipe(Effect.option)
+// Effect<Option<number>> — cannot fail
+
+const asResult = load.pipe(Effect.result)
+// Effect<Result<number, string>> — cannot fail, keeps the error value
+
+const asDefect = load.pipe(Effect.orDie)
+// Effect<number> — a "db broke" string error now kills the fiber
+
+const fire = load.pipe(Effect.ignore({ log: true }))
+// Effect<void> — logs "Ignored failure: ..." at warning level
+```
+
+:::caution[`option` erases information]
+`Effect.option` collapses *every* failure — including defects' neighbours and
+interruptions — into `None`. If you need the error value afterwards, use
+`Effect.result`. Reserve `option` for cases where absence truly carries all
+the information you need.
+:::
+
+`flip` is niche but precise: `Effect<A, E>` becomes `Effect<E, A>`. It shows up
+in adapter layers where you've inverted the meaning of the channels (e.g. an
+effect whose "success" is actually a sentinel error code you want to inspect).
+
+## pipe & flow
+
+`pipe(value, ...fns)` threads a value left-to-right through unary functions;
+`flow(f, g, h)` composes unary functions into one. Both come from the `"effect"`
+root export and are plain-JS utilities — nothing to do with fibers or effects
+specifically:
+
+```ts
+import { flow, pipe } from "effect"
+
+const double = (n: number) => n * 2
+const stringify = (n: number) => String(n)
+
+// pipe: apply now
+const twelve = pipe(3, double, double, stringify) // "12"
+
+// flow: build the function first, apply later
+const process = flow(double, double, stringify)
+process(3) // "12"
+```
+
+In Effect code, `pipe` earns its keep because every combinator has a
+data-last overload designed for exactly this threading. `flow` shines when
+building reusable data-last transformations for `Array.map` etc. If you find
+yourself nesting `pipe` calls more than two deep, that's the signal to move the
+logic into an `Effect.gen` body.
+
+## A realistic pipeline, twice
+
+Requirements: fetch a JSON payload, narrow it to an article shape, enforce an
+invariant, return the article — or a typed error explaining what went wrong.
+
+First, the way you'd write it defensively with promises:
+
+```ts title="src/article-promise.ts"
+export class HttpProblem extends Error {}
+export class ShapeProblem extends Error {}
+
+type Article = { readonly id: string; readonly title: string; readonly likes: number }
+
+async function loadArticle(url: string): Promise<Article> {
+  let raw: unknown
+  try {
+    const res = await fetch(url)
+    if (!res.ok) throw new HttpProblem(`HTTP ${res.status}`)
+    raw = await res.json()
+  } catch (cause) {
+    throw new HttpProblem(`fetch failed`, { cause })
+  }
+
+  const asRecord = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null
+
+  if (!asRecord(raw) || typeof raw.id !== "string" ||
+      typeof raw.title !== "string" || typeof raw.likes !== "number") {
+    throw new ShapeProblem("payload does not match Article")
+  }
+  if (raw.likes < 0) throw new ShapeProblem(`negative likes: ${raw.likes}`)
+
+  return { id: raw.id, title: raw.title, likes: raw.likes }
+}
+```
+
+Count the failure modes hiding in there: `HttpProblem` and `ShapeProblem`
+exist only in doc comments; nothing stops a caller from forgetting to catch
+them; the `try/catch` boundary is doing silent type erasure (`catch (cause)`
+types as `unknown`); and there's no way to tell from the signature which errors
+are *expected* versus *bugs*.
+
+Now the Effect version:
+
+```ts title="src/article.ts"
+import { Effect, Schema } from "effect"
+
+export class FetchError extends Schema.TaggedError<FetchError>()("FetchError", {
+  url: Schema.String,
+  status: Schema.optional(Schema.Number)
+}) {}
+
+export class ShapeError extends Schema.TaggedError<ShapeError>()("ShapeError", {
+  detail: Schema.String
+}) {}
+
+export interface Article {
+  readonly id: string
+  readonly title: string
+  readonly likes: number
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null
+
+const fetchJson = (url: string): Effect.Effect<unknown, FetchError> =>
+  Effect.tryPromise({
+    try: async (signal) => {
+      const res = await fetch(url, { signal })
+      if (!res.ok) throw new FetchError({ url, status: res.status })
+      return res.json()
+    },
+    // thrown values land here; keep our own typed error, wrap the rest
+    catch: (cause) => (cause instanceof FetchError ? cause : new FetchError({ url }))
+  })
+
+const narrow = (data: unknown): Effect.Effect<Article, ShapeError> =>
+  Effect.try({
+    try: () => {
+      if (!isRecord(data)) throw new Error("not an object")
+      const { id, title, likes } = data
+      if (typeof id !== "string") throw new Error("id missing")
+      if (typeof title !== "string") throw new Error("title missing")
+      if (typeof likes !== "number") throw new Error("likes missing")
+      return { id, title, likes } satisfies Article
+    },
+    catch: (detail) => new ShapeError({ detail: String(detail) })
+  })
+
+const saneLikes = (article: Article): Effect.Effect<Article, ShapeError> =>
+  article.likes >= 0
+    ? Effect.succeed(article)
+    : Effect.fail(new ShapeError({ detail: `negative likes: ${article.likes}` }))
+
+export const loadArticle = (url: string): Effect.Effect<Article, FetchError | ShapeError> =>
+  fetchJson(url).pipe(
+    Effect.flatMap(narrow),
+    Effect.flatMap(saneLikes)
+  )
+```
+
+Read the return type of `loadArticle` aloud: *"an `Article`, or a `FetchError`
+or `ShapeError`, needing nothing."* Every failure mode from the promise
+version is present in the signature, catchable by tag, and constructible as
+data. Callers who ignore it get a compile error, not a production incident.
+Chapter 05 turns this error taxonomy into a discipline.
+
+## Laziness: the gotchas
+
+Because effects are descriptions, *when* you write an expression and *when* it
+runs are decoupled. Three traps follow:
+
+### Trap 1: eager arguments
+
+```ts
+import { Effect } from "effect"
+
+let count = 0
+
+// WRONG: ++count evaluates NOW, at composition time. Runs once ever.
+const wrong: Effect.Effect<number, never> = Effect.succeed(++count)
+Effect.runSync(wrong) // 1
+Effect.runSync(wrong) // 1 — not 2!
+
+// RIGHT: defer the increment to execution time
+const right = Effect.sync(() => ++count)
+Effect.runSync(right) // 1
+Effect.runSync(right) // 2
+```
+
+`Effect.succeed` is for values you already hold. Anything computed goes behind
+`sync`/`suspend`.
+
+### Trap 2: branching evaluates both arms
+
+```ts
+import { Effect } from "effect"
+
+declare const cacheHit: boolean
+declare const expensive: Effect.Effect<string>
+declare const cheap: Effect.Effect<string>
+
+// WRONG: expensive is *constructed* here (cheap if it's pure AST,
+// but wrong if construction itself does work or captures state)
+const chosenWrong = cacheHit ? cheap : expensive
+
+// RIGHT: construction deferred until the branch is taken
+const chosenRight = Effect.suspend(() => (cacheHit ? cheap : expensive))
+
+// Also right, idiomatic: decide inside gen
+const chosenGen = Effect.gen(function* () {
+  return yield* cacheHit ? cheap : expensive
+})
+```
+
+Inside a generator body, plain ternaries are fine — the body doesn't execute
+until run time anyway.
+
+### Trap 3: passing a started promise
+
+```ts
+import { Effect } from "effect"
+
+declare function getData(): Promise<number>
+
+// WRONG: getData() already ran. The effect wraps a promise in flight.
+const hot = Effect.tryPromise(getData())
+
+// RIGHT: the arrow defers invocation until the effect executes
+const cold = Effect.tryPromise(() => getData())
+```
+
+Same rule as Python coroutines: a thunk stays a thunk until you call it. Every
+constructor that takes a function does so deliberately — resist "simplifying"
+the lambda away.
+
+### The payoff
+
+Laziness is not a tax; it's the feature. Because `loadArticle` above returns an
+unexecuted description, you can — without touching it — add retries, wrap it
+in a timeout, run ten concurrently, log its failures, or execute the entire
+thing under a fake clock in tests:
+
+```ts
+import { Effect } from "effect"
+
+declare const loadArticle: (url: string) => Effect.Effect<unknown, unknown>
+
+const resilient = (url: string) =>
+  loadArticle(url).pipe(
+    Effect.retry({ times: 3 }),
+    Effect.timeout("5 seconds")
+  )
+```
+
+`retry` and `timeout` are pure wrappers around the description — no line of
+`loadArticle` changed. Timeout failures surface as `Cause.TimeoutError` in the
+error channel; handling them properly is chapter 08's job.
+
+## Cheat sheet
+
+| Goal | Code |
+|---|---|
+| Pure value | `Effect.succeed(v)` |
+| Typed raise | `Effect.fail(e)` |
+| Crash the fiber | `Effect.die(defect)` |
+| Wrap throwing sync fn | `Effect.try(fn)` / `Effect.try({ try, catch })` |
+| Wrap rejecting promise | `Effect.tryPromise(fn)` / `Effect.tryPromise({ try, catch })` |
+| Wrap non-rejecting promise | `Effect.promise(fn)` |
+| Wrap callback API | `Effect.callback((resume, signal) => ...)` |
+| Defer construction | `Effect.suspend(() => eff)` |
+| Run N things, keep results | `Effect.all(list, { concurrency })` |
+| Run N things, per-item results | `Effect.all(list, { mode: "result" })` |
+| Map over a list | `Effect.forEach(list, f, { concurrency })` |
+| Collect all errors | `Effect.validate(list, f)` |
+| Split successes/failures | `Effect.partition(list, f)` |
+| Move failures to data | `Effect.exit` / `Effect.result` / `Effect.option` |
+| Errors become defects | `Effect.orDie` |
+| Don't care about failure | `Effect.ignore` |
+
+## Next
+
+<LinkCard
+  title="05 · Typed Errors"
+  description="The E channel in full: Schema.TaggedError domains, the renamed catch family, reason-errors with catchReason(s), exhaustive handling, and the failures-vs-defects taxonomy."
+  href="/effect-ts/05-errors/"
+/>

@@ -1,0 +1,499 @@
+---
+title: Layers & Composition
+description: Layers as memoized constructors — acquire/release lifetimes, provide vs provideMerge vs merge, the layerNoDeps/layer split pattern, shared memoization maps, LayerMap per-tenant pools, and whole-app assembly.
+sidebar:
+  order: 10
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Chapter 9 established *what* services are: requirements in the type system,
+stored in an immutable context map. What it deliberately skipped is where
+implementations come from. Hand-built `Context.make` values are fine for tests;
+real applications need construction that is effectful (open a socket), scoped
+(close it on shutdown), dependent (the repository needs the SQL client), and
+shared (exactly one pool no matter how many consumers ask).
+
+`Layer` is Effect's answer, and the mental model is worth stating before any
+API: **a layer is a memoized constructor from contexts to contexts**.
+
+```ts
+interface Layer<out ROut, out E = never, out RIn = never>
+```
+
+- `RIn` — what it *requires* (services that must exist before it can build)
+- `E` — how building can fail
+- `ROut` — what it *provides* (services added to the context)
+
+Compose layers into a graph, hand the graph to `Effect.provide`, and the
+runtime walks it bottom-up, building each node once, threading scopes so every
+acquired resource is released when the graph shuts down. If you squint, this is
+a module system: each layer is a module, dependencies are imports,
+memoization gives you singletons, and teardown is deterministic.
+
+## Building layers
+
+### `Layer.effect` — the workhorse
+
+```ts
+import { Context, Effect, Layer } from "effect"
+
+export class Mailer extends Context.Service<Mailer, {
+  send(input: { to: string; subject: string; html: string }): Effect.Effect<void>
+}>()("myapp/mail/Mailer") {
+  static readonly layerNoDeps = Layer.effect(
+    Mailer,
+    Effect.gen(function* () {
+      const transport = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          nodemailer.createTransport({
+            host: process.env.SMTP_HOST,
+            port: Number(process.env.SMTP_PORT ?? 587),
+          }),
+        ),
+        (transport) => Effect.promise(() => transport.close()),
+      )
+
+      const send = Effect.fn("Mailer.send")(function* (input: {
+        to: string
+        subject: string
+        html: string
+      }) {
+        yield* Effect.promise(() =>
+          transport.sendMail({ from: "no-reply@myapp.dev", ...input }),
+        )
+      })
+
+      return Mailer.of({ send })
+    }),
+  )
+}
+```
+
+(Imagine `import nodemailer from "nodemailer"` at the top.)
+
+Two things happen in that body that would be awkward anywhere else:
+
+1. **The construction effect runs under a `Scope`.** `Effect.acquireRelease`
+   normally adds `Scope` to its requirements — someone must own the resource.
+   `Layer.effect`'s signature tells you the runtime handles this:
+
+   ```ts
+   <I, S>(service: Context.Key<I, S>): <E, R>(
+     effect: Effect<S, E, R>
+   ) => Layer<I, E, Exclude<R, Scope.Scope>>
+   ```
+
+   That `Exclude<R, Scope.Scope>` is v4 collapsing v3's separate
+   `Layer.scoped` into plain `Layer.effect`: the requirement is supplied by the
+   layer itself and excluded automatically. Acquire inside, cleanup happens at
+   layer teardown — interruption-safe, ordered, guaranteed even when sibling
+   branches of the graph fail mid-build.
+
+2. **Methods close over private state.** The transport never appears on the
+   service interface. This closure-over-state pattern is the idiomatic v4 shape
+   for stateful components — not classes with mutable fields (see
+   [03 · gen & fn](/effect-ts/03-gen-and-fn/) on `this` binding).
+
+### The other constructors
+
+| Constructor | Signature sketch | Use for |
+|---|---|---|
+| `Layer.succeed(Service, impl)` | value → layer | pure implementations, test stubs |
+| `Layer.succeed(Service)(impl)` | data-last form | point-free pipelines |
+| `Layer.sync(Service, () => impl)` | lazy sync thunk | defer cheap construction until build |
+| `Layer.effect(Service, effect)` | effectful build | anything acquiring resources |
+| `Layer.effectContext(effect)` | builds whole `Context` | multi-service builders |
+| `Layer.effectDiscard(effect)` | provides nothing | init steps, background workers |
+| `Layer.suspend(() => layer)` | deferred selection | pick a layer at build time |
+| `Layer.unwrap(effectOfLayer)` | effectful selection | config-driven choice |
+| `Layer.empty` | provides nothing, does nothing | neutral element for merging |
+
+`succeed` deserves one caution: it evaluates the implementation **eagerly** at
+layer-definition time. Fine for objects, wrong for anything reading ambient
+state — use `sync` or `effect` to defer.
+
+### Background workers: `Layer.effectDiscard`
+
+Some layers exist for their side effects — a consumer loop, a scheduler, a
+metrics exporter — and provide no service anyone calls. Fork the worker into
+the layer's scope so its lifetime *is* the application lifetime:
+
+```ts
+import { Effect, Layer, Queue } from "effect"
+
+const EmailWorker = Layer.effectDiscard(
+  Effect.gen(function* () {
+    yield* Effect.forkScoped(
+      Effect.forever(
+        Effect.gen(function* () {
+          const job = yield* Queue.take(emailQueue)
+          yield* deliver(job)
+        }),
+      ),
+    )
+    // the gen body completes; the forked fiber keeps running
+    // until the layer's scope closes, then it's interrupted cleanly
+  }),
+)
+```
+
+`forkScoped` attaches the fiber to the enclosing scope — here the scope that
+`Layer.effectDiscard` supplies, exactly like it did for `acquireRelease`.
+Shutdown interrupts the worker before finalizers run. No orphaned loops.
+
+### Config-driven construction: `Layer.unwrap`
+
+When configuration decides *which* implementation to build, `Layer.unwrap`
+turns an `Effect<Layer>` into a layer — the outer effect runs first, then the
+selected inner layer builds:
+
+```ts
+import { Config, Effect, Layer } from "effect"
+import { Cache } from "./cache.ts"
+// RedisCache.layer and InMemoryCache.layer are both Layer<Cache> variants
+// defined elsewhere in the codebase
+
+const CacheLayer = Layer.unwrap(
+  Effect.map(
+    Config.String("CACHE_BACKEND").pipe(Config.withDefault("memory")),
+    (backend) =>
+      backend === "redis" ? RedisCache.layer : InMemoryCache.layer,
+  ),
+)
+```
+
+This composes with everything below because the result is still just a layer.
+Note the shape of the dependency: choosing between branches adds nothing to
+`RIn` — Config descriptions require no services — while whatever both branch
+layers require flows straight through into `CacheLayer`'s `RIn`, and the
+config read contributes `ConfigError` to `E`. Chapter 11 covers Config properly.
+
+## Composition semantics
+
+Four operators cover composition. They differ in exactly two questions: who
+builds first, and what the resulting layer exposes.
+
+```ts
+// UserRepository.layerNoDeps still requires SqlClient
+const withDeps = UserRepository.layerNoDeps.pipe(Layer.provide(SqlClient.layer))
+const merged = Layer.merge(UserRepository.layerNoDeps, Mailer.layer)
+const allDeps = Layer.mergeAll(SqlClient.layer, RedisCache.layer, ClockLayer)
+```
+
+| Operator | Builds | Resulting layer exposes (`ROut`) | Requirements (`RIn`) |
+|---|---|---|---|
+| `Layer.provide(self, dep)` | `dep` first, feeds `self` | **only `self`** — deps hidden | deps' `RIn` minus what `dep` satisfies |
+| `Layer.provideMerge(self, dep)` | `dep` first, feeds `self` | `self` **and** dep's services | same narrowing as `provide` |
+| `Layer.merge(a, b)` / `mergeAll(...)` | siblings, **concurrently** | union of all services | union of all requirements |
+| `Layer.flatMap(layer, f)` | `layer`, then `f(context)` builds next | whatever `f` returns | sequenced |
+
+Decision rules:
+
+- Default to `provide`. Hiding dependencies is the point — callers of
+  `UserRepository.layer` should neither know nor care that Postgres exists.
+- Reach for `provideMerge` when downstream genuinely needs a dependency too —
+  e.g. several services sharing one `SqlClient`, exposed so they can all
+  require it.
+- `merge`/`mergeAll` combine *independent* layers. Shared references stay
+  shared: if you pass the same `SqlClient.layer` value twice, memoization
+  guarantees one pool.
+- `flatMap` is the escape hatch for "build A, inspect it, decide B". Most
+  uses collapse into `unwrap` or `LayerMap`.
+
+:::caution[Direction confusion]
+`Layer.provide` is dual, and the pipe position matters:
+`self.pipe(Layer.provide(dep))` means *dep feeds self*. Reading it left-to-right
+as "provide self with..." is the classic mistake — the data-last argument is the
+dependency, the piped receiver is the consumer.
+:::
+
+## The split pattern
+
+Real codebases converge on one convention for service modules, and it's worth
+naming because you'll see it throughout this course. Each service class ships
+three statics:
+
+```ts
+import { Context, Effect, Layer } from "effect"
+import { SqlClient } from "./sql-client.ts"
+
+export interface UserRow { id: string; email: string }
+
+export class UserRepository extends Context.Service<UserRepository, {
+  findById(id: string): Effect.Effect<UserRow | undefined>
+}>()("myapp/repo/UserRepository") {
+  // 1. Construction requiring SqlClient — wiring left to the caller
+  static readonly layerNoDeps = Layer.effect(
+    UserRepository,
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const findById = Effect.fn("UserRepository.findById")(function* (
+        id: string,
+      ) {
+        const rows = yield* sql.query(
+          "SELECT id, email FROM users WHERE id = $1",
+          [id],
+        )
+        return rows[0]
+      })
+      return UserRepository.of({ findById })
+    }),
+  )
+
+  // 2. Fully wired with production dependencies — the convenient default
+  static readonly layer = Layer.provide(
+    UserRepository.layerNoDeps,
+    SqlClient.layerPostgres,
+  )
+
+  // 3. Caller-supplied dependency variant — exposes SqlClient too
+  static readonly layerWithSqlClient = (client: Layer.Layer<SqlClient>) =>
+    Layer.provideMerge(UserRepository.layerNoDeps, client)
+}
+```
+
+Why three?
+
+- `layerNoDeps` is honest about requirements: its type literally says
+  `Layer<UserRepository, never, SqlClient>` (no build errors possible here;
+  requirements visible). Test code and alternative stacks target this.
+- `layer` bakes in the production choice via `Layer.provide`, so application
+  assembly stays one-liner clean — and because `provide` hides the dependency,
+  the rest of the app compiles without knowing a database exists.
+- `layerWithSqlClient` exists for the case where something else needs the same
+  client instance. Using `provideMerge` (not two independent layers) is what
+  makes the shared-instance guarantee hold: one `SqlClient` built once, visible
+  to both the repository and whoever else requires it.
+
+The naming scales: `layerTest`, `layerMemory`, `layerConfig` (reads options
+from Config) are all variants of the same idea. Upstream Effect packages follow
+it too — when you meet `NodeFileSystem.layer` or `PgClient.layer` later in the
+course, the contract will already be familiar.
+
+## Memoization: the singleton mechanism
+
+Here is the property everything above leans on: **layers build once per run,
+no matter how many times they're provided.**
+
+When you call `Effect.provide(program, someLayer)`, the runtime builds the
+layer graph against a `MemoMap` — a cache keyed by layer identity. Two facts
+about v4's memo map matter enormously if you came from v3:
+
+1. **It is ambient and shared across separate `Effect.provide` calls within a
+   program run.** Provide the same layer value twice — in different places, at
+   different nesting depths — and the second provide reuses the first build.
+2. **In v3 this was false.** v3 created a fresh memo map per top-level
+   `Effect.provide`, so providing the same layer twice built two instances —
+   two pools, two connections, two background workers. The classic v3 bug was
+   "why do I have five database pools?" Answer: five provide sites.
+
+Demonstrating it directly:
+
+```ts
+import { Context, Effect, Layer } from "effect"
+
+let builds = 0
+
+class MyService extends Context.Service<MyService, {
+  greet(): string
+}>()("myapp/MyService") {}
+
+const MyServiceLayer = Layer.effect(
+  MyService,
+  Effect.gen(function* () {
+    builds++
+    yield* Effect.log("Building MyService")
+    return MyService.of({ greet: () => "hello" })
+  }),
+)
+
+const useA = Effect.gen(function* () {
+  const svc = yield* MyService
+  return svc.greet()
+})
+const useB = Effect.gen(function* () {
+  const svc = yield* MyService
+  return svc.greet()
+})
+
+const program = Effect.gen(function* () {
+  const a = yield* Effect.provide(useA, MyServiceLayer)
+  const b = yield* Effect.provide(useB, MyServiceLayer)
+  return [a, b]
+})
+
+await Effect.runPromise(program)
+// log: "Building MyService"   ← exactly once
+// builds === 1                ← both provides shared one instance
+```
+
+Under v3 semantics that program logs twice and `builds === 2`. Under v4 it logs
+once. Every "singleton" in your architecture — pools, caches, transports —
+rests on this.
+
+### Opt-outs
+
+Occasionally you *want* fresh state: per-test isolation, a second cache tier,
+parallel tenants.
+
+```ts
+// bypasses the shared memo map entirely — always builds anew
+const isolated = Effect.provide(useA, Layer.fresh(MyServiceLayer))
+
+// local: true — share within THIS provide call, but don't reuse across calls
+const semiIsolated = Effect.provide(useA, MyServiceLayer, { local: true })
+```
+
+| Mechanism | Shares within one provide | Shares across provides | Use for |
+|---|---|---|---|
+| default | yes | yes | production singletons |
+| `{ local: true }` | yes | **no** | isolate one composition site |
+| `Layer.fresh(layer)` | **no** | no | guaranteed-new instance |
+
+:::note[Memoization keys on identity]
+Sharing happens when the *same layer value* is provided. Two separately written
+but structurally identical `Layer.effect(...)` expressions are distinct layers
+and build independently — another reason the split pattern (define one
+`static readonly layer`, pass the reference around) beats inline layer literals.
+:::
+
+## Dynamic families: `LayerMap`
+
+Memoization solves "one instance of X." Multi-tenant systems need "one instance
+of X *per key*" — a pool per tenant, a client per region — with eviction when
+keys go cold. `LayerMap.Service` packages exactly that:
+
+```ts
+import { Context, Effect, Layer, LayerMap } from "effect"
+import { Database } from "./database.ts"
+
+export class TenantPools extends LayerMap.Service<TenantPools>()(
+  "myapp/TenantPools",
+  {
+    lookup: (tenantId: string) =>
+      Layer.effect(
+        Database,
+        Effect.gen(function* () {
+          const config = yield* tenantConfig(tenantId)
+          const conn = yield* Effect.acquireRelease(
+            connect(config),
+            (conn) => Effect.promise(() => conn.close()),
+          )
+          return Database.of({
+            query: (sql) => runQuery(conn, sql),
+          })
+        }),
+      ),
+
+    // evict entries unused for this long (per-key TTL, refreshed on access)
+    idleTimeToLive: "1 minute",
+  },
+) {}
+```
+
+Unlike plain services, `LayerMap.Service` *does* generate statics for you:
+`TenantPools.layer` / `.layerNoDeps` (the map itself), plus keyed accessors
+`.get(key)`, `.contextEffect(key)`, `.invalidate(key)`. Usage wires two
+provides — the outer layer builds the map, the inner injects the right entry:
+
+```ts
+export const handleRequest = (tenantId: string, sql: string) =>
+  Effect.gen(function* () {
+    const db = yield* Database
+    return yield* db.query(sql)
+  }).pipe(
+    Effect.provide(TenantPools.get(tenantId)), // keyed Database for this request
+    Effect.provide(TenantPools.layer),         // the shared map itself
+  )
+```
+
+Semantics worth knowing:
+
+- Entries build lazily on first `.get(key)` and are reference-counted while in
+  use; `idleTimeToLive` releases them after quiet periods. Finalizers (your
+  `acquireRelease`) run on eviction — connections actually close.
+- `yield* TenantPools.invalidate(tenantId)` forces the next access to rebuild —
+  the tool for credential rotation or config changes.
+- Keys can be any type (strings, structs — structural equality applies), and
+  `lookup` may itself depend on services; those flow through
+  `TenantPools.layerNoDeps` like any other layer.
+- `idleTimeToLive` also accepts a function of the key for per-tenant TTLs.
+
+Think of it as `RcMap` wearing a layer costume: keyed caching, ref-counted
+lifetimes, and full layer composition for the entries.
+
+## Assembling an application
+
+Everything converges at one place: the main module builds the graph, launches
+it, and lets the runtime keep the process alive until interruption.
+
+<Mermaid title="Application layer graph" height={420} code={`
+flowchart LR
+  runMain["NodeRuntime.runMain"] --> launch["Layer.launch(MainLayer)"]
+  subgraph MainLayer["MainLayer"]
+    API["Api.layer<br/>(HTTP routes)"]
+    REPO["UserRepository.layer"]
+    MAILER["Mailer.layer"]
+    SQL["SqlClient.layerPostgres"]
+    SMTP["SmtpConfig.layer"]
+  end
+  API -->|"Layer.provide"| REPO
+  API -->|"Layer.provide"| MAILER
+  REPO -->|"needs SqlClient"| SQL
+  MAILER -->|"needs SmtpConfig"| SMTP
+  SQL -.->|"ConfigProvider (ch. 11)"| CFG["env vars"]
+  SMTP -.-> CFG
+`} />
+
+```ts
+// src/main.ts
+import { Layer } from "effect"
+import { NodeRuntime } from "@effect/platform-node"
+import { Api } from "./api.ts"
+import { UserRepository } from "./user-repository.ts"
+import { Mailer } from "./mailer.ts"
+import { SqlClient } from "./sql-client.ts"
+import { SmtpConfig } from "./smtp-config.ts"
+
+const MainLayer = Api.layer.pipe(
+  Layer.provide(UserRepository.layer),
+  Layer.provide(Mailer.layer),
+  Layer.provide(SqlClient.layerPostgres),
+  Layer.provide(SmtpConfig.layer),
+)
+
+Layer.launch(MainLayer).pipe(NodeRuntime.runMain)
+```
+
+What each line buys you:
+
+- The chained `Layer.provide` calls wire dependencies inward while keeping
+  `MainLayer`'s public surface equal to whatever `Api.layer` provides. Type
+  errors here mean your graph has a hole — missing dependency, mismatched
+  error — caught at compile time, before `npm start`.
+- `Layer.launch(MainLayer)` builds the graph, then blocks forever
+  (`Effect.never`) holding the scope open. SIGINT/SIGTERM interrupt it, the
+  scope closes, and every `acquireRelease` finalizer — connection pools, SMTP
+  transports, worker fibers — runs in reverse acquisition order.
+- `NodeRuntime.runMain` is the process boundary: it runs the effect, installs
+  signal handling and pretty error reporting, and sets the exit code. It takes
+  an `Effect` with no remaining `R` — if the compiler accepts your
+  `Layer.launch(MainLayer).pipe(NodeRuntime.runMain)` call, your graph is
+  complete by definition.
+
+That last sentence is the pitch for this entire chapter: the dependency graph
+is a value, completeness is a type error away from being verified, and startup
+and shutdown fall out of the same structure. One input remains before this
+pipeline is truly production-shaped — `Mailer.layerNoDeps` above reads
+`process.env.SMTP_HOST` ad hoc, and every real layer will want the same kind of
+settings. Chapter 11 makes configuration itself part of the graph.
+
+## Next
+
+<LinkCard
+  title="11 · Configuration"
+  description="Describe-vs-provide config: typed Config descriptors, providers for env/files/secrets, defaults and validation, nested paths, Redacted secrets, and a full AppConfig consumed by service layers."
+  href="/effect-ts/11-config/"
+/>

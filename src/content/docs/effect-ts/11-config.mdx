@@ -1,0 +1,629 @@
+---
+title: Configuration
+description: Typed configuration descriptors over swappable providers — constructors and coercion, nested paths, defaults and the three-state rule, Redacted secrets, Config.schema validation, and providers for env, JSON, dotenv, and Kubernetes mounts.
+sidebar:
+  order: 11
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Configuration is the dependency nobody types properly. It reaches your services
+through `process.env`, arrives as strings regardless of what it means, fails at
+3am instead of at startup, and carries secrets that leak into logs. Effect v4
+treats it as a first-class part of the graph you built in
+[Chapter 10](/effect-ts/10-layers/): configuration is *described* as typed
+values, *provided* by swappable sources, and *resolved* before your layers ever
+construct — with failures surfaced through the same `E` channel as everything
+else.
+
+## Two modules, one split
+
+The design separates description from source:
+
+<Mermaid title="Config architecture" height={300} code={`
+flowchart LR
+  subgraph describe["Config module (describes)"]
+    C["yield* Config.Number(PORT)"]
+  end
+  subgraph provide["ConfigProvider module (provides)"]
+    P["ambient provider<br/>(default: process.env)"]
+  end
+  C -->|"parse(path)"| P
+  P -->|"raw node or undefined"| C
+  C -->|"decoded, validated value"| SVC["your service layer"]
+`} />
+
+- **`Config<A>`** — a *description*: "an integer named `PORT`, required". A
+  `Config` is itself an `Effect<A, ConfigError>` (with no `R` — see below),
+  so you can `yield*` it anywhere in a gen body. Descriptions compose with
+  combinators and know nothing about where bytes come from.
+- **`ConfigProvider`** — a *source*: something that answers "what's at path
+  `["PORT"]`?" with raw data or nothing. One provider is ambient per program,
+  installed exactly like any other context entry.
+
+```ts
+import { Config, Effect } from "effect"
+
+const program = Effect.gen(function* () {
+  const port = yield* Config.Number("PORT") // reads via the ambient provider
+  return port * 2
+})
+```
+
+Why does yielding a `Config` add nothing to `R`? Because the provider isn't a
+service you declare — it's a **`Context.Reference`** with a default:
+
+```ts
+// actual definition from packages/effect/src/ConfigProvider.ts
+export const ConfigProvider: Context.Reference<ConfigProvider> =
+  Context.Reference<ConfigProvider>("effect/ConfigProvider", {
+    defaultValue: () => fromEnv(),
+  })
+```
+
+This is [Chapter 9's](/effect-ts/09-context-services/) reference pattern doing
+real work: reading config requires nothing, while any call site can override
+the source without touching the describing code. The default provider merges
+`process.env` and `import.meta.env` (when present).
+
+## The constructor toolbox
+
+Every constructor takes an optional name (the lookup path). Omitting it reads
+from the current location — meaningful under `nested`/`schema`, covered below.
+
+| Constructor | Type | Accepts |
+|---|---|---|
+| `Config.String(name?)` | `string` | any raw value |
+| `Config.NonEmptyString(name?)` | `string` | non-empty strings |
+| `Config.Number(name?)` | `number` | full JS domain incl. `NaN`, `Infinity` |
+| `Config.Finite(name?)` | `number` | rejects `NaN`/`Infinity` |
+| `Config.Int(name?)` | `number` | integers only |
+| `Config.Port(name?)` | `number` | integers `1`–`65535` |
+| `Config.Boolean(name?)` | `boolean` | `true/false/yes/no/on/off/1/0/y/n` |
+| `Config.Duration(name?)` | `Duration` | `"10 seconds"`, `"500 millis"`, `"Infinity"` |
+| `Config.URL(name?)` | `URL` | anything `new URL()` parses |
+| `Config.Date(name?)` | `Date` | anything `Date` parses |
+| `Config.LogLevel(name?)` | log level name | `"All"/"Fatal"/"Error"/"Warn"/"Info"/"Debug"/"Trace"/"None"` |
+| `Config.Redacted(name?)` | `Redacted` | secrets — see below |
+| `Config.Literal(v, name?)` | `v` | exactly that one value |
+| `Config.Literals([...], name?)` | union | one of the listed values |
+| `Config.Array(value, path?, opts?)` | `ReadonlyArray<A>` | structural array **or** flat string |
+| `Config.Record(key, value, path?, opts?)` | `Record<K, V>` | structural object **or** flat `k=v,k=v` |
+| `Config.schema(codec, path?)` | codec's type | any Schema — full section below |
+
+Combinators hang off the description:
+
+```ts
+const retries = Config.Number("MAX_RETRIES").pipe(
+  Config.withDefault(3),
+  Config.nested("database"), // now reads DATABASE_MAX_RETRIES
+)
+
+const flags = Config.all({
+  newCheckout: Config.Boolean("NEW_CHECKOUT").pipe(Config.withDefault(false)),
+  betaApi: Config.option(Config.Boolean("BETA_API")),
+})
+```
+
+### Coercion: everything is a string until it isn't
+
+Environment variables are strings; JSON files aren't. Providers hand back raw
+nodes and `Config` descriptions decode them, so both of these work identically:
+
+```ts
+const port = Config.Port("PORT")
+// env:   PORT="5432"      (string) → 5432
+// json:  { PORT: 5432 }   (number) → 5432
+```
+
+Rules worth internalizing:
+
+- Numeric/boolean/duration constructors parse their string form; real typed
+  values pass through.
+- Booleans are deliberately liberal (`FEATURE=on` works). The flip side:
+  typos fail loudly instead of coercing to `false` — `FEATURE=ture` is a
+  `ConfigError`, not a silent off-switch.
+- `Number` vs `Finite` vs `Int` vs `Port`: pick the narrowest truth. A config
+  that accepts `NaN` because you reached for `Number` out of habit will find
+  production eventually.
+- Empty strings count as **missing** by default across providers (an env var
+  set to `""` behaves like absent, feeding `withDefault`). Pass
+  `{ preserveEmptyStrings: true }` to treat them as explicit values.
+
+## Paths, nesting, and naming
+
+A lookup path is an array of segments. Flat names are one segment;
+`Config.nested("name")` prepends one:
+
+```ts
+const host = Config.String("host").pipe(Config.nested("database"))
+```
+
+How the path resolves depends on the provider's shape model:
+
+| Source | `nested("database")` + key `"host"` looks up |
+|---|---|
+| `fromEnv` | env var `database_host` (segments joined with `_`) |
+| `fromUnknown` / JSON | `{ database: { host: ... } }` |
+| `fromDir` | `<rootPath>/database/host` (a file) |
+
+The env provider builds a trie by splitting variable names on `_`, making the
+mapping bidirectional: `DATABASE_HOST=localhost` is reachable both as flat
+path `["DATABASE_HOST"]` and nested path `["DATABASE", "HOST"]`. Arrays emerge
+when all children of a trie node are numeric — `ALLOWED_0`, `ALLOWED_1`,
+`ALLOWED_2` read as an array at `["ALLOWED"]`.
+
+Nested calls compose outermost-last:
+
+```ts
+const ttl = Config.Duration("ttl")
+  .pipe(Config.nested("cache"), Config.nested("myapp"))
+// env: myapp_cache_ttl="30 seconds"
+```
+
+### camelCase code, SCREAMING_SNAKE env
+
+Schema keys and struct fields are conventionally camelCase; environments are
+conventionally uppercase snake. The provider-side `constantCase` combinator
+bridges them by transforming lookup paths before they hit the source:
+
+```ts
+import { ConfigProvider } from "effect"
+
+export const envProvider = ConfigProvider.fromEnv().pipe(
+  ConfigProvider.constantCase,
+)
+
+// now Config.String("maxRetries") finds MAX_RETRIES,
+// and nested("database") + "poolSize" finds DATABASE_POOL_SIZE
+```
+
+:::caution[Ordering matters]
+Provider transformations compose application-order — later ones run after
+earlier ones and see the whole transformed path. `.pipe(constantCase)` then
+`.pipe(nested("app"))` uppercases keys then prepends `app`; nesting first means
+the prefix gets uppercased too. With custom `mapInput` transforms, decide
+whether `f` should see pre- or post-cased segments.
+:::
+
+## Absence, failure, and recovery
+
+Here is where naive env-reading falls apart and `Config` earns its keep. Every
+lookup has **three possible outcomes**, and the recovery combinators differ in
+which outcomes they handle:
+
+| State | Meaning | `withDefault(x)` | `option` | `orElse(f)` |
+|---|---|---|---|---|
+| Resolved | found and decoded | keeps value | `Some(value)` | keeps value |
+| Absent | **no relevant input exists** | uses `x` | `None` | runs fallback |
+| Failed | input exists but invalid | **error propagates** | **error propagates** | runs fallback |
+
+```ts
+// Absent → 5432. Failed ("abc") → still a ConfigError. That's the point.
+const port = Config.Port("PORT").pipe(Config.withDefault(5432))
+
+// Absent → None. Failed → ConfigError. For genuinely optional settings.
+const redisUrl = Config.option(Config.URL("REDIS_URL"))
+
+// Recover from BOTH absence and hard failure — last-resort chains.
+const region = Config.Literals(["us", "eu", "ap"], "REGION")
+  .pipe(Config.orElse(() => Config.succeed("us")))
+```
+
+The asymmetry between `withDefault` and `orElse` is deliberate: a typo'd value
+(`PORT=54g32`) should crash startup, not silently become your default.
+Defaults answer "nothing was said"; `orElse` answers "I don't care why, do this
+instead."
+
+### The partial-group gotcha
+
+`Config.all({...})` has its own notion of absence, and it bites people who mix
+it with `withDefault`:
+
+> A group is absent only when **at least one child can't resolve AND none of
+> the others read provider input**. Once any child reads input, a missing
+> sibling makes the whole group fail.
+
+```ts
+const db = Config.all({
+  host: Config.NonEmptyString("DB_HOST"),
+  port: Config.Number("DB_PORT"),
+})
+
+// {}           → whole group Absent (an outer withDefault would fire)
+// { DB_HOST }  → FAILS: host read input, port is missing — partial group
+// { both }     → resolved
+```
+
+One refinement: values supplied by child-level defaults don't count as
+"input". So if `port` above had `.pipe(Config.withDefault(5432))`,
+`{ DB_HOST }` alone would resolve fine. Design intent decides which shape you
+want: bare children make partial groups fail loudly at startup; defaulted
+children make every key independently optional.
+
+Also note the mirror-image rule for `Config.schema`: a schema struct considers
+itself present once its *parent container* exists, even if explicitly empty —
+whereas `all` only counts input actually read by its children.
+
+## Secrets: `Config.Redacted`
+
+Secrets get their own type so they can't wander into logs:
+
+```ts
+import { Config, Redacted } from "effect"
+
+// inside some layer construction...
+Effect.gen(function* () {
+  const apiKey = yield* Config.Redacted("STRIPE_API_KEY")
+
+  // opaque everywhere — logging/stringifying shows <redacted>
+  yield* Effect.log(`loaded key ${apiKey}`) // "loaded key <redacted>"
+
+  // unwrap exactly once, at the boundary that needs plaintext
+  const client = createStripeClient(Redacted.value(apiKey))
+})
+```
+
+`Config.Redacted` decodes into a `Redacted<string>`: `toString`, logging, and
+JSON serialization reveal only `<redacted>`; equality compares safely. The
+type shows up in signatures too — an interface field declared `Redacted`
+documents itself, and code review catches anyone passing secrets around as
+plain strings.
+
+## Structured config: `Config.schema`
+
+When a flat bag of constructors stops scaling — validation rules, reusable
+blocks — describe the whole section as a Schema. `Config.schema(codec, path?)`
+converts any Schema codec into a `Config`:
+
+```ts
+import { Config, Schema } from "effect"
+
+export const DbConfig = Config.schema(
+  Schema.Struct({
+    url: Schema.NonEmptyString,
+    maxConnections: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 200 })),
+    ssl: Schema.Boolean,
+  }),
+  "database",
+)
+
+// env: DATABASE_URL, DATABASE_MAX_CONNECTIONS, DATABASE_SSL
+const program = Effect.gen(function* () {
+  const parsed = yield* DbConfig
+  return parsed.maxConnections // number, range-checked, before any layer constructs
+})
+```
+
+What this buys over constructor soup:
+
+- **Whole-block error reporting** — missing keys and failed validations are
+  collected into one `ConfigError` instead of surfacing one per restart.
+- **Reuse** — the same `Schema.Struct` doubles as your HTTP request decoder
+  and serialization boundary
+  ([20 · Schema foundations](/effect-ts/20-schema-foundations/)).
+- **Structural reads from any provider** — object properties map to nested
+  paths, arrays to indexed children, scalars coerce from raw strings. The same
+  description works against JSON files and env tries alike.
+
+:::note[What schema configs can't express]
+`withDefault` on individual fields lives in `Config`, not Schema — wrap the
+whole `Config.schema(...)` result, or mix: parse required sections with
+`schema` and optional leaves with constructors + `withDefault`. Recursive or
+lazy schemas are supported as long as their eventual shape is concrete; opaque
+string-tree encodings are rejected at construction.
+:::
+
+## Providers: choosing the source
+
+A provider implements one capability — load a path, return a raw node or
+`undefined` — plus path transformations (`mapInput`/`nested`). Built-ins cover
+the usual sources:
+
+| Provider | Input | Needs | Notes |
+|---|---|---|---|
+| `ConfigProvider.fromEnv(opts?)` | `process.env` (+ `import.meta.env`) | — | the default; `{ env }` overrides the record |
+| `ConfigProvider.fromEnvRecord(rec)` | explicit record | — | restricted runtimes |
+| `ConfigProvider.fromUnknown(obj)` | plain JS object | — | tests, parsed JSON files |
+| `ConfigProvider.fromDotEnvContents(str)` | `.env` text | — | quotes/comments/exports; `{ expandVariables: true }` for `${VAR}` |
+| `ConfigProvider.fromDotEnv(opts?)` | `.env` file | `FileSystem` | returns an `Effect`; fails with `PlatformError` |
+| `ConfigProvider.fromDir(opts?)` | directory tree | `Path` + `FileSystem` | one file per key — Kubernetes ConfigMap/Secret mounts |
+| `ConfigProvider.make(load)` | your lookup fn | — | databases, vaults, remote APIs |
+
+The JSON-object provider doubles as a config-file reader with zero ceremony:
+
+```ts
+import { ConfigProvider, FileSystem } from "effect"
+
+const readJsonConfig = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const raw = yield* fs.readFileString("config.production.json")
+  return ConfigProvider.fromUnknown(JSON.parse(raw))
+})
+```
+
+`fromDir` is purpose-built for container mounts where each file is a leaf
+value — `/etc/config/database/url` holding just the connection string:
+
+```ts
+// k8s mounts /etc/myapp/<path> as files — one leaf value per file
+const k8sProvider: Effect.Effect<
+  ConfigProvider.ConfigProvider,
+  never,
+  Path.Path | FileSystem.FileSystem
+> = ConfigProvider.fromDir({ rootPath: "/etc/myapp" })
+```
+
+And a custom store is one function — return `undefined` for "not here",
+`makeValue(...)` for a leaf, and fail with `SourceError` only when the *source
+itself* is broken:
+
+```ts
+import { ConfigProvider, Effect } from "effect"
+import { VaultClient } from "./vault.ts"
+
+const vaultProvider = ConfigProvider.make((path) =>
+  VaultClient.use((vault) => vault.read(path.join("/"))).pipe(
+    Effect.map((entry) =>
+      entry === undefined ? undefined : ConfigProvider.makeValue(entry.value),
+    ),
+  ),
+)
+```
+
+## Installing providers
+
+Because the provider is a `Context.Reference`, installation reuses Chapter 9's
+tools plus two purpose-built layers:
+
+```ts
+// REPLACE the ambient provider for everything below
+Effect.provide(program, ConfigProvider.layer(envProvider))
+
+// ADD a fallback — current provider wins; `defaults` fills gaps
+Effect.provide(program, ConfigProvider.layerAdd(defaults))
+
+// ADD as primary — `overrides` win; existing provider fills gaps
+Effect.provide(program, ConfigProvider.layerAdd(overrides, { asPrimary: true }))
+
+// raw service provision also works — references are ordinary keys
+program.pipe(Effect.provideService(ConfigProvider.ConfigProvider, envProvider))
+```
+
+Both `layer` and `layerAdd` accept a provider **or an Effect producing one**,
+so file-backed sources join the graph naturally:
+
+```ts
+import { Layer } from "effect"
+
+const MainLayer = AppLayer.pipe(
+  // dotenv values win locally; real env vars fill in everywhere else
+  Layer.provide(ConfigProvider.layerAdd(ConfigProvider.fromDotEnv())),
+  // plus your platform's FileSystem layer to satisfy fromDotEnv
+  Layer.provide(FileSystemLayer),
+)
+```
+
+Layer placement is the whole story: providers must sit *below* any layer whose
+construction reads config. Since layer construction happens during
+`Effect.provide` / `Layer.launch`, a provider placed above a config-consuming
+layer never applies to it. The compiler can't catch this one — the symptom is
+loud but confusing: defaults firing for keys you clearly set. When debugging,
+remember resolution happens at layer-build time, not lazily at first use.
+
+:::caution[Provider `orElse` ≠ config `orElse`]
+`ConfigProvider.orElse(a, b)` consults `b` only when `a`'s lookup returns
+`undefined`. If `a` fails with a `SourceError` (network down, permissions), the
+error propagates — composition does not swallow broken sources. Usually right;
+a silent fall-through would mask outages.
+:::
+
+## Worked example: AppConfig feeding a service layer
+
+Pulling it together. One config service, described once, validated at startup,
+consumed like any other service:
+
+```ts
+// src/config/app-config.ts
+import { Config, ConfigProvider, Context, Effect, Layer, Redacted, Schema } from "effect"
+
+export interface Shape {
+  readonly host: string
+  readonly port: number
+  readonly logLevel: "debug" | "info" | "warn" | "error"
+  readonly database: {
+    readonly url: string
+    readonly maxConnections: number
+    readonly ssl: boolean
+  }
+  readonly stripeApiKey: Redacted.Redacted
+}
+
+/** SCREAMING_SNAKE bridge: keys like "maxConnections" find MAX_CONNECTIONS */
+export const envProvider = ConfigProvider.fromEnv().pipe(
+  ConfigProvider.constantCase,
+)
+
+export class AppConfig extends Context.Service<AppConfig, Shape>()(
+  "myapp/config/AppConfig",
+) {
+  static readonly layerNoDeps = Layer.effect(
+    AppConfig,
+    Effect.gen(function* () {
+      const database = yield* Config.schema(
+        Schema.Struct({
+          url: Schema.NonEmptyString,
+          maxConnections: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 200 })),
+          ssl: Schema.Boolean,
+        }),
+        "database",
+      )
+
+      return AppConfig.of({
+        host: yield* Config.String("host").pipe(Config.withDefault("0.0.0.0")),
+        port: yield* Config.Port("port").pipe(Config.withDefault(8080)),
+        logLevel: yield* Config.Literals(
+          ["debug", "info", "warn", "error"],
+          "logLevel",
+        ).pipe(Config.withDefault("info")),
+        database,
+        stripeApiKey: yield* Config.Redacted("stripeApiKey"),
+      })
+    }),
+  )
+}
+```
+
+Consumers never touch env vars — they require `AppConfig` like any service,
+and the split pattern from Chapter 10 keeps wiring honest:
+
+```ts
+// src/db/sql-client.ts
+import { Context, Effect, Layer } from "effect"
+import { AppConfig } from "../config/app-config.ts"
+
+export class SqlClient extends Context.Service<SqlClient, {
+  query(sql: string, params?: ReadonlyArray<unknown>): Effect.Effect<Array<unknown>>
+}>()("myapp/db/SqlClient") {
+  static readonly layerNoDeps = Layer.effect(
+    SqlClient,
+    Effect.gen(function* () {
+      const cfg = yield* AppConfig
+      const conn = yield* Effect.acquireRelease(
+        // cfg.database is already validated: url non-empty, maxConnections 1–200
+        Effect.promise(() => connect(cfg.database)),
+        (conn) => Effect.promise(() => conn.close()),
+      )
+      return SqlClient.of({
+        query: (sql, params) => runQuery(conn, sql, params),
+      })
+    }),
+  )
+}
+```
+
+Assembly stays declarative — note the provider riding below everything:
+
+```ts
+// src/main.ts
+import { Layer } from "effect"
+import { NodeRuntime } from "@effect/platform-node"
+import { Api } from "./api.ts"
+import { SqlClient } from "./db/sql-client.ts"
+import { AppConfig, envProvider } from "./config/app-config.ts"
+import { ConfigProvider } from "effect"
+
+const MainLayer = Api.layer.pipe(
+  Layer.provide(SqlClient.layerNoDeps),
+  Layer.provide(AppConfig.layerNoDeps),
+  Layer.provide(ConfigProvider.layer(envProvider)),
+)
+
+Layer.launch(MainLayer).pipe(NodeRuntime.runMain)
+```
+
+Startup order falls out of the graph: provider → `AppConfig` (parses and
+validates everything exactly once) → `SqlClient` (opens the pool with
+validated values) → API. Bad config kills the process during launch with a
+`ConfigError` naming every offending key — before a single socket opens.
+
+## Testing configurations
+
+Two distinct scenarios, both trivially wired:
+
+**1. Test consumers of config** — freeze inputs with a `fromUnknown` fixture
+and swap the provider via `ConfigProvider.layer`:
+
+```ts
+import { ConfigProvider, Effect } from "effect"
+import { assert, describe, it } from "vitest"
+import { AppConfig } from "../src/config/app-config.ts"
+
+// Fixtures mirror the PATHS of your descriptions: camelCase keys, nested
+// objects. (Unlike fromEnv, fromUnknown does not split "_" into segments.)
+const fixture = {
+  host: "test.example.com",
+  port: 9999,
+  logLevel: "warn",
+  database: {
+    url: "postgres://localhost/test",
+    maxConnections: 3,
+    ssl: false,
+  },
+  stripeApiKey: "sk_test_123",
+}
+
+const TestConfigLayer = ConfigProvider.layer(ConfigProvider.fromUnknown(fixture))
+
+describe("AppConfig", () => {
+  it("resolves the fixture", async () => {
+    const cfg = await Effect.runPromise(
+      Effect.provide(AppConfig.layerNoDeps, TestConfigLayer),
+    )
+    assert.equal(cfg.port, 9999)
+    assert.equal(cfg.logLevel, "warn")
+    assert.equal(cfg.database.maxConnections, 3)
+  })
+})
+```
+
+Two ways to reuse env-shaped data instead:
+
+- `ConfigProvider.fromEnvRecord({ DATABASE_URL: ..., ... })` needs no bridge —
+  its underscore trie resolves nested camelCase lookups exactly like `fromEnv`.
+- `fromUnknown` mirrors your object's *exact* structure — no key splitting.
+  Either nest camelCase objects as shown above, or write the description with
+  an explicit flat name (`Config.String("DATABASE_URL")`).
+
+**2. Test a description directly** — parse against a provider without
+building any layers at all:
+
+```ts
+const port = await Effect.runPromise(
+  Config.Port("port").pipe(
+    Config.withDefault(8080),
+    Effect.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))),
+  ),
+)
+assert.equal(port, 8080) // absent in fixture → default fired
+```
+
+Because providers are values, fixtures compose: spread a base object with
+per-test overrides, use `ConfigProvider.orElse(primaryFixture, baseFixture)`
+for partial coverage, or `layerAdd` for "env where available, fixture for the
+rest."
+
+:::tip[Secrets in CI]
+Keep public keys in committed fixtures and let real secrets ride through the
+environment:
+`ConfigProvider.layerAdd(ConfigProvider.fromUnknown(publicFixture))` layered
+over the default env provider. The fixture fills what's public; CI injects the
+rest.
+:::
+
+## Cheat sheet
+
+| Task | Tool |
+|---|---|
+| Read a typed value | `yield* Config.Port("PORT")` |
+| Optional with fallback | `.pipe(Config.withDefault(x))` — absence only |
+| Truly optional | `Config.option(...)` — `None` on absence only |
+| Recover from bad values too | `.pipe(Config.orElse(() => ...))` |
+| Group related keys | `Config.all({...})` — mind the partial-group rule |
+| Validate rich shapes | `Config.schema(Schema.Struct({...}), path?)` |
+| Namespace keys | `Config.nested("database")` → `DATABASE_*` in env |
+| camelCase ↔ SCREAMING_CASE | `provider.pipe(ConfigProvider.constantCase)` |
+| Secrets | `Config.Redacted` + `Redacted.value(pass)` at the use site |
+| Swap source (replace) | `ConfigProvider.layer(p)` |
+| Swap source (augment) | `ConfigProvider.layerAdd(p, { asPrimary? })` |
+| Tests / JSON files | `ConfigProvider.fromUnknown(obj)` |
+| K8s mounts | `ConfigProvider.fromDir({ rootPath })` |
+
+## Next
+
+<LinkCard
+  title="12 · Scopes & Resources"
+  description="The lifetime machinery underneath layers: Scope, acquireRelease and its siblings, finalizer ordering, scoped effects outside layers, and manual resource management."
+  href="/effect-ts/12-scopes-resources/"
+/>

@@ -1,0 +1,657 @@
+---
+title: SQL — Model, Migrations & Repositories
+description: From one Model.Class declaration to database rows, JSON APIs, migrations, and traced repositories. Branded IDs, variant derivation, SqlClient, SqlModel, SqlSchema, and test-swappable layers.
+sidebar:
+  order: 25
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Most projects maintain three overlapping sources of truth: the SQL schema, the TypeScript interface for rows, and the API schema for payloads. They drift — a column renamed in a migration, a nullable field that the JSON variant forgot to expose as `Option`. `Model.Class` collapses them: one field declaration is canonical, and variant schemas for every boundary are derived mechanically. On top of that foundation, `SqlClient`, `Migrator`, and `SqlModel.makeRepository` handle the rest — driver-swapped queries, ordered migrations, and typed CRUD with spans and repository tracing.
+
+This chapter is the persistence counterpart to chapter 24's HTTP stack — it completes the `Model` story you first saw in the user domain there.
+
+:::note[Module paths]
+```ts
+import { Model } from "effect/unstable/schema"          // Model.Class, FieldExcept, etc.
+import { SqlClient, SqlModel, SqlSchema, SqlError } from "effect/unstable/sql"
+import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node"  // driver
+// production alternative: import { PgClient, PgMigrator } from "@effect/sql-pg"
+```
+`effect/unstable/sql` is the interface + repositories; `@effect/sql-*` are drivers. Swap the driver layer and the rest of the code is unchanged.
+:::
+
+## The two worlds — one declaration
+
+A `Model.Class` declares fields once and generates six variant schemas:
+
+| Variant | Context | Included fields | Purpose |
+|---|---|---|---|
+| `Group` (select) | database read | all fields | `SELECT *` rows → `Group` instances |
+| `Group.insert` | database write (insert) | `FieldExcept(["select"])` excluded, defaults filled | `INSERT` — id + timestamps generated |
+| `Group.update` | database write (update) | `FieldExcept(["insert"])` excluded appropriately | `UPDATE` — caller supplies `id` + patch |
+| `Group.json` | API read | `json` included, `Sensitive` / `FieldOnly(select)` excluded | `HttpApi` success schema |
+| `Group.jsonCreate` | API write (create) | `Slug`, id, timestamps excluded per `FieldExcept` | `POST /` payload |
+| `Group.jsonUpdate` | API write (update) | same narrow set + `FieldExcept(update)` | `PATCH /:id` payload |
+
+```ts title="src/domain/Group.ts — the canonical example (ai-docs/src/40_sql/10_basics.ts:24)"
+import { Schema } from "effect"
+import { Model } from "effect/unstable/schema"
+
+export const GroupId = Schema.String.pipe(Schema.brand("GroupId"))
+export type GroupId = typeof GroupId.Type
+
+export class Group extends Model.Class<Group>("Group")({
+  id: Model.UuidV4Insert(GroupId),
+  name: Schema.NonEmptyString,
+  slug: Schema.NonEmptyString.pipe(Model.FieldExcept(["update", "jsonUpdate"])),
+  notes: Schema.NullOr(Schema.String).pipe(Model.FieldOnly(["select", "insert"])),
+  memberCount: Model.Field({ select: Schema.Int, json: Schema.Int }),
+  createdAt: Model.DateTimeInsert,
+  updatedAt: Model.DateTimeUpdate
+}) {}
+```
+
+Field-by-field:
+
+* **`id: Model.UuidV4Insert(GroupId)`** — branded `string`, generated as `v4` on `Group.insert.makeEffect(...)`. Exposed in `select` / `json` as `GroupId`, absent in `jsonCreate` / `jsonUpdate`. The insert variant's constructor default is `Effect.sync(() => Uuid.v4String())` — clock-not-required.
+* **`name: Schema.NonEmptyString`** — every variant has it; required on insert, still required on update.
+* **`slug: Schema.NonEmptyString.pipe(Model.FieldExcept(["update", "jsonUpdate"]))`** — immutable after creation. Available in `select`, `insert`, `json`, `jsonCreate`, but not in either `update` variant — the repository cannot accidentally overwrite it.
+* **`notes: Schema.NullOr(Schema.String).pipe(Model.FieldOnly(["select", "insert"]))`** — internal, nullable DB-only field. Never appears in any JSON variant — it never leaks to API clients and the codec never expects it from JSON.
+* **`memberCount: Model.Field({ select: Schema.Int, json: Schema.Int })`** — read-only: DB and JSON readable, but absent in `insert` / `update` / `jsonCreate` / `jsonUpdate`. The DB owns the value (default `0`, increments via triggers or application writes behind the repository).
+* **`createdAt: Model.DateTimeInsert`** — set to `now` on insert, present in `select` / `json`, omitted from updates (which use `DateTimeUpdate`).
+* **`updatedAt: Model.DateTimeUpdate`** — set to `now` on insert *and* on every update — present in `select` / `json`, but its insert/update variants auto-populate so callers never provide it manually.
+
+:::tip[Branded IDs are load-bearing]
+`GroupId = Schema.String.pipe(Schema.brand("GroupId"))` makes `GroupId` and `UserId` incompatible despite both being encoded as `string` — `users.getById(aGroupId)` is a type error. This prevents the most common "stringly-typed" bug without runtime cost. Every model with an id should brand (see chapter 20 for the Schema Foundations treatment).
+:::
+
+### Field control primitives
+
+| Primitive | Keeps | Removes | Use when |
+|---|---|---|---|
+| `Model.Field({ select: S, json: S })` | exactly listed variants | all others | read-only fields (`memberCount`) |
+| `Model.FieldExcept(["update","jsonUpdate"])` | all except named | named variants | immutable after creation (`slug`, `createdAt`) |
+| `Model.FieldOnly(["select","insert"])` | exactly named | all others | internal DB-only fields (`notes`) |
+| `Model.GeneratedByDb(S)` | `select` + `json` | `insert` / `update` + json writes | auto-increment PKs |
+| `Model.GeneratedByApp(S)` | `select` / `insert` / `update` / `json` | json writes | app-generated but client-invisible (`memberCount` when app owns it) |
+| `Model.Sensitive(S)` | `select` / `insert` / `update` | `json*` all | passwords, internal tokens |
+| `Model.FieldOption(S)` | wraps field with `Option` handling | — | optional keys across all variants |
+
+All are verified in `packages/effect/src/unstable/schema/Model.ts`. `FieldExcept` / `FieldOnly` accept any subset of the six variant names — the depleted variant omits the key entirely, so codecs and `insert.makeEffect` never expect it.
+
+### `DateTime` and `Uuid` field helpers
+
+```ts
+Model.DateTimeInsert          // auto-now on insert (string encoding, select + insert + json)
+Model.DateTimeUpdate          // auto-now on insert & update (string encoding)
+Model.DateTimeInsertFromDate  // same, but Date encoding for DB (SQLite TEXT vs pg DATE distinction)
+Model.Date                          // DateTime.Utc as YYYY-MM-DD
+Model.UuidV4Insert(Brand)     // branded string UUID v4, generated on insert
+Model.UuidV7Insert(Brand)     // branded string UUID v7 (time-ordered) — via Effect.clock for v7
+Model.UuidV4BytesInsert(Brand)// branded Uint8Array UUID v4
+```
+
+`v7` is monotonic-ish and sorts by creation time — prefer it for clustered primary keys when ordering by creation time is hot-path. `v4` is fully random, friendlier for scatter.
+
+## The `sql` tag and `SqlClient`
+
+The `SqlClient.SqlClient` service exposes a **tagged-template** query constructor. Interpolation is parameterization — not string concatenation:
+
+```ts
+import { SqlClient } from "effect/unstable/sql"
+
+const findByName = Effect.fn("findByName")(function* (name: string) {
+  const sql = yield* SqlClient.SqlClient
+  // `name` becomes a bound parameter, not an interpolated literal.
+  // The driver translates `${name}` to `$1` (pg) or `?` (sqlite) internally.
+  const rows = yield* sql`SELECT * FROM groups WHERE name = ${name}`
+  return rows
+})
+```
+
+:::caution[SQL injection safety is structural]
+`sql` is *not* `String.raw` — the tag builds a `Statement` AST with text fragments and separately-held parameter values. There is no string in which injection could occur, even when you interpolate table names by quoting — use `sql.identifier` helpers for identifiers when you must, never raw interpolation for them. `sql` plus `SqlSchema` (below) is the complete boundary: parameterization + typed decoding, both enforced.
+:::
+
+Streaming large result sets uses `SqlStream`:
+
+```ts
+import { SqlStream } from "effect/unstable/sql"
+
+const streamAll = (sql: SqlClient.SqlClient) =>
+  sql`SELECT * FROM groups ORDER BY createdAt`.pipe(
+    SqlStream.stream, // Stream<Group, SqlError>
+    Stream.tap((row) => Effect.log(`group ${row.slug}`))
+  )
+```
+
+But when the domain model exists, `SqlModel` / `SqlSchema` subsume the raw decode — prefer them.
+
+## Driver layers
+
+One line chooses the database; everything else stays identical:
+
+```ts
+// SQLite — tests, prototypes, single-node services
+import { SqliteClient } from "@effect/sql-sqlite-node"
+const SqlLayer = SqliteClient.layer({ filename: ":memory:" })
+const SqlLayerFile = SqliteClient.layer({ filename: "./app.db" })
+
+// Postgres — production
+import { PgClient } from "@effect/sql-pg"
+const SqlLayerPg = PgClient.layer({
+  host: "localhost",
+  port: 5432,
+  database: "acme",
+  username: "acme",
+  password: Redacted.make("secret")
+})
+// constructor variants also include `connectionString`, SSL, pool sizes —
+// driver README is authoritative; the SqlClient contract is stable across them.
+```
+
+| Driver package | Migrator | Client |
+|---|---|---|
+| `@effect/sql-sqlite-node` | `SqliteMigrator` | `SqliteClient` |
+| `@effect/sql-sqlite-bun` | `SqliteMigrator` | `SqliteClient` |
+| `@effect/sql-pg` | `PgMigrator` | `PgClient` |
+| `@effect/sql-mysql2` | `MySqlMigrator` | `MysqlClient` |
+
+`SqlClient.SqlClient` is a single `Context.Service` key shared across drivers — provide whichever one matches the driver, and dependent services (`SqlModel`, `SqlSchema` helpers) resolve it without change.
+
+## Migrations
+
+Migrations are effects keyed by `"<id>_<name>"`, run once in lexicographic `id` order. The loader decides where migration code lives:
+
+```ts title="src/migrations.ts"
+import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node"
+import { Effect, Layer } from "effect"
+import { SqlClient } from "effect/unstable/sql"
+
+const SqlLayer = SqliteClient.layer({ filename: ":memory:" })
+
+// tests / single-file examples: inline record
+const MigratorLayer = SqliteMigrator.layer({
+  loader: SqliteMigrator.fromRecord({
+    "0001_create_groups": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`
+        CREATE TABLE groups (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          slug TEXT NOT NULL,
+          notes TEXT,
+          memberCount INTEGER NOT NULL DEFAULT 0,
+          createdAt TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `
+    })
+  })
+})
+
+// production: one file per migration on disk
+// import { NodeFileSystem } from "@effect/platform-node"
+// const MigratorLayerProd = SqliteMigrator.layer({
+//   loader: SqliteMigrator.fromFileSystem({ path: "./migrations" })
+// })
+
+const SqlLive = MigratorLayer.pipe(Layer.provideMerge(SqlLayer))
+```
+
+| Loader | When to use |
+|---|---|
+| `Migrator.fromRecord({ "0001_...": effect, ... })` | tests, examples, apps with few migrations kept co-located |
+| `Migrator.fromFileSystem({ path })` (+ `NodeFileSystem`) | production — one `<id>_<name>.sql` or `.ts` per migration file; `SqliteMigrator` watches the directory for new ids |
+
+Conventions that matter:
+
+* **Lexicographic order = execution order.** Use zero-padded numeric prefixes (`0001`, `0002`, …) with a deterministic width. The migrator creates a `__migrations` tracking table and skips already-run ids — re-runs are idempotent.
+* **`Layer.provideMerge(SqlLayer)` keeps the client visible.** Compare `Layer.provide` (hides the dependency) vs `provideMerge` (exposes it alongside) from chapter 10 — `SqlLive` uses `provideMerge` so services that depend on `SqlLive` *also* get `SqlClient.SqlClient`; migrations hide no wiring downstream that needs it.
+* **`SqliteMigrator.fromFileSystem`** requires `NodeFileSystem` or the Bun equivalent in the layer graph — pass it via `Layer.provide` when building `MigratorLayerProd`.
+
+## Repository derivation: `SqlModel.makeRepository`
+
+`SqlModel.makeRepository(Model, { tableName, spanPrefix, idColumn })` inspects the `Model.Class` variants and returns typed CRUD operations, each using the appropriate variant's codec for its parameters and rows:
+
+```ts title="src/repository.ts"
+import { SqlClient, SqlModel, SqlSchema } from "effect/unstable/sql"
+import { Effect, Schema } from "effect"
+
+const repo = yield* SqlModel.makeRepository(Group, {
+  tableName: "groups",
+  spanPrefix: "Groups",
+  idColumn: "id"
+})
+
+// derived methods (all verified in SqlModel):
+// repo.insert(InsertVariant)        → Effect<Group, SqlError | SchemaError>
+// repo.update(UpdateVariant)        → Effect<Group, SqlError | SchemaError>
+// repo.findById(id)                 → Effect<Group, NoSuchElementError | SqlError | SchemaError>
+// repo.delete(id)                   → Effect<void, SqlError>
+// repo.findByIdSync(Option)... etc — see repo type for full surface
+```
+
+* `spanPrefix` namespaces every repository operation's span: `"Groups.insert"`, `"Groups.findById"`, visible in traces and `annotateCurrentSpan` overlays.
+* `idColumn` is the column name for `findById` / `delete` — usually `"id"`. Override when the table uses a legacy PK name.
+
+For queries the repository doesn't cover, `SqlSchema` helpers decode arbitrary `sql` tag results through a model variant:
+
+```ts
+import { SqlClient, SqlSchema } from "effect/unstable/sql"
+import { Schema } from "effect"
+
+const listAll = SqlSchema.findAll({
+  Request: Schema.Void,
+  Result: Group,
+  execute: () => sql`SELECT * FROM groups ORDER BY createdAt`
+})
+// listAll: () => Effect<Array<Group>, SqlError | SchemaError>
+
+const searchByName = SqlSchema.findAll({
+  Request: Schema.String,
+  Result: Group,
+  execute: (needle) => {
+    const pattern = `%${needle}%`
+    return sql`SELECT * FROM groups WHERE name LIKE ${pattern}`
+  }
+})
+// searchByName: (string) => Effect<Array<Group>, ...>
+```
+
+`SqlSchema` family (verify in `packages/effect/src/unstable/sql/SqlSchema.ts`):
+
+| Helper | Returns |
+|---|---|
+| `SqlSchema.findAll({ Request, Result, execute })` | `Request → Effect<Array<Result>>` |
+| `SqlSchema.findOne` | `Request → Effect<Option<Result>>` / `NoSuchElement` depending on variant |
+| `SqlSchema.void` | fire-and-forget |
+| `SqlSchema.single` | exactly one row — fail otherwise |
+
+`execute` receives the bound `Request` value — parameterization stays intact even in custom queries.
+
+## Service layer: the `Groups` example end-to-end
+
+The canonical `Groups` service from `ai-docs/src/40_sql/10_basics.ts:85` — four methods, each with a distinct error/lifecycle shape, wrapped with `Effect.fn` names and deliberate `orDie` vs domain mapping:
+
+```ts title="src/groups.ts"
+import { NodeRuntime } from "@effect/platform-node"
+import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node"
+import { Context, Effect, Layer, Schema } from "effect"
+import { Model } from "effect/unstable/schema"
+import { SqlClient, SqlModel, SqlSchema } from "effect/unstable/sql"
+import { Group, GroupId } from "./domain/Group.ts"
+
+// ---- domain error (user-visible) ----
+export class GroupNotFound extends Schema.TaggedError<GroupNotFound>()(
+  "GroupNotFound",
+  { id: GroupId }
+) {}
+
+// ---- driver + migrator (same as above) ----
+const SqlLayer = SqliteClient.layer({ filename: ":memory:" })
+const MigratorLayer = SqliteMigrator.layer({
+  loader: SqliteMigrator.fromRecord({
+    "0001_create_groups": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`CREATE TABLE groups (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT NOT NULL,
+        notes TEXT,
+        memberCount INTEGER NOT NULL DEFAULT 0,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )`
+    })
+  })
+})
+const SqlLive = MigratorLayer.pipe(Layer.provideMerge(SqlLayer))
+
+// ---- service ----
+export class Groups extends Context.Service<Groups, {
+  create(name: string, slug: string): Effect.Effect<Group>
+  rename(id: GroupId, name: string): Effect.Effect<Group, GroupNotFound>
+  findById(id: GroupId): Effect.Effect<Group, GroupNotFound>
+  readonly list: Effect.Effect<Array<Group>>
+}>()("app/Groups") {
+  static readonly layer = Layer.effect(
+    Groups,
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      const repo = yield* SqlModel.makeRepository(Group, {
+        tableName: "groups",
+        spanPrefix: "Groups",
+        idColumn: "id"
+      })
+
+      const listAll = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Group,
+        execute: () => sql`SELECT * FROM groups ORDER BY createdAt`
+      })
+
+      const create = Effect.fn("Groups.create")((name: string, slug: string) =>
+        Group.insert.makeEffect({ name, slug, notes: null }).pipe(
+          Effect.flatMap(repo.insert),
+          Effect.orDie
+        )
+      )
+
+      const rename = Effect.fn("Groups.rename")((id: GroupId, name: string) =>
+        Group.update.makeEffect({ id, name }).pipe(
+          Effect.flatMap(repo.update),
+          Effect.orDie
+        )
+      )
+
+      const findById = Effect.fn("Groups.findById")((id: GroupId) =>
+        repo.findById(id).pipe(
+          Effect.catchTags({
+            NoSuchElementError: () => new GroupNotFound({ id }),
+            SchemaError: Effect.die,
+            SqlError: Effect.die
+          })
+        )
+      )
+
+      const list = listAll().pipe(
+        Effect.orDie,
+        Effect.withSpan("Groups.list")
+      )
+
+      return Groups.of({ create, rename, findById, list })
+    })
+  ).pipe(Layer.provide(SqlLive))
+}
+```
+
+### Reading the error discipline
+
+| Method | Repository error before mapping | Service error after | Strategy |
+|---|---|---|---|
+| `create` | `SqlError \| SchemaError` | `never` (defect) | `Effect.orDie` — unexpected at this boundary |
+| `rename` | same | `never` (defect) | same — caller validates id exists via `findById` first when domain error is needed |
+| `findById` | `NoSuchElementError \| SqlError \| SchemaError` | `GroupNotFound` (domain) vs defect | `catchTags`: absence → domain error, others → `die` |
+| `list` | `SqlError \| SchemaError` | `never` | `orDie` — listing has no expected domain failure |
+
+The split mirrors the HTTP chapter's `UsersError` / `GroupNotFound` taxonomy: existence checks deserve a typed error the caller can branch on; storage/encoding breakage is a defect that should crash noisily and alert.
+
+:::note[`makeEffect` vs `make` and the `TestClock`]
+`Group.insert.makeEffect({ name, slug, notes })` is preferred over `make` because `UuidV4Insert` / `DateTimeInsert` defaults that involve `Effect.clock` (notably `UuidV7Insert`) run as effects — `makeEffect` threads them through the `TestClock` so deterministic tests (`TestClock.setTime`) control generated ids/timestamps. `make` works for `v4` / string-encoded timestamps but blocks clock injection.
+:::
+
+:::caution[`orDie` narrows `E`, it does not erase `Cause`]
+`Effect.orDie` turns `E` into a defect held in `Cause.Die`. Operators like `Effect.catch` won't see it; only `Catch.Defect` / `Exit`-level handlers do. Reach for `orDie` at repository edges where "database is unreachable" is genuinely unrecoverable for that service; keep callers like `HttpApiBuilder` responsible for turning defects into `500` via the runtime (which chapter 24's `handleAll` already does for unhandled reasons).
+:::
+
+### Split pattern: `layerNoDeps` / `layer` / `layerMemory`
+
+The canonical three-layer shape from chapter 10 appears here too — the `Users` service in `ai-docs/src/51_http-server/fixtures/server/Users.ts:37` demonstrates it with a fully fleshed SQL variant:
+
+```ts
+export class Users extends Context.Service<Users, {/* ... */}>()("acme/Users") {
+  // raw derivation — requires SqlClient (satisfied by SqlLive)
+  static readonly layerNoDeps = Layer.effect(
+    Users,
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      const repo = yield* SqlModel.makeRepository(User, { tableName: "users", spanPrefix: "Users", idColumn: "id" })
+      // ... listAll, searchUsers, list/getById/create/update methods ...
+      return Users.of({ list, getById, create, update })
+    })
+  )
+
+  // production: bakes in SqlLive → requires nothing
+  static readonly layer: Layer.Layer<Users> = this.layerNoDeps.pipe(
+    Layer.provide(MigratorLayer.pipe(Layer.provideMerge(SqlLayer))),
+    Layer.orDie
+  )
+
+  // tests: in-memory Map — no SQL at all
+  static readonly layerMemory = Layer.effect(
+    Users,
+    Effect.gen(function* () {
+      const users = new Map<UserId, User>()
+      const makeUser = (input: typeof User.jsonCreate.Type) =>
+        User.insert.makeEffect(input).pipe(Effect.map((u) => new User(u)), Effect.orDie)
+      const admin = yield* makeUser({ name: "Admin", email: "admin@acme.dev" })
+      users.set(admin.id, admin)
+
+      const list = Effect.fn("Users.list")(function* (search: string | undefined) {
+        // ...filter on users.values()...
+      })
+      // ... getById / create / update against the Map ...
+      return Users.of({ list, getById, create, update })
+    })
+  )
+}
+```
+
+Why three, when does each win:
+
+| Layer | Requires | Provides | Use |
+|---|---|---|---|
+| `layerNoDeps` | `SqlClient.SqlClient` (via `SqlLive` internals) | `Groups` | wiring edge chooses persistence; custom `SqlLayer` injection |
+| `layer` | nothing (hides `SqlLive`) | `Groups` | production entrypoint — one import, done |
+| `layerMemory` | nothing (no DB) | `Groups` | tests + `HttpApiTest` — see chapter 24 fixture `HandlersLayer` |
+
+`Users.layerMemory` in chapter 24 is exactly where HTTP tests avoid the database entirely: `UsersApiHandlersNoDeps.pipe(Layer.provide(Users.layerMemory), Layer.provideMerge(AuthorizationLayer))`.
+
+:::tip[Clock-controlled inserts in tests]
+Because `User.insert.makeEffect` threads through `Effect.clock`, tests using `TestClock` can deterministically freeze `createdAt` / `updatedAt` and still exercise the real repository. With `layerMemory`, this is moot — but swap to `layerNoDeps` + a real `SqlLive` against `:memory:` SQLite and the same property holds.
+:::
+
+## Using the service
+
+```ts
+const program = Effect.gen(function* () {
+  const groups = yield* Groups
+
+  const eng = yield* groups.create("Engineering", "engineering")
+  const design = yield* groups.create("Design", "design")
+
+  yield* groups.rename(design.id, "Product Design")
+
+  const found = yield* groups.findById(eng.id)
+  yield* Effect.log("found group", found)
+
+  const all = yield* groups.list
+  yield* Effect.log(`total groups: ${all.length}`)
+})
+
+program.pipe(Effect.provide(Groups.layer), NodeRuntime.runMain)
+```
+
+Commerce example closer to reality — same repository, more interesting lifecycle:
+
+```ts
+const checkout = Effect.fn("checkout")(function* (groupId: GroupId) {
+  const groups = yield* Groups
+  const group = yield* groups.findById(groupId)   // GroupNotFound is catchable
+  if (group.memberCount <= 0) {
+    // domain guard - still typed, before any writes
+    return yield* Effect.fail(new GroupNotFound({ id: groupId }))
+  }
+  // ...payment, audit ...
+})
+```
+
+## Mermaid: layer wiring
+
+<Mermaid title="Groups layer graph" height={360} code={`
+flowchart TB
+  subgraph SQL["SqlLive (chapter 10 provide vs provideMerge)"]
+    SqlLayer["SqliteClient.layer<br/>filename :memory: / PgClient.layer"]
+    MigLayer["SqliteMigrator.layer<br/>fromRecord 0001_create_groups<br/>vs fromFileSystem prod"]
+    SqlLive["SqlLive = MigratorLayer.pipe<br/>Layer.provideMerge SqlLayer"]
+    SqlLayer --> MigLayer
+    MigLayer --> SqlLive
+  end
+
+  subgraph Model["Domain"]
+    GroupModel["Group extends Model.Class<br/>FieldExcept / FieldOnly / Field<br/>id UuidV4Insert / DateTimeInsert"]
+    GroupErr["GroupNotFound"]
+  end
+
+  subgraph Repo["Repository"]
+    MakeRepo["SqlModel.makeRepository Group<br/>tableName groups spanPrefix Groups"]
+    CustomQ["SqlSchema.findAll listAll<br/>sql SELECT * FROM groups"]
+  end
+
+  subgraph Service["Service"]
+    NoDeps["Groups.layerNoDeps<br/>repo + listAll + Effect.fn methods<br/>orDie vs catchTags"]
+    FullLayer["Groups.layer<br/>NoDeps + SqlLive"]
+    MemLayer["Groups.layerMemory<br/>Map-backed, no SQL"]
+  end
+
+  GroupModel --> MakeRepo
+  MakeRepo --> NoDeps
+  CustomQ --> NoDeps
+  SqlLive --> NoDeps
+  NoDeps --> FullLayer
+  NoDeps -.->|"test"| MemLayer
+  GroupErr -.-> NoDeps
+
+  FullLayer --> App["program.pipe Effect.provide Groups.layer"]
+  MemLayer -.-> TestApp["HttpApiTest layer<br/>chapter 24"]
+`} />
+
+## Real-world extensions
+
+### Transactions, search, and pagination
+
+The repository derivation covers CRUD; `SqlSchema` covers the rest. The `Users` fixture's `searchUsers` shows pattern-parameterized search:
+
+```ts
+const searchUsers = SqlSchema.findAll({
+  Request: Schema.String,
+  Result: User,
+  execute: (search) => {
+    const pattern = `%${search}%`
+    return sql`SELECT * FROM users WHERE name LIKE ${pattern} OR email LIKE ${pattern}`
+  }
+})
+// guarded at the service boundary by domain length validation:
+const list = Effect.fn("Users.list")(function* (search: string | undefined) {
+  if (search === undefined || search.length === 0) return yield* Effect.orDie(listAll())
+  if (search.length < SearchQueryTooShort.minimumLength)
+    return yield* new UsersError({ reason: new SearchQueryTooShort() })
+  yield* Effect.annotateCurrentSpan({ search })
+  return yield* Effect.orDie(searchUsers(search))
+})
+```
+
+Transactions go through `SqlClient` directly — wrap a multi-statement unit in `sql.withTransaction` when you need serializability beyond single-row repo operations. The service method reads the transaction via `SqlClient.SqlClient` exactly like the outer `Effect.gen` does — the driver binds all statements in the closure to the same transactional connection.
+
+### From `:memory:` to production
+
+The only mechanical change between tests and production is the layer argument:
+
+```ts
+// test
+const SqlLayerTest = SqliteClient.layer({ filename: ":memory:" })
+// warm SQLite prod — file + WAL
+const SqlLayerProdSqlite = SqliteClient.layer({ filename: "./data/app.db" })
+// Postgres (pool, SSL, migrations from disk)
+const SqlLayerProdPg = PgClient.layer({ connectionString: process.env.DATABASE_URL! })
+const MigratorLayerProd = PgMigrator.layer({
+  loader: PgMigrator.fromFileSystem({ path: "./migrations" })
+})
+const SqlLiveProd = MigratorLayerProd.pipe(Layer.provideMerge(SqlLayerProdPg))
+```
+
+Everything else — `Group` model, `SqlModel.makeRepository`, service methods, `GroupNotFound` mapping — does not move.
+
+### Observability and spans
+
+Every repository operation and custom `SqlSchema` query is already wrapped in a span via `spanPrefix` and `Effect.fn` names. Layer names show up as `Groups.create`, `Groups.findById`, `Groups.list` with `Effect.annotateCurrentSpan` attributes where you added them:
+
+```ts
+const findById = Effect.fn("Groups.findById")((id: GroupId) =>
+  repo.findById(id).pipe(
+    Effect.catchTags({
+      NoSuchElementError: () => new GroupNotFound({ id }),
+      SchemaError: Effect.die,
+      SqlError: Effect.die
+    })
+  )
+)
+
+const list = listAll().pipe(
+  Effect.orDie,
+  Effect.withSpan("Groups.list") // bare effect — needs explicit span
+)
+```
+
+The span timeline for a `POST /groups` that then does a notification reads: `http.server POST /groups` → `Groups.create` (with `sql` tag's `Groups.insert` child) → downstream `Mailer.send`. No manual instrumentation beyond `Effect.fn` names — tracing from [28 · Observability](/effect-ts/28-observability/) does the rest.
+
+### Testing the persistence layer
+
+`Groups.layerMemory` is the fast path for suites that care about HTTP-or-domain logic, not SQL fidelity. But SQL-specific tests (migrations, constraints, `LIKE` patterns) should run against the real driver on `:memory:`:
+
+```ts title="test/groups-sql.test.ts"
+import { assert, layer } from "@effect/vitest"
+import { Effect } from "effect"
+import { Groups } from "../src/groups.ts"
+
+layer(Groups.layer)("Groups (sql)", (it) => {
+  it.effect("creates and finds a group", () =>
+    Effect.gen(function* () {
+      const groups = yield* Groups
+      const g = yield* groups.create("Eng", "eng")
+      const found = yield* groups.findById(g.id)
+      assert.deepStrictEqual(found.id, g.id)
+      assert.strictEqual(found.slug, "eng")
+    }))
+
+  it.effect("rename does not overwrite slug", () =>
+    Effect.gen(function* () {
+      const groups = yield* Groups
+      const g = yield* groups.create("Design", "design")
+      const renamed = yield* groups.rename(g.id, "Product Design")
+      assert.strictEqual(renamed.slug, "design") // FieldExcept guarantees this
+      assert.strictEqual(renamed.name, "Product Design")
+    }))
+})
+```
+
+Because `Groups.layer` provisions `SqliteClient.layer({ filename: ":memory:" })` per `layer(...)` memoization root, each `describe` block gets an isolated database when using Vitest's per-file `layer`. No tear-down SQL, no global mutation, no flake. Swap to `layerMemory` inside `HttpApiTest` handlers when you want the same service exercised without touching the `:memory:` provider at all — chapter 24's `HandlersLayer` demonstrates that fork.
+
+### Variant derivation under the hood
+
+`Model.Class` delegates to `VariantSchema.make` with `variants: ["select","insert","update","json","jsonCreate","jsonUpdate"]`. Each `Model.Field*` helper builds a `VariantSchema.Field` keyed by variant name; the derived schemas for a model are `Schema.Struct`s filtered by field presence. Verifying variant membership in a REPL catches drift early:
+
+```ts
+import { Group } from "./domain/Group.ts"
+
+Group.fields       // VariantSchema field map — every declared field + its Field* wrapper
+Group.insert.fields // Schema.Struct.Fields for the insert variant — id absent? no — UuidV4Insert defaults it
+Schema.isSchema(Group)         // true
+Schema.isSchema(Group.json)    // true
+Schema.isSchema(Group.jsonCreate) // true
+```
+
+If you add a field but forget to place it with `Field*`, it appears in all six variants — intentionally visible so audits are easy. Remove it from intended variants explicitly.
+
+## Pitfalls
+
+| Pitfall | Symptom | Fix |
+|---|---|---|
+| `Model.FieldOnly(["select","insert"])` leaving a secret out of `jsonCreate` but still expecting it from JSON in a manual decode | `SchemaError` at the API boundary — field missing from encoded `jsonCreate` | internal-only fields should be `FieldOnly(select, insert)` and never referenced by `HttpApi` payload schemas |
+| `Group.insert.make` instead of `makeEffect` with `UuidV7Insert` | non-deterministic `createdAt` in `TestClock` tests | use `makeEffect` when any field involves `Effect.clock` (v7, timestamp defaults) |
+| `Layer.provide(SqlLive)` vs `provideMerge` | `Groups.layerNoDeps` requires `SqlClient`, but nothing provides it after a `provide` hiding it | `provideMerge` when the service and its consumers must both see `SqlClient`; `provide` when hiding is intentional |
+| Lexicographically unordered migration ids (`1_...`, `10_...`, `2_...`) | `10_...` runs before `2_...` | zero-pad id prefix (`0001`, `0002`, …) |
+| `schemaBodyJson` on a non-JSON response from `HttpApi` | decode rejects because body was text/csv | choose success variant via `HttpApiSchema.asText` — see chapter 24 |
+| Reusing `layerMemory` Map without `Layer.fresh` across `it` blocks | test pollution — groups created in one test leak into the next | construct per-test or `Layer.fresh` (chapter 10) |
+| `sql` template with string-interpolated table name | injection vector or `SqlError` on reserved keywords | use `sql.identifier("tableName")` helper, never raw `${table}` |
+
+## Next
+
+<LinkCard
+  title="26 · Batching & Caching — RequestResolver"
+  description="Kill N+1 at the data-source boundary — Request.Class, batched resolvers, deduplication, parent-span tracing, and when the resolver cache is enough vs the full Cache/RcMap layer."
+  href="/effect-ts/26-batching-caching/"
+/>

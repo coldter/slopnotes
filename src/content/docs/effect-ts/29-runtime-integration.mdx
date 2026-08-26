@@ -1,0 +1,536 @@
+---
+title: Running Effect — Runtimes & Integration
+description: From layers to running processes — Layer-as-program and Layer.launch, NodeRuntime and BunRuntime runMain with signal handling and exit codes, embedding via runPromise/runSync, the ManagedRuntime bridge with a shared memo map, Hono and alternative framework walkthroughs, config-driven layer selection, and the "observability last" wiring rule.
+sidebar:
+  order: 29
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+An `Effect<A, E, R>` is a description. A `Layer<ROut, E, RIn>` is a memoized constructor from `Context`s to `Context`s. Neither runs by itself. This chapter closes the loop: how descriptions and graphs become a live process, on what host, with what lifetime, and alongside what imperative code that was not written in Effect.
+
+## The layer-as-program model
+
+Most serious Effect programs do not have a single `Effect` main. They have a **layer graph** main. The graph owns pools, transports, worker fibers, caches, everything that has a lifetime. The program *is* the graph running.
+
+Two placements:
+
+| Shape | Holds | Use when |
+|---|---|---|
+| One long-running `Effect<never>` (blocks forever) | the single effect owns lifetime | a script, a one-shot migration |
+| `Layer<ROut, E, RIn>` + `Layer.launch` | the layer's scope owns lifetime | servers, workers, most apps |
+
+`Layer.launch(layer)` (`effect/src/Layer.ts` via `ai-docs/src/01_effect/06_running/20_layer-launch.ts`) builds `layer`, holds its scope open, and blocks as `Effect<never>` (`Effect.never`). When the fiber running `launch` is interrupted, the scope closes and every `acquireRelease` finalizer, every `forkScoped` worker, runs in reverse acquisition order.
+
+Two forms — discarding vs exposing services:
+
+```ts
+import { Context, Effect, Layer } from "effect"
+import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
+import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
+import { createServer } from "node:http"
+
+// Build routes as a layer-aware router definition:
+export const HealthRoutes = HttpRouter.use(Effect.fn(function* (router) {
+  yield* router.add("GET", "/health",  Effect.succeed(HttpServerResponse.text("ok")))
+  yield* router.add("GET", "/healthz", Effect.succeed(HttpServerResponse.text("ok")))
+}))
+
+// Turn routes into a server layer — provides HttpServer via Node's createServer:
+export const HttpServerLive = HttpRouter.serve(HealthRoutes).pipe(
+  Layer.provide(NodeHttpServer.layer(createServer, { port: 3000 }))
+)
+
+// Long-running entry — blocks forever, like Effect.never, holding HttpServerLive open
+export const main = Layer.launch(HttpServerLive)
+
+NodeRuntime.runMain(main)
+```
+
+Contrast with `Layer.effectDiscard` for background workers:
+
+```ts
+import { Effect, Layer } from "effect"
+
+const Worker = Layer.effectDiscard(Effect.gen(function* () {
+  yield* Effect.logInfo("Starting worker...")
+  yield* Effect.forkScoped(Effect.gen(function* () {
+    while (true) {
+      yield* Effect.logInfo("Working...")
+      yield* Effect.sleep("1 second")
+    }
+  }))
+}))
+
+// Still launched the same way:
+Layer.launch(Worker).pipe(NodeRuntime.runMain)
+```
+
+`Layer.effectDiscard(effect)` provides *no* service; it exists for effects that only need to run while the app lives. `Layer.effectContext(effect)` provides an entire `Context` built by one effect. `Layer.effect(service, effect)` provides a single keyed service. All three are scoped and interruptible when `launch` shuts down.
+
+:::tip[Prefer `Layer.launch` over hand-rolled `Effect.never`]
+`Layer.launch(layer)` is semantically `Layer.build(layer) + Scope + Effect.never` with supervision and typed errors preserved. Writing `Effect.never.pipe(Effect.provide(layer))` by hand loses the error typing and makes shutdown ordering implicit. Use `launch`.
+:::
+
+## `NodeRuntime.runMain` and `BunRuntime.runMain`
+
+The runtime entrypoint for Node and Bun lives in platform packages, not core. Verified in `ai-docs/src/01_effect/06_running/10_run-main.ts`:
+
+```ts
+import { BunRuntime } from "@effect/platform-bun"
+import { NodeRuntime } from "@effect/platform-node"
+import { Effect, Layer } from "effect"
+
+const Worker = Layer.effectDiscard(Effect.gen(function* () {
+  yield* Effect.logInfo("Starting worker...")
+  yield* Effect.forkScoped(Effect.gen(function* () {
+    while (true) {
+      yield* Effect.logInfo("Working...")
+      yield* Effect.sleep("1 second")
+    }
+  }))
+}))
+
+const program = Layer.launch(Worker)
+
+// runMain: signal handling + keep-alive + exit codes
+NodeRuntime.runMain(program, { disableErrorReporting: true })
+
+// Bun has the same API shape:
+BunRuntime.runMain(program, { disableErrorReporting: true })
+```
+
+What `runMain` does for you:
+
+| Responsibility | Detail |
+|---|---|
+| **Keep-alive** | Installs a reference-counted timer while the main fiber lives. Background `forkScoped` fibers keep the process open even when the launching fiber has already "completed" logically. Clears when the fiber settles. Replaces v3's "must call runMain to stay alive" manual rule — core now has its own keep-alive, `runMain` just adds host wiring. |
+| **Signal handling** | Traps `SIGINT`/`SIGTERM`, interrupts the main fiber, closes the scope, waits for finalizers. Shutdown is typed and interruptible. |
+| **Exit codes** | Maps `Exit` to `process.exitCode`: `Success` → `0`, typed `Failure(E)` → reports `E` then `1`, `Die`/`Interrupt` → `1` with `Cause` formatting. `disableErrorReporting: true` opts out of default pretty reporting if you centralize it. |
+| **Pretty errors** | On failure prints `Cause` with annotated stack traces (synthetic frames from `Effect.fn("name")`). |
+
+`NodeRuntime.runMain` vs `BunRuntime.runMain` (`@effect/platform-node` vs `@effect/platform-bun`) differ only in the host imports (`createServer`, file system, etc.) — the API surface is the same.
+
+:::note[Keep-alive lives in core, not Node]
+From `effect/src/internal/opSupervision.ts` and chapter 13's note: core runtime now installs a keep-alive interval while any fiber runs. So `Effect.runPromise(Effect.forkChild(backgroundLoop))` does not exit silently as in v3 — the loop keeps the process open until interrupted. `runMain` adds signal handling on top of that; `runPromise` leaves signal handling to you.
+:::
+
+### Bare `Effect.run*` family — revisiting embedding tools
+
+When you own the process fully, prefer `runMain` + `Layer.launch`. When embedding Effect inside another host, you reach for the lower primitives summarized here (from chapter 1 and chapter 6):
+
+| API | Type | Host keeps-alive? | When to use |
+|---|---|---|---|
+| `NodeRuntime.runMain(effect)` | `Effect<void, E>` → process, signals | host + Effect | CLI or server entrypoints |
+| `Effect.runPromise(effect)` | `Promise<A>` | caller's responsibility | bridge to async hosts (Hono, Express) |
+| `Effect.runPromiseExit(effect)` | `Promise<Exit<A, E>>` | caller | when you need to branch on failure without throwing |
+| `Effect.runSync(effect)` | `A` (or throws `E`) | caller | sync edges — validation at the HTTP boundary |
+| `Effect.runSyncExit(effect)` | `Exit<A, E>` | caller | sync branch without throw |
+| `Effect.runCallback(effect, cb)` | `void` | caller | callback-shaped APIs (`setTimeout` consumers, worker queue acks) |
+| `Effect.runFork(effect)` | `Fiber<A, E>` | core keep-alive | you manage the fiber explicitly |
+
+`runSync` variants require the effect to be synchronous (no `sleep`, no `promise`), otherwise they throw/return a die.
+
+## The `ManagedRuntime` bridge — Effect inside imperative frameworks
+
+The canonical need: you already have a framework (Hono, Express, Fastify, Koa), but you want domain logic in `Context.Service` + `Layer` while handlers stay thin adapters. `ManagedRuntime` (`effect/src/ManagedRuntime.ts:231`) is the bridge: it builds a layer once, keeps its services and scope alive, and exposes `runPromise`/`runSync`/`runCallback` methods that automatically provide the built context.
+
+### The shared `memoMap` trick
+
+Verified in `ai-docs/src/04_integration/10_managed-runtime.ts:60`:
+
+```ts
+import { Layer, ManagedRuntime } from "effect"
+import { TodoRepo } from "./todo-repo.ts"
+
+// One global memo map so memoization works across ManagedRuntime instances.
+export const appMemoMap = Layer.makeMemoMapUnsafe()
+
+export const runtime = ManagedRuntime.make(TodoRepo.layer, { memoMap: appMemoMap })
+```
+
+`Layer.makeMemoMapUnsafe()` creates an ambient memoization cache. Passing the same `memoMap` to multiple `ManagedRuntime.make` calls (or to `Effect.provide` at various sites) ensures the *same* `SqlClient` pool, the *same* cache, etc. are shared — not rebuilt per runtime. Without it v4's cross-provide memoization still shares within one runtime; the global map extends sharing *across* runtimes.
+
+Disposal on shutdown:
+
+```ts
+const shutdown = () => { void runtime.dispose() }
+process.once("SIGINT", shutdown)
+process.once("SIGTERM", shutdown)
+```
+
+`dispose()` closes the scope, runs finalizers (pools, file handles), and clears keep-alive.
+
+### Hono walkthrough
+
+Source: `ai-docs/src/04_integration/10_managed-runtime.ts`:
+
+```ts
+import { Context, Effect, Layer, ManagedRuntime, Ref, Schema } from "effect"
+import { Hono } from "hono"
+
+class Todo extends Schema.Class<Todo>("Todo")({
+  id: Schema.Int,
+  title: Schema.String,
+  completed: Schema.Boolean
+}) {}
+
+class CreateTodoPayload extends Schema.Class<CreateTodoPayload>("CreateTodoPayload")({
+  title: Schema.String
+}) {}
+
+class TodoNotFound extends Schema.TaggedError<TodoNotFound>()("TodoNotFound", {
+  id: Schema.Int
+}) {}
+
+export class TodoRepo extends Context.Service<TodoRepo, {
+  readonly getAll: Effect.Effect<ReadonlyArray<Todo>>
+  getById(id: number): Effect.Effect<Todo, TodoNotFound>
+  create(payload: CreateTodoPayload): Effect.Effect<Todo>
+}>()("app/TodoRepo") {
+  static readonly layer = Layer.effect(
+    TodoRepo,
+    Effect.gen(function* () {
+      const store = new Map<number, Todo>()
+      const nextId = yield* Ref.make(1)
+
+      const getAll = Effect.gen(function* () {
+        return Array.from(store.values())
+      }).pipe(Effect.withSpan("TodoRepo.getAll"))
+
+      const getById = Effect.fn("TodoRepo.getById")(function* (id: number) {
+        const todo = store.get(id)
+        if (todo === undefined) return yield* new TodoNotFound({ id })
+        return todo
+      })
+
+      const create = Effect.fn("TodoRepo.create")(function* (payload: CreateTodoPayload) {
+        const id = yield* Ref.getAndUpdate(nextId, (c) => c + 1)
+        const todo = new Todo({ id, title: payload.title, completed: false })
+        store.set(id, todo)
+        return todo
+      })
+
+      return TodoRepo.of({ getAll, getById, create })
+    })
+  )
+}
+
+// Global memo map + runtime
+export const appMemoMap = Layer.makeMemoMapUnsafe()
+export const runtime = ManagedRuntime.make(TodoRepo.layer, { memoMap: appMemoMap })
+
+export const app = new Hono()
+
+// List
+app.get("/todos", async (context) => {
+  const todos = await runtime.runPromise(
+    TodoRepo.use((repo) => repo.getAll)
+  )
+  return context.json(todos)
+})
+
+// Get by id — sync validation at the edge, typed error → 404 mapping
+app.get("/todos/:id", async (context) => {
+  const id = Number(context.req.param("id"))
+  if (!Number.isFinite(id)) {
+    return context.json({ message: "Todo id must be a number" }, 400)
+  }
+
+  const todo = await runtime.runPromise(
+    TodoRepo.use((repo) => repo.getById(id)).pipe(
+      Effect.catchTag("TodoNotFound", () => Effect.succeed(null))
+    )
+  )
+
+  if (todo === null) return context.json({ message: "Todo not found" }, 404)
+  return context.json(todo)
+})
+
+// Create — schema sync validation, then effectful create
+const decodeCreateTodoPayload = Schema.decodeUnknownSync(CreateTodoPayload)
+
+app.post("/todos", async (context) => {
+  const body = await context.req.json()
+  let payload: CreateTodoPayload
+  try {
+    payload = decodeCreateTodoPayload(body)
+  } catch {
+    return context.json({ message: "Invalid request body" }, 400)
+  }
+
+  const todo = await runtime.runPromise(
+    TodoRepo.use((repo) => repo.create(payload))
+  )
+  return context.json(todo, 201)
+})
+
+// Disposal
+process.once("SIGINT", () => { void runtime.dispose() })
+process.once("SIGTERM", () => { void runtime.dispose() })
+```
+
+Dissecting the boundary:
+
+| HTTP → Effect edge | What happens | Why this way |
+|---|---|---|
+| Param/body parsing | `Schema.decodeUnknownSync(Class)` inside `try/catch` → `400` | sync validation before entering Effect — no wasted scheduler hop |
+| Missing id → NaN → `400` | imperative `if (!Number.isFinite)` check | cheapest failure out; no typed error needed |
+| `TodoRepo.use(repo => repo.getById(id))` | `Context.Service.use` is `Effect.flatMap` sugar | reads the service and calls it in one step |
+| `Effect.catchTag("TodoNotFound", … -> succeed(null))` + imperative `if (null) → 404` | typed error mapped to HTTP status | domain `E` never leaks through `runPromise` — you choose the code |
+| `await runtime.runPromise(effect)` | resumes Effect's `E` as rejected promise if uncaught | unmapped failures become 500s automatically (or catch higher) |
+
+:::tip[Sync validation at the edge]
+`Schema.decodeUnknownSync` (throws on failure) is the right call in the imperative preamble of a handler. Do not wrap initial parsing in `Effect.try` if you are already in an `async` handler — `try/catch` mapping to `400` is lighter. Once you cross `runtime.runPromise`, stay in Effect and map typed errors with `catchTag`/`catchTags`.
+:::
+
+### Alternative embeddings
+
+The same `ManagedRuntime` pattern works mechanically for any style:
+
+**Express (callback-imperative):**
+
+```ts
+import express from "express"
+const app = express()
+app.use(express.json())
+
+app.get("/todos", async (req, res) => {
+  const todos = await runtime.runPromise(TodoRepo.use((repo) => repo.getAll))
+  res.json(todos)
+})
+
+// For middleware that must be sync:
+app.use((req, _res, next) => {
+  // Synchronous effect — no sleep/promise inside
+  const validated = runtime.runSync(validateApiKey(req.headers["x-api-key"]))
+  if (!validated) throw new Error("unauthorized")
+  next()
+})
+```
+
+**Fastify (decorators):**
+
+```ts
+import Fastify from "fastify"
+const app = Fastify()
+
+app.get("/todos", async () => {
+  return runtime.runPromise(TodoRepo.use((repo) => repo.getAll))
+})
+```
+
+**Worker queues / callbacks via `runCallback`:**
+
+```ts
+// ai-docs note: use runCallback for callback-only APIs
+queue.consume(async (msg, ack, nack) => {
+  runtime.runCallback(
+    TodoRepo.use((repo) => repo.create(Schema.decodeUnknownSync(CreateTodoPayload)(msg.json()))),
+    {
+      onSuccess: () => ack(),
+      onFailure: (error) => nack(error),
+      onExit: (exit) => console.log("exit", exit)
+    }
+  )
+})
+
+// Or suspend an effect from the queue library inside Effect and run it once:
+const awaitQueue = Effect.async<void>((cb) => {
+  queue.on("message", (m) => cb(Effect.succeed(m)))
+})
+```
+
+| Host shape | Reach for | Signature |
+|---|---|---|
+| `async (req, res) => …` | `runtime.runPromise(effect)` | `(Effect<A, E>) => Promise<A>` |
+| `(req, res, next) => void` sync | `runtime.runSync(effect)` | `(Effect<A, E>) => A` |
+| `(msg, cb) => void` | `runtime.runCallback(effect, { onSuccess, onFailure })` | callback bridging |
+| Background loop you manage | `ManagedRuntime.make(...).runFork(effect)` or `Layer.launch` | Fiber handle + scope |
+
+:::caution[One runtime per app, one memoMap per runtime]
+Do not create a new `ManagedRuntime.make(layer)` per request — you would rebuild pools per request and leak scopes. Create one `runtime` at module init, share it, and `dispose()` once on shutdown. If you need per-request services (request id, tenant override), provide them *around* the per-request effect (`Effect.provideService(requestEffect, RequestId, id).pipe(runtime.runPromise)`) while the base runtime stays shared.
+:::
+
+### Error mapping at the boundary
+
+The bridge is also where typed `E` becomes an HTTP status. The Hono walkthrough above used two idioms — keep them consistent across a codebase:
+
+```ts
+import { Effect, Schema } from "effect"
+
+class NotFound extends Schema.TaggedError<NotFound>()("NotFound", { id: Schema.Number }) {}
+class ValidationError extends Schema.TaggedError<ValidationError>()("ValidationError", { reason: Schema.String }) {}
+
+// Inside an async handler:
+const result = await runtime.runPromise(
+  TodoRepo.use((repo) => repo.getById(id)).pipe(
+    Effect.catchAll((error) => {
+      // Branch once, with exhaustiveness checked by _tag:
+      switch (error._tag) {
+        case "NotFound": return Effect.succeed(null as const)
+        case "ValidationError": return Effect.fail(error) // let outer catch handle 400
+      }
+    })
+  )
+)
+// null → 404, ValidationError → 400 via outer handler, success → 200
+```
+
+For whole-effect mapping, `Effect.catchTag`/`catchTags` keep per-tag handlers separate and preserve unused branches in `E`. For exhaustive folding into a single `Exit`, `Effect.exit` + `Exit.match` in the handler also works — but `catchTag` is the idiomatic edge translator.
+
+### Shutdown and resource finalization
+
+Both entrypoints — `runMain` and `ManagedRuntime` — close the same scope graph:
+
+```ts
+// runMain path — signal handling built in:
+Layer.launch(HttpServerLive).pipe(NodeRuntime.runMain)
+// SIGINT → interrupt main fiber → close scope (reverse acquire order) → exit 0 or 1
+
+// ManagedRuntime path — you wire signals yourself:
+const runtime = ManagedRuntime.make(HttpServerLive, { memoMap: appMemoMap })
+process.once("SIGINT", () => { void runtime.dispose() })
+process.once("SIGTERM", () => { void runtime.dispose() })
+// dispose() → interrupt internal fiber → close scope → clear keep-alive
+```
+
+Finalizers installed via `Effect.acquireRelease` and `Layer.effect` are LIFO per scope. Worker fibers `forkScoped` into the layer scope are interrupted before finalizers. Observability flushers (`Logger.batched` background fiber, OTLP flusher) are themselves scoped — they get a final `flush` on the way out.
+
+## Config-driven layer selection
+
+Chapter 10 introduced `Layer.unwrap` and `Layer.suspend` for branching. Chapter 11 threaded `Config` through providers. Here they compose to pick implementations at startup:
+
+```ts
+import { Config, Effect, Layer } from "effect"
+import { Cache } from "./cache.ts"
+
+const CacheLayer = Layer.unwrap(
+  Effect.map(
+    Config.String("CACHE_BACKEND").pipe(Config.withDefault("memory")),
+    (backend) => backend === "redis" ? RedisCache.layer : InMemoryCache.layer
+  )
+)
+
+// More elaborate: choose database driver + observability in one sweep
+const DbLayer = Layer.unwrap(Effect.gen(function* () {
+  const driver = yield* Config.String("DB_DRIVER").pipe(Config.withDefault("memory"))
+  if (driver === "postgres") return PgClient.layer({ url: yield* Config.String("DATABASE_URL") })
+  if (driver === "sqlite") return SqliteClient.layer({ filename: yield* Config.String("DB_PATH") })
+  return InMemoryDb.layer
+}))
+```
+
+This composes with observability-last wiring because the outer `Layer.unwrap` effect is itself a layer — providing `ObservabilityLayer` outermost still wraps it.
+
+:::note[`Layer.suspend` vs `Layer.unwrap`]
+`Layer.suspend(() => cond ? a : b)` defers *layer* choice until build time without an effect (no `R` needed). `Layer.unwrap(Effect<Layer>)` defers choice based on *running an effect* (e.g., reading `Config`). Use `suspend` for cheap feature flags, `unwrap` when the choice must read config or a service.
+:::
+
+## Putting observability last — revisited
+
+From chapter 27, the canonical assembly applies here too. Build the graph inward, provide observability outermost:
+
+```ts
+import { Layer } from "effect"
+import { NodeRuntime } from "@effect/platform-node"
+import { ObservabilityLayer } from "./observability.ts"
+import { DbLayer, CacheLayer } from "./layers.ts"
+import { HttpServerLive } from "./http.ts"
+
+const AppLayer = HttpServerLive.pipe(
+  Layer.provide(CacheLayer),
+  Layer.provide(DbLayer)
+)
+
+// Observability covers the entire graph — including DbLayer's spans
+const Main = AppLayer.pipe(Layer.provide(ObservabilityLayer))
+
+Layer.launch(Main).pipe(NodeRuntime.runMain)
+```
+
+`ObservabilityLayer` itself is `Layer.merge(OtlpTracingLayer, OtlpLoggingLayer).pipe(Layer.provide(OtlpSerialization.layerJson), Layer.provide(FetchHttpClient.layer))` — two OTLP exporters sharing serialization + HTTP client. Providing it last guarantees `Effect.fn("…")` spans from `Cache` and `Db` have a tracer to record to.
+
+:::caution[Do not interleave provides]
+The wrong order:
+
+```ts
+const Bad = HttpServerLive.pipe(
+  Layer.provide(ObservabilityLayer), // tracing not yet covering DbLayer
+  Layer.provide(DbLayer)
+)
+// Db spans are recordings to nowhere
+```
+
+Reads left-to-right as "provide `App` with …" are easy to get backwards (chapter 10's dual caution). Remember: receiver is consumer, argument is dependency — `app.pipe(Layer.provide(dep))` means `dep` builds first and feeds `app`. Put observability `provide` last and you cannot be wrong.
+:::
+
+## Micro-architecture — who owns what
+
+<Mermaid title="Micro-architecture: Effect core → platform → imperative host" height={460} code={`
+flowchart TB
+  subgraph core["Effect core (effect)"]
+    E["Effect / Context / Layer<br/>pure descriptions + memo graph"]
+    Scope["Scope & finalizers<br/>acquireRelease"]
+    Fiber["Fibers & concurrency<br/>fork/race/timeout"]
+    Obs["Observability refs<br/>Logger / Tracer / Metric"]
+  end
+  subgraph platform["Platform layers (effects)"]
+    File["FileSystem / Path / Terminal"]
+    Http["HttpServer / HttpApiBuilder<br/>HttpClient"]
+    Sql["SqlClient / Migrator / SqlModel"]
+    Otlp["OtlpTracer / OtlpLogger<br/>+ Serialization + HttpClient"]
+  end
+  subgraph runtime["Runtime boundary"]
+    Launch["Layer.launch(MainLayer)"]
+    RunMain["NodeRuntime / BunRuntime<br/>.runMain"]
+    Managed["ManagedRuntime.make<br/>(appMemoMap, dispose)"]
+  end
+  subgraph imperative["Imperative world (imperative hosts)"]
+    Hono["Hono / Express / Fastify / Koa<br/>async handlers, callbacks"]
+    Workers["Worker queues / CRON<br/>callback acks"]
+    Process["process SIGINT/SIGTERM<br/>exit codes"]
+  end
+  E --> Scope --> Fiber --> Obs
+  Obs -.->|"Effect.provide / Layer.provide"| platform
+  platform --> Launch --> RunMain --> Process
+  platform -.->|"shared memoMap"| Managed -.->|"runPromise / runSync / runCallback"| Hono
+  Managed -.-> Workers
+  Obs -.->|"outermost Layer.provide"| Otlp
+  RunMain -.->|"interrupts on signal<br/>runs finalizers"| Scope
+  style core fill:#ffffff,stroke:#111
+  style platform fill:#f6f8ff,stroke:#4f46e5
+  style runtime fill:#fff7e6,stroke:#d97706
+  style imperative fill:#f0fdf4,stroke:#16a34a
+`} />
+
+Reading that diagram top-to-bottom tells the lifecycle story:
+
+1. **Core** — you write `Effect`, `Context.Service`, and compose them into `Layer`s. Nothing touches I/O yet.
+2. **Platform** — you add platform layers: `NodeFileSystem`, `NodeHttpServer`, `SqlClient`, `HttpClient`. Still inert — a bigger `Layer`.
+3. **Runtime boundary** — you choose your entry style: whole-app `Layer.launch → runMain`, or `ManagedRuntime` bridge for an imperative host. This is the only place where an `Effect` becomes a process.
+4. **Imperative world** — HTTP handlers, queue consumers, process signals live here. `runMain` owns signals and exit codes; `ManagedRuntime` translates `Effect` results to `Promise`/`value`/`callback` per call site.
+5. **Observability** cuts across every layer as the outermost `Layer.provide` — spans, log annotations, and metrics from core and platform share one exporter.
+
+## Quick reference
+
+| Need | Use | Notes |
+|---|---|---|
+| Whole app as a loop | `Layer.launch(MainLayer).pipe(NodeRuntime.runMain)` | keeps scope open until `SIGINT`/`SIGTERM` |
+| Background worker forever | `Layer.effectDiscard(Effect.forkScoped(Effect.forever(job)))` then `Layer.launch` | interrupted on scope close |
+| Bun entrypoint | `BunRuntime.runMain(layer)` | same shape as `NodeRuntime.runMain` |
+| Embed in Hono/Express | `ManagedRuntime.make(layer, { memoMap: Layer.makeMemoMapUnsafe() })` then `runtime.runPromise` | one runtime, shared map, `dispose()` on shutdown |
+| Sync edge (validation) | `runtime.runSync(decodeSyncEffect)` | effect must be synchronous |
+| Callback API | `runtime.runCallback(effect, { onSuccess, onFailure })` | bridges ack/nack queues |
+| Choose layer by env | `Layer.unwrap(Config.String("…").pipe(Config.map(...)))` | Config lives in effect, `provide` still outermost |
+| Provide logging/tracing | `Main.pipe(Layer.provide(ObservabilityLayer))` — **last** | covers every inner span |
+| Disable error reporting | `NodeRuntime.runMain(effect, { disableErrorReporting: true })` | when you report yourself |
+
+## Next
+
+<LinkCard
+  title="30 · Capstone — A Complete Service"
+  description="Assemble everything so far into one running service — models, migrations, HttpApi, SQL and in-memory implementations, handlers, serving, typed docs and clients, tests, and observability."
+  href="/effect-ts/30-capstone/"
+/>

@@ -1,0 +1,600 @@
+---
+title: HttpClient — Typed HTTP Clients
+description: Build context-injected, middleware-composable HTTP clients in Effect v4 — base URLs, status filtering, transient retries, schema-decoded responses, and domain error wrapping against a real JsonPlaceholder example.
+sidebar:
+  order: 23
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+`fetch` is simple to call and expensive to evolve. The second time you need a base URL, an `Accept` header, 5xx retries with backoff, and typed JSON decoding, the call sites have already diverged — each helper wrapping `fetch` a little differently, each error shape a little inconsistent, each test reaching for a different mock. Effect's `HttpClient` replaces the ad-hoc wrapper with a **service**: an immutable pipeline you compose once, inject through the context channel, and swap in tests without touching business code.
+
+This chapter is the client half of Effect's HTTP story. [Chapter 24](/effect-ts/24-httpapi-server/) is the server half; both share the same `effect/unstable/http` primitives.
+
+:::note[Module paths]
+All HTTP client symbols live under `effect/unstable/http` — the path itself signals that minor-version breaking changes are allowed. Imports below assume `effect@4.0.0-rc.112`.
+
+```ts
+import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+```
+:::
+
+## Why a service, not a function
+
+| Concern | Bare `fetch` / helper function | `HttpClient` service |
+|---|---|---|
+| Base URL | string concatenation at every call site | `mapRequest(prependUrl(...))` once, on the client value |
+| Headers | per-request object literals | middleware in the pipeline, centrally testable |
+| Status handling | `if (!res.ok) throw` repeated | `filterStatusOk` — typed error channel |
+| Retries | manual loops, no jitter | `retryTransient` with a `Schedule` |
+| Decoding | `res.json()` returns `unknown` / `any` | `schemaBodyJson(Schema)` — failure is typed |
+| Testing | global mock of `fetch`, leakage between suites | provide a different `HttpClient` layer |
+| Lifetime | ambient singleton | layer with scope — pools, interceptors, tracing |
+
+The last row is the habit to internalize from [09 · Context & Services](/effect-ts/09-context-services/) and [10 · Layers & Composition](/effect-ts/10-layers/): anything threaded through many call sites unchanged — a connection, a client, a clock — belongs in `R`, not in a module global. `HttpClient` is exactly that: `HttpClient.HttpClient` is a `Context.Service` whose implementations live in layers.
+
+```ts
+// ai-docs shape — packages/effect/src/unstable/http/HttpClient.ts:150
+export const HttpClient: Context.Service<HttpClient, HttpClient> =
+  Context.Service<HttpClient, HttpClient>("effect/HttpClient")
+```
+
+You never `new` it. You `yield*` it, transform it, and provide it at the edge.
+
+## The four pieces
+
+| Symbol | Role |
+|---|---|
+| `HttpClient.HttpClient` | The service key *and* the interface — an object with methods `get`, `post`, `execute`, etc., each returning `Effect<HttpClientResponse, HttpClientError, never>` |
+| `HttpClientRequest` | Immutable request value + builders (`get`, `post`, `prependUrl`, `acceptJson`, `setUrlParams`, `bodyJsonUnsafe`, `bearerToken`, …) |
+| `HttpClientResponse` | Immutable response value + decoders (`schemaBodyJson`, `schemaBodyUrlParams`, `schemaHeaders`, `text`, `json`, streaming helpers) |
+| `FetchHttpClient.layer` | Bottom layer — an `HttpClient` backed by the platform `fetch` (or a `Context.Reference`-overridden one) |
+
+```ts
+import { FetchHttpClient, HttpClient } from "effect/unstable/http"
+
+// inside a Layer.effect or Effect.gen, HttpClient.HttpClient is yieldable:
+const client = yield* HttpClient.HttpClient
+//    ^? HttpClient.With<HttpClientError>
+// With = interface with get/post/put/patch/del/head/options + execute(request)
+```
+
+`FetchHttpClient.layer` is the production leaf — it constructs the `HttpClient` that actually calls `fetch` and translates the `Response` into an `HttpClientResponse`:
+
+```ts
+// packages/effect/src/unstable/http/FetchHttpClient.ts (simplified)
+export const layer: Layer.Layer<HttpClient.HttpClient> =
+  HttpClient.layerMergedContext(Effect.succeed(fetchImpl))
+```
+
+Other drivers (`NodeHttpClient`, `BunHttpClient`, platform-specific) expose the same service key — swapping drivers is a one-line layer change. The middleware you write against `HttpClient` does not care which leaf backs it.
+
+## Middleware composition: build the pipeline once
+
+The canonical shape, taken verbatim from `ai-docs/src/50_http-client/10_basics.ts:26`, is a `pipe` on the *client value* — not on individual requests:
+
+```ts
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { Context, Effect, flow, Layer, Schedule } from "effect"
+
+const baseClient = (yield* HttpClient.HttpClient).pipe(
+  HttpClient.mapRequest(flow(
+    HttpClientRequest.prependUrl("https://jsonplaceholder.typicode.com"),
+    HttpClientRequest.acceptJson
+  )),
+  HttpClient.filterStatusOk,
+  HttpClient.retryTransient({
+    schedule: Schedule.exponential(100),
+    times: 3
+  })
+)
+```
+
+Read left-to-right:
+
+1. **`mapRequest`** — transforms every outgoing `HttpClientRequest` before execution. `flow(prependUrl(...), acceptJson)` composes two request transforms: resolve relative URLs against the base, then set `Accept: application/json`.
+2. **`filterStatusOk`** — after execution, fail with `HttpClientError.ResponseError` if `status` is not 2xx. Without it, a `404` is still a *successful* effect carrying a response — you would have to inspect `response.status` yourself.
+3. **`retryTransient`** — retries only *transient* failures: network errors + 5xx / 429. Transient detection is built into `HttpClientError` classification; the `schedule` controls backoff (here, exponential starting at 100 ms, up to 3 attempts).
+
+<Mermaid title="HttpClient pipeline" height={260} code={`
+flowchart LR
+  call["client.get(...)"] --> reqMap["mapRequest<br/>prependUrl + acceptJson"]
+  reqMap --> exec["fetch via FetchHttpClient"]
+  exec --> status{"status 2xx?"}
+  status -- "no" --> err["HttpClientError.ResponseError"]
+  status -- "yes" --> retry{"transient?"}
+  retry -- "yes + retries left" --> backoff["Schedule.exponential<br/>100ms, times 3"]
+  backoff --> reqMap
+  retry -- "no" --> decode["schemaBodyJson(Schema)"]
+`} />
+
+### Transform order matters
+
+| Position | Effect | Guideline |
+|---|---|---|
+| `mapRequest` first | base URL + headers applied before retries | keep first — retries should resend the already-rewritten request |
+| `filterStatusOk` before `retryTransient` | 5xx becomes a transient failure the retrier can see | required — without it, 5xx responses are successes and never retried |
+| `mapRequestEffect` / `filterStatusOk` variants | effectful transforms (read config, check `Context.Reference`) | use when the transform itself needs services |
+
+Available transforms (all verified in `packages/effect/src/unstable/http/HttpClient.ts`):
+
+| Transform | Signature sketch | Purpose |
+|---|---|---|
+| `HttpClient.mapRequest(f)` | `(req => req) => HttpClient => HttpClient` | pure request rewrite (prependUrl, headers, urlParams) |
+| `HttpClient.mapRequestEffect(f)` | `(req => Effect<req>) => HttpClient => HttpClient` | effectful request rewrite (read a token service) |
+| `HttpClient.mapRequestInput(f)` | variant accepting `HttpClientRequest.Options` | normalize shorthand `get` options |
+| `HttpClient.filterStatus(f)` | predicate on response → error | custom status handling |
+| `HttpClient.filterStatusOk` | — | shorthand for `status in 200..299` |
+| `HttpClient.retry(transitions)` | `Schedule` + predicate | fully custom retry |
+| `HttpClient.retryTransient(opts)` | `{ schedule, times }` | retry only transient errors (the 95% case) |
+| `HttpClient.followRedirects` | — | opt into redirect following |
+
+:::tip[Keep middleware pure where you can]
+`mapRequest` with a pure `flow(...)` is cheaper, easier to test, and composes without introducing implicit `R`. Reach for `mapRequestEffect` only when the rewrite must *read* context (a token, a feature flag, tenant routing). The token case is shown below under auth.
+:::
+
+:::caution[Retry scope]
+`retryTransient` retries *client-level* failures (transport errors + non-2xx that `filterStatusOk` turned into errors). It does **not** retry failures from `schemaBodyJson` — a decode error is not transient. Place `retryTransient` on the client, not around the decode combinator, so schema mismatches fail fast while flaky networks retry.
+:::
+
+## Typed request building
+
+The client offers method shorthands and a lower-level request builder. Both produce the same pipeline — the difference is ergonomics.
+
+### Shorthand methods on the client
+
+```ts
+// HttpClientRequest.Options.NoUrl fields shown inline — verify in HttpClientRequest.ts:75
+
+// GET with query params — relative URL resolved by prependUrl middleware
+const res1 = yield* client.get("/todos", {
+  urlParams: { format: "json" }
+})
+
+// GET with an interpolated id (still relative — middleware prepends base)
+const res2 = yield* client.get(`/todos/${id}`, {
+  urlParams: { format: "json" }
+})
+
+// POST with JSON body — built via HttpClientRequest builder below,
+// but shorthand exists too:
+// client.post("/todos", { body: HttpBody.jsonUnsafe(todo) })
+```
+
+All shorthands (`get`, `post`, `put`, `patch`, `del`, `head`, `options`) accept `(url: string | URL, options?: HttpClientRequest.Options.NoUrl)` — the same options bag, documented in `HttpClientRequest.ts:75` (`urlParams`, `headers`, `body`, `acceptJson`, …). Use them for one-liners.
+
+### The `HttpClientRequest` builder for anything non-trivial
+
+For headers, bodies, url params, or content-type control, build a request value and `execute` it. This is the shape `ai-docs/src/50_http-client/10_basics.ts:76` uses for `createTodo`:
+
+```ts
+import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+
+const createdTodo = yield* HttpClientRequest.post("/todos").pipe(
+  HttpClientRequest.setUrlParams({ format: "json" }),
+  HttpClientRequest.bodyJsonUnsafe(todo),
+  client.execute,
+  Effect.flatMap(HttpClientResponse.schemaBodyJson(Todo)),
+  Effect.mapError((cause) => new JsonPlaceholderError({ cause }))
+)
+```
+
+Builders, verified in `packages/effect/src/unstable/http/HttpClientRequest.ts`:
+
+| Builder | Purpose |
+|---|---|
+| `HttpClientRequest.get(url)` / `post(url)` / `put` / `patch` / `del` | verb-prefixed constructors — set `method` + `url` |
+| `HttpClientRequest.prependUrl(base)` | pure transform — join base and relative url |
+| `HttpClientRequest.acceptJson` / `accept(type)` | set `Accept` header |
+| `HttpClientRequest.setUrlParams(params)` | merge `UrlParams` (record, tuple array, or `URLSearchParams`) |
+| `HttpClientRequest.setHeaders(headers)` / `setHeader(k,v)` | merge headers |
+| `HttpClientRequest.bodyJson(body)` | `Effect`-returning — encodes with `Schema` + sets `Content-Type: application/json` |
+| `HttpClientRequest.bodyJsonUnsafe(body)` | synchronous — `JSON.stringify` + header; failure is a defect if body is not serializable |
+| `HttpClientRequest.bodyText(text, contentType?)` | plain text body |
+| `HttpClientRequest.bodyFormUrlEncoded(params)` | `application/x-www-form-urlencoded` |
+| `HttpClientRequest.bearerToken(request, token)` | sets ``Authorization: Bearer <token>`` — accepts `string \| Redacted<string>` |
+
+:::note[`bodyJson` vs `bodyJsonUnsafe`]
+`bodyJson(schema)` encodes with a `Schema` and can *fail* (its error channel carries `SchemaError`); `bodyJsonUnsafe` calls `JSON.stringify` and sets the header synchronously — it is simpler for `Record<string, unknown>` payloads where runtime shape is already known. In `HttpApi` client code the body is schema-derived and `bodyJson` is the norm; in hand-rolled `HttpClient` code against loosely-typed external APIs, `bodyJsonUnsafe` is idiomatic.
+:::
+
+### Auth headers
+
+Bearer auth is a one-liner whether in client middleware or per-request:
+
+```ts
+import { HttpClientRequest } from "effect/unstable/http"
+
+// per-request:
+const authed = HttpClientRequest.bearerToken(request, token)
+
+// as client middleware (pure — token closed over at build time):
+const authedClient = client.pipe(
+  HttpClient.mapRequest((req) => HttpClientRequest.bearerToken(req, token))
+)
+
+// effectful — read a token service at request time:
+const authedClientEff = client.pipe(
+  HttpClient.mapRequestEffect((req) =>
+    Effect.map(TokenService, (svc) => HttpClientRequest.bearerToken(req, svc.token))
+  )
+)
+```
+
+When the token itself comes from a `Context.Reference` or an expiring refresh effect, `mapRequestEffect` is the right slot. Chapter 24 shows the richer form of this idea as `HttpApiMiddleware` with `HttpApiSecurity.bearer`.
+
+## Decoding responses: `schemaBodyJson` and friends
+
+Responses are not decoded automatically. You choose how to read the body, and *every* choice returns an `Effect` whose error channel carries both transport errors and decode errors:
+
+```ts
+import { HttpClientResponse } from "effect/unstable/http"
+import { Schema } from "effect"
+
+class Todo extends Schema.Class<Todo>("Todo")({
+  userId: Schema.Int,
+  id: Schema.Int,
+  title: Schema.String,
+  completed: Schema.Boolean
+}) {}
+
+// the workhorse — read body as JSON then decode with a Schema
+Effect.flatMap(HttpClientResponse.schemaBodyJson(Todo))
+
+// array response
+Effect.flatMap(HttpClientResponse.schemaBodyJson(Schema.Array(Todo)))
+
+// also available (verify in HttpIncomingMessage.ts / HttpClientResponse.ts):
+HttpClientResponse.schemaBodyUrlParams(schema)
+HttpClientResponse.schemaHeaders(schema)
+HttpClientResponse.text    // Effect<string, HttpClientError>
+HttpClientResponse.json    // Effect<unknown, HttpClientError>
+response.arrayBuffer       // Effect<ArrayBuffer, HttpClientError>
+response.stream            // Stream<Uint8Array, HttpClientError>
+response.formData          // Effect<FormData, HttpClientError>
+```
+
+`schemaBodyJson` is re-exported from `HttpIncomingMessage` through `HttpClientResponse` (`HttpClientResponse.ts:35`) — the import path is through `HttpClientResponse` in client code regardless of the internal indirection.
+
+### Spans, annotations, and error wrapping
+
+Two conventions from the ai-docs example are worth adopting wholesale:
+
+1. **`annotateCurrentSpan`** — attach request-scoped facts to the surrounding trace span, so telemetry carries the `id` or `title`:
+
+```ts
+const getTodo = Effect.fn("JsonPlaceholder.getTodo")(function* (id: number) {
+  yield* Effect.annotateCurrentSpan({ id })
+  return yield* client.get(`/todos/${id}`, { urlParams: { format: "json" } }).pipe(
+    Effect.flatMap(HttpClientResponse.schemaBodyJson(Todo)),
+    Effect.mapError((cause) => new JsonPlaceholderError({ cause }))
+  )
+})
+```
+
+2. **`Effect.mapError` into a tagged domain error** — collapse the low-level union (`HttpClientError | SchemaError`) into one domain error your callers can `catchTag`:
+
+```ts
+export class JsonPlaceholderError extends Schema.TaggedError<JsonPlaceholderError>()(
+  "JsonPlaceholderError",
+  { cause: Schema.Defect }
+) {}
+```
+
+`Schema.Defect` is a schema for `unknown` defects/causes stored opaquely — it accepts whatever `HttpClientError | SchemaError` the pipeline produced without trying to model it precisely. When the error taxonomy is small and the caller genuinely branches on cause, model `cause` as `Schema.Union([...HttpErrors])` instead; when the caller's only meaningful action is "log and surface a 502," `Defect` is honest and keeps the union small.
+
+3. **`Effect.withSpan("JsonPlaceholder.allTodos")`** for top-level, non-function entry points that are plain `Effect` values (not `Effect.fn`):
+
+```ts
+const allTodos = client.get("/todos").pipe(
+  Effect.flatMap(HttpClientResponse.schemaBodyJson(Schema.Array(Todo))),
+  Effect.mapError((cause) => new JsonPlaceholderError({ cause })),
+  Effect.withSpan("JsonPlaceholder.allTodos")
+)
+```
+
+`Effect.fn("name")` already creates a span named `"name"` per invocation; bare effects need `withSpan` explicitly. Mixing both is the idiom from `Effect.gen` / `Effect.fn` guidance in [03 · gen & fn](/effect-ts/03-gen-and-fn/).
+
+## The complete JsonPlaceholder service
+
+Everything above assembled into one service module — the shape that ships. This mirrors `ai-docs/src/50_http-client/10_basics.ts:1` line-for-line with minimal naming drift:
+
+```ts title="src/json-placeholder.ts"
+import { Context, Effect, flow, Layer, Schedule, Schema } from "effect"
+import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+
+class Todo extends Schema.Class<Todo>("Todo")({
+  userId: Schema.Int,
+  id: Schema.Int,
+  title: Schema.String,
+  completed: Schema.Boolean
+}) {}
+
+export class JsonPlaceholderError extends Schema.TaggedError<JsonPlaceholderError>()(
+  "JsonPlaceholderError",
+  { cause: Schema.Defect }
+) {}
+
+export class JsonPlaceholder extends Context.Service<JsonPlaceholder, {
+  readonly allTodos: Effect.Effect<ReadonlyArray<Todo>, JsonPlaceholderError>
+  getTodo(id: number): Effect.Effect<Todo, JsonPlaceholderError>
+  createTodo(todo: Omit<Todo, "id">): Effect.Effect<Todo, JsonPlaceholderError>
+}>()("app/JsonPlaceholder") {
+  static readonly layer = Layer.effect(
+    JsonPlaceholder,
+    Effect.gen(function* () {
+      const client = (yield* HttpClient.HttpClient).pipe(
+        HttpClient.mapRequest(flow(
+          HttpClientRequest.prependUrl("https://jsonplaceholder.typicode.com"),
+          HttpClientRequest.acceptJson
+        )),
+        HttpClient.filterStatusOk,
+        HttpClient.retryTransient({
+          schedule: Schedule.exponential(100),
+          times: 3
+        })
+      )
+
+      const allTodos = client.get("/todos").pipe(
+        Effect.flatMap(HttpClientResponse.schemaBodyJson(Schema.Array(Todo))),
+        Effect.mapError((cause) => new JsonPlaceholderError({ cause })),
+        Effect.withSpan("JsonPlaceholder.allTodos")
+      )
+
+      const getTodo = Effect.fn("JsonPlaceholder.getTodo")(function* (id: number) {
+        yield* Effect.annotateCurrentSpan({ id })
+        return yield* client.get(`/todos/${id}`, {
+          urlParams: { format: "json" }
+        }).pipe(
+          Effect.flatMap(HttpClientResponse.schemaBodyJson(Todo)),
+          Effect.mapError((cause) => new JsonPlaceholderError({ cause }))
+        )
+      })
+
+      const createTodo = Effect.fn("JsonPlaceholder.createTodo")(function* (
+        todo: Omit<Todo, "id">
+      ) {
+        yield* Effect.annotateCurrentSpan({ title: todo.title })
+        return yield* HttpClientRequest.post("/todos").pipe(
+          HttpClientRequest.setUrlParams({ format: "json" }),
+          HttpClientRequest.bodyJsonUnsafe(todo),
+          client.execute,
+          Effect.flatMap(HttpClientResponse.schemaBodyJson(Todo)),
+          Effect.mapError((cause) => new JsonPlaceholderError({ cause }))
+        )
+      })
+
+      return JsonPlaceholder.of({ allTodos, getTodo, createTodo })
+    })
+  ).pipe(Layer.provide(FetchHttpClient.layer))
+}
+
+// usage — inject at the edge
+const program = Effect.gen(function* () {
+  const api = yield* JsonPlaceholder
+  const one = yield* api.getTodo(1)
+  const all = yield* api.allTodos
+  yield* Effect.log(`got ${all.length} todos; first: ${one.title}`)
+}).pipe(Effect.provide(JsonPlaceholder.layer))
+```
+
+Note the service's public type: every method's error channel is exactly `JsonPlaceholderError` — not `HttpClientError | SchemaError | ParseError`. Callers `catchTag("JsonPlaceholderError", ...)` once; the internal union never leaks. This is the same narrowing discipline from [05 · Typed Errors](/effect-ts/05-errors/) applied at a network boundary.
+
+### Wiring the base client separately
+
+When more than one external service shares host, headers, or retry policy, extract the *client transformation* rather than duplicating it:
+
+```ts title="src/http/base-client.ts"
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { Context, Effect, flow, Layer, Schedule } from "effect"
+
+export class BaseClient extends Context.Service<BaseClient, HttpClient.HttpClient>()(
+  "app/BaseClient"
+) {
+  static readonly layer = Layer.effect(
+    BaseClient,
+    Effect.gen(function* () {
+      const base = (yield* HttpClient.HttpClient).pipe(
+        HttpClient.mapRequest(flow(
+          HttpClientRequest.prependUrl("https://jsonplaceholder.typicode.com"),
+          HttpClientRequest.acceptJson
+        )),
+        HttpClient.filterStatusOk,
+        HttpClient.retryTransient({
+          schedule: Schedule.exponential(100),
+          times: 3
+        })
+      )
+      return base
+    })
+  ).pipe(Layer.provide(FetchHttpClient.layer))
+}
+
+// downstream services depend on BaseClient instead of raw HttpClient:
+export class JsonPlaceholder2 extends Context.Service<JsonPlaceholder2, {
+  getTodo(id: number): Effect.Effect<Todo, JsonPlaceholderError>
+}>()("app/JsonPlaceholder2") {
+  static readonly layer = Layer.effect(
+    JsonPlaceholder2,
+    Effect.gen(function* () {
+      const client = yield* BaseClient
+      // ...same get/post logic, now sharing the base pipeline
+      return JsonPlaceholder2.of({ getTodo: Effect.fn("JsonPlaceholder2.getTodo")(function* (id: number) {
+        return yield* client.get(`/todos/${id}`).pipe(
+          Effect.flatMap(HttpClientResponse.schemaBodyJson(Todo)),
+          Effect.mapError((cause) => new JsonPlaceholderError({ cause }))
+        )
+      }) })
+    })
+  )
+}
+
+// one provide at the edge wires everything:
+const AppLayer = Layer.mergeAll(BaseClient.layer, JsonPlaceholder2.layer)
+```
+
+Decision rule: **one `BaseClient`-style layer per origin** (host + auth + retry covenant). If two upstreams have different retry budgets or status semantics (payments vs analytics, for example), they deserve separate clients even if they share a host — `filterStatusOk` vs custom `filterStatus` handling diverges quickly.
+
+Alternatively, keep a single `HttpClient.HttpClient` key and distinguish by `transformClient` at the `HttpApiClient` boundary (chapter 24) — the same idea, expressed at the generated-client layer rather than a manual service.
+
+## Providing the fetch implementation
+
+`FetchHttpClient.layer` reads `globalThis.fetch` by default, overridable through two `Context.Reference` keys (verify in `packages/effect/src/unstable/http/FetchHttpClient.ts`):
+
+| Reference | Key string | Purpose |
+|---|---|---|
+| `FetchHttpClient.Fetch` | `"effect/http/FetchHttpClient/Fetch"` | override the `fetch` function itself (polyfill, instrumented fetch, mock) |
+| `FetchHttpClient.RequestInit` | `"effect/http/FetchHttpClient/RequestInit"` | default `RequestInit` merged into every request (dispatcher, keepalive) |
+
+```ts
+import { FetchHttpClient } from "effect/unstable/http"
+
+// inject an instrumented fetch for one subtree:
+const withTracingFetch = Effect.provideService(
+  program,
+  FetchHttpClient.Fetch,
+  myInstrumentedFetch
+)
+```
+
+For Node-specific HTTP servers you will meet `NodeHttpServer` in chapter 24; for clients, `FetchHttpClient` is driver-agnostic — it works in Node 18+, Bun, Deno, and browsers because it goes through `fetch`.
+
+## Testing: swap the layer, keep the pipeline
+
+Because the service depends on `HttpClient.HttpClient` — not on a global — tests provide a different `HttpClient` that never hits the network.
+
+### Mock the client with `Layer.succeed`
+
+The quickest fake: an in-memory `HttpClient` whose `execute` returns canned `HttpClientResponse` values.
+
+```ts title="test/json-placeholder.test.ts"
+import { assert, layer } from "@effect/vitest"
+import { Context, Effect, Layer, Schema } from "effect"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { JsonPlaceholder } from "../src/json-placeholder.ts"
+
+class Todo extends Schema.Class<Todo>("Todo")({
+  userId: Schema.Int,
+  id: Schema.Int,
+  title: Schema.String,
+  completed: Schema.Boolean
+}) {}
+
+const fakeTodos: ReadonlyArray<Todo> = [
+  new Todo({ userId: 1, id: 1, title: "buy milk", completed: false }),
+  new Todo({ userId: 1, id: 2, title: "write tests", completed: true })
+]
+
+// build a fake HttpClient whose execute maps URLs to responses
+const FakeHttpClient = Layer.succeed(
+  HttpClient.HttpClient,
+  HttpClient.make((request) => {
+    const url = request.url
+    if (url.endsWith("/todos")) {
+      return HttpClientResponse.fromWeb(request, new Response(
+        JSON.stringify(fakeTodos),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )).pipe(Effect.orDie) as any
+      // In real tests, build responses with the test helper your
+      // Effect version exposes, or use HttpApiTest for full-stack tests (ch. 24).
+    }
+    return HttpClientResponse.fromWeb(request, new Response(
+      JSON.stringify(fakeTodos[0]),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    )).pipe(Effect.orDie) as any
+  })
+)
+
+// Provide the fake below the service so JsonPlaceholder's middleware still runs:
+const TestLayer = JsonPlaceholder.layer.pipe(
+  Layer.provide(FakeHttpClient)
+)
+
+layer(TestLayer)("JsonPlaceholder", (it) => {
+  it.effect("getTodo decodes a Todo", () =>
+    Effect.gen(function* () {
+      const api = yield* JsonPlaceholder
+      const todo = yield* api.getTodo(1)
+      assert.strictEqual(todo.title, "buy milk")
+    }))
+})
+```
+
+:::note[A more ergonomic path for typed APIs]
+When the *upstream* is an `HttpApi` you own (chapter 24), skip hand-rolled `HttpClient` fakes entirely — `HttpApiTest` gives you a typed client wired directly to your handlers with no `fetch` involved. The fake-`HttpClient` pattern above is for **external** APIs like JsonPlaceholder where you do not control the spec.
+:::
+
+### Inject per-request behavior with middleware in tests
+
+To assert that retry or header logic fired, wrap the fake with the same middleware helpers the production client uses:
+
+```ts
+import { HttpClient } from "effect/unstable/http"
+
+let attempts = 0
+const FlakyThenOk = HttpClient.make((request) =>
+  attempts++ === 0
+    ? Effect.fail(new HttpClient.HttpClientError({ reason: "TransportError", cause: new Error("flap") } as any))
+    : HttpClientResponse.fromWeb(request, new Response(JSON.stringify(fakeTodos), { status: 200 })) as any
+)
+
+const clientWithRetry = FlakyThenOk.pipe(
+  HttpClient.retryTransient({ schedule: Schedule.exponential(10), times: 3 })
+)
+```
+
+:::caution[Don't forget `filterStatusOk` in fakes]
+If production uses `filterStatusOk`, your fake responses must carry a valid `status` field — otherwise a `500` canned response will *succeed* in tests but *fail* in prod (and vice versa for synthesized `2xx` ranges). Mirror status codes faithfully, or provide tests both with and without the filter to cover error branches.
+:::
+
+## Error taxonomy at the HTTP boundary
+
+| Failure | Error type before `mapError` | Meaning | Retried by `retryTransient`? |
+|---|---|---|---|
+| DNS / TCP / timeout | `HttpClientError` (`TransportError`) | network is down | yes |
+| `5xx` with `filterStatusOk` | `HttpClientError.ResponseError` | server broke | yes |
+| `4xx` with `filterStatusOk` | `HttpClientError.ResponseError` | client asked badly — bad id, bad auth | **no** |
+| `5xx` / `4xx` without `filterStatusOk` | not an error — still `HttpClientResponse` | caller must inspect `response.status` | — |
+| JSON parse failure | `HttpClientError` | wire is not JSON | no |
+| `schemaBodyJson` mismatch | `SchemaError` | shape drift vs contract | **no** (correct — fail fast) |
+
+The discipline: transport/server failures deserve retries; decode failures deserve loud, non-retried errors. Collapsing both into the same retry would mask schema drift as flakiness. `JsonPlaceholderError` with `Schema.Defect` at least preserves the distinction in logs even when the type does not branch on it.
+
+## `http` vs `httpapi` — when to use which
+
+| Situation | Reach for |
+|---|---|
+| Calling an external API you don't control (JsonPlaceholder, Stripe, GitHub) | `HttpClient` — hand-coded services like `JsonPlaceholder` |
+| Defining your own API where server + docs + typed client share one spec | `HttpApi` — chapter 24; generates everything from the schema |
+| One service calling another service you *do* control, already on `HttpApi` | `HttpApiClient` (built on `HttpClient` internally) — see chapter 24's client section |
+| Streaming bodies (SSE, file uploads) | `HttpClientResponse.stream` / `HttpBody` — then `Stream` from chapter 19 |
+
+The two layers compose: `HttpApiClient.make(Api, { transformClient })` accepts a `transformClient` callback that receives the underlying `HttpClient` — exactly where `prependUrl` / `retryTransient` middleware lives in the `HttpApi` world, too.
+
+## Cheat sheet
+
+| Goal | Code |
+|---|---|
+| Access the client service | `yield* HttpClient.HttpClient` |
+| Add base URL + Accept header | `client.pipe(HttpClient.mapRequest(flow(prependUrl(url), acceptJson)))` |
+| Fail on non-2xx | `client.pipe(HttpClient.filterStatusOk)` |
+| Retry transient with backoff | `client.pipe(HttpClient.retryTransient({ schedule: Schedule.exponential(100), times: 3 }))` |
+| GET shorthand | `client.get("/path", { urlParams: {...} })` |
+| Build a POST with JSON | `HttpClientRequest.post(url).pipe(setUrlParams(...), bodyJsonUnsafe(body), client.execute)` |
+| Bearer auth | `HttpClientRequest.bearerToken(request, token)` |
+| Decode JSON body | `Effect.flatMap(HttpClientResponse.schemaBodyJson(MySchema))` |
+| Annotate current span | `yield* Effect.annotateCurrentSpan({ id })` |
+| Collapse errors | `Effect.mapError(cause => new DomainError({ cause }))` |
+| Provide fetch impl | `Layer.provide(FetchHttpClient.layer)` |
+| Override fetch fn | `Effect.provideService(FetchHttpClient.Fetch, myFetch)` |
+| Per-request retry in tests | `fakeClient.pipe(HttpClient.retryTransient(...))` |
+
+## Next
+
+<LinkCard
+  title="24 · HttpApi — Schema-First Servers"
+  description="Define once, get a server, OpenAPI, and a typed client. Domain models, status-annotated errors, groups, middleware, handlers, serving, and in-memory testing — the chapter that snaps platform HTTP together."
+  href="/effect-ts/24-httpapi-server/"
+/>
+

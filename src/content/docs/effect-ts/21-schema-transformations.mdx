@@ -1,0 +1,842 @@
+---
+title: Schema — Transformations & Validation
+description: First-class Transformation and Getter pipelines — decodeTo/decode wiring, optional-key patterns, defaults families, custom filters, FilterGroup, effectful validation, and bridging to config and HTTP.
+sidebar:
+  order: 21
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Chapter 20 left you with a codec that decoded and encoded with the identity transformation: `Schema.String` validates a string and hands it back unchanged. Real schemas rarely stay there — wire strings encode dates, numbers, cents, hex bytes, `Option` fields hide behind optional keys, defaults must materialize when keys are absent, and validation is more than "is this a string". v4 models all of that as **first-class `Transformation`s built from `Getter`s**, composed explicitly and typed through `RD`/`RE`.
+
+## The two primitives: `Getter` and `Transformation`
+
+<Mermaid title="Getter and Transformation" height={360} code={`
+flowchart LR
+  subgraph getter["Getter&lt;T, E, R&gt;"]
+    direction LR
+    E1["Option&lt;E&gt;"] -->|"Effect&lt;Option&lt;T&gt;, Issue, R&gt;"| T1["Option&lt;T&gt;"]
+  end
+  getter --> trans
+  subgraph trans["Transformation&lt;T, E, RD, RE&gt;"]
+    direction LR
+    D["decode: Getter&lt;T, E, RD&gt;"]
+    Enc["encode: Getter&lt;E, T, RE&gt;"]
+  end
+  trans --> codec
+  codec["Codec&lt;T, E, RD, RE&gt;<br/>via Schema.decodeTo / decode"]
+`} />
+
+### `Getter<T, E, R>`
+
+A `Getter` is an `Option<E> -> Effect<Option<T>, Issue, R>` wrapped as an object with `.map` and `.compose`. The `Option` layer is how optionality and missing keys are represented *outside* of "value" space:
+
+- `Some(value)` — key present, transform this value.
+- `None` — key absent; return `None` to omit, `Some(default)` to inject, or `fail` to require.
+
+```ts title="src/getter-shape.ts"
+import { Effect, Option, SchemaGetter } from "effect"
+
+// Getter<number, string>: string? -> number?
+const parseNumber = SchemaGetter.transform<number, string>((s) => Number(s))
+await Effect.runPromise(parseNumber.run(Option.some("21"), {})) // Some(21)
+await Effect.runPromise(parseNumber.run(Option.none(), {}))     // None (absent stays absent)
+
+// Composing getters is function composition over Option
+const double = SchemaGetter.transform<number, number>((n) => n * 2)
+const composed = parseNumber.compose(double)
+await Effect.runPromise(composed.run(Option.some("21"), {})) // Some(42)
+
+// Passthrough getters are optimized away during compose — no allocation
+```
+
+| Constructor | Behavior on `Some` | Behavior on `None` | Can fail? | Needs `R`? |
+|---|---|---|---|---|
+| `SchemaGetter.transform(f)` | `Some(f(value))` | `None` | no | no |
+| `SchemaGetter.transformOrFail(f)` | `Some(await f(value, opts))` or `fail(issue)` | `None` | yes | yes |
+| `SchemaGetter.transformOptional(f)` | `f(Option<E>) → Option<T>` | fully controlled | no | no |
+| `SchemaGetter.passthrough()` | `Some(value)` | `None` | no | no — singleton |
+| `SchemaGetter.omit()` | `None` always | `None` | no | no |
+| `SchemaGetter.required()` | `Some(value)` | `fail(MissingKey)` | yes | no |
+| `SchemaGetter.withDefault(effect)` | `Some(value)` if present & not `undefined` | `Some(default)` | yes | yes |
+| `SchemaGetter.fail(f)` / `forbidden(msg)` | fail | fail | yes | no |
+| `SchemaGetter.checkEffect(f)` | validate, keep `Some(value)` or fail | `None` | yes | yes |
+| `SchemaGetter.onSome / onNone` | custom per branch | custom | yes | yes |
+| `SchemaGetter.succeed(t)` | `Some(t)` always | `Some(t)` always | no | no |
+| `SchemaGetter.String / Number / Boolean / BigInt / Date / trim / ...` | coercion via builtins | `None` | no* | no |
+
+`*` Except fallible variants like `decodeBase64`, `parseJson`, `dateTimeUtcFromInput` which *can* fail.
+
+### `Transformation<T, E, RD, RE>`
+
+A `Transformation` is a *pair* of `Getter`s:
+
+```ts title="src/transformation-shape.ts"
+import { SchemaGetter, SchemaTransformation } from "effect"
+
+const numberFromString = new SchemaTransformation.Transformation(
+  SchemaGetter.transform<number, string>((s) => Number(s)), // decode: string -> number
+  SchemaGetter.transform<string, number>((n) => String(n))  // encode: number -> string
+)
+
+// Shorter: helpers that build the pair from functions
+const centsFromDollars = SchemaTransformation.transform({
+  decode: (dollars: number) => dollars * 100,
+  encode: (cents: number) => cents / 100
+})
+
+const dateFromString = SchemaTransformation.transformOrFail({
+  decode: (s: string, opts) => {
+    const d = new Date(s)
+    return isNaN(d.getTime())
+      ? Effect.fail(new SchemaIssue.InvalidValue({ message: "Invalid date" }, s, opts))
+      : Effect.succeed(d)
+  },
+  encode: (d: Date) => Effect.succeed(d.toISOString())
+})
+
+// Optional-key level — both branches see Option
+const optToOption = SchemaTransformation.transformOptional({
+  decode: Option.some,      // Some(E) -> Some(Some(E)); None -> None
+  encode: Option.flatten    // Some(Some(E)) -> Some(E); Some(None) -> None; None -> None
+})
+```
+
+`Transformation` is immutable; `flip()` swaps decode/encode, `compose(other)` pipelines decode forward and encode backward.
+
+## Attaching transformations to schemas
+
+Transformations never run alone — they must be *attached* to codecs. Three attachment operators differ in one question: does the decoded type change?
+
+| Operator | Signature sketch | When |
+|---|---|---|
+| `schema.pipe(Schema.decodeTo(target, t))` | `Codec<T, E> -> Codec<U, E>` | Type changes: `T` (source `Type`) becomes `U` (`target`'s `Type`); `E` stays `E`? Actually encoded becomes `E` of target? See below |
+| `schema.pipe(Schema.decode(transformation))` | `Codec<T, E> -> Codec<T, E>` | Same `T`/`E`, just transform encoding/decoding |
+| `SchemaTransformation.transform*` | builds the `Transformation` itself | helper for the `decodeTo`/`decode` second argument |
+
+More precisely, from `packages/effect/src/Schema.ts:5530`:
+
+```ts
+// decodeTo — From's Type decodes *to* To's Type, with an explicit Transformation bridging them
+Schema.decodeTo<To, From, RD, RE>(to: To, transformation: { decode: Getter<To["Encoded"], From["Type"], RD>, encode: Getter<From["Type"], To["Encoded"], RE> })
+// When transformation omitted, passthrough is implied
+Schema.decodeTo(target)(source) // source.Type -> target.Type via passthrough Link
+```
+
+Concrete wiring patterns:
+
+### 1. `decodeTo` — the workhorse (type-changing)
+
+```ts title="src/decode-to.ts"
+import { Schema, SchemaGetter, SchemaTransformation } from "effect"
+
+// String on wire → Date in domain
+const DateFromIso = Schema.String.pipe(
+  Schema.decodeTo(Schema.Date, SchemaTransformation.dateFromString)
+)
+// Codec<Date, string>
+
+// Loose string → branded domain primitive
+const UserId = Schema.String.pipe(Schema.brand("UserId"))
+// brand = validation + nominalization; no wire change, Type becomes string & Brand<"UserId">
+
+// Infallible coercion via Getter.transform
+const NumberFromString = Schema.String.pipe(
+  Schema.decodeTo(Schema.Number, {
+    decode: SchemaGetter.transform((s) => Number(s)),
+    encode: SchemaGetter.transform((n) => String(n))
+  })
+)
+
+// Fallible, effectful
+const ValidatedAge = Schema.Finite.pipe(
+  Schema.decodeTo(Schema.Finite, {
+    decode: SchemaGetter.checkEffect((n) =>
+      Effect.succeed(n >= 0 ? undefined : "age must be non-negative")
+    ),
+    encode: SchemaGetter.passthrough()
+  })
+)
+
+// Pure Transformation helper (shorthand for the getter pair)
+const Trimmed = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, SchemaTransformation.trim())
+)
+
+// Compose codecs instead of building a transformation literally
+const TrimmedThenLoved = Schema.String.pipe(
+  Schema.decodeTo(Schema.Trim),                        // Trim on decode
+  Schema.decodeTo(
+    Schema.Number,
+    SchemaTransformation.numberFromString
+  ) // wait: this composes how? Prefer pipe chaining:
+)
+// Canonical composition — pipe through decodeTo sequentially:
+const Pipeline = Schema.String.pipe(
+  Schema.decode(SchemaTransformation.trim()),
+  Schema.decodeTo(Schema.Number, SchemaTransformation.numberFromString)
+)
+// equivalent to: Schema.String -> Trim transformation -> NumberFromString via codec composition
+// alternatively, explicit Transformation.compose:
+const viaCompose = SchemaTransformation.trim().compose(
+  SchemaTransformation.numberFromString as any
+)
+```
+
+### 2. `decode` — same-type transformation (encode/decode both stay `T`)
+
+When decoded type does not change and the transformation is purely about normalization, use `Schema.decode(transformation)` — it operates on `T ↔ T` (or `E ↔ E` via `encode`).
+
+```ts title="src/decode-same-type.ts"
+import { Schema, SchemaTransformation } from "effect"
+
+// Normalize whitespace on decode; encode is passthrough (not round-trippable if input had whitespace)
+const TrimmedName = Schema.String.pipe(Schema.decode(SchemaTransformation.trim()))
+Schema.decodeSync(TrimmedName)("  Ada  ") // "Ada"
+Schema.encodeSync(TrimmedName)("Ada")    // "Ada" (no re-padding)
+
+// Lowercase email on decode
+const LoweredEmail = Schema.String.pipe(Schema.decode(SchemaTransformation.toLowerCase()))
+
+// snake_case ↔ camelCase symmetry — decode snake → camel, encode camel → snake
+const SnakeToCamel = Schema.String.pipe(Schema.decode(SchemaTransformation.snakeToCamel()))
+```
+
+Rule of thumb: `decodeTo(target, ...)` when `T` changes; `decode(...)` when `T` is fixed and you are normalizing.
+
+### 3. Inline `transform` / `transformOrFail`
+
+When no ready-made getter exists, inline the pair:
+
+```ts title="src/inline-transform.ts"
+import { Effect, Schema, SchemaGetter, SchemaIssue, SchemaTransformation } from "effect"
+
+const StringFromNumber = Schema.Number.pipe(
+  Schema.decodeTo(Schema.String, SchemaTransformation.transform({
+    decode: (n) => String(n),
+    encode: (s) => Number(s)
+  }))
+)
+
+// Fallible inline with error reporting
+const PositiveIntFromString = Schema.String.pipe(
+  Schema.decodeTo(Schema.Number, SchemaTransformation.transformOrFail({
+    decode: (s, opts) =>
+      /^-?\d+$/.test(s)
+        ? Effect.succeed(Number(s))
+        : Effect.fail(new SchemaIssue.InvalidValue({ message: "not an integer string" }, s, opts)),
+    encode: (n, _opts) => Effect.succeed(String(n))
+  }))
+)
+
+// Direct Getter pair form (useful when one side needs Option-level control)
+const WithPrefix = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, {
+    decode: SchemaGetter.transform((s) => `prefix_${s}`),
+    encode: SchemaGetter.transform((s) => s.replace(/^prefix_/, ""))
+  })
+)
+```
+
+:::tip[Prefer `SchemaTransformation.*` constants]
+`SchemaTransformation.numberFromString`, `stringFromBase64String`, `dateFromString`, `urlFromString`, `bigDecimalFromString`, `uint8ArrayFromBase64String`, and `durationFromString / durationFromNanos / durationFromMillis` are ready-made `Transformation` values. Prefer them over hand-rolling the `Number`/`String` getter pair.
+:::
+
+## Passthrough variants
+
+`passthrough` is the *identity transformation* — necessary when a decoding/encoding side intentionally does nothing. Because `T` and `E` may not be identical, three typed variants exist: strict identity, subtype, and supertype identities.
+
+| Getter | Type constraint | Transformation counterpart |
+|---|---|---|
+| `SchemaGetter.passthrough()` | `T = E` | `SchemaTransformation.passthrough()` |
+| `SchemaGetter.passthroughSupertype<T extends E>()` | decoded narrower (`T extends E`) | `SchemaTransformation.passthroughSupertype<T extends E>()` |
+| `SchemaGetter.passthroughSubtype<E extends T>()` | encoded narrower | `SchemaTransformation.passthroughSubtype<E extends T>()` |
+| `SchemaGetter.passthrough({ strict: false })` | opt out — any `T`, `E` | `SchemaTransformation.passthrough({ strict: false })` |
+
+```ts title="src/passthrough.ts"
+import { Schema, SchemaGetter, SchemaTransformation } from "effect"
+
+// Validated but not transformed — decode checks, encode is passthrough
+const NonEmptyTrimmed = Schema.String.pipe(
+  Schema.decode(SchemaTransformation.trim()),
+  Schema.decodeTo(Schema.String, {
+    decode: SchemaGetter.checkEffect((s) =>
+      Effect.succeed(s.length > 0 ? undefined : "empty after trim")
+    ),
+    encode: SchemaGetter.passthrough()
+  })
+)
+
+// Subtype passthrough: decoded is union subtype of encoded
+type Status = "a" | "b"
+const StatusPassthrough: SchemaTransformation.Transformation<Status, string> =
+  SchemaTransformation.passthroughSupertype<Status, string>()
+
+// Strict-false escape
+const Loose = SchemaTransformation.passthrough<string, number>({ strict: false } as any)
+```
+
+When composing getters, `passthrough` is optimized away — `g.compose(passthrough()) === g` and `passthrough().compose(g) === g` identity at runtime.
+
+## Composing codecs as transformations
+
+Instead of manually building a `Transformation`, compose *codecs* via `pipe(decodeTo(...))` — the codec's own isomorphism becomes the transformation:
+
+```ts title="src/codec-compose.ts"
+import { Schema, SchemaTransformation } from "effect"
+
+const A = Schema.String.pipe(Schema.decodeTo(Schema.Number, SchemaTransformation.numberFromString))
+const B = Schema.Number.pipe(Schema.decodeTo(Schema.Boolean, SchemaTransformation.transform({
+  decode: (n) => n !== 0,
+  encode: (b) => b ? 1 : 0
+})))
+// Equivalent transformation via codec composition:
+const Composed = A.pipe(Schema.decodeTo(schemaB)) // but wait — correct chaining:
+
+// Canonical: chain codecs directly
+const StringToBool = Schema.String.pipe(
+  Schema.decodeTo(Schema.Number, SchemaTransformation.numberFromString),
+).pipe(
+  Schema.decodeTo(Schema.Boolean, SchemaTransformation.transform({
+    decode: (n) => n !== 0,
+    encode: (b) => b ? 1 : 0
+  }))
+)
+// StringToBool: Codec<boolean, string>
+
+// Flip a codec's direction by calling .flip on its Transformation when you own it
+const Flipped = SchemaTransformation.numberFromString.flip() // number -> string vs string -> number
+```
+
+This codec-composition style is idiomatic when the intermediate type already exists as a named codec.
+
+## Optional-key transform patterns
+
+The hardest Schema pattern to get right is: *optional keys whose domain representation is `Option`, not `undefined`* — translating `absent` to `Option.None` and back. Three closely related patterns cover this; all operate at `Option` level via `transformOptional`.
+
+```ts title="src/optional-key-patterns.ts"
+import { Option, Schema, SchemaTransformation } from "effect"
+
+// 1. optionalKey (absent only) → Option
+const WithOptionKey = Schema.Struct({
+  nickname: Schema.optionalKey(Schema.String).pipe(
+    Schema.decodeTo(
+      Schema.Option(Schema.String),
+      SchemaTransformation.optionFromOptionalKey()
+    )
+  )
+})
+Schema.decodeUnknownSync(WithOptionKey)({}) // { nickname: None }
+Schema.decodeUnknownSync(WithOptionKey)({ nickname: "Ada" }) // { nickname: Some("Ada") }
+Schema.encodeSync(WithOptionKey)({ nickname: Option.none() }) // {}
+Schema.encodeSync(WithOptionKey)({ nickname: Option.some("Ada") }) // { nickname: "Ada" }
+
+// 2. optional (absent | undefined) → Option
+const WithOption = Schema.Struct({
+  bio: Schema.optional(Schema.String).pipe(
+    Schema.decodeTo(
+      Schema.Option(Schema.String),
+      SchemaTransformation.optionFromOptional()
+    )
+  )
+})
+Schema.decodeUnknownSync(WithOption)({ bio: undefined } as any) // { bio: None }
+
+// 3. Manual Option control — equivalent to optionFromOptionalKey, written longhand:
+const ManualOptionKey = Schema.Struct({
+  a: Schema.optionalKey(Schema.Number).pipe(
+    Schema.decodeTo(
+      Schema.Option(Schema.Number),
+      SchemaTransformation.transformOptional({
+        decode: Option.some,
+        encode: Option.flatten
+      })
+    )
+  )
+})
+
+// Filter empty strings as absent: extend the Option mapping with Option.filter
+const FilterEmpty = Schema.Struct({
+  tag: Schema.optionalKey(Schema.String).pipe(
+    Schema.decodeTo(
+      Schema.Option(Schema.String),
+      SchemaTransformation.transformOptional({
+        decode: (opt) => Option.filter(opt, (s) => s.length > 0) as any,
+        encode: Option.flatten as any
+      })
+    )
+  )
+})
+
+// Nullable → Option (not optional-key, but value-level null)
+const NullableToOption = Schema.NullOr(Schema.String).pipe(
+  Schema.decodeTo(Schema.Option(Schema.String), SchemaTransformation.optionFromNullOr())
+)
+Schema.decodeSync(NullableToOption)(null) // None
+Schema.encodeSync(NullableToOption)(Option.some("hi")) // "hi"
+
+// Nullish → Option (null | undefined → None)
+const NullishToOption = Schema.NullishOr(Schema.String).pipe(
+  Schema.decodeTo(Schema.Option(Schema.String), SchemaTransformation.optionFromNullishOr())
+)
+
+// UndefinedOr → Option
+const UndefToOption = Schema.UndefinedOr(Schema.String).pipe(
+  Schema.decodeTo(Schema.Option(Schema.String), SchemaTransformation.optionFromUndefinedOr())
+)
+```
+
+:::caution[Omit vs passthrough on encode]
+`SchemaGetter.omit()` *removes* a key on encode (return `None`); `passthrough` *keeps* the value. `optionFromOptionalKey`'s encode is `Option.flatten` — `Some(None)` becomes `None` (omit), `Some(Some(v))` becomes `Some(v)` (emit). Use `SchemaGetter.omit()` directly when you want a field that *never* appears on the wire.
+:::
+
+The same `transformOptional` mechanism powers "skip empty" or "rename and coerce" transforms — its getter receives `Option<E>` and may return `Option<T>`, so `None → Some(x)` injects a value and `Some(x) → None` suppresses it.
+
+## Defaults family
+
+Defaults sit at the intersection of optionality and transformation: an absent key or `undefined` value materializes a default on *decode*, and the corresponding *encode* must decide whether to write the default back or omit it. v4 splits this by two axes — *optionality kind* (`optionalKey` vs `optional`) and *default shape* (`Encoded` vs `Type`) — yielding four combinators plus `withConstructorDefault`.
+
+| Combinator | Encoded optionality | Default value type | Wraps `Encoded` with | `make` needs key? | Typical code |
+|---|---|---|---|---|---|
+| `Schema.withDecodingDefaultKey(effect, opts?)` | `optionalKey` (absent only) | `Encoded` | `optionalKey(toEncoded(S))` | no — `make({})` omits | `Schema.String.pipe(Schema.withDecodingDefaultKey(Effect.succeed("anon")))` |
+| `Schema.withDecodingDefaultTypeKey(effect, opts?)` | `optionalKey` | `Type` | `optionalKey(S)` via `toType` bridge | no | when default is already decoded (e.g. a `Date` object) |
+| `Schema.withDecodingDefault(effect, opts?)` | `optional` (absent \| `undefined`) | `Encoded` | `optional(toEncoded(S))` | no | handles both absent and `undefined` leaves |
+| `Schema.withDecodingDefaultType(effect, opts?)` | `optional` | `Type` | `optional(S)` via `toType` | no | same but from decoded value |
+| `Schema.withConstructorDefault(effect)` | `optionalKey` (absent only) | `~type.make.in` | `withConstructorDefault` | no — applies only to `make` | literal tags (`Schema.tag`) |
+
+All `withDecodingDefault*` variants accept `{ encodingStrategy: "omit" | "passthrough" }` (default `passthrough`):
+
+- `"passthrough"` — encoding includes the default value verbatim.
+- `"omit"` — encoding omits the key when the decoded value equals the default's encoded shape.
+
+```ts title="src/defaults.ts"
+import { Effect, Schema } from "effect"
+
+// 1. withDecodingDefaultKey — absent only, default is Encoded (pre-transform)
+const WithKey = Schema.Struct({
+  name: Schema.String.pipe(Schema.withDecodingDefaultKey(Effect.succeed("anonymous")))
+})
+Schema.decodeUnknownSync(WithKey)({}) // { name: "anonymous" }
+Schema.decodeUnknownSync(WithKey)({ name: "Ada" }) // { name: "Ada" }
+Schema.encodeSync(WithKey)({ name: "anonymous" }) // { name: "anonymous" } — passthrough
+// { encodingStrategy: "omit" } would encode { name: "anonymous" } as {} so round-trip erases defaults
+
+// 2. withDecodingDefaultTypeKey — same absent-only, but default is Type (no decoding needed)
+const WithKeyType = Schema.Struct({
+  createdAt: Schema.Date.pipe(
+    Schema.withDecodingDefaultTypeKey(Effect.succeed(new Date("2024-01-01")))
+  )
+})
+Schema.decodeUnknownSync(WithKeyType)({}) // { createdAt: 2024-01-01T00:00:00.000Z }
+
+// 3. withDecodingDefault — absent OR undefined leaves, Encoded default
+const WithUndef = Schema.Struct({
+  name: Schema.String.pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed("anonymous")))
+})
+Schema.decodeUnknownSync(WithUndef)({} as any) // { name: "anonymous" }
+Schema.decodeUnknownSync(WithUndef)({ name: undefined } as any) // { name: "anonymous" }
+
+// 4. withDecodingDefaultType — same absent|undefined, Type-level default
+const WithUndefType = Schema.Struct({
+  count: Schema.Finite.pipe(Schema.optional, Schema.withDecodingDefaultType(Effect.succeed(0)))
+})
+
+// 5. withConstructorDefault — default only for `.make`, NOT for decoding!
+const Constructable = Schema.Struct({
+  _tag: Schema.tag("Circle"), // tag's make-input is optional; decode still requires it
+  radius: Schema.Finite
+})
+Constructable.make({ radius: 5 }) // { _tag: "Circle", radius: 5 }
+Schema.decodeUnknownSync(Constructable)({ _tag: "Circle", radius: 5 }) // ok
+// Schema.decodeUnknownSync(Constructable)({ radius: 5 } as any) // throws — tag required on wire
+
+// Canonical discriminated tag via helper:
+const Tagged = Schema.Struct({ _tag: Schema.tag("A"), value: Schema.Number })
+Tagged.make({ value: 42 }) // _tag auto-filled; encode includes it
+
+// Omit-on-round-trip tag: tagDefaultOmit strips _tag on encode (wire has no discriminator)
+const WireOmitting = Schema.Struct({ _tag: Schema.tagDefaultOmit("B"), value: Schema.Number })
+Schema.encodeSync(WireOmitting)({ _tag: "B", value: 1 }) // { value: 1 } — no _tag on wire
+```
+
+:::note[Default values are effects]
+Defaults take `Effect<Encoded | Type, SchemaError, R>` — they *can* fail and *can* require services. That `Effect` runs during decode whenever the key is missing. Encoding `withDecodingDefault*` defaults are synchronized against the encode-side getter; effectful encode defaults are rare but permitted. `withConstructorDefault` runs during `.make` construction, not decoding — don't confuse the two.
+:::
+
+:::caution[Picking the right default variant]
+If your wire never sends `undefined` (JSON never does), prefer `*Key` variants — they don't introduce `undefined` into the domain type. If you are decoding `FormData`/`URLSearchParams` or JS-to-JS objects where `undefined` may appear as a field value, use `withDecodingDefault` (the `optional` variant).
+:::
+
+## Custom validation
+
+Filters attach after decoding shapes — they receive an already-decoded `T` and return a `FilterOutput` describing success or failure. Every `.check` refines the *same* schema type (narrowing without type change at the TypeScript level; runtime filtering still happens of course).
+
+### `makeFilter` and `FilterOutput`
+
+```ts title="src/make-filter.ts"
+import { Result, Schema } from "effect"
+
+const PasswordPair = Schema.Struct({
+  password: Schema.String,
+  confirmPassword: Schema.String
+}).check(
+  Schema.makeFilter((o) =>
+    o.password === o.confirmPassword
+      ? undefined
+      : { path: ["confirmPassword"], issue: "passwords must match" }
+  )
+)
+
+Schema.decodeUnknownResult(PasswordPair)({ password: "secret", confirmPassword: "other" })
+// Failure( Filter( Pointer{ path: ["confirmPassword"], issue: InvalidValue("passwords must match") } ) )
+```
+
+`FilterOutput` values (what the predicate may return) normalize as follows:
+
+| Return | Meaning | Normalized issue |
+|---|---|---|
+| `undefined` / `true` | success | — |
+| `false` | generic failure | `InvalidValue` with no custom message, honors `reportInput` |
+| `string` | single failure | `InvalidValue` with `message` = string, honors `reportInput` |
+| `SchemaIssue.Issue` | single custom failure | returned as-is (not enriched with `reportInput`) |
+| `{ path, issue }` | failure at nested path | `Pointer` wrapping `issue` (string → `InvalidValue` or raw `Issue`) |
+| `ReadonlyArray<FilterIssue>` | batch of failures | `[]` → success; `[x]` → `x`; `[x, y, ...]` → `Composite` |
+
+```ts title="src/filter-output-shapes.ts"
+import { Result, Schema } from "effect"
+
+// Single string shortcut
+const NonEmpty = Schema.String.check(
+  Schema.makeFilter((s) => s.length > 0 ? undefined : "must be non-empty")
+)
+
+// Multiple failures at once — both reported when { errors: "all" } (or Check filter behavior)
+const Triple = Schema.Struct({ a: Schema.Finite, b: Schema.Finite, c: Schema.Finite }).check(
+  Schema.makeFilter((o) => {
+    const issues: Array<Schema.FilterIssue> = []
+    if (o.a > 0) {
+      if (o.b <= 0) issues.push({ path: ["b"], issue: "b must be > 0 when a > 0" })
+      if (o.c <= 0) issues.push({ path: ["c"], issue: "c must be > 0 when a > 0" })
+    }
+    return issues
+  })
+)
+const r = Schema.decodeUnknownResult(Triple, { errors: "all" })({ a: 1, b: 0, c: 0 })
+if (Result.isFailure(r) && r.failure.issue._tag === "Filter" && r.failure.issue.issue._tag === "Composite") {
+  // both b and c issues are inside Composite
+}
+
+// Filter targeting a nested path via full Issue
+const CustomIssue = Schema.Struct({ count: Schema.Finite }).check(
+  Schema.makeFilter((o, _ast, opts) =>
+    o.count < 0
+      ? { path: ["count"], issue: `count ${o.count} is negative` }
+      : undefined
+  )
+)
+```
+
+### Multiple `.check` calls, `errors: "all"`, and `abort`
+
+```ts title="src/check-aggregation.ts"
+import { Schema } from "effect"
+
+// Each .check adds a Filter AST node; multiple filters on one .check run sequentially over the same T
+const User = Schema.Struct({ name: Schema.String, age: Schema.Finite })
+  .check(
+    Schema.makeFilter((o) => o.name.length >= 3 ? undefined : { path: ["name"], issue: "name too short" }),
+    Schema.makeFilter((o) => o.age >= 0 ? undefined : { path: ["age"], issue: "age negative" })
+  )
+  // or chained .check(...) — equivalent, just adds another node
+
+// { errors: "all" } *per runner* collects all failing Filter nodes into a Composite
+Schema.decodeUnknownSync(User, { errors: "all" })({ name: "Al", age: -5 } as any)
+// Failure({ _tag: "Composite", issues: [Pointer(["name"]), Pointer(["age"])] })
+
+// Without "all", parsing stops at the first failing branch
+Schema.decodeUnknownSync(User)({ name: "Al", age: -5 } as any)
+// single Pointer issue — whichever was tried first
+
+// abort: stop collecting further checks after this filter fails
+const AbortViaArg = Schema.String.check(
+  Schema.makeFilter((s) => s.length > 0 ? undefined : "empty", undefined, true)
+)
+const AbortViaMethod = Schema.String.check(
+  Schema.makeFilter((s: string) => s.length > 0 ? undefined : "empty").abort()
+)
+// Both set `filter.aborted = true`; when this filter fails, later sibling checks are not evaluated
+```
+
+> `abort` may be supplied either as the third argument to `makeFilter(pred, annotations, true)` or via `filter.abort()`, which returns a copy with `aborted: true`. `FilterGroup` is the coarser aggregation primitive covered next.
+
+### `FilterGroup`
+
+`FilterGroup` merges several `Check` values into a single `FilterGroup` node — a coarser grouping than per-`.check`, with shared annotations:
+
+```ts title="src/filter-group.ts"
+import { Schema } from "effect"
+
+const Positive = Schema.Finite.check(Schema.isGreaterThan(0))
+const Even = Schema.Finite.check(Schema.isMultipleOf(2))
+
+// Two separate .check nodes — default collection semantics
+const Separate = Schema.Finite.check(Schema.isGreaterThan(0)).check(Schema.isMultipleOf(2))
+
+// One FilterGroup — treated as one composite check unit with shared annotations
+const Grouped = Schema.Finite.check(
+  Schema.makeFilterGroup(
+    [Schema.isGreaterThan(0), Schema.isMultipleOf(2)],
+    { message: "must be positive and even" }
+  )
+)
+```
+
+Use `FilterGroup` when a set of refinements logically belong together and should present as one conceptual check with shared `message`/`identifier` annotations.
+
+### Effectful validation via `checkEffect`
+
+Synchronous filters (`FilterOutput`) cannot do I/O. When validation needs a service or async `Effect`, move the check into the `Getter` side of a `decodeTo` via `SchemaGetter.checkEffect`:
+
+```ts title="src/check-effect.ts"
+import { Effect, Schema, SchemaGetter } from "effect"
+
+declare class LookupService extends Effect.Service<LookupService>()("LookupService", {
+  succeed: {
+    exists(username: string): Effect.Effect<boolean>
+  }
+}) {}
+
+const UniqueUsername = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, {
+    // Runs on Every decoding; requires LookupService
+    decode: SchemaGetter.checkEffect<string>((s, _opts) =>
+      Effect.flatMap(
+        LookupService,
+        (svc) => svc.exists(s).pipe(
+          Effect.map((alreadyTaken) =>
+            !alreadyTaken ? undefined : `username ${s} is taken`
+          )
+        )
+      )
+    ),
+    encode: SchemaGetter.passthrough()
+  })
+)
+
+// Effectful checks also understand the FilterOutput shapes — returning a string, Issue, or { path, issue }
+// Decoding now needs the service:
+const program = Schema.decodeUnknownEffect(UniqueUsername)("alice").pipe(
+  Effect.provideService(LookupService, { exists: () => Effect.succeed(false) })
+)
+```
+
+:::note[Validation vs transformation]
+Use `.check(makeFilter(...))` for *synchronous* validation that does not need services. Use `Getter.checkEffect` inside `decodeTo` for *effectful* validation. Both preserve the schema's `T`/`E`. Mixing them is fine — sync checks run first, effectful checks join the `Effect` pipeline that the runner executes.
+:::
+
+### Branding — nominal typing without data
+
+```ts title="src/branding.ts"
+import { Brand, Schema } from "effect"
+
+// Tag-only: intersects string with Brand<B>, prevents accidental mixing of structurally identical primitives
+const UserId = Schema.String.pipe(Schema.brand("UserId"))
+type UserId = typeof UserId.Type // string & Brand<"UserId">
+
+const OrderId = Schema.String.pipe(Schema.brand("OrderId"))
+declare function loadUser(id: UserId): void
+// loadUser(OrderId.make("o_1") as any) // type error — OrderId is not assignable to UserId
+
+// Apply a Brand constructor's intrinsic checks alongside the tag
+import { Brand as BrandNS } from "effect"
+const PositiveBrand = BrandNS.nominal<number>() // nominal brand helper
+// Define a brand with invariants
+const NonEmptyBrand = (BrandNS as any).refined<string>(
+  (s: string) => s.length > 0,
+  { identifier: "NonEmpty" }
+)
+const BrandedViaConstructor = Schema.String.pipe(
+  Schema.fromBrand("NonEmpty", NonEmptyBrand as any)
+)
+// equivalent to filtering then branding in one step
+```
+
+Branding adds metadata to the AST and narrows `Type`, but adds *no* runtime conversion — `encodeSync` and `decodeSync` remain identity over the underlying value, and equality is structural.
+
+## Bridging to other boundaries
+
+Transformations and validation are the glue between `Schema` and two adjacent modules you'll meet soon — configuration and HTTP. A preview of how the same codecs cross those boundaries:
+
+### Config
+
+`Config.schema(codec, path?)` lifts any codec into a `Config` descriptor: paths become nested lookup keys, env provider splits `_` tries, structured providers preserve nested objects. The codec's `RD` flows into the `Config`'s error channel as `ConfigError`.
+
+```ts title="src/schema-to-config.ts"
+import { Config, Schema } from "effect"
+
+const DbConfigSchema = Schema.Struct({
+  url: Schema.NonEmptyString,
+  maxConnections: Schema.Finite.check(Schema.isBetween({ minimum: 1, maximum: 200 })),
+  ssl: Schema.Boolean
+})
+
+// Config layer: reads DATABASE_URL etc. (or { database: { url: ... } } via JSON provider)
+const DbConfig = Config.schema(DbConfigSchema, "database")
+// Effect<ConfigType, ConfigError, never> — no services required to read
+
+const WithDefaults = Schema.Struct({
+  host: Schema.String.pipe(Schema.withDecodingDefaultKey(Effect.succeed("0.0.0.0")) as any),
+  port: Schema.Finite
+})
+// Mixing Config.schema with defaults: unsupported — defaults are higher-level than Config
+// Instead: wrap the whole Config.schema result with Config.withDefault / Config.option
+```
+
+See [11 · Configuration](/effect-ts/11-config/) for the full split between description and provider.
+
+### HTTP
+
+String-level transformations (`trim`, `toLowerCase`, `snakeToCamel`, numeric-string helpers) are directly reusable in HTTP bodies, query strings, and headers by piping schemas through `fromFormData` / `fromURLSearchParams` or canonical StringTree codecs (next chapter). HttpApi's request/response codecs *are* the same `Codec` values — annotating a schema with `{ httpApiStatus: 404 }` (see `HttpApiSchema.withStatus`) wires the codec to route-level error mapping.
+
+```ts title="src/http-teaser.ts"
+import { Schema, SchemaTransformation } from "effect"
+
+// Reusable wire normalization shared across HTTP and env boundaries
+const Slug = Schema.String.pipe(
+  Schema.decode(SchemaTransformation.trim()),
+  Schema.decode(SchemaTransformation.toLowerCase())
+)
+
+// Form / query wiring (covered in Chapter 22)
+// Schema.fromURLSearchParams(Schema.toCodecStringTree(AppQuery))
+// Schema.fromFormData(Schema.toCodecStringTree(UploadForm))
+```
+
+The next chapter gives these serializers their full due — canonical codecs, `fromJsonString` wiring, and how declarations supply their own serialization branches.
+
+## End-to-end runnable: bridging pipeline
+
+A single module putting transformations, defaults, optional-key patterns, and validation together — parse query + body, validate cross-field, enrich with a default, and round-trip to JSON:
+
+```ts title="src/bridging.ts"
+import { Effect, Option, Result, Schema, SchemaGetter, SchemaTransformation } from "effect"
+
+// — Primitives with checks —
+const Email = Schema.String.check(Schema.isPattern(/^[^\s@]+@[^\s@]+\.[^\s@]+$/))
+const Handle = Schema.String.pipe(
+  Schema.decode(SchemaTransformation.trim()),
+  Schema.decode(SchemaTransformation.toLowerCase())
+).pipe(
+  (s) => s.check(Schema.isMinLength(3), Schema.isMaxLength(30), Schema.isPattern(/^[a-z0-9_]+$/))
+)
+
+// — Struct with defaults + Option bridging —
+const CreateUserInput = Schema.Struct({
+  handle: Handle,
+  email: Email,
+  // absent on wire → defaults to 1 on decode; encoded defaults passthrough (kept on encode)
+  maxProjects: Schema.Finite.pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed(1))
+  ),
+  // Wire may omit, but domain wants Option rather than undefined
+  bio: Schema.optionalKey(Schema.String).pipe(
+    Schema.decodeTo(
+      Schema.Option(Schema.String),
+      SchemaTransformation.optionFromOptionalKey()
+    )
+  )
+})
+
+// Cross-field validation via makeFilter
+const ValidatedInput = CreateUserInput.check(
+  Schema.makeFilter((o) =>
+    o.maxProjects >= 1 ? undefined : { path: ["maxProjects"], issue: "at least 1 project required" }
+  )
+)
+
+// — Optional effects inside parsing —
+// Async uniqueness check via Getter.checkEffect
+declare class NameRegistry extends Effect.Service<NameRegistry>()("NameRegistry", {
+  succeed: { taken(handle: string): Effect.Effect<boolean> }
+}) {}
+
+const Checked = ValidatedInput.pipe(
+  Schema.decodeTo(ValidatedInput, {
+    decode: SchemaGetter.checkEffect((o) =>
+      Effect.flatMap(NameRegistry, (reg) =>
+        reg.taken(o.handle).pipe(
+          Effect.map((taken) => taken ? { path: ["handle" as const], issue: `handle ${o.handle} taken` } : undefined)
+        )
+      )
+    ),
+    encode: SchemaGetter.passthrough()
+  })
+)
+
+// — Usage —
+const raw = { handle: "  Ada_L ", email: "ada@analytic.dev" }
+const program = Effect.gen(function* () {
+  // Trim + lowercase happens first (handle → "ada_l"), still subject to minLength/pattern checks
+  const parsed = yield* Schema.decodeUnknownEffect(Checked)(raw).pipe(
+    Effect.provideService(NameRegistry, { taken: () => Effect.succeed(false) })
+  )
+  console.log(parsed.handle)       // "ada_l"
+  console.log(parsed.maxProjects)  // 1 (default)
+  console.log(parsed.bio)          // Option.none()
+
+  const wire = Schema.encodeSync(Checked)(parsed) as any
+  console.log(wire.maxProjects)    // 1 — default survived encoding via passthrough
+  return wire
+})
+
+await Effect.runPromise(program)
+
+// Sync path without the async guard — same codec without the NameRegistry requirement
+Schema.decodeUnknownSync(ValidatedInput)({ handle: "bob", email: "bob@example.com" } as any)
+// { handle: "bob", email: "bob@example.com", maxProjects: 1, bio: None }
+
+// Multiple issues collected:
+const r = Schema.decodeUnknownResult(Checked, { errors: "all" })(
+  { handle: "a", email: "bad", maxProjects: 0 } as any
+)
+if (Result.isFailure(r)) {
+  // Composite containing handle-length, email pattern, maxProjects issues — and path-annotated pointers
+  console.log(r.failure.message)
+}
+```
+
+## Cheat sheet
+
+| Need | Write |
+|---|---|
+| Pure `T ↔ E` pair | `SchemaTransformation.transform({ decode, encode })` |
+| Fallible `T ↔ E` | `SchemaTransformation.transformOrFail({ decode, encode })` |
+| Option-aware | `SchemaTransformation.transformOptional({ decode: (optE)=>optT, encode: ... })` |
+| Ready-made | `SchemaTransformation.numberFromString`, `dateFromString`, `stringFromBase64String`, `urlFromString`, … |
+| Attach, type changes | `schema.pipe(Schema.decodeTo(target, transformation))` |
+| Attach, same type | `schema.pipe(Schema.decode(transformation))` |
+| Identity | `SchemaGetter.passthrough()` / `SchemaTransformation.passthrough()` |
+| Identity for subtype/supertype | `passthroughSubtype` / `passthroughSupertype` |
+| `optionalKey → Option` | `Schema.optionalKey(S).pipe(decodeTo(Option(S), optionFromOptionalKey()))` |
+| `optional → Option` | same with `optionFromOptional()` |
+| `null → Option` | `Schema.NullOr(S).pipe(decodeTo(Option(S), optionFromNullOr()))` |
+| Omit on encode | `SchemaGetter.omit()` |
+| Default, absent-only | `S.pipe(Schema.withDecodingDefaultKey(Effect.succeed(enc)))` |
+| Default, absent\|undef | `S.pipe(Schema.optional, Schema.withDecodingDefault(...))` |
+| Default as `Type` not `Encoded` | `withDecodingDefaultTypeKey` / `withDecodingDefaultType` |
+| Constructor-only default | `S.pipe(Schema.withConstructorDefault(Effect.succeed(v)))` / `Schema.tag("A")` |
+| Sync validation | `schema.check(Schema.makeFilter((v, ast, opts) => FilterOutput))` |
+| Several issues at once | return `Array<FilterIssue>` or rely on `{ errors: "all" }` |
+| Group checks | `Schema.makeFilterGroup([checkA, checkB])` |
+| Short-circuit | `filter.abort()` |
+| Async/service validation | `Schema.decodeTo(same, { decode: SchemaGetter.checkEffect(...) })` |
+| Nominalize | `Schema.String.pipe(Schema.brand("UserId"))` / `Schema.fromBrand(id, ctor)` |
+
+## Next
+
+<LinkCard
+  title="22 · Schema — Classes, Opaque Types & Serialization"
+  description="Constructible domain classes vs nominal opaques, TaggedClass/TaggedError patterns with httpApiStatus, declaring existing types, JSON/FormData/StringTree canonical codecs, and generation tooling."
+  href="/effect-ts/22-schema-classes/"
+/>

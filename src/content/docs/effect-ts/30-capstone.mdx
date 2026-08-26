@@ -1,0 +1,809 @@
+---
+title: Capstone — A Complete Service
+description: A single end-to-end Effect service — from branded ids and field variants through migrations, SqlModel repositories, HttpApi definition with middleware and status-annotated errors, SQL and in-memory implementations, handlers, serving, docs, typed clients, shared-layer tests, observability, and the layer graph that composes it all.
+sidebar:
+  order: 30
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Every preceding chapter introduced one mechanism in isolation. This chapter puts them in one building and turns the lights on. The service is a **Task API** — a tiny TODO domain with just enough shape to need everything the course taught you. Shorten the example and you lose migration strategy; simplify the errors and you lose `HttpApiError` mapping; drop the middleware and you lose the testing story. Keep it whole and it is the reference architecture you can clone for the next service.
+
+:::note[What this covers — and where each piece was explained]
+- **Model domain** — branded ids, field variants ([ch 07](/effect-ts/07-option-result-data/)/[Schema track])
+- **Migrations + SqlModel derivation** — `SqlModel.makeRepository` ([SQL track — ch 25](/effect-ts/25-sql/))
+- **HttpApi definition** — groups, endpoints, middleware, status-annotated errors ([ch 24](/effect-ts/24-http-apis/))
+- **Service implementations** — `layerNoDeps` / `layer` / `layerMemory` split ([ch 10](/effect-ts/10-layers/))
+- **HttpApiBuilder handlers** — `catchReason` error mapping ([ch 05](/effect-ts/05-errors/))
+- **Serving** — `NodeHttpServer` + docs via `HttpApiScalar` + client ([ch 24](/effect-ts/24-http-apis/))
+- **Testing** — `HttpApiTest` + `layer(...)` block ([ch 28](/effect-ts/28-testing/))
+- **Observability** — `Logger` + `Otlp` wiring, "observability last" ([ch 27](/effect-ts/27-observability/))
+- **Entry** — `Layer.launch` + `NodeRuntime.runMain` ([ch 29](/effect-ts/29-runtime-integration/))
+:::
+
+## 1. Model domain
+
+From `effect/src/Schema.ts` and `effect/unstable/sql/SqlModel.ts` (previously `effect/unstable/schema/Model`): one `Class` declaration spawns the database row, the JSON DTOs, and the arbitrary generators for property tests.
+
+```ts
+// src/domain/Task.ts
+import { Schema } from "effect"
+
+export const TaskId = Schema.String.pipe(Schema.brand("TaskId"))
+export type TaskId = typeof TaskId.Type
+
+// Used for path params — decodes from a string via toCodecStringTree in HttpApi.
+// In SQL it maps to TEXT.
+
+export class Task extends Schema.Class<Task>("Task")({
+  id: TaskId,
+  title: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(200)),
+  completed: Schema.Boolean,
+  createdAt: Schema.DateTimeUtc,
+  updatedAt: Schema.DateTimeUtc
+}) {
+  // Field variants — which columns appear on each operation:
+  // The book keeps one Class, multiple projections. SqlModel understands this.
+  static readonly json = Schema.Class.make({
+    id: TaskId,
+    title: Schema.String,
+    completed: Schema.Boolean,
+    createdAt: Schema.DateTimeUtc,
+    updatedAt: Schema.DateTimeUtc
+  })
+
+  static readonly jsonCreate = Schema.Class.make({
+    title: Schema.String.pipe(Schema.minLength(1))
+  })
+
+  static readonly jsonUpdate = Schema.Class.make({
+    title: Schema.optional(Schema.String.pipe(Schema.minLength(1))),
+    completed: Schema.optional(Schema.Boolean)
+  })
+}
+```
+
+```ts
+// src/domain/TaskErrors.ts
+import { Schema } from "effect"
+
+export class TaskNotFound extends Schema.TaggedError<TaskNotFound>()("TaskNotFound", {
+  id: TaskId // reuses the branded id — same brand, one source
+}) {}
+
+export class TitleTooShort extends Schema.TaggedError<TitleTooShort>()("TitleTooShort", {
+  minimumLength: Schema.Number
+}) {
+  static readonly minimumLength = 1 as const
+}
+
+export class TaskError extends Schema.TaggedError<TaskError>()("TaskError", {
+  reason: Schema.Union(TaskNotFound, TitleTooShort)
+}) {}
+```
+
+Why `Schema.TaggedError` over `Data.TaggedError`? Tagged errors are schemas: decodable, loggable, HTTP-mappable via `HttpApiSchema`, and catchable by `_tag`/`catchTag`/`catchReason` without a class guard. Chapter 5 argued this is the default for domain errors.
+
+Branded `TaskId` flows everywhere — model field, path param, error payload, `HttpApi` param schema, `SqlModel` `idColumn` — no bare `string` id.
+
+## 2. Migrations + SqlModel repository derivation
+
+`SqlModel` (`effect/unstable/sql/SqlModel.ts` — verified via `packages/effect/src/unstable/sql`) derives CRUD from the `Task` model plus a `tableName`/`spanPrefix` configuration. Routing through `SqlModel` is preferred over hand-written `sql` tags for the happy-path columns; `SqlSchema`/`sql` remain for searches and joins.
+
+```ts
+// src/repo/TaskRepo.ts
+import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node"
+import { Context, Effect, Layer, Schema } from "effect"
+import { SqlClient, SqlModel, SqlSchema } from "effect/unstable/sql"
+import { Task, TaskId } from "../domain/Task.ts"
+import { TaskError, TaskNotFound, TitleTooShort } from "../domain/TaskErrors.ts"
+
+// Swappable client — point at Postgres by swapping this layer for PgClient.layer
+const SqlLayer = SqliteClient.layer({ filename: ":memory:" })
+
+// Migrations keyed by id_name, applied once in order.
+// Real apps keep each migration in its own file via fromFileSystem.
+const MigratorLayer = SqliteMigrator.layer({
+  loader: SqliteMigrator.fromRecord({
+    "0001_create_tasks": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          completed INTEGER NOT NULL DEFAULT 0,
+          createdAt TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `
+    })
+  })
+})
+
+export class Tasks extends Context.Service<Tasks, {
+  list(search: string | undefined): Effect.Effect<Array<Task>, TaskError>
+  getById(id: TaskId): Effect.Effect<Task, TaskError>
+  create(input: typeof Task.jsonCreate.Type): Effect.Effect<Task, TaskError>
+  update(id: TaskId, input: typeof Task.jsonUpdate.Type): Effect.Effect<Task, TaskError>
+  delete(id: TaskId): Effect.Effect<void, TaskError>
+}>()("acme/Tasks") {
+  // Production database implementation — honest about requiring SqlClient.
+  static readonly layerNoDeps = Layer.effect(
+    Tasks,
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      const repo = yield* SqlModel.makeRepository(Task, {
+        tableName: "tasks",
+        spanPrefix: "Tasks",
+        idColumn: "id"
+      })
+
+      const listAll = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Task,
+        execute: () => sql`SELECT * FROM tasks ORDER BY createdAt DESC`
+      })
+
+      const searchTasks = SqlSchema.findAll({
+        Request: Schema.String,
+        Result: Task,
+        execute: (search) => {
+          const pattern = `%${search}%`
+          return sql`SELECT * FROM tasks WHERE title LIKE ${pattern}`
+        }
+      })
+
+      const list = Effect.fn("Tasks.list")(function* (search: string | undefined) {
+        if (search === undefined || search.length === 0) return yield* Effect.orDie(listAll())
+        if (search.length < TitleTooShort.minimumLength) {
+          return yield* new TaskError({ reason: new TitleTooShort({ minimumLength: 1 }) })
+        }
+        yield* Effect.annotateCurrentSpan({ search })
+        return yield* Effect.orDie(searchTasks(search))
+      })
+
+      const getById = Effect.fn("Tasks.getById")(function* (id: TaskId) {
+        const row = yield* repo.findById(id).pipe(Effect.orDie)
+        if (row === undefined) return yield* new TaskError({ reason: new TaskNotFound({ id }) })
+        return row
+      })
+
+      const create = Effect.fn("Tasks.create")(function* (input: typeof Task.jsonCreate.Type) {
+        // repo.insert handles id + timestamps encoding according to the model
+        const now = new Date()
+        const task = yield* repo.insert(
+          Task.make({
+            id: TaskId.make(crypto.randomUUID()),
+            title: input.title,
+            completed: false,
+            createdAt: now,
+            updatedAt: now
+          })
+        ).pipe(Effect.orDie)
+        return task
+      })
+
+      const update = Effect.fn("Tasks.update")(function* (id: TaskId, input: typeof Task.jsonUpdate.Type) {
+        const existing = yield* getById(id)
+        const patch: Partial<Task> = {
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(input.completed !== undefined ? { completed: input.completed } : {}),
+          updatedAt: new Date()
+        }
+        const updated = yield* repo.update({ ...existing, ...patch }).pipe(Effect.orDie)
+        return updated
+      })
+
+      const remove = Effect.fn("Tasks.delete")(function* (id: TaskId) {
+        const existing = yield* getById(id)
+        yield* repo.delete(existing.id).pipe(Effect.orDie)
+      })
+
+      return Tasks.of({ list, getById, create, update, delete: remove })
+    })
+  )
+
+  // Wired: depends on SqlClient, needs Migrator for startup.
+  static readonly layer = Tasks.layerNoDeps.pipe(
+    Layer.provide(SqlLayer),
+    Layer.provideMerge(MigratorLayer)
+  )
+
+  // In-memory double — no SqlClient required. Uses a Ref, like chapter 28.
+  static readonly layerMemory = Layer.effect(
+    Tasks,
+    Effect.gen(function* () {
+      const { Ref } = yield* import("effect")
+      const store = yield* Ref.make(new Map<TaskId, Task>())
+
+      const list = Effect.fn("Tasks.list.memory")(function* (search: string | undefined) {
+        const map = yield* Ref.get(store)
+        const all = Array.from(map.values())
+        if (!search) return all
+        if (search.length < TitleTooShort.minimumLength) {
+          return yield* new TaskError({ reason: new TitleTooShort({ minimumLength: 1 }) })
+        }
+        return all.filter((t) => t.title.includes(search))
+      })
+
+      const getById = Effect.fn("Tasks.getById.memory")(function* (id: TaskId) {
+        const map = yield* Ref.get(store)
+        const task = map.get(id)
+        if (task === undefined) return yield* new TaskError({ reason: new TaskNotFound({ id }) })
+        return task
+      })
+
+      const create = Effect.fn("Tasks.create.memory")(function* (input: typeof Task.jsonCreate.Type) {
+        const id = TaskId.make(crypto.randomUUID()) as TaskId
+        const now = new Date()
+        const task = new Task({ id, title: input.title, completed: false, createdAt: now, updatedAt: now })
+        yield* Ref.update(store, (m) => new Map(m).set(id, task))
+        return task
+      })
+
+      const update = Effect.fn("Tasks.update.memory")(function* (id: TaskId, input: typeof Task.jsonUpdate.Type) {
+        const task = yield* getById(id)
+        const updated = new Task({
+          ...task,
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(input.completed !== undefined ? { completed: input.completed } : {}),
+          updatedAt: new Date()
+        })
+        yield* Ref.update(store, (m) => new Map(m).set(id, updated))
+        return updated
+      })
+
+      const remove = Effect.fn("Tasks.delete.memory")(function* (id: TaskId) {
+        yield* getById(id) // ensure 404 behavior matches SQL
+        yield* Ref.update(store, (m) => { const n = new Map(m); n.delete(id); return n })
+      })
+
+      return Tasks.of({ list, getById, create, update, delete: remove })
+    })
+  )
+}
+```
+
+Conventions:
+
+- **`layerNoDeps`** is honest about `SqlClient`. Type: `Layer<Tasks, never, SqlClient>`.
+- **`layer`** bakes in `SqliteClient + Migrator`. Type: `Layer<Tasks>` with no requirements.
+- **`layerMemory`** is the test/integration fallback. Same service shape, no I/O.
+
+SqlModel's `spanPrefix: "Tasks"` gives per-operation tracing spans `Tasks.findById`, `Tasks.insert` for free — visible alongside the handler spans below.
+
+## 3. HttpApi definition
+
+One root `HttpApi`; two groups (`tasks`, `system`). Chapter 24's shapes directly:
+
+```ts
+// src/api/TasksGroup.ts
+import { Schema } from "effect"
+import { HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
+import { Task, TaskId } from "../domain/Task.ts"
+import { TaskNotFound, TitleTooShort } from "../domain/TaskErrors.ts"
+import { Authorization } from "./Authorization.ts"
+
+export class TasksApiGroup extends HttpApiGroup.make("tasks")
+  .add(
+    HttpApiEndpoint.get("list", "/", {
+      query: { search: Schema.optional(Schema.String) },
+      success: Schema.Array(Task.json)
+    }),
+    HttpApiEndpoint.get("search", "/search", {
+      payload: { search: Schema.String },
+      success: [
+        Schema.Array(Task.json),
+        Schema.String.pipe(HttpApiSchema.asText({ contentType: "text/csv" }))
+      ],
+      error: [
+        TitleTooShort.pipe(HttpApiSchema.asNoContent({ decode: () => new TitleTooShort({ minimumLength: 1 }) })),
+        HttpApiError.RequestTimeoutNoContent
+      ]
+    }),
+    HttpApiEndpoint.get("getById", "/:id", {
+      params: { id: TaskId },
+      success: Task.json,
+      error: TaskNotFound.pipe(HttpApiSchema.asNoContent({ decode: () => new TaskNotFound({ id: TaskId.make("00000000-0000-4000-a000-000000000000") }) }))
+    }),
+    HttpApiEndpoint.post("create", "/", {
+      payload: Task.jsonCreate,
+      success: Task.json
+    }),
+    HttpApiEndpoint.patch("update", "/:id", {
+      params: { id: TaskId },
+      payload: Task.jsonUpdate,
+      success: Task.json,
+      error: TaskNotFound.pipe(HttpApiSchema.asNoContent({ decode: () => new TaskNotFound({ id: TaskId.make("00000000-0000-4000-a000-000000000000") }) }))
+    }),
+    HttpApiEndpoint.del("delete", "/:id", {
+      params: { id: TaskId },
+      success: Schema.Void,
+      error: TaskNotFound.pipe(HttpApiSchema.asNoContent({ decode: () => new TaskNotFound({ id: TaskId.make("00000000-0000-4000-a000-000000000000") }) }))
+    }),
+    HttpApiEndpoint.get("me", "/me", {
+      success: Task.json,
+      error: TaskNotFound.pipe(HttpApiSchema.status(404))
+    })
+  )
+  .middleware(Authorization) // every /tasks/* route requires Auth
+  .prefix("/tasks")
+  .annotateMerge(OpenApi.annotations({ title: "Tasks", description: "Task management endpoints" }))
+{}
+```
+
+```ts
+// src/api/Authorization.ts
+import { Context, Effect, Schema } from "effect"
+import { HttpApiMiddleware, HttpApiSecurity } from "effect/unstable/httpapi"
+
+export class Authorization extends HttpApiMiddleware.Tag<Authorization>()("Authorization", {
+  failure: Schema.TaggedError<Authorization>()("Unauthorized", {}),
+  provides: Context.Service<Authorization, { userId: string }>(),
+  security: HttpApiSecurity.bearer
+}) {}
+
+// Client-side helper (for HttpApiTest and real clients):
+// import { HttpClientRequest } from "effect/unstable/http"
+// HttpApiMiddleware.layerClient(Authorization, ({ next, request }) =>
+//   next(HttpClientRequest.bearerToken(request, "dev-token")))
+```
+
+```ts
+// src/api/Api.ts
+import { HttpApi, OpenApi } from "effect/unstable/httpapi"
+import { SystemApi } from "./System.ts"
+import { TasksApiGroup } from "./TasksGroup.ts"
+
+export class Api extends HttpApi.make("task-api")
+  .add(TasksApiGroup)
+  .add(SystemApi)
+  .annotateMerge(OpenApi.annotations({ title: "Acme Task API", version: "1.0.0" }))
+{}
+```
+
+Status-annotated errors: `.pipe(HttpApiSchema.asNoContent({ decode: ... }))` makes `TaskNotFound` return `204 No Content` with no body; `.pipe(HttpApiSchema.status(404))` returns that status while keeping JSON error body, per fixture `UsersApiGroup` (`ai-docs/src/51_http-server/fixtures/api/Users.ts`). The decode function round-trips the error at the edge.
+
+## 4. Service implementations — the split pattern
+
+Already introduced in §2 as `layerNoDeps`/`layer`/`layerMemory`. The three statics exist so different entrypoints can pick the same service surface with different construction. The default prod path uses `Tasks.layer` (SQL), the test path uses `Tasks.layerMemory` (Ref). Either satisfies the same `Tasks` interface consumed by handlers.
+
+For services that wrap the repository:
+
+```ts
+// src/services/TaskEvents.ts
+import { Context, Effect, Layer } from "effect"
+import { Tasks } from "../repo/TaskRepo.ts"
+
+export class TaskEvents extends Context.Service<TaskEvents, {
+  onCreated(id: string): Effect.Effect<void>
+}>()("acme/TaskEvents") {
+  static readonly layerNoDeps = Layer.effect(
+    TaskEvents,
+    Effect.gen(function* () {
+      const tasks = yield* Tasks
+      const onCreated = Effect.fn("TaskEvents.onCreated")(function* (id: string) {
+        const task = yield* tasks.getById(id as any)
+        yield* Effect.logInfo("task created", { id: task.id, title: task.title })
+      })
+      return TaskEvents.of({ onCreated })
+    })
+  )
+  static readonly layer = TaskEvents.layerNoDeps.pipe(Layer.provide(Tasks.layer))
+  static readonly layerMemory = TaskEvents.layerNoDeps.pipe(Layer.provide(Tasks.layerMemory))
+}
+```
+
+## 5. HttpApiBuilder handlers
+
+Handlers bind endpoints to effects, translating domain `TaskError` into HTTP-oriented error mapping. Chapter 5's `catchReason` keeps the parent `TaskError` shape while peeling the inner `reason` variant without broadening `E`.
+
+```ts
+// src/server/TasksHandlers.ts
+import { Effect, Layer } from "effect"
+import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { Api } from "../api/Api.ts"
+import { Tasks } from "../repo/TaskRepo.ts"
+import { Authorization } from "../api/Authorization.ts"
+
+export const TasksHandlersNoDeps = HttpApiBuilder.group(Api, "tasks", (handlers) =>
+  Effect.gen(function* () {
+    const tasks = yield* Tasks
+    const auth = yield* Authorization
+
+    return handlers
+      .handle("list", ({ query }) =>
+        tasks.list(query.search).pipe(
+          Effect.catchReason("TaskError", "TitleTooShort", () => Effect.fail(new TitleTooShort({ minimumLength: 1 }))),
+          Effect.annotateCurrentSpan({ userId: auth.userId })
+        )
+      )
+      .handle("getById", ({ params }) =>
+        tasks.getById(params.id).pipe(
+          // Peel the reason: TaskError(reason: TaskNotFound) → fail TaskNotFound directly
+          Effect.catchReason("TaskError", "TaskNotFound", (err) => Effect.fail(err.reason))
+        )
+      )
+      .handle("create", ({ payload }) =>
+        tasks.create(payload).pipe(
+          Effect.tap((task) => Effect.logInfo("created task", { id: task.id })),
+          Effect.withSpan("tasks.create")
+        )
+      )
+      .handle("update", ({ params, payload }) =>
+        tasks.update(params.id, payload).pipe(
+          Effect.catchReason("TaskError", "TaskNotFound", (err) => Effect.fail(err.reason))
+        )
+      )
+      .handle("delete", ({ params }) =>
+        tasks.delete(params.id).pipe(
+          Effect.catchReason("TaskError", "TaskNotFound", (err) => Effect.fail(err.reason))
+        )
+      )
+      .handle("search", ({ payload }) =>
+        tasks.list(payload.search).pipe(
+          Effect.catchReason("TaskError", "TitleTooShort", (err) => Effect.fail(err.reason))
+        )
+      )
+  })
+)
+
+// Authorization middleware provider — stub that trusts the bearer token:
+// Real implementation verifies JWT and provides { userId }
+import { TaskNotFound } from "../domain/TaskErrors.ts"
+import { TitleTooShort } from "../domain/TaskErrors.ts"
+
+export const AuthorizationLive = Layer.succeed(
+  Authorization,
+  Authorization.of({ userId: "user_42" })
+)
+// Tests replace this with Layer.fail(new Unauthorized()) or good/bad clients.
+```
+
+`Effect.catchReason` is the v4 reason-error primitive: `Effect.catchReason("TaskError", "TaskNotFound", handler)` matches only the `reason` variant inside a `TaskError`, leaving the outer `TaskError` wrapper untouched for unhandled branches. This is how a single `Tasks` service that always fails with `TaskError(reason: ...)` can be mapped endpoint-by-endpoint to the narrow error declared in `HttpApiEndpoint.error`.
+
+## 6. Serving — HTTP, docs, and typed clients
+
+One program wires handlers to `NodeHttpServer`. Docs and client are derived from the same `Api`.
+
+```ts
+// src/server/Http.ts
+import { NodeHttpServer } from "@effect/platform-node"
+import { Effect, Layer } from "effect"
+import { HttpApiBuilder, HttpApiScalar, HttpApiSwagger } from "effect/unstable/httpapi"
+import { createServer } from "node:http"
+import { Api } from "../api/Api.ts"
+import { AuthorizationLive } from "./Authorization.ts"
+import { Tasks } from "../repo/TaskRepo.ts"
+import { TasksHandlersNoDeps } from "./TasksHandlers.ts"
+
+export const HandlersLive = TasksHandlersNoDeps.pipe(
+  Layer.provide(Tasks.layer),
+  Layer.provideMerge(AuthorizationLive)
+)
+
+export const HttpLive = HttpApiBuilder.api(Api).pipe(
+  Layer.provide(HandlersLive)
+)
+
+// Docs routes — mounted alongside the same server:
+export const DocsLive = Layer.mergeAll(
+  HttpApiScalar.layer({ path: "/docs" }),  // Scalar UI at /docs
+  HttpApiSwagger.layer({ path: "/openapi.json" })
+)
+
+// Serve over Node's createServer on :3000
+export const ServerLive = HttpLive.pipe(
+  Layer.provide(NodeHttpServer.layer(createServer, { port: 3000 }))
+)
+
+// Combined: API + docs + http server
+export const AppHttpLive = Layer.mergeAll(HttpLive, DocsLive).pipe(
+  Layer.provide(NodeHttpServer.layer(createServer, { port: 3000 }))
+)
+
+// Typed client — used by external consumers and by tests via HttpApiTest
+import { HttpApiClient } from "effect/unstable/httpapi"
+export const makeClient = HttpApiClient.make(Api, { baseUrl: "http://localhost:3000" })
+```
+
+## 7. Testing — in-memory without a server or DB
+
+Chapter 28's patterns applied to the capstone domain. Tests use the *same* `Api` definition, same `TasksHandlersNoDeps` handlers, but provide `Tasks.layerMemory` and `HttpServer.layerServices` plus a good/bad `AuthorizationMiddleware`.
+
+```ts
+// test/tasks.test.ts
+import { assert, layer } from "@effect/vitest"
+import { Effect, Layer } from "effect"
+import { HttpClientRequest, HttpServer } from "effect/unstable/http"
+import { HttpApiMiddleware, HttpApiTest } from "effect/unstable/httpapi"
+import { Api } from "../src/api/Api.ts"
+import { Authorization } from "../src/api/Authorization.ts"
+import { TaskId } from "../src/domain/Task.ts"
+import { AuthorizationLive } from "../src/server/Authorization.ts"
+import { Tasks } from "../src/repo/TaskRepo.ts"
+import { TasksHandlersNoDeps } from "../src/server/TasksHandlers.ts"
+
+const HandlersLayer = TasksHandlersNoDeps.pipe(
+  Layer.provide(Tasks.layerMemory),
+  Layer.provideMerge(AuthorizationLive)
+)
+
+const AuthorizationMiddlewareGood = HttpApiMiddleware.layerClient(
+  Authorization,
+  ({ next, request }) => next(HttpClientRequest.bearerToken(request, "dev-token"))
+)
+
+const AuthorizationMiddlewareBad = HttpApiMiddleware.layerClient(
+  Authorization,
+  ({ next, request }) => next(request) // no token
+)
+
+const makeClient = HttpApiTest.groups(Api, ["tasks"])
+
+layer(Layer.mergeAll(HandlersLayer, HttpServer.layerServices))("TasksApi", (it) => {
+  it.effect("lists, fetches, and creates tasks", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+
+      const created = yield* client.tasks.create({ payload: { title: "Write docs" } })
+      assert.strictEqual(created.title, "Write docs")
+
+      const fetched = yield* client.tasks.getById({ params: { id: created.id } })
+      assert.deepStrictEqual(fetched, created)
+
+      const all = yield* client.tasks.list({ query: {} })
+      assert.isTrue(all.some((t) => t.id === created.id))
+    }).pipe(Effect.provide(AuthorizationMiddlewareGood)))
+
+  it.effect("returns 404 for a missing task", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const error = yield* client.tasks.getById({
+        params: { id: TaskId.make("019845e1-682f-4b02-a706-3b2422d13aec") as TaskId }
+      }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "TaskNotFound")
+    }).pipe(Effect.provide(AuthorizationMiddlewareGood)))
+
+  it.effect("rejects requests without a valid bearer token", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const error = yield* client.tasks.list({ query: {} }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "Unauthorized")
+    }).pipe(Effect.provide(AuthorizationMiddlewareBad)))
+
+  it.effect("search requires at least 1 character (focused regression)", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const error = yield* client.tasks.search({ payload: { search: "" } }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "TitleTooShort")
+    }).pipe(Effect.provide(AuthorizationMiddlewareGood)))
+})
+```
+
+### Virtual-time race test for the same domain
+
+```ts
+import { assert, it } from "@effect/vitest"
+import { Effect, Fiber } from "effect"
+import { TestClock } from "effect/testing"
+
+it.effect("task fetch times out as 404 after deadline", () =>
+  Effect.gen(function* () {
+    const tasks = yield* Tasks
+    const fiber = yield* Effect.forkChild(
+      tasks.getById(TaskId.make("019845e1-682f-4b02-a706-3b2422d13aec") as TaskId).pipe(
+        Effect.timeout("2 seconds"),
+        Effect.catchTag("TimeoutException", () => Effect.fail(new TaskNotFound({ id: TaskId.make("dead-beef") as TaskId })))
+      )
+    )
+    yield* TestClock.adjust("2 seconds")
+    const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+    assert.strictEqual(error._tag, "TaskNotFound")
+  }).pipe(Effect.provide(Tasks.layerMemory)))
+```
+
+### Property test — title round-trips through create
+
+```ts
+import { it } from "@effect/vitest"
+import { assert } from "@effect/vitest"
+import { Effect, Schema } from "effect"
+
+it.effect.prop("titles survive create → fetch", [Schema.String.pipe(Schema.minLength(1), Schema.maxLength(50))], ([title]) =>
+  Effect.gen(function* () {
+    const client = yield* makeClient
+    const created = yield* client.tasks.create({ payload: { title } })
+    const fetched = yield* client.tasks.getById({ params: { id: created.id } })
+    assert.strictEqual(fetched.title, title)
+  }).pipe(Effect.provide(AuthorizationMiddlewareGood))
+)
+```
+
+## 8. Observability wiring
+
+From chapter 27, the observability layer is the *outermost* `Layer.provide`. It covers every span created by `Effect.fn`, `withSpan`, `Task` repository prefixes, and `Layer.withSpan`.
+
+```ts
+// src/observability.ts
+import { Layer } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
+import { OtlpLogger, OtlpSerialization, OtlpTracer } from "effect/unstable/observability"
+
+export const OtlpTracingLayer = OtlpTracer.layer({
+  url: "http://localhost:4318/v1/traces",
+  resource: { serviceName: "task-api", serviceVersion: "1.0.0", attributes: { "deployment.environment": "staging" } }
+})
+
+export const OtlpLoggingLayer = OtlpLogger.layer({
+  url: "http://localhost:4318/v1/logs",
+  resource: { serviceName: "task-api", serviceVersion: "1.0.0" }
+})
+
+export const ObservabilityLayer = Layer.merge(OtlpTracingLayer, OtlpLoggingLayer).pipe(
+  Layer.provide(OtlpSerialization.layerJson),
+  Layer.provide(FetchHttpClient.layer)
+)
+```
+
+Annotate requests at the handler edge:
+
+```ts
+// In TasksHandlers — every tasks.* call carries userId + search on spans
+Effect.annotateCurrentSpan({ userId: auth.userId })
+Effect.annotateSpans({ "tasks.search": payload.search })
+```
+
+## 9. The layer assembly graph
+
+<Mermaid title="Task API — full layer assembly" height={560} code={`
+flowchart TB
+  subgraph domain["Domain"]
+    Task["Task + TaskId<br/>Schema.Class + brand"]
+    Errors["TaskError / TaskNotFound<br/>Schema.TaggedError"]
+  end
+  subgraph repo["Repository"]
+    SqlLayer["SqliteClient.layer<br/>(:memory: prod: Postgres swap)"]
+    Migrator["SqliteMigrator.layer<br/>0001_create_tasks"]
+    TasksNoDeps["Tasks.layerNoDeps<br/>needs SqlClient"]
+    TasksLayer["Tasks.layer<br/>NoDeps + Sql + Migrator"]
+    TasksMemory["Tasks.layerMemory<br/>Ref backed"]
+  end
+  subgraph api["HTTP API"]
+    AuthMW["Authorization<br/>HttpApiMiddleware Tag"]
+    TasksGroup["TasksApiGroup<br/>6 endpoints, asNoContent(status)"]
+    ApiDef["Api<br/>HttpApi.make(task-api)"]
+  end
+  subgraph handlers["Handlers"]
+    HandlersNoDeps["TasksHandlersNoDeps<br/>catchReason mappings"]
+    HandlersLive["HandlersLive<br/>+ Tasks.layer + Auth"]
+    HandlersTest["HandlersTest<br/>+ Tasks.layerMemory + Auth"]
+  end
+  subgraph serve["Serve & docs & client"]
+    HttpBuilder["HttpApiBuilder.api(Api)"]
+    NodeSrv["NodeHttpServer.layer(:3000)"]
+    Docs["HttpApiScalar + Swagger<br/>/docs /openapi.json"]
+    Client["HttpApiClient.make(Api)"]
+  end
+  subgraph test["Tests"]
+    HttpTest["HttpApiTest.groups(Api, [tasks])<br/>typed in-memory client"]
+    LayerBlock["layer(HandlersTest, HttpServer.layerServices)<br/>shared block"]
+  end
+  subgraph obs["Observability"]
+    OtlpT["OtlpTracer.layer"]
+    OtlpL["OtlpLogger.layer"]
+    Ser["OtlpSerialization.layerJson"]
+    HttpC["FetchHttpClient.layer"]
+    ObsLayer["ObservabilityLayer<br/>(merge + serialization + http)"]
+  end
+  subgraph entry["Entry"]
+    AppLive["AppLive<br/>HttpBuilder + NodeSrv + Docs"]
+    Main["Main = AppLive | CheckoutTest<br/>.pipe(Layer.provide(ObsLayer))"]
+    Launch["Layer.launch(Main)<br/>.pipe(NodeRuntime.runMain)"]
+  end
+  Task --> TasksNoDeps --> TasksLayer
+  Errors --> TasksNoDeps
+  SqlLayer --> TasksLayer
+  Migrator --> TasksLayer
+  TasksMemory --> HandlersTest
+  TasksLayer --> HandlersLive
+  Task --> TasksGroup --> ApiDef
+  Errors --> TasksGroup
+  AuthMW --> TasksGroup
+  ApiDef --> HandlersNoDeps --> HandlersLive
+  ApiDef --> HandlersNoDeps --> HandlersTest
+  HandlersLive --> HttpBuilder --> AppLive --> Main --> Launch
+  Docs --> AppLive
+  ApiDef --> Client
+  ApiDef --> HttpTest --> LayerBlock
+  HandlersTest --> LayerBlock
+  LayerBlock --> test
+  ObsLayer --> Main
+  OtlpT --> ObsLayer
+  OtlpL --> ObsLayer
+  Ser --> ObsLayer
+  HttpC --> ObsLayer
+  style obs fill:#f6f8ff,stroke:#4f46e5
+  style test fill:#f0fdf4,stroke:#16a34a
+  style entry fill:#fff7e6,stroke:#d97706
+`} />
+
+The flow left-to-right is book order: model → repo → api → handlers → serve → test/observe → run. The rightmost column is the only place an `Effect` actually runs.
+
+## 10. Entrypoint — `Layer.launch` + `NodeRuntime.runMain`
+
+```ts
+// src/main.ts
+import { NodeRuntime } from "@effect/platform-node"
+import { Effect, Layer } from "effect"
+import { Api } from "./api/Api.ts"
+import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { NodeHttpServer } from "@effect/platform-node"
+import { createServer } from "node:http"
+import { Tasks } from "./repo/TaskRepo.ts"
+import { TasksHandlersNoDeps } from "./server/TasksHandlers.ts"
+import { AuthorizationLive } from "./server/Authorization.ts"
+import { ObservabilityLayer } from "./observability.ts"
+
+const HandlersLive = TasksHandlersNoDeps.pipe(
+  Layer.provide(Tasks.layer),
+  Layer.provideMerge(AuthorizationLive)
+)
+
+const HttpLive = HttpApiBuilder.api(Api).pipe(
+  Layer.provide(HandlersLive)
+)
+
+const AppLive = Layer.mergeAll(
+  HttpLive,
+  // Docs routes also served by the same Node server
+  (await import("effect/unstable/httpapi")).HttpApiScalar.layer({ path: "/docs" })
+).pipe(
+  Layer.provide(NodeHttpServer.layer(createServer, { port: 3000 }))
+)
+
+// Observability outermost — every inner span is exported
+const Main = AppLive.pipe(Layer.provide(ObservabilityLayer))
+
+Layer.launch(Main).pipe(NodeRuntime.runMain)
+
+// Alternative: embed inside Hono/Fastify — chapter 29's ManagedRuntime path:
+// const runtime = ManagedRuntime.make(Tasks.layer, { memoMap: Layer.makeMemoMapUnsafe() })
+// app.get("/tasks", async (c) => c.json(await runtime.runPromise(Tasks.use((r) => r.list(undefined)))))
+```
+
+:::note[One graph, multiple launches]
+`AppLive` is just a `Layer`. `Layer.launch(AppLive)` is the "run forever" entry. `HttpApiTest.groups` builds a client off the same `Api` definition without launching. Property tests call `Tasks.layerMemory` directly without HTTP at all. One graph, three launchers — chapters 28 and 29 each show a different one.
+:::
+
+### What to run first
+
+```sh
+pnpm install
+
+# In one terminal — migrations apply automatically via MigratorLayer on first build:
+pnpm start
+# → {"level":"Info","message":["setting up Tasks"],"spans":{}}
+# → Listening on http://localhost:3000  — /docs shows Scalar UI
+# → OTLP traces → http://localhost:4318/v1/traces if a collector is up
+
+# In another — typed client via curl or generate:
+curl http://localhost:3000/tasks -H "Authorization: Bearer dev-token"
+curl -X POST http://localhost:3000/tasks -H "Authorization: Bearer dev-token" -H "Content-Type: application/json" -d '{"title":"Write capstone"}'
+
+# Tests — no server, no DB, in-memory store:
+pnpm test
+```
+
+:::tip[Swapping the store]
+Change one line in `src/main.ts` and one import: replace `Tasks.layer` (Sqlite) with `Tasks.layerMemory` or a `PgClient.layer` variant. Handlers, routes, docs, typed client, and tests compile unchanged because they depend only on `Tasks` the service, not its construction. That is the payoff of chapter 10's split pattern.
+:::
+
+## Next
+
+<LinkCard
+  title="Cheatsheet"
+  description="Fast lookup tables — Effect triple and constructors, combinators, error handling, Cause, Scope, fibers, concurrency primitives, Context/Layer, Config, Schedule, DateTime, Stream, Schema, HTTP/SQL/batching, observability, testing, and import maps."
+  href="/effect-ts/cheatsheet/"
+/>

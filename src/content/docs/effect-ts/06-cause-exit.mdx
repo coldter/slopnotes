@@ -1,0 +1,505 @@
+---
+title: Cause & Exit
+description: The v4 flat Cause model — Fail/Die/Interrupt reasons in a single array — why the v3 tree was flattened, inspecting and combining causes, the Exit type across runFork/runPromiseExit/Fiber.await, interruption as a reason, and defect strategy.
+sidebar:
+  order: 6
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+Typed errors (chapter 05) describe what your program expects to go wrong. A
+`Cause` records what *actually* went wrong — including the things you didn't
+type, like defects and interruptions — possibly several at once. Every failed
+effect execution produces one; every `run*` entry point surfaces one; every
+`catchCause` handler receives one. This chapter makes you fluent in reading,
+combining, and formatting them.
+
+## The shape
+
+```ts
+interface Cause<out E> {
+  readonly [TypeId]: typeof TypeId
+  readonly reasons: ReadonlyArray<Reason<E>>
+}
+
+type Reason<E> = Fail<E> | Die | Interrupt
+```
+
+That's the entire model. No nesting, no variants-of-variants:
+
+- **`Fail<E>`** — a typed error from the error channel. Carries `.error: E`.
+- **`Die`** — an untyped defect. Carries `.defect: unknown`.
+- **`Interrupt`** — the fiber was interrupted. Carries
+  `.fiberId: number | undefined`.
+
+Every reason also carries an `annotations` map (the runtime attaches stack
+frames, spans, and anything you add via `Effect.annotateLogs`) plus an
+`annotate()` method returning a copy with more metadata.
+
+```ts title="src/reasons.ts"
+import { Cause } from "effect"
+
+const c1 = Cause.fail("boom")
+c1.reasons[0] // { _tag: "Fail", error: "boom", annotations: {} }
+
+const c2 = Cause.die(new Error("bug"))
+if (Cause.isDieReason(c2.reasons[0])) {
+  c2.reasons[0].defect // Error("bug")
+}
+
+const c3 = Cause.interrupt(42)
+if (Cause.isInterruptReason(c3.reasons[0])) {
+  c3.reasons[0].fiberId // 42
+}
+```
+
+### Annotations: the metadata that makes causes debuggable
+
+Each reason's `annotations` is where the failure site lives. The runtime
+records the captured stack frame under `Cause.StackTrace` — a
+`Context.Service` keyed annotation you read like any other:
+
+```ts
+import { Cause, Context } from "effect"
+
+declare const reason: Cause.Fail<string>
+
+// read the frame recorded when the error was raised
+const frame = Context.getOption(Cause.reasonAnnotations(reason), Cause.StackTrace)
+```
+
+You can attach your own annotations to every reason in a cause:
+
+```ts
+import { Cause, Context } from "effect"
+
+class RequestId extends Context.Service<RequestId, string>()("RequestId") {}
+
+declare const cause: Cause.Cause<string>
+declare const requestId: string
+
+const enriched = Cause.annotate(cause, Context.make(RequestId, requestId))
+```
+
+This is how request-scoped facts survive into crash logs without threading a
+logger through everything: annotate once at the edge, render later.
+
+## Why v4 flattened the tree
+
+In v3, `Cause` was a recursive ADT:
+
+```
+v3: Empty | Fail(e) | Die(d) | Interrupt
+    | Sequential([Cause])      ← "these happened one after another"
+    | Parallel([Cause])        ← "these happened concurrently"
+```
+
+The structure was elegant on paper and miserable in practice. Combining causes
+during composition produced deeply nested `Sequential(Parallel(Sequential(...)))`
+values; pattern-matching them required recursive helpers for even simple
+questions ("give me all the errors"); and the Sequential/Parallel distinction
+was almost never load-bearing for handlers — nobody branches on *how* two
+failures came to coexist, only on *what they are*.
+
+v4 keeps exactly the information handlers use. A cause is a flat array of
+reasons; combining is concatenation:
+
+```ts title="src/combine.ts"
+import { Cause } from "effect"
+
+const combined = Cause.combine(Cause.fail("a"), Cause.die(new Error("b")))
+combined.reasons.map((r) => r._tag) // ["Fail", "Die"]
+
+// empty is the identity
+Cause.combine(Cause.empty, Cause.fail("x")).reasons.length // 1
+```
+
+If you genuinely need ordering metadata, annotations carry it. What you lose
+in topology you gain in trivially serialisable, diffable, loggable values.
+
+:::note[Equality]
+`Cause` implements structural equality (chapter 07 covers the machinery): two
+causes with equal reason arrays compare equal, so tests can assert on entire
+failure shapes.
+:::
+
+## How multiple reasons arise
+
+A single sequential failure yields a single-reason cause. Multiplicity comes
+from three places:
+
+**1. Concurrent composition.** When effects run side by side under
+`all` / `race` / `forEach({ concurrency })`, several can fail before siblings
+notice. Their causes merge into one multi-reason value rather than dropping
+losers:
+
+```ts
+import { Cause, Effect } from "effect"
+
+// concurrent all: siblings may fail before interruption lands,
+// and their causes merge into the surviving failure
+const program = Effect.all(
+  [Effect.fail("a"), Effect.fail("b"), Effect.die(new Error("c"))],
+  { concurrency: "unbounded" }
+)
+```
+
+**2. Explicit combination** via `Cause.combine`, e.g. inside `catchCause`
+handlers aggregating upstream results, or when joining fibers that each failed
+differently (`Fiber.join` merges child causes into yours).
+
+**3. Collection APIs with aggregate payloads.** Note the subtlety:
+`Effect.validate` runs every element, but its failure is a *single* `Fail`
+reason whose `.error` is the `NonEmptyArray<E>` of collected errors — not one
+reason per element:
+
+```ts
+const checked = Effect.validate(["a", "", "c"], (s) =>
+  s.length > 0 ? Effect.succeed(s) : Effect.fail(`empty:${s}`)
+)
+// fails once; cause.reasons.length === 1
+// cause.reasons[0].error === ["empty:", ...]  ← an array payload inside one Fail
+```
+
+The practical consequence: *never assume `cause.reasons.length === 1`, and
+never assume a `Fail` reason's error isn't itself a collection.* Loop, narrow,
+inspect.
+
+## Inspecting a cause
+
+Three layers of API, from coarse to fine:
+
+| Layer | Functions | Question answered |
+|---|---|---|
+| Predicates | `hasFails` `hasDies` `hasInterrupts` `hasInterruptsOnly` | does any reason of kind X exist? |
+| Guards | `isFailReason` `isDieReason` `isInterruptReason` | narrowing while iterating |
+| Extractors | `findError` `findErrorOption` `findDefect` `findFail` `findDie` `findInterrupt` | give me the first X |
+
+```ts title="src/inspect.ts"
+import { Cause, Result } from "effect"
+
+declare const cause: Cause.Cause<string>
+
+// coarse
+if (Cause.hasDies(cause)) {
+  console.error("at least one defect present")
+}
+
+// iterate everything
+for (const reason of cause.reasons) {
+  switch (reason._tag) {
+    case "Fail":
+      console.log("typed:", reason.error)
+      break
+    case "Die":
+      console.log("defect:", reason.defect)
+      break
+    case "Interrupt":
+      console.log("interrupted by fiber:", reason.fiberId)
+      break
+  }
+}
+
+// extractors return Result (success-first! see chapter 07)
+const first: Result.Result<string, Cause.Cause<never>> = Cause.findError(cause)
+const defect: Result.Result<unknown, Cause.Cause<string>> = Cause.findDefect(cause)
+const asOption = Cause.findErrorOption(cause) // Option<string>
+```
+
+`findErrorOption` is the workhorse for "just tell me the error if there is
+one"; the `Result` variants preserve the remaining cause when nothing matches,
+so chained extraction doesn't lose information.
+
+Two niche-but-handy members: `interruptors(cause)` collects defined fiber IDs
+into a `ReadonlySet<number>`, and `Cause.map(cause, f)` transforms only the
+`Fail` payloads, passing `Die`/`Interrupt` through untouched.
+
+## Exit: the completed-fiber envelope
+
+An effect *executing* can fail in flight; a fiber that has *finished* reports
+an `Exit`:
+
+```ts
+type Exit<A, E> = Success<A, E> | Failure<A, E>
+
+interface Success<A, E> { /* .value: A */ }
+interface Failure<A, E> { /* .cause: Cause.Cause<E> */ }
+```
+
+Constructors mirror the failure modes — `Exit.succeed(a)`, `Exit.fail(e)`
+(sugar for a single-Fail cause), `Exit.die(defect)`, `Exit.failCause(cause)`,
+`Exit.interrupt(fiberId?)`. Note `Exit.fail(e)` exists but the canonical
+carrier is the cause: `Failure.cause` may hold any number of mixed reasons.
+
+### Where Exits appear
+
+**`Effect.runPromiseExit`** — the never-rejecting runner:
+
+```ts
+import { Effect, Exit } from "effect"
+
+declare const program: Effect.Effect<number, string>
+
+const exit = await Effect.runPromiseExit(program)
+if (Exit.isSuccess(exit)) {
+  exit.value // number
+} else {
+  exit.cause // Cause.Cause<string>
+}
+```
+
+Contrast with `Effect.runPromise`, which resolves only on success and on
+failure throws the *squashed* cause (`Cause.squash`: first Fail error, else
+first Die defect, else an interrupt placeholder). Squashing is deliberately
+lossy — prefer `runPromiseExit` whenever the difference between "failed" and
+"died" matters.
+
+**`Fiber.await`** — observing a forked fiber returns its Exit instead of
+propagating its failure:
+
+```ts
+import { Cause, Effect, Fiber } from "effect"
+
+declare const task: Effect.Effect<number, string>
+
+const supervised = Effect.gen(function* () {
+  const fiber = yield* Effect.forkChild(task)
+  const exit = yield* Fiber.await(fiber) // Effect<Exit<number, string>>
+  if (
+    Exit.isFailure(exit) &&
+    Cause.hasInterruptsOnly(exit.cause)
+  ) {
+    yield* Effect.log("child was cancelled")
+  }
+})
+```
+
+(`Fiber.join` is the counterpart that re-raises: it joins the child's cause
+into yours.)
+
+**Fiber observers / `runFork`** — `fiber.addObserver(cb)` delivers the final
+Exit; this is what ManagedRuntime and test harnesses build on.
+
+**Request resolvers (preview).** Batching infrastructure completes individual
+requests with exits directly — `entry.completeUnsafe(Exit.succeed(value))` or
+`Exit.failCause(cause)` per entry. You'll meet this properly with
+`RequestResolver`; recognise the type when you see it.
+
+### Folding an Exit
+
+```ts
+import { Effect, Exit } from "effect"
+
+declare const exit: Exit.Exit<number, string>
+
+const rendered = Exit.match(exit, {
+  onSuccess: (value) => `ok: ${value}`,
+  onFailure: (cause) => `bad: ${Cause.pretty(cause)}`
+})
+```
+
+Guards `Exit.isSuccess` / `Exit.isFailure` narrow directly; `hasFails`,
+`hasDies`, `hasInterrupts` exist on Exit too, delegating to the wrapped cause.
+
+The rest of the Exit surface is what you'd expect from a settled-outcome
+wrapper:
+
+| Function | Behaviour |
+|---|---|
+| `Exit.getSuccess(exit)` | `Option<A>` — the value if success |
+| `Exit.getCause(exit)` | `Option<Cause<E>>` — the cause if failure |
+| `Exit.findErrorOption(exit)` | first typed error, or `None` |
+| `Exit.map` / `mapError` / `mapBoth` | channel transforms |
+| `Exit.asVoid` | erase the payload |
+
+### A worked pass through a failure
+
+Putting the pieces together — run something that fails in three ways at once,
+then dissect what comes back:
+
+```ts title="src/dissect.ts"
+import { Cause, Effect, Exit } from "effect"
+
+declare const flaky: Effect.Effect<number, string>
+
+const exit = await Effect.runPromiseExit(
+  Effect.all([flaky, Effect.die(new Error("boom"))], { concurrency: "unbounded" })
+)
+
+if (Exit.isFailure(exit)) {
+  const { reasons } = exit.cause
+
+  // how many distinct things went wrong?
+  const counts = {
+    fail: reasons.filter(Cause.isFailReason).length,
+    die: reasons.filter(Cause.isDieReason).length,
+    interrupt: reasons.filter(Cause.isInterruptReason).length
+  }
+
+  // the single "most important" value (what runPromise would throw)
+  const headline = Cause.squash(exit.cause)
+
+  // everything, human-readable
+  const report = Cause.pretty(exit.cause)
+
+  console.log(counts, headline, report)
+}
+```
+
+This is the shape of every crash-reporting hook, HTTP 500 handler, and job
+runner error path you'll write: take an Exit, split its reasons, render.
+
+<Mermaid title="Failure plumbing through the runtime" height={340} code={`
+flowchart TD
+  E["Effect fails<br/>fail / die / interrupt"] --> C["Cause built:<br/>reasons array grows"]
+  C --> X{"How is it observed?"}
+  X -->|"runPromise"| S["throw Cause.squash(cause)<br/>(lossy)"]
+  X -->|"runPromiseExit / Fiber.await"| EX["Exit.failure(cause)<br/>(full information)"]
+  X -->|"catchCause handler"| H["handler receives Cause"]
+  X -->|"unhandled"| L["runtime logs Cause.pretty"]
+`} />
+
+## Interruption is a reason, not an exception
+
+v3 represented cancellation as an `InterruptedException` flowing through the
+error channel — which meant every signature that could be interrupted carried
+it, and every catch-all risked swallowing cancellations. v4 removes both the
+exception and the problem: interruption is an `Interrupt` **reason** in the
+cause, structurally distinct from failures.
+
+Consequences worth knowing:
+
+- Typed-error combinators (`catch`, `catchTag`, ...) never see interrupts.
+  Cancellation cannot be accidentally swallowed by business logic.
+- To react specifically to cancellation, use `Effect.onInterrupt` or check
+  `Cause.hasInterruptsOnly` — the latter distinguishes "cancelled" from
+  "cancelled *and also* something failed".
+- Cleanup runs during unwinding regardless (finalizers, `acquireRelease`);
+  chapter 13 covers the fiber-level semantics.
+
+## Defect strategy, revisited
+
+Chapter 04 introduced `die`; now you know where defects land. The working
+rules:
+
+**Prefer fail over die whenever recovery is conceivable.** A defect skips
+every `catchTag` table in your codebase and surfaces only to
+`catchCause`/`catchDefect`/crash reporting.
+
+**Let defects crash.** The runtime logs them with full pretty-printed causes
+and kills the owning fiber. That's the correct default for bugs.
+
+**Capture defects only where you add value:**
+
+```ts title="src/report.ts"
+import { Cause, Effect } from "effect"
+
+declare const pluginTask: Effect.Effect<void>
+
+// observe without swallowing
+const observed = pluginTask.pipe(
+  Effect.onError((cause) =>
+    Cause.hasDies(cause)
+      ? Effect.logError("plugin crashed", { cause: Cause.pretty(cause) })
+      : Effect.void
+  )
+)
+
+// recover, but only from defects, and say why
+const sandboxed = pluginTask.pipe(
+  Effect.catchDefect((defect) =>
+    Effect.logWarning("disabling broken feature").pipe(Effect.asVoid)
+  )
+)
+```
+
+`Effect.onError` fires on any non-success exit (errors included) and cannot
+change the outcome — ideal for audit logging. `Effect.catchDefect` converts a
+defect into a typed error path, which is justified almost exclusively at
+integration boundaries: plugin hosts, worker pools, request handlers deciding
+between 500 and fallback content.
+
+:::caution[Don't convert defects to typed errors reflexively]
+Every `catchDefect` you add weakens the signal that "a defect means a bug".
+Convert at the outermost boundary that must respond, and log the original
+cause there.
+:::
+
+## Pretty-printing
+
+Three renderers, in increasing fidelity:
+
+```ts
+import { Cause } from "effect"
+
+declare const cause: Cause.Cause<unknown>
+
+Cause.squash(cause)     // unknown — the single thrown value runPromise would raise
+Cause.prettyErrors(cause) // Array<Error> — one Error per Fail/Die, stacks annotated with spans
+Cause.pretty(cause)     // string — joined stack traces, nested causes indented
+```
+
+`prettyErrors` preserves messages, names, stacks, and `cause` chains, and
+appends span annotations captured at the failure site — which is why
+`withSpan`/`Effect.fn` naming pays off the moment you read a production log.
+For structured logging pipelines, ship `prettyErrors` output; for humans,
+`pretty`.
+
+`squash` exists mainly as the semantics of `runPromise`'s rejection. Treat it
+as lossy documentation of "which single error wins" — first `Fail`, then first
+`Die`, then a generic interrupt marker.
+
+### Causes in your logs
+
+The default runtime already logs unhandled failures with pretty-printed
+causes. For your own error paths, two idioms:
+
+```ts
+import { Cause, Effect } from "effect"
+
+declare const task: Effect.Effect<number, string>
+
+// structured: attach the rendered cause as a log annotation
+const logged = task.pipe(
+  Effect.catch((error) =>
+    Effect.logWarning("task failed", { tag: "TaskFailure", detail: error })
+      .pipe(Effect.as(0))
+  )
+)
+
+// or let onError observe every exit shape (errors, defects, interrupts)
+const audited = task.pipe(
+  Effect.onError((cause) => Effect.logError(`exit cause: ${Cause.pretty(cause)}`))
+)
+```
+
+Because `prettyErrors` returns plain `Array<Error>` objects with stacks and
+spans attached, they drop straight into Sentry/Datadog-style reporters without
+custom serialisers — one more payoff of the flat model.
+
+## Cheat sheet
+
+| Task | Code |
+|---|---|
+| Any typed failures? | `Cause.hasFails(cause)` |
+| Any defects? | `Cause.hasDies(cause)` |
+| Only cancellation? | `Cause.hasInterruptsOnly(cause)` |
+| First typed error | `Cause.findErrorOption(cause)` |
+| First defect | `Cause.findDefect(cause)` |
+| Merge two causes | `Cause.combine(a, b)` |
+| Build from reasons | `Cause.fromReasons([...])` |
+| Never-rejecting run | `await Effect.runPromiseExit(eff)` |
+| Observe a child fiber | `yield* Fiber.await(fiber)` |
+| Fold success/failure | `Exit.match(exit, { onSuccess, onFailure })` |
+| Log-on-any-exit | `Effect.onError(cb)` |
+| Capture defects | `Effect.catchDefect(d => ...)` |
+| Human-readable string | `Cause.pretty(cause)` |
+
+## Next
+
+<LinkCard
+  title="07 · Option, Result & Data"
+  description="Absence and already-settled outcomes as values: the Option and Result APIs, Result's success-first flip from Either, structural equality by default, the Data module, and branded opaque ids."
+  href="/effect-ts/07-option-result-data/"
+/>

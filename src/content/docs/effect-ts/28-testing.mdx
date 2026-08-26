@@ -1,0 +1,613 @@
+---
+title: Testing — Virtual Time & Layers
+description: The Effect test pyramid — pure functions, in-memory layers, and schema-based properties — via @effect/vitest helpers (it.effect, each, prop, live), virtual time with TestClock, shared layer blocks, Ref-backed test doubles, TestConsole, and HttpApiTest.
+sidebar:
+  order: 28
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+import Mermaid from "~/components/Mermaid.astro";
+
+If you already test TypeScript promises, most of what you know about assertions and mocking still applies. What changes in an Effect codebase is *where* the seams are. Pure functions stay pure. Effects expose their requirements as `R`, their failures as `E`, and their lifetimes as `Layer` — which means you can test them by providing different `R`s, by observing `E` as `Exit`, and by running the clock forward on demand. This chapter is the field manual for that.
+
+## The pyramid for Effect apps
+
+| Layer | What it tests | How you arrange it | Speed | Confidence |
+|---|---|---|---|---|
+| **Pure unit** | `Schema` codecs, pure helpers, reducers | Plain Vitest `it/test` without Effect | microseconds | high for the function, low for integration |
+| **Effect unit** | An Effect's success/error channel + annotations | `it.effect` with `assert` helpers inside `Effect.gen` | milliseconds, virtual time | high — typed errors enforced |
+| **Integration via layers** | Service interactions through interfaces | `layer(Layer.mergeAll(...))` shared block or `.pipe(Effect.provide(layerTest))` | tens of ms | the sweet spot for most behavior |
+| **Property-based** | Invariants over arbitrary inputs | `it.effect.prop` with `Schema` arbitraries | seconds | catches edge cases humans miss |
+| **HttpApi in-memory** | Full request pipeline without server/DB | `HttpApiTest.groups` typed client | ms | highest for API contracts |
+
+The rest of the chapter walks top-to-bottom across that pyramid.
+
+## `it.effect` — your default test
+
+`ai-docs/src/09_testing/10_effect-tests.ts` is the source for this section. `@effect/vitest` (`effect/tool` dep `@effect/vitest`) provides drop-in replacements for Vitest's globals, but `it`/`describe` run `Effect`s instead of `Promise`s:
+
+```ts
+// ai-docs/src/09_testing/10_effect-tests.ts
+import { assert, describe, it } from "@effect/vitest"
+import { Effect, Schema } from "effect"
+import { TestClock } from "effect/testing"
+
+describe("@effect/vitest basics", () => {
+  it.effect("runs Effect code with assert helpers", () =>
+    Effect.gen(function* () {
+      const upper = ["ada", "lin"].map((name) => name.toUpperCase())
+      assert.deepStrictEqual(upper, ["ADA", "LIN"])
+      assert.strictEqual(upper.length, 2)
+      assert.isTrue(upper.includes("ADA"))
+    }))
+})
+```
+
+Notes:
+
+- The test body is `() => Effect<A, E, R>`. Whatever `R` it still requires is provided by the `@effect/vitest` test runtime — `TestClock`, `TestConsole`, config overrides, and a fresh default `Logger` are all pre-wired.
+- `assert` is re-exported from `@effect/vitest`; it is `vitest/assert` with soft-assert behavior tuned for `it.effect`. You can also `import { assert } from "vitest"` and mix.
+- If the Effect fails, Vitest reports the `E` value. If it defects (die), you get the `Cause`. There is no `expect(...).rejects` dance — typed failures are just values.
+
+### Parameterized: `it.effect.each`
+
+```ts
+import { assert, it } from "@effect/vitest"
+import { Effect } from "effect"
+
+it.effect.each([
+  { input: " Ada ", expected: "ada" },
+  { input: " Lin ", expected: "lin" },
+  { input: " Nia ", expected: "nia" }
+])("parameterized normalization %#", ({ input, expected }) =>
+  Effect.gen(function* () {
+    assert.strictEqual(input.trim().toLowerCase(), expected)
+  }))
+```
+
+The `%#` interpolation prints the index; `%p` pretty-prints the row. Same table-driven shape as plain `vitest`, now inside an Effect.
+
+### Property-based: `it.effect.prop`
+
+`it.effect.prop` couples `fast-check` with `Schema` arbitraries. Pass one or more `Schema`s (or `Schema.Arbitrary` objects); each trial generates a value that satisfies the schema — including brand checks, refinements, and `Class` instances:
+
+```ts
+import { assert, it } from "@effect/vitest"
+import { Effect, Schema } from "effect"
+
+it.effect.prop("reversing twice is identity", [Schema.String], ([value]) =>
+  Effect.gen(function* () {
+    const reversedTwice = value.split("").reverse().reverse().join("")
+    assert.strictEqual(reversedTwice, value)
+  }))
+```
+
+You can also pass an `Arbitrary` directly for custom generators, and configure trial count:
+
+```ts
+import { it } from "@effect/vitest"
+import { Effect, Schema } from "effect"
+
+it.effect.prop(
+  "amounts round-trip through json codec",
+  [Schema.Number.pipe(Schema.between(0, 1_000_000), Schema.finite())],
+  ([n]) => Effect.gen(function* () { /* ... */ })
+)
+```
+
+:::tip[Schemas ARE arbitraries]
+Every `Schema` in v4 carries an `Arbitrary` for generation. Brand a string with `Schema.String.pipe(Schema.brand("Email"))` and property tests will generate values respecting the brand's predicate. That is why `it.effect.prop` takes schemas rather than raw `fast-check` arbitraries — the same source of truth validates your domain and generates your tests.
+:::
+
+### Live time: `it.live`
+
+By default `@effect/vitest` replaces `Clock`, `Timer`, and `Random` with test implementations. `it.live` opts a single test back into real services — real wall-clock sleeps, real jitter:
+
+```ts
+import { assert, it } from "@effect/vitest"
+import { Effect } from "effect"
+
+it.live("uses real runtime services", () =>
+  Effect.gen(function* () {
+    const startedAt = Date.now()
+    yield* Effect.sleep(1) // 1 ms real sleep
+    assert.isTrue(Date.now() >= startedAt)
+  }))
+```
+
+Use `it.live` for the handful of tests where you intentionally measure wall-clock behavior (rate-limit integration, actual timeout against a test HTTP server). Every other test should remain in virtual time — it is deterministic and instant.
+
+| Helper | Runtime services | Clock | Use when |
+|---|---|---|---|
+| `it.effect` | test doubles | `TestClock` (virtual) | default |
+| `it.effect.each` | test doubles | `TestClock` | table-driven cases |
+| `it.effect.prop` | test doubles | `TestClock` | invariant discovery |
+| `it.live` | real `Clock`, `Random` | real time | wall-clock assertions |
+
+## Virtual time — `TestClock`
+
+`effect/testing/TestClock` (`effect/src/testing/TestClock.ts`) is a `Clock` that only advances when you tell it to. `Effect.sleep`, `Effect.delay`, `Schedule` delays, `Queue` timeouts, and `Cache` TTLs all park on the clock. In `it.effect` tests the clock starts at zero and freezes until `TestClock.adjust` moves it.
+
+The canonical pattern from `ai-docs/src/09_testing/10_effect-tests.ts:28`:
+
+```ts
+import { assert, it } from "@effect/vitest"
+import { Effect, Fiber } from "effect"
+import { TestClock } from "effect/testing"
+
+it.effect("controls time with TestClock", () =>
+  Effect.gen(function* () {
+    const fiber = yield* Effect.forkChild(
+      Effect.sleep(60_000).pipe(Effect.as("done" as const))
+    )
+
+    // Virtual time: no real wait — sleeping fibers complete immediately.
+    yield* TestClock.adjust(60_000)
+
+    const value = yield* Fiber.join(fiber)
+    assert.strictEqual(value, "done")
+  }))
+```
+
+`TestClock.adjust` also accepts a `DurationInput` string:
+
+```ts
+yield* TestClock.adjust("60 seconds")
+yield* TestClock.adjust("1 hour")
+yield* TestClock.adjust("2 millis")
+```
+
+Long form with string was introduced so tests read temporally: `adjust("60 seconds")` mirrors `sleep("60 seconds")` in the program.
+
+### Testing timeouts and races deterministically
+
+The above pattern generalizes to races. `Effect.timeout`, `Effect.race`, and any `Schedule` built from `Duration` all depend on `TestClock`:
+
+```ts
+import { assert, it } from "@effect/vitest"
+import { Cause, Effect, Fiber } from "effect"
+import { TestClock } from "effect/testing"
+
+it.effect("timeouts fail with Cause.TimeoutError", () =>
+  Effect.gen(function* () {
+    const fiber = yield* Effect.forkChild(
+      Effect.sleep("5 seconds").pipe(Effect.as("ok"))
+        .pipe(Effect.timeout("1 second"))
+    )
+
+    yield* TestClock.adjust("1 second")
+
+    const exit = yield* Fiber.await(fiber)
+    assert.isTrue(Cause.isTimeoutError(exit.cause))
+  }))
+
+it.effect("the faster effect wins the race", () =>
+  Effect.gen(function* () {
+    const winner = Effect.sleep("100 millis").pipe(Effect.as("fast"))
+    const loser = Effect.sleep("5 seconds").pipe(Effect.as("slow"))
+
+    const fiber = yield* Effect.forkChild(Effect.race(winner, loser))
+    yield* TestClock.adjust("100 millis")
+    const value = yield* Fiber.join(fiber)
+    assert.strictEqual(value, "fast")
+  }))
+```
+
+:::caution[Always fork before adjusting]
+`TestClock.adjust` advances time only for fibers that are already sleeping. Write `forkChild`, *then* `adjust`, *then* `join`. Doing `adjust` before `forkChild` has nothing to wake and does nothing. The sequence in every example here — `forkChild` → `adjust` → `join`/`await` — is the only correct order.
+:::
+
+### Other TestClock operations
+
+| API | Effect |
+|---|---|
+| `TestClock.adjust(duration)` | Move virtual time forward; wake due sleeps. |
+| `TestClock.adjustWith(duration, f)` | Advance and run `f` at each step — useful for observing intermediate states. |
+| `TestClock.setTime(ms)` | Jump to absolute time (rare; prefer `adjust`). |
+| `TestClock.currentTimeMillis` | `Effect<number>`: read current virtual time. |
+| `TestClock.sleep(duration)` | Test-aware sleep that registers with the clock (internal to `Effect.sleep`). |
+
+:::note[TestClock resets between tests]
+Inside `it.effect`, the `TestClock` instance is fresh per test. Time does not leak across tests. If you need to share built state across tests while keeping time isolated, combine `it.effect` with the shared `layer(...)` block described next — the layer persists, the clock resets.
+:::
+
+## Shared layers — `layer(...)` blocks
+
+The test file `ai-docs/src/09_testing/20_layer-tests.ts` introduces the block form:
+
+```ts
+import { assert, layer } from "@effect/vitest"
+import { Effect, Layer } from "effect"
+import { HttpServer } from "effect/unstable/http"
+
+// layer(layers)("Block name", (it) => { ... })
+layer(Layer.mergeAll(HandlersLayer, HttpServer.layerServices))("UsersApi", (it) => {
+  it.effect("lists, fetches, and creates users", () => ...)
+  it.effect("returns 404 for missing user", () => ...)
+  it.effect("rejects without bearer token", () => ...)
+})
+```
+
+`layer` is imported from `@effect/vitest` — not `effect/Layer`. Its contract:
+
+1. **One shared layer for the block.** The layer is built once before the first `it` runs, and its `Scope` tears down in `afterAll`. All `it.effect` bodies inside the block run with that layer already provided.
+2. **State persists between tests inside the block.** If the layer holds mutable state (a `Ref`, an in-memory repo), mutations from test 1 are visible in test 2. This is intentional — it is how you test sequences like create → fetch → list without rebuilding the world each time.
+3. **Isolation is by block.** Two separate `layer(...)(...)` blocks each get their own instance. Two `describe` blocks without `layer` get per-test layers via `.pipe(Effect.provide(...))`.
+
+### Single-test layers with `Effect.provide`
+
+For one-off provisioning without a shared block, pipe the layer onto the test:
+
+```ts
+import { assert, describe, it } from "@effect/vitest"
+import { Effect } from "effect"
+
+describe("TodoService", () => {
+  it.effect("tests higher-level service logic", () =>
+    Effect.gen(function* () {
+      const svc = yield* TodoService
+      const n = yield* svc.addAndCount("Review docs")
+      assert.isTrue(n >= 1)
+    }).pipe(Effect.provide(TodoService.layerTest)))
+})
+```
+
+### Cross-reference: `HttpServer.layerServices`
+
+Every test file in this chapter that touches HTTP needs `HttpServer.layerServices` somewhere in the layer graph. It provides `HttpServer` + `HttpPlatform` stubs suitable for in-memory testing (no real socket). From `ai-docs/src/51_http-server/20_testing.ts:48`:
+
+```ts
+layer(Layer.mergeAll(HandlersLayer, HttpServer.layerServices))("UsersApi", (it) => {
+  // ...
+})
+```
+
+If you forget it you will get a compile-time `R` error: the `HttpApiTest` client requires `HttpServer`, `HttpPlatform`, etc. Adding `HttpServer.layerServices` satisfies them.
+
+## Testing services that depend on other services
+
+The most common unit-integration seam: a service needs another service. In production the two are wired with `Layer.provide`. In tests you replace the leaf with a controllable double.
+
+The pattern from `ai-docs/src/09_testing/20_layer-tests.ts` uses a `Ref`-backed test double:
+
+```ts
+import { Context, Effect, Layer, Ref } from "effect"
+
+export interface Todo {
+  readonly id: number
+  readonly title: string
+}
+
+// 1. A mutable cell that tests own directly.
+//    The ref layer builds an empty array.
+export class TodoRepoTestRef extends Context.Service<TodoRepoTestRef, Ref.Ref<Array<Todo>>>()(
+  "app/TodoRepoTestRef"
+) {
+  static readonly layer = Layer.effect(TodoRepoTestRef, Ref.make([] as Array<Todo>))
+}
+
+// 2. The real service interface, test implementation closed over the ref.
+class TodoRepo extends Context.Service<TodoRepo, {
+  create(title: string): Effect.Effect<Todo>
+  readonly list: Effect.Effect<ReadonlyArray<Todo>>
+}>()("app/TodoRepo") {
+  static readonly layerTest = Layer.effect(
+    TodoRepo,
+    Effect.gen(function* () {
+      const store = yield* TodoRepoTestRef
+
+      const create = Effect.fn("TodoRepo.create")(function* (title: string) {
+        const todos = yield* Ref.get(store)
+        const todo = { id: todos.length + 1, title }
+        yield* Ref.set(store, [...todos, todo])
+        return todo
+      })
+
+      const list = Ref.get(store)
+
+      return TodoRepo.of({ create, list })
+    })
+  ).pipe(
+    // Expose the underlying ref so tests can peek at it too:
+    Layer.provideMerge(TodoRepoTestRef.layer)
+  )
+}
+
+// 3. A higher-level service that depends on TodoRepo.
+class TodoService extends Context.Service<TodoService, {
+  addAndCount(title: string): Effect.Effect<number>
+  readonly titles: Effect.Effect<ReadonlyArray<string>>
+}>()("app/TodoService") {
+  static readonly layerNoDeps = Layer.effect(
+    TodoService,
+    Effect.gen(function* () {
+      const repo = yield* TodoRepo
+      const addAndCount = Effect.fn("TodoService.addAndCount")(function* (title: string) {
+        yield* repo.create(title)
+        const todos = yield* repo.list
+        return todos.length
+      })
+      const titles = repo.list.pipe(Effect.map((todos) => todos.map((t) => t.title)))
+      return TodoService.of({ addAndCount, titles })
+    })
+  )
+
+  // Wires the test double: TodoService → TodoRepo.layerTest (which itself exposes TodoRepoTestRef)
+  static readonly layerTest = this.layerNoDeps.pipe(Layer.provideMerge(TodoRepo.layerTest))
+}
+```
+
+Why `provideMerge` instead of `provide`? `provideMerge` keeps the dependency's services visible. Tests that consume `TodoService.layerTest` can also `yield* TodoRepo` or `yield* TodoRepoTestRef` — useful to set up preconditions or assert on underlying state:
+
+```ts
+import { assert, describe, it } from "@effect/vitest"
+import { Effect, Ref } from "effect"
+
+describe("TodoService", () => {
+  it.effect("tests higher-level service logic", () =>
+    Effect.gen(function* () {
+      const ref = yield* TodoRepoTestRef
+      const svc = yield* TodoService
+
+      const count = yield* svc.addAndCount("Review docs")
+      const titles = yield* svc.titles
+      assert.isTrue(count >= 1)
+      assert.isTrue(titles.some((t) => t.includes("Review docs")))
+
+      // Peek at the underlying store — available because layerTest used provideMerge
+      const todos = yield* Ref.get(ref)
+      assert.isTrue(todos.length >= 1)
+    }).pipe(Effect.provide(TodoService.layerTest)))
+})
+```
+
+### Shared-block state illustration
+
+```ts
+import { assert, layer } from "@effect/vitest"
+import { Effect } from "effect"
+
+layer(TodoRepo.layerTest)("TodoRepo", (it) => {
+  it.effect("tests repository behavior", () =>
+    Effect.gen(function* () {
+      const repo = yield* TodoRepo
+      assert.strictEqual((yield* repo.list).length, 0)
+      yield* repo.create("Write docs")
+      assert.strictEqual((yield* repo.list).length, 1)
+    }))
+
+  it.effect("layer is shared", () =>
+    Effect.gen(function* () {
+      const repo = yield* TodoRepo
+      // Still 1 from the previous test — same layer, same Ref, not rebuilt!
+      assert.strictEqual((yield* repo.list).length, 1)
+      yield* repo.create("Write docs again")
+      assert.strictEqual((yield* repo.list).length, 2)
+    }))
+})
+```
+
+If you need isolation instead of sharing, do not use a `layer(...)` block — use per-test `Effect.provide` or wrap the layer with `Layer.fresh`.
+
+:::note[Layer memoization and test isolation]
+Under v4, `Effect.provide(layer, program)` shares the layer's construction across calls within one runtime (chapter 10's memoization). `layer(...)` blocks and `ManagedRuntime` share one memo map internally, so "no duplicate pools" stays true. For per-test fresh pools in integration tests, `Layer.fresh(layer)` forces a new instance, or `{ local: true }` on a specific `Effect.provide` prevents cross-test reuse.
+:::
+
+## `TestConsole` — asserting on console output
+
+`effect/testing/TestConsole` (`effect/src/testing/TestConsole.ts`) captures `Console.log` and `Console.error` so you can assert on emitted text without reading stdout.
+
+```ts
+import { assert, it } from "@effect/vitest"
+import { Console, Effect } from "effect"
+import { TestConsole } from "effect/testing"
+
+it.effect("captures console output", () =>
+  Effect.gen(function* () {
+    yield* Console.log("hello from Effect")
+    yield* Console.error("something failed")
+
+    const logs = yield* TestConsole.logLines
+    const errors = yield* TestConsole.errorLines
+    assert.deepStrictEqual(logs, ["hello from Effect"])
+    assert.deepStrictEqual(errors, ["something failed"])
+  }))
+```
+
+All loggers built with `Logger.withConsoleLog` ultimately route through `Console`, so the same mechanism captures `Effect.log` lines when the logger under test targets console.
+
+:::tip[Prefer asserting on values over console text]
+`TestConsole` is sharpest for CLI chapter tests (Chapter 19) and for asserting that `Effect.log` wired through a specific console-backed logger emits the expected line. For most service behavior, assert on return values or `Ref` state instead — it is less brittle.
+:::
+
+## `HttpApiTest` — in-memory typed-client testing
+
+The heavy integration test seam is the HTTP boundary. Chapter 24 covers `HttpApi` fully; here we record the testing pattern and point there for definitions. Source: `ai-docs/src/51_http-server/20_testing.ts:44`.
+
+```ts
+import { assert, layer } from "@effect/vitest"
+import { Effect, Layer } from "effect"
+import { HttpClientRequest, HttpServer } from "effect/unstable/http"
+import { HttpApiMiddleware, HttpApiTest } from "effect/unstable/httpapi"
+import { Api } from "./fixtures/api/Api.ts"
+import { Authorization } from "./fixtures/api/Authorization.ts"
+import { UserId } from "./fixtures/domain/User.ts"
+import { AuthorizationLayer } from "./fixtures/server/Authorization.ts"
+import { Users } from "./fixtures/server/Users.ts"
+import { UsersApiHandlersNoDeps } from "./fixtures/server/Users/http.ts"
+
+// Handlers + in-memory store + middleware — no real DB, no server.
+const HandlersLayer = UsersApiHandlersNoDeps.pipe(
+  Layer.provide(Users.layerMemory),
+  Layer.provideMerge(AuthorizationLayer)
+)
+
+// Client-side Authorization that supplies the bearer token.
+// Swap this per-test to cover good / bad / missing tokens.
+const AuthorizationMiddlewareGood = HttpApiMiddleware.layerClient(
+  Authorization,
+  ({ next, request }) => next(HttpClientRequest.bearerToken(request, "dev-token"))
+)
+
+const AuthorizationMiddlewareBad = HttpApiMiddleware.layerClient(
+  Authorization,
+  ({ next, request }) => next(request) // no token
+)
+
+// A typed client wired directly to the selected groups —
+// same encoding/routing/decoding as the real server.
+const makeClient = HttpApiTest.groups(Api, ["users"])
+
+// One shared layer: Handlers + minimal HttpServer stub
+layer(Layer.mergeAll(HandlersLayer, HttpServer.layerServices))("UsersApi", (it) => {
+  it.effect("lists, fetches, and creates users", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const created = yield* client.users.create({
+        payload: { name: "Alice", email: "alice@acme.dev" }
+      })
+      assert.strictEqual(created.name, "Alice")
+
+      const fetched = yield* client.users.getById({ params: { id: created.id } })
+      assert.deepStrictEqual(fetched, created)
+
+      const all = yield* client.users.list({ query: {} })
+      assert.isTrue(all.some((u) => u.id === created.id))
+    }).pipe(Effect.provide(AuthorizationMiddlewareGood)))
+
+  it.effect("returns a 404 for a missing user", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const error = yield* client.users.getById({
+        params: { id: UserId.make("019845e1-682f-4b02-a706-3b2422d13aec") }
+      }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "UserNotFound")
+    }).pipe(Effect.provide(AuthorizationMiddlewareGood)))
+
+  it.effect("rejects requests without a valid bearer token", () =>
+    Effect.gen(function* () {
+      const client = yield* makeClient
+      const error = yield* client.users.list({ query: {} }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "Unauthorized")
+    }).pipe(Effect.provide(AuthorizationMiddlewareBad)))
+})
+```
+
+Key points:
+
+- **`HttpApiTest.groups(Api, ["users"])`** returns `Effect<ClientForGroups, never, HttpApiHandlers>`. `yield* makeClient` inside a testEffect gives you a fully typed `client.users.*` surface. The handlers are called directly — no HTTP, no `fetch`, no random ports.
+- **`HttpServer.layerServices`** satisfies the platform services the handler pipeline requires in tests (already noted above).
+- **Auth is just another middleware layer.** `HttpApiMiddleware.layerClient(Authorization, ...)` builds a *client-side* middleware that the test client composes before hitting handlers. Provide a `Good` layer for happy paths, `Bad` for failure paths — both through `Effect.provide` per-test rather than rebuilding the server layer.
+- **Status-annotated errors decode as `_tag`.** `error.pipe(HttpApiSchema.asNoContent(...))` in the `Api` definition (chapter 24) controls how an error's HTTP status and body encode. In `HttpApiTest` failures surface as typed errors — assert on `_tag` after `Effect.flip`.
+
+:::note[Cross-ref, not duplication]
+Chapter 24 ([HTTP APIs](/effect-ts/24-http-apis/)) defines groups, endpoints, middleware/authorization, `HttpApiBuilder`, serving, and client generation. This chapter only records the *testing* shape. See that chapter for the full `Api`/`HttpApiGroup`/`HttpApiEndpoint`/`HttpApiMiddleware` construction; come back here for how to exercise it in tests.
+:::
+
+### A focused regression test pattern
+
+A good in-memory regression test nails one contract in under 20 lines by holding every other variable constant:
+
+```ts
+import { assert, it } from "@effect/vitest"
+import { Effect } from "effect"
+
+it.effect("search requires at least 3 characters", () =>
+  Effect.gen(function* () {
+    const client = yield* makeClient
+    const error = yield* client.users.search({ payload: { search: "ab" } }).pipe(Effect.flip)
+    assert.strictEqual(error._tag, "SearchQueryTooShort")
+  }).pipe(
+    Effect.provide(AuthorizationMiddlewareGood),
+    Effect.provide(HandlersLayer), // handlers + memory store
+    Effect.provide(HttpServer.layerServices)
+  ))
+```
+
+Because `HttpApiTest` is synchronous and fast, you can write many of these alongside property tests — generous coverage without flakiness.
+
+## Gotchas
+
+### `it.effect` resets `TestClock` between tests; `layer(...)` persists shared resources
+
+These two guarantees interact:
+
+```ts
+import { layer } from "@effect/vitest"
+import { Effect, Ref } from "effect"
+
+let buildCount = 0
+const CountingLayer = Layer.effect(CountingService, Effect.sync(() => {
+  buildCount++
+  return new CountingService()
+}))
+
+layer(CountingLayer)("Counting", (it) => {
+  it.effect("first test sleeps", () => Effect.sleep("10 seconds"))
+  it.effect("second test still builds only once", () =>
+    Effect.gen(function* () {
+      // Clock is 0 again here, despite previous test advancing it.
+      // But CountingLayer was NOT rebuilt — buildCount === 1.
+      assert.strictEqual(buildCount, 1)
+    }))
+})
+```
+
+- If you rely on virtual time inside a `layer(...)` block, call `TestClock.adjust` per-test. The clock is fresh, so sleeps left pending by earlier tests are already resolved.
+- If you need fresh store state per test, prefer per-test `Effect.provide(layerTest)` instead of a shared block, or `yield* Ref.set(store, [])` in `beforeEach`-shaped setup inside the first line of the test.
+
+### Do not use real sleeps inside `it.effect`
+
+`Effect.sleep("1 second")` inside `it.effect` parks forever until `TestClock.adjust` fires. If you forget the adjust, the test hangs until Vitest's own timeout. Always pair sleeping effects with a fork-then-adjust-then-join shim, or use `it.live` for the rare test that should truly sleep.
+
+### `assert` inside `Effect.gen` is an effect
+
+`assert.strictEqual` and friends throw on mismatch. Inside `Effect.gen`, a thrown exception becomes a defect (`Cause.die`). `@effect/vitest` catches that defect and reports it as a test failure — no extra wiring needed. Do not wrap asserts in `Effect.try` or `Effect.catch` unless you are intentionally testing assertion helpers.
+
+### Debugging failing `HttpApiTest` calls
+
+`HttpApiTest` decodes response bodies through the same `Schema` as production. If the handler returns a value that fails the success schema, the test failure will show a `ParseError` rather than your domain error. Check handler return shape first; the fix is usually a mismatched field in the `jsonCreate` variant.
+
+## Putting it together — a decision tree
+
+<Mermaid title="Which test helper?" height={380} code={`
+flowchart TD
+  Q1{"Need HTTP/server/DB?"}
+  Q1 -- "yes — API contract" --> A1["HttpApiTest.groups + layer block<br/>typed client, in-memory handlers"]
+  Q1 -- "no" --> Q2{"Need virtual time?"}
+  Q2 -- "yes — timeouts/races/schedules" --> A2["it.effect + forkChild/adjust/join"]
+  Q2 -- "no" --> Q3{"Need an invariant?"}
+  Q3 -- "yes — many inputs" --> A3["it.effect.prop + Schema arbitraries"]
+  Q3 -- "no" --> Q4{"Shared state?"}
+  Q4 -- "many tests, same store" --> A4["layer(Layer.mergeAll(...)) block"]
+  Q4 -- "isolated per test" --> A5["it.effect(...).pipe(Effect.provide(layerTest))"]
+  Q4 -- "real wall-clock" --> A6["it.live"]
+`} />
+
+## Quick reference
+
+| Helper | Import | Effect signature |
+|---|---|---|
+| `it.effect(name, () => Effect.gen(...))` | `from "@effect/vitest"` | runs with `TestClock`, `TestConsole`, test `Logger` |
+| `it.effect.each(table)(name, row => Effect.gen...)` | `from "@effect/vitest"` | param per row — `Effect` body |
+| `it.effect.prop(name, [Schema…], ([a]) => Effect.gen…)` | `from "@effect/vitest"` | property-based, Schema arbitraries |
+| `it.live(name, () => Effect.gen(...))` | `from "@effect/vitest"` | real `Clock`/`Random`, wall time |
+| `layer(layers)("name", (it) => { it.effect(...) })` | `from "@effect/vitest"` | one shared layer; torn down in `afterAll` |
+| `TestClock.adjust(duration)` | `from "effect/testing"` | `"60 seconds"` or `60_000` ms |
+| `TestClock.adjust("1 hour")` | `"effect/testing"` | string durations preferred |
+| `Effect.forkChild(sleep); adjust; Fiber.join` | `from "effect"` | canonical virtual-time pattern |
+| `Effect.provide(effect, layerTest)` | `from "effect"` | per-test layer |
+| `Layer.provideMerge` | `from "effect"` | expose dependency for peeking (`Ref`) |
+| `TestConsole.logLines / errorLines` | `from "effect/testing"` | `Effect<ReadonlyArray<string>>` |
+| `HttpApiTest.groups(Api, ["users"])` | `from "effect/unstable/httpapi"` | `Effect<TypedClient>` — `yield*` inside test |
+| `HttpServer.layerServices` | `from "effect/unstable/http"` | stub services for in-memory HTTP tests |
+| `HttpApiMiddleware.layerClient` | `from "effect/unstable/httpapi"` | client-side middleware (auth tokens) |
+| `Effect.flip` | `from "effect"` | assert on error channel (`_tag`) |
+
+## Next
+
+<LinkCard
+  title="29 · Running Effect — Runtimes & Integration"
+  description="Layer-as-program, NodeRuntime/BunRuntime runMain signals, the ManagedRuntime bridge with shared memo maps, Hono and other framework embeddings, and config-driven layer selection."
+  href="/effect-ts/29-runtime-integration/"
+/>
