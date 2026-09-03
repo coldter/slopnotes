@@ -61,6 +61,7 @@ export default defineConfig({
     }),
   ],
   vite: {
+    server: { watch: { ignored: ["**/.local-exp/**"] } },
     optimizeDeps: {
       include: [
         "astro/toolbar",

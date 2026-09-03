@@ -59,8 +59,8 @@ const calculateFontSizes = (base, scale) => {
     sizes[`h${i}-sm`] = `${currentSize * 0.9}rem`;
     currentSize *= scale;
   }
-  sizes.base = `${base}px`;
-  sizes["base-sm"] = `${base * 0.8}px`;
+  sizes.base = `${base / 16}rem`;
+  sizes["base-sm"] = `0.9375rem`;
   return sizes;
 };
 const fontSizes = calculateFontSizes(baseSize, scale);
