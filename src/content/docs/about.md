@@ -6,7 +6,6 @@ lastUpdated: 2026-06-16
 head:
   - tag: style
     content: |
-      .hero-bg { display: none !important; }
       .content-panel { max-width: 60rem !important; margin: auto; padding:1.5rem 0px !important; }
 ---
 
