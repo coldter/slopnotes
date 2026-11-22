@@ -1,6 +1,6 @@
 ---
 title: Pipelines, Webhooks & Observability
-description: How Auther runs sandboxed Lua at auth lifecycle hooks, delivers signed webhooks with retries, and surfaces metrics and traces in the admin UI.
+description: "Sandboxed Lua at auth lifecycle hooks, signed webhooks with retries via QStash, metrics, and the admin UI that ties them together."
 sidebar:
   order: 6
 ---
@@ -8,72 +8,50 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { Steps } from "@astrojs/starlight/components";
 
-The chapters so far covered what Auther *is* — its authentication core, its
-permission engine, its machine-access story. This one covers how you *extend and
-operate* it: running your own logic at auth events without redeploying the server,
-notifying other systems when something happens, and seeing what the running system
-is actually doing. Four subsystems work together here — pipelines, webhooks,
-metrics, and the admin UI that ties them together.
+Four subsystems cover extending and operating Auther: **pipelines** run your Lua at auth events without a redeploy, **webhooks** notify other systems, **metrics** show what's happening, and the **admin UI** ties them together.
 
 ## The pipeline system
 
-**Pipelines let you run your own code at auth events.** Most identity providers
-force a choice: either accept the built-in behavior, or fork the server to change
-it. Auther's pipeline system is the escape hatch in between. Administrators attach
-custom Lua scripts to 16 auth lifecycle hooks, and those scripts run sandboxed at
-the moment an event fires — so you can geo-block a signup, enrich a token with
-custom claims, or fan out a side effect, all without touching the codebase.
-
-Scripts are organized as a **DAG** — a directed acyclic graph, where each node is a
-script and the edges say "this one runs after that one," with no cycles allowed — and
-executed under strict safety limits.
+Attach custom Lua scripts to 16 auth lifecycle hooks; they run sandboxed when the event fires — geo-block a signup, enrich a token, fan out a side effect. Scripts form a **DAG** (directed acyclic graph): nodes are scripts, edges are "runs after," no cycles.
 
 ### Lifecycle hooks
 
-The hooks are defined in `src/lib/pipelines/definitions.ts` and fall into three
-families. Each hook has a *type* that determines what a script attached to it can
-do: a **blocking** hook can abort the operation, an **async** hook runs
-side effects after the fact, and an **enrichment** hook contributes data back into
-the flow.
+Defined in `src/lib/pipelines/definitions.ts`, in three families. Each hook's *type* sets what a script can do: **blocking** aborts the operation, **async** runs side effects after, **enrichment** contributes data back into the flow.
 
-The authentication lifecycle is where most policy lives:
+Auth lifecycle:
 
 | Hook | Type | Purpose |
 | --- | --- | --- |
-| `before_signup` | Blocking | Can abort user registration (e.g. geo-blocking, email domain filtering) |
-| `after_signup` | Async | Post-registration side effects (e.g. send a welcome Slack message) |
-| `before_signin` | Blocking | Can abort sign-in (e.g. ban check, suspicious IP detection) |
-| `after_signin` | Async | Post-login side effects (e.g. audit logging) |
-| `before_signout` | Blocking | Can abort sign-out (rarely used) |
+| `before_signup` | Blocking | Abort registration (geo-block, email-domain filter) |
+| `after_signup` | Async | Post-registration side effects |
+| `before_signin` | Blocking | Abort sign-in (ban check, suspicious IP) |
+| `after_signin` | Async | Post-login side effects |
+| `before_signout` | Blocking | Abort sign-out (rarely used) |
 | `token_build` | Enrichment | Inject custom claims into JWTs |
 
-The API-key lifecycle mirrors the create/exchange/revoke flow from the
-[API Keys & Machine Access](/auther/server/api-keys/) chapter:
+API-key lifecycle (mirrors [API Keys](/auther/server/api-keys/)):
 
 | Hook | Type | Purpose |
 | --- | --- | --- |
-| `apikey_before_create` | Blocking | Can abort API key creation |
+| `apikey_before_create` | Blocking | Abort key creation |
 | `apikey_after_create` | Async | Post-creation side effects |
-| `apikey_before_exchange` | Blocking | Can abort the API key to JWT exchange |
+| `apikey_before_exchange` | Blocking | Abort key→JWT exchange |
 | `apikey_after_exchange` | Async | Post-exchange side effects |
-| `apikey_before_revoke` | Blocking | Can abort API key revocation |
+| `apikey_before_revoke` | Blocking | Abort key revocation |
 
-And the OAuth client lifecycle covers registration and authorization:
+OAuth client lifecycle:
 
 | Hook | Type | Purpose |
 | --- | --- | --- |
-| `client_before_register` | Blocking | Can abort client registration |
+| `client_before_register` | Blocking | Abort client registration |
 | `client_after_register` | Async | Post-registration side effects |
-| `client_before_authorize` | Blocking | Can abort authorization |
+| `client_before_authorize` | Blocking | Abort authorization |
 | `client_after_authorize` | Async | Post-authorization side effects |
 | `client_access_change` | Async | Access level changes |
 
 ### Execution model
 
-The `PipelineEngine` (`src/lib/auth/pipeline-engine.ts`) treats a pipeline as a
-layered DAG. The key insight is that scripts in the same layer have no dependency on
-each other, so they can run together, while later layers depend on the results of
-earlier ones — so the engine walks the graph one layer at a time.
+`PipelineEngine` (`src/lib/auth/pipeline-engine.ts`) walks the DAG one layer at a time — scripts in the same layer are independent and run in parallel, later layers depend on earlier outputs:
 
 <Mermaid title="DAG layer execution" height={420} code={`
 flowchart TB
@@ -94,48 +72,28 @@ flowchart TB
   Decision -->|"no / error / timeout"| Pass["Continue (fail-open)"]
 `} />
 
-Four properties define the model:
-
-- **DAG execution.** Scripts are organized into layers. Layers execute
-  sequentially; scripts within a layer execute in parallel via `Promise.all`.
-- **Context propagation.** Each layer's output becomes the next layer's `prev`
-  input. An `outputs` map lets a script reach back and read the result of a specific
-  named node.
-- **Safety limits.** A pipeline is capped at `MAX_CHAIN_DEPTH = 10` layers and
-  `MAX_PARALLEL_NODES = 5` scripts per layer.
-- **Fail-open.** Script errors and timeouts do *not* block the auth flow. Only an
-  explicit `allowed: false` return from a blocking hook stops the operation.
+- **DAG execution.** Layers sequential; scripts within a layer parallel via `Promise.all`.
+- **Context propagation.** Each layer's output becomes the next layer's `prev`; an `outputs` map reaches back to a named node's result.
+- **Safety limits.** `MAX_CHAIN_DEPTH = 10` layers, `MAX_PARALLEL_NODES = 5` scripts per layer.
+- **Fail-open.** Errors and timeouts do *not* block the flow — only an explicit `allowed: false` from a blocking hook stops it.
 
 :::tip[Why fail-open]
-A buggy or slow pipeline script should never lock users out of the system. By
-treating only an explicit `allowed: false` as a block — and treating crashes and
-timeouts as "carry on" — a misbehaving script degrades the *extension*, not the
-*core auth flow*. Make blocking decisions explicit; everything else is best-effort.
+A buggy script must never lock users out. Only an explicit `allowed: false` blocks; crashes and timeouts carry on — a misbehaving script degrades the *extension*, not the core auth flow.
 :::
 
 ### The script sandbox
 
-Because pipeline scripts are user-authored and run on the auth server's hot path,
-the sandbox is doing real security work, not bookkeeping. Each Lua script runs
-inside `wasmoon` (Lua-in-WASM) with the following protections:
+Scripts are user-authored and run on the hot path, so each runs in `wasmoon` (Lua-in-WASM) with hard protections:
 
 | Protection | Detail |
 | --- | --- |
 | Disabled globals | `os`, `io`, `package`, `require`, `loadfile`, `dofile` |
-| Instruction limit | 50,000 operations (enforced via `debug.sethook`) |
+| Instruction limit | 50,000 operations via `debug.sethook` |
 | Execution timeout | 10 seconds |
-| SSRF protection | `helpers.fetch()` blocks private IPs, enforces HTTPS, applies a 3s timeout and a 1MB response limit |
-| Secret encryption | Pipeline secrets are encrypted at rest with AES-256-GCM |
+| SSRF protection | `helpers.fetch()` blocks private IPs, enforces HTTPS, 3s timeout, 1MB response cap |
+| Secret encryption | Pipeline secrets encrypted at rest with AES-256-GCM |
 
-:::caution[The `helpers.fetch()` SSRF surface]
-A script that can make arbitrary outbound requests is a server-side request forgery
-risk — it could be coaxed into hitting internal metadata endpoints or private
-network addresses. That is why `helpers.fetch()` is not a general HTTP client: it
-refuses private IP ranges, requires HTTPS, and bounds both time and response size.
-:::
-
-Rather than exposing raw Lua libraries, the sandbox hands scripts a curated
-`helpers` table:
+Instead of raw Lua libraries, scripts get a curated `helpers` table:
 
 ```lua
 helpers.log(message)              -- Log to trace
@@ -150,9 +108,7 @@ helpers.metrics.count(name, val)  -- Emit counter metric
 helpers.metrics.gauge(name, val)  -- Emit gauge metric
 ```
 
-To make this concrete, here are two sketches that use the model end to end. The
-first is an **enrichment** hook on `token_build` that adds a custom claim to every
-JWT — the kind of thing you'd otherwise have to fork the server for:
+An **enrichment** hook on `token_build` tagging every token with a plan tier:
 
 ```lua
 -- token_build (Enrichment): tag every token with a plan tier
@@ -161,10 +117,7 @@ helpers.metrics.count("token.enriched", 1)
 return { claims = { tier = tier } }
 ```
 
-The second is a **blocking** hook on `before_signin` that aborts a login. Returning
-`allowed: false` is the *only* thing that stops the flow — anything else (including a
-crash or timeout) lets sign-in proceed, which is the fail-open behavior described
-below:
+A **blocking** hook on `before_signin` — returning `allowed: false` is the *only* thing that stops the flow:
 
 ```lua
 -- before_signin (Blocking): block sign-in when an external check says so
@@ -178,40 +131,24 @@ return { allowed = true }
 
 ### Pipeline observability
 
-Every pipeline run produces OpenTelemetry-compatible traces (the `pipeline_traces`
-table) and spans (the `pipeline_spans` table). The `helpers.trace(name, fn)` helper
-above is what lets a script carve its work into nested spans. The admin UI renders
-these as a waterfall trace viewer, so you can see exactly which layer and which
-script spent the time on any given execution.
+Every run produces OpenTelemetry-compatible traces (`pipeline_traces`) and spans (`pipeline_spans`); `helpers.trace(name, fn)` carves nested spans. The admin UI renders a waterfall trace viewer showing which layer/script spent the time.
 
 ## The webhook system
 
-**Webhooks tell other apps what happened.** Pipelines run logic *inside* Auther;
-webhooks are the outbound counterpart. They let external applications receive
-real-time notifications about auth events, so a downstream system can react when a
-user is created, a session is deleted, or an OAuth client is registered.
-
-A concrete case: your billing service subscribes to `user.created`, and the moment
-someone signs up Auther fires it an HTTP POST so the service can provision an account
-— no polling, no shared database.
+Webhooks are the outbound counterpart to pipelines: external apps receive real-time notifications about auth events (e.g. your billing service subscribes to `user.created` and provisions an account on signup — no polling, no shared DB).
 
 ### Architecture
 
-Four database tables model the webhook lifecycle, and the split matters — it
-separates *configuration* from *intent* from *the record of what happened* from
-*each attempt to deliver it*:
+Four tables split configuration from intent from record from delivery attempt:
 
 | Table | Role |
 | --- | --- |
-| `webhook_endpoint` | A destination URL with its configuration: retry policy, delivery format, and encrypted signing secret. |
-| `webhook_subscription` | Which event types each endpoint wants to receive (e.g. `user.created`, `session.deleted`). |
+| `webhook_endpoint` | Destination URL + config: retry policy, format, encrypted signing secret. |
+| `webhook_subscription` | Which event types each endpoint wants. |
 | `webhook_event` | A record that something happened, with a JSON payload snapshot. |
-| `webhook_delivery` | A specific attempt to send one event to one endpoint, with status tracking. |
+| `webhook_delivery` | One delivery attempt, with status tracking. |
 
 ### Event types
-
-The events an endpoint can subscribe to span the user, session, account,
-verification, client, and access lifecycles:
 
 ```text
 user.created, user.updated, user.deleted, user.verified
@@ -224,45 +161,29 @@ access.granted, access.revoked
 
 ### Delivery flow
 
-Delivery is deliberately asynchronous: an auth event records what happened and hands
-the actual HTTP delivery to a queue, so a slow or unavailable recipient never slows
-down the auth flow that triggered it. The path from event to delivered payload runs
-in seven steps:
+Delivery is async — an auth event records what happened and hands the HTTP delivery to a queue, so a slow recipient never slows the auth flow:
 
 <Steps>
 
-1. An auth event occurs — for example, a user signs up.
-2. `emitWebhookEvent()` in `src/lib/webhooks/delivery-service.ts` creates an event
-   record.
-3. For each active endpoint subscribed to this event type, a `pending` delivery
-   record is created.
-4. A `WebhookDeliveryJob` is enqueued to Upstash QStash — a hosted message queue
-   that holds the job and retries delivery on Auther's behalf.
-5. The QStash worker at `/api/internal/queues/webhook-delivery` receives the job,
-   verifies the QStash signature, and calls `deliverWebhook()`.
-6. The delivery service loads the event and endpoint, decrypts the signing secret,
-   builds an HMAC-SHA256 signed payload, and makes the HTTP request.
-7. The delivery record is updated with the response status, body, and duration.
+1. An auth event occurs (e.g. a user signs up).
+2. `emitWebhookEvent()` in `src/lib/webhooks/delivery-service.ts` creates an event record.
+3. For each subscribed active endpoint, a `pending` delivery record is created.
+4. A `WebhookDeliveryJob` is enqueued to Upstash QStash.
+5. The QStash worker at `/api/internal/queues/webhook-delivery` verifies the QStash signature and calls `deliverWebhook()`.
+6. The delivery service loads the event + endpoint, decrypts the signing secret, builds an HMAC-SHA256 signed payload, and makes the HTTP request.
+7. The delivery record is updated with response status, body, and duration.
 
 </Steps>
 
-Retries are governed by the endpoint's policy: `none` performs zero retries, while
-`standard` allows three retries managed by QStash's exponential backoff.
+Retries follow the endpoint's policy: `none` = zero retries; `standard` = three retries with QStash exponential backoff.
 
-:::caution[Design your receiver to be idempotent]
-Because deliveries are retried, your endpoint may receive the *same* event more than
-once — for instance if it succeeds but the response is lost in transit. Idempotency
-means handling a duplicate exactly like the original: no double-charged invoice, no
-second welcome email. The `x-webhook-id` header carries the event ID precisely so a
-receiver can dedupe on it.
+:::caution[Make your receiver idempotent]
+Retried deliveries may arrive more than once. Dedupe on the `x-webhook-id` header so a duplicate is a no-op — no double-charged invoice, no second welcome email.
 :::
 
 ### Webhook signatures
 
-A recipient needs to trust that a payload genuinely came from Auther and wasn't
-tampered with in transit. Payloads are therefore signed with HMAC-SHA256
-(`src/lib/webhooks/signature.ts`), and recipients verify the signature using a
-constant-time comparison to avoid timing attacks. Each request carries four headers:
+Payloads are HMAC-SHA256 signed (`src/lib/webhooks/signature.ts`); recipients verify with a constant-time compare. Each request carries:
 
 ```text
 x-webhook-id: <event_id>
@@ -273,69 +194,46 @@ x-webhook-origin: better-auth
 
 ## Metrics and observability
 
-**Metrics tell you what the running system is doing.** You cannot operate what you
-cannot see. The metrics system
-(`src/lib/services/metrics-service.ts`) records counters, gauges, and histograms to
-the project's own SQLite database (the `metrics` table), so operational telemetry
-lives alongside the data it describes rather than in a separate observability stack.
+`src/lib/services/metrics-service.ts` records counters, gauges, and histograms to the `metrics` table in the project's own SQLite DB — telemetry lives alongside the data it describes:
 
 | Metric type | Method | Example |
 | --- | --- | --- |
 | Counter | `count(name, value, tags)` | `auth.login.attempt` with `{ method: "email", status: "success" }` |
 | Gauge | `gauge(name, value, tags)` | `jwks.active_key.age_ms` |
 | Histogram | `histogram(name, value, tags)` | `authz.check.duration_ms` with `{ result: "allowed" }` |
-| Measured | `measure(name, fn, tags)` | Wraps an async function and records its duration |
+| Measured | `measure(name, fn, tags)` | Wraps an async fn and records duration |
 
 :::caution[Metrics must not leak PII]
-Telemetry tags are an easy place to accidentally store sensitive data. Auther
-sanitizes tags to block sensitive keys (`user_id`, `email`, `ip`, `user_agent`,
-`authorization`), and caps a metric at 10 tag keys with values truncated to 128
-characters.
+Tags are an easy place to store sensitive data. Auther sanitizes tags — blocking `user_id`, `email`, `ip`, `user_agent`, `authorization` — caps at 10 tag keys, and truncates values to 128 chars.
 :::
 
-The key metrics tracked across the system give a sense of what's worth measuring in
-an IdP:
+Key metrics across the IdP:
 
-- `auth.login.attempt` — login attempts by method and status
-- `auth.register.success` — successful registrations
-- `auth.session.created.count` — new sessions by source
-- `oidc.{route}.request.count` — OIDC endpoint requests
-- `oidc.{route}.latency_ms` — OIDC endpoint latency
-- `authz.check.duration_ms` — permission-check latency
-- `authz.decision.count` — permission decisions by result and source
-- `authz.rebac.traversal_depth` — ReBAC graph traversal depth
-- `jwks.rotate.triggered.count` — key rotations
-- `apikey.resolve.duration_ms` — API key permission resolution time
-- `webhook.delivery.duration_ms` — webhook delivery latency
-- `lua.pool.active` — active Lua engine count
-- `email.send.duration_ms` — email-sending latency
+- `auth.login.attempt`, `auth.register.success`, `auth.session.created.count`
+- `oidc.{route}.request.count`, `oidc.{route}.latency_ms`
+- `authz.check.duration_ms`, `authz.decision.count`, `authz.rebac.traversal_depth`
+- `jwks.rotate.triggered.count`, `apikey.resolve.duration_ms`
+- `webhook.delivery.duration_ms`, `lua.pool.active`, `email.send.duration_ms`
 
-The admin dashboard at `/admin` visualizes these metrics with Recharts.
+The admin dashboard at `/admin` visualizes these with Recharts.
 
 ## The admin UI
 
-Everything above — pipelines, webhooks, metrics — needs an operator-facing surface,
-and that is the admin dashboard at `/admin`. It's also the management console for the
-identity data covered in earlier chapters. Each section maps to a subsystem you've
-already met:
+Each section maps to a subsystem and is gated by the matching platform guard — the admin UI is not a privileged bypass:
 
 | Section | Path | Purpose |
 | --- | --- | --- |
 | Dashboard | `/admin` | Metrics visualization, system overview |
 | Users | `/admin/users` | User management (create, edit, ban, impersonate) |
-| Groups | `/admin/groups` | User-group management with member and permission tabs |
-| Clients | `/admin/clients` | OAuth client management (register, configure, access control) |
+| Groups | `/admin/groups` | User-group management, member and permission tabs |
+| Clients | `/admin/clients` | OAuth client management |
 | Keys | `/admin/keys` | JWKS signing-key management and rotation |
 | Sessions | `/admin/sessions` | Active session monitoring and revocation |
-| Webhooks | `/admin/webhooks` | Webhook endpoint configuration and delivery logs |
-| Pipelines | `/admin/pipelines` | Pipeline editor (DAG canvas), secret management, trace viewer |
+| Webhooks | `/admin/webhooks` | Endpoint config and delivery logs |
+| Pipelines | `/admin/pipelines` | DAG editor, secret management, trace viewer |
 | Access | `/admin/access` | Platform-level access-control management |
-| Requests | `/admin/requests` | Permission-escalation request review |
+| Requests | `/admin/requests` | Permission-escalation review |
 | Settings | `/admin/settings` | Platform configuration |
-| Profile | `/admin/profile` | Current user's profile and session management |
+| Profile | `/admin/profile` | Current user's profile and sessions |
 
-Crucially, the admin UI is not a privileged bypass. Each section is protected by the
-corresponding platform guard — `/admin/users`, for example, requires the
-`users:view` permission — so the same ABAC engine described in
-[ABAC, Guards, Groups & Invites](/auther/server/abac-groups/) gates the console
-itself.
+`/admin/users` requires `users:view`, for example — the same ABAC engine from [ABAC, Guards, Groups & Invites](/auther/server/abac-groups/) gates the console itself.

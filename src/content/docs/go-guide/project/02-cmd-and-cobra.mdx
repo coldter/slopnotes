@@ -1,6 +1,6 @@
 ---
 title: CLIs with Cobra
-description: How Go binaries build their command trees, bind flags to config, and run lifecycle hooks using the Cobra library.
+description: "Every binary under `cmd/` is one of two shapes — a service daemon (`CreateXCommand` → `PreRunE`/`RunE`) or a subcommand tool (`GetRootCommand` + `AddCommand` tree); bind pflags to viper with `BindFlags` last."
 sidebar:
   order: 2
 ---
@@ -8,17 +8,9 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { FileTree, LinkCard, CardGrid } from "@astrojs/starlight/components";
 
-**What you will learn:** how a real Go codebase builds its command-line binaries with [Cobra](https://github.com/spf13/cobra) — the two distinct binary shapes (service daemons vs. subcommand tools), how command trees are wired with `AddCommand`, how `pflag` flags bind to viper config, the lifecycle hooks (`PersistentPreRunE`/`PreRunE`/`RunE`), and how a leaf subcommand actually reaches a gRPC service or a topology store.
-
-**Prerequisites:** [packages and imports](/go-guide/language/01-packages-modules-imports/) (the package split and blank imports), [interfaces & composition](/go-guide/language/03-interfaces-composition/) (struct embedding, struct-literal construction), [errors](/go-guide/language/05-errors/) (`RunE` returns wrapped errors instead of exiting), [context](/go-guide/language/08-context/) (`cmd.Context()`), and [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/) (closures as handlers, the dependency-carrier struct). This builds on [architecture & request flow](/go-guide/project/01-architecture-request-flow/), which is where these binaries sit.
-
-We'll use the example system — a distributed SQL proxy — as the running example. Every binary it ships is a clean illustration of one of two Cobra patterns.
-
----
-
 ## The two binary shapes
 
-Everything you run lives under `cmd/<name>/main.go`. There are exactly two shapes, and knowing which one you're looking at is the first thing to figure out.
+Everything you run lives under `cmd/<name>/main.go`. Knowing which shape you're looking at is the first thing to figure out:
 
 <FileTree>
 - cmd/
@@ -31,8 +23,6 @@ Everything you run lives under `cmd/<name>/main.go`. There are exactly two shape
   - dbctld/ main.go + command/ — hybrid: subcommand tree whose `server` leaf is a daemon
 </FileTree>
 
-The two shapes differ on every axis that matters:
-
 | | Service daemon | Subcommand tool |
 |---|---|---|
 | Factory | `CreateGatewayCommand() (*cobra.Command, *Service)` | `GetRootCommand() *cobra.Command` |
@@ -42,10 +32,8 @@ The two shapes differ on every axis that matters:
 | What `RunE` does | starts a long-running server | does one thing and returns |
 
 :::caution[Gotcha]
-Don't go looking for `GetRootCommand` in a service daemon — it doesn't exist. The daemons use a `CreateXCommand` factory. Only the tools have a `GetRootCommand`.
+Don't go looking for `GetRootCommand` in a service daemon — it doesn't exist. The daemons use a `CreateXCommand` factory; only the tools have a `GetRootCommand`.
 :::
-
----
 
 ## The `main.go` pattern (subcommand tool)
 
@@ -62,15 +50,13 @@ func main() {
 
 Three things to notice:
 
-1. **`Execute()` drives everything.** Cobra parses `os.Args`, walks the command tree to find the invoked subcommand, runs the persistent and local hooks, then runs that command's `RunE`. Any error from any of those bubbles back here.
-2. **`os.Exit` lives only in `main`.** Command handlers return errors; `main` translates a non-nil error into exit code 1. The `//nolint:forbidigo` comment documents that `os.Exit` is *banned everywhere else* by the linter — that ban is what forces handlers to use `RunE`. (See [errors](/go-guide/language/05-errors/) for why returning errors beats exiting.)
+1. **`Execute()` drives everything.** Cobra parses `os.Args`, walks the tree to the invoked subcommand, runs the persistent and local hooks, then that command's `RunE`. Any error bubbles back here.
+2. **`os.Exit` lives only in `main`.** Handlers return errors; `main` translates a non-nil error into exit code 1. The `//nolint:forbidigo` documents that `os.Exit` is *banned everywhere else* by the linter — that ban forces handlers to use `RunE`.
 3. **All the wiring is in a factory.** `main` knows nothing about the command tree; `GetRootCommand` owns it.
-
----
 
 ## `GetRootCommand`: the factory + dependency-carrier struct
 
-The factory builds the whole tree. The state the commands need is hung off a struct so every handler closure and subcommand can reach it — this is the **dependency-carrier idiom**: one struct of fields wired once, with methods and closures used as handlers (see [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/)).
+State the commands need is hung off one struct so every handler closure and subcommand can reach it — the **dependency-carrier idiom**: one struct of fields wired once, with methods/closures as handlers:
 
 ```go title="cmd/platformctl/command/root.go"
 // platformCtlCommand holds the configuration for platformctl commands
@@ -116,7 +102,7 @@ root := &cobra.Command{
 }
 ```
 
-After construction, three more steps complete the root before subcommands are attached:
+After construction, three more steps complete the root before subcommands attach:
 
 ```go title="cmd/platformctl/command/root.go"
 mc.vc.RegisterFlags(root.PersistentFlags())   // declare + bind config-path/config-name on the root
@@ -130,12 +116,10 @@ AddPoolerCommands(root, mc)   // flat:    platformctl getpoolerstatus
 ```
 
 :::caution[Gotcha — output streams]
-Cobra writes command output to *stderr* by default. The root overrides this with `SetOut(os.Stdout)`. That's why leaf commands print results with `cmd.Print(...)` and not `fmt.Println(...)` — `cmd.Print` respects `SetOut`, so JSON goes to stdout and stays capturable in tests.
+Cobra writes command output to *stderr* by default; the root overrides with `SetOut(os.Stdout)`. That's why leaf commands print with `cmd.Print(...)`, not `fmt.Println(...)` — `cmd.Print` respects `SetOut`, so JSON goes to stdout and stays capturable in tests.
 :::
 
 ### The hook lifecycle, and the `SilenceUsage` trick
-
-Cobra runs hooks in this order for the actually-invoked command chain.
 
 <Mermaid title="Cobra hook order" height={360} code={`
 flowchart TB
@@ -146,16 +130,14 @@ flowchart TB
   PRE --> PREE --> RUN --> POST
 `} />
 
-Two subtle but load-bearing facts:
+Two load-bearing facts:
 
-- **`SilenceUsage` is set *inside* `PersistentPreRunE`, not at construction.** Flag-parse errors happen *before* any hook runs, so a bad flag still prints the usage block. Once parsing succeeds and the hook runs, `SilenceUsage = true` means a later application error prints just the error, not a wall of usage text.
-- **A child that defines its own `PersistentPreRunE` *overrides* the parent's** — Cobra does not merge them. The tools here deliberately define persistent hooks *only on the root*, so every subcommand inherits config loading and telemetry init. Add a subcommand with its own `PersistentPreRunE` and you'd silently lose config loading.
-
----
+- **`SilenceUsage` is set *inside* `PersistentPreRunE`, not at construction.** Flag-parse errors happen *before* any hook runs, so a bad flag still prints the usage block. Once parsing succeeds, `SilenceUsage = true` means a later application error prints just the error, not a wall of usage.
+- **A child that defines its own `PersistentPreRunE` *overrides* the parent's** — Cobra does not merge them. These tools deliberately define persistent hooks *only on the root*, so every subcommand inherits config loading and telemetry init.
 
 ## `AddCommand` wiring: nested vs. flat
 
-The root calls three `Add*` helpers. Each one decides the tree shape by *how many `AddCommand` hops* it makes.
+The root calls three `Add*` helpers; each decides the tree shape by *how many `AddCommand` hops* it makes.
 
 ### Nested — `platformctl cluster init`
 
@@ -177,11 +159,11 @@ func AddClusterCommand(root *cobra.Command, mc *platformCtlCommand) {
 }
 ```
 
-That's two hops: `root` → `clusterCmd` → `initCmd`. `clusterCmd` itself has no `RunE`; it's just a grouping node, so `platformctl cluster` with no leaf prints help.
+Two hops: `root` → `clusterCmd` → `initCmd`. `clusterCmd` has no `RunE` — it's a grouping node, so bare `platformctl cluster` prints help.
 
 ### Flat — `platformctl getgateways`
 
-A flat group attaches each leaf directly to the root — one hop, no grouping node:
+A flat group attaches each leaf directly to the root — one hop:
 
 ```go title="cmd/platformctl/command/topo.go"
 func AddTopoCommands(root *cobra.Command, mc *platformCtlCommand) {
@@ -193,11 +175,9 @@ func AddTopoCommands(root *cobra.Command, mc *platformCtlCommand) {
 }
 ```
 
-:::note
-There are two flavors of `Add*` helper. A *flat* one (`topo.AddGetGatewaysCommand()`) **returns** a `*cobra.Command` the caller attaches; a *nested* one (`cluster.AddInitCommand(clusterCmd)`) **takes a parent** and attaches itself. The receiving-parent style is what lets a leaf live in its own package while still registering onto a command built elsewhere.
-:::
+There are two flavors of `Add*` helper: a *flat* one (`topo.AddGetGatewaysCommand()`) **returns** a `*cobra.Command` the caller attaches; a *nested* one (`cluster.AddInitCommand(clusterCmd)`) **takes a parent** and attaches itself — which lets a leaf live in its own package while registering onto a command built elsewhere. `platformctl getgateways` works because it's wired flat; `platformctl init` *fails* — there's no flat `init`; it lives under `cluster`, so the path is `platformctl cluster init`.
 
-Put together, the tree mirrors the directory layout under `command/`:
+The tree mirrors the directory layout under `command/`:
 
 <FileTree>
 - platformctl/ (root, command/root.go)
@@ -210,26 +190,15 @@ Put together, the tree mirrors the directory layout under `command/`:
   - getpoolerstatus (flat leaf, command/pooler/status.go)
 </FileTree>
 
-The directories `command/cluster`, `command/topo`, `command/pooler`, and `command/admin` are separate Go packages, each leaf in its own file. The `admin` package holds the shared gRPC client reused by the `topo` and `pooler` leaves.
-
-:::caution[Gotcha — flat vs. nested wiring explains the UX]
-`platformctl getgateways` works because it's wired flat onto the root. `platformctl init` *fails* — there's no flat `init`; it lives under the `cluster` group, so the path is `platformctl cluster init`. The "unknown command" error is a direct consequence of which `Add*` helper registered it.
-:::
-
----
+The directories `command/cluster`, `command/topo`, `command/pooler`, `command/admin` are separate Go packages, each leaf in its own file. The `admin` package holds the shared gRPC client reused by the `topo` and `pooler` leaves.
 
 ## Flags: declare, then bind to viper
 
-Cobra uses [`pflag`](https://github.com/spf13/pflag), a POSIX-style superset of the stdlib `flag` package. There are two flag scopes:
-
-- `cmd.Flags()` — **local** to that command.
-- `root.PersistentFlags()` — **inherited** by every descendant.
-
-At execution time Cobra merges inherited flags into `cmd.Flags()`, so a leaf can read `config-path` (declared on the root) via `cmd.Flags().GetStringSlice("config-path")` even though it never declared it.
+Cobra uses [`pflag`](https://github.com/spf13/pflag) (a POSIX superset of stdlib `flag`). Two flag scopes: `cmd.Flags()` (local) and `root.PersistentFlags()` (inherited by every descendant — merged into `cmd.Flags()` at execution time).
 
 ### Declaration
 
-Plain `pflag` calls declare flags with a name, default, and help string. Shorthands use the `P` suffix, and there are typed variants for every kind:
+Plain `pflag` calls declare flags with name, default, help string. Shorthands use the `P` suffix:
 
 ```go title="cmd/dbctld/command/root.go"
 root.PersistentFlags().StringP("pg-database", "D", pc.pgDatabase.Default(), "...")
@@ -237,20 +206,16 @@ root.PersistentFlags().IntP("timeout", "t", pc.timeout.Default(), "...")
 root.PersistentFlags().StringSlice("pg-initdb-sql-files", pc.pgInitdbSQLFiles.Default(), "...")
 ```
 
-Required flags use `MarkFlagRequired`:
+Required flags use `MarkFlagRequired` (the `_ =` discard is intentional — it only errors if the flag name doesn't exist, a programming bug caught on first run):
 
 ```go title="cmd/platformctl/command/pooler/status.go"
 _ = cmd.MarkFlagRequired("cell")
 _ = cmd.MarkFlagRequired("service-id")
 ```
 
-:::caution[Gotcha — the `_ =` is intentional]
-`MarkFlagRequired` only returns an error if the flag name doesn't exist, which would be a programming bug caught the first time you run the binary. Discarding the error is the established pattern here; don't "fix" it.
-:::
-
 ### Binding to viper
 
-A flag's *value* and its *config binding* are separate steps. This codebase uses `config.Value[T]` objects (configured via `config.Configure(...)`) and ties them to flags with `config.BindFlags`. A leaf shows the full sequence — configure the typed values, build the command, declare the matching pflags, then bind:
+A flag's *value* and its *config binding* are separate steps. The repo uses `config.Value[T]` objects (configured via `config.Configure(...)`) tied to flags with `config.BindFlags`. A leaf shows the full sequence — configure the typed values, build the command, declare the pflags, then bind **last**:
 
 ```go title="cmd/platformctl/command/cluster/init.go"
 func AddInitCommand(clusterCmd *cobra.Command) {
@@ -275,10 +240,10 @@ func AddInitCommand(clusterCmd *cobra.Command) {
 }
 ```
 
-Once bound, `icmd.provisioner.Get()` returns the value with precedence **flag > env > config > default**. (The full Configure/Registry/precedence mechanics live in [config](/go-guide/project/03-config-and-flags/); here we only care about the wiring order.)
+Once bound, `icmd.provisioner.Get()` returns the value with precedence **flag > env > config > default**. (Full Configure/Registry/precedence mechanics: [config](/go-guide/project/03-config-and-flags/).)
 
 :::caution[Gotcha — `BindFlags` must come AFTER the pflag declarations]
-`BindFlags` panics if a Value maps to a flag that isn't defined on the flag set:
+`BindFlags` panics if a Value maps to a flag not yet defined on the flag set:
 
 ```go title="internal/config/value.go"
 // This function will panic if any of the values was configured to map to a flag
@@ -286,22 +251,16 @@ Once bound, `icmd.provisioner.Get()` returns the value with precedence **flag > 
 func BindFlags(fs *pflag.FlagSet, values ...value.Registerable) { ... }
 ```
 
-That panic is *why* every command declares its `cmd.Flags().String(...)` lines first and calls `BindFlags(...)` last. Reorder them and the binary panics on startup.
+That panic is why every command declares its `cmd.Flags().String(...)` lines first and calls `BindFlags(...)` last. Also note two ways to read a flag: `icmd.provisioner.Get()` (a viper Value) honors env/config/default; `cmd.Flags().GetString("cells")` reads the *flag only* and ignores config and env. Don't assume a flag is config-backed just because it exists — check whether it was passed to `BindFlags`.
 :::
-
-:::caution[Gotcha — two ways to read a flag]
-`icmd.provisioner.Get()` (a viper Value) honors env/config/default. `cmd.Flags().GetString("cells")` reads the *flag only* and ignores config and env entirely. Some leaves use raw flag reads with no viper binding at all; others use viper Values. Don't assume a flag is config-backed just because it exists — check whether it was passed to `BindFlags`.
-:::
-
----
 
 ## How a subcommand reaches a service
 
-A leaf's `RunE` is where it talks to the rest of the system. There are two paths.
+A leaf's `RunE` is where it talks to the rest of the system. Two paths.
 
 ### Path 1 — gRPC via the shared admin client
 
-The cleanest example reads a flag, builds the client, calls the RPC with `cmd.Context()`, and renders the response as JSON:
+Read a flag, build the client, call the RPC with `cmd.Context()`, render the response as JSON:
 
 ```go title="cmd/platformctl/command/topo/getgateways.go"
 func runGetGateways(cmd *cobra.Command, args []string) error {
@@ -327,7 +286,7 @@ func runGetGateways(cmd *cobra.Command, args []string) error {
 }
 ```
 
-The bridge from CLI to a gRPC stub is the `admin` package's `Conn`. It **embeds** the generated client interface (struct embedding; see [interfaces & composition](/go-guide/language/03-interfaces-composition/)) so `client.GetGateways(...)` resolves directly to the embedded `AdminServiceClient`:
+The bridge from CLI to a gRPC stub is the `admin` package's `Conn`, which **embeds** the generated client interface so `client.GetGateways(...)` resolves directly to the embedded `AdminServiceClient`:
 
 ```go title="cmd/platformctl/command/admin/client.go" {2}
 type Conn struct {
@@ -350,9 +309,7 @@ func NewClient(cmd *cobra.Command) (*Conn, error) {
 }
 ```
 
-`GetServerAddress` resolves the address with the same flag-or-config precedence theme: the `--admin-server` flag wins, otherwise it reads `platformctl.yaml` from a `--config-path` directory and computes `localhost:<grpcPort>` from the local provisioner config. The gRPC dial mechanics are covered in [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/).
-
-A second client leaf adds two idioms worth copying — a per-RPC timeout layered on `cmd.Context()` (see [context](/go-guide/language/08-context/)) and `protojson` to render enums as readable names:
+`GetServerAddress` resolves the address with the same flag-or-config precedence: the `--admin-server` flag wins, otherwise it reads `platformctl.yaml` from a `--config-path` directory and computes `localhost:<grpcPort>` from the local provisioner config. A second client leaf adds two idioms — a per-RPC timeout layered on `cmd.Context()`, and `protojson` to render enums as readable names:
 
 ```go title="cmd/platformctl/command/pooler/status.go"
 ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
@@ -366,7 +323,7 @@ marshaler := protojson.MarshalOptions{Indent: "  ", UseProtoNames: true}
 
 ### Path 2 — straight to the topology store
 
-Not every leaf goes through the admin service. The cluster-bootstrap leaf opens the topology store directly and writes metadata:
+Not every leaf goes through the admin service. The cluster-bootstrap leaf opens the topology store directly and writes metadata (there's no running gateway or admin yet, so it talks to etcd directly, reading flags with raw `cmd.Flags().GetString(...)` and `MarkFlagRequired(...)` — no viper binding):
 
 ```go title="cmd/platformctl/command/topo/createclustermetadata.go"
 ts, err := topo.OpenServer("etcd", globalTopoRoot, []string{globalTopoAddress},
@@ -377,10 +334,6 @@ if err != nil {
 defer ts.Close()
 // ... createCell / provisionDatabase ...
 ```
-
-This is the "operator bootstrap" path — there's no running gateway or admin service yet, so it talks to etcd directly. This leaf also reads its flags with raw `cmd.Flags().GetString(...)` and `MarkFlagRequired(...)` — no viper binding at all.
-
----
 
 ## The service-daemon shape
 
@@ -413,9 +366,9 @@ func run(ctx context.Context, g *gateway.Gateway) error {
 }
 ```
 
-The other daemons follow the same pattern (`CreatePoolerCommand`, `CreateOrchestratorCommand`, and so on). The `Use:` value comes from a shared `constants` package, so the binary name and the cobra command name never drift apart.
+The other daemons follow the same pattern (`CreatePoolerCommand`, `CreateOrchestratorCommand`, …). The `Use:` value comes from a shared `constants` package, so binary name and cobra command name never drift apart.
 
-Where do the flags come from? Not from a persistent root — from the service's own `RegisterFlags`, which declares the pflags, binds them, then delegates to sub-components:
+Flags come from the service's own `RegisterFlags`, which declares the pflags, binds them, then delegates to sub-components:
 
 ```go title="services/gateway/init.go"
 func (g *Gateway) RegisterFlags(fs *pflag.FlagSet) {
@@ -429,7 +382,7 @@ func (g *Gateway) RegisterFlags(fs *pflag.FlagSet) {
 }
 ```
 
-And config loading? Not a `PersistentPreRunE` — it's `CobraPreRunE`, which bottoms out in a shared `servenv` implementation:
+Config loading is `CobraPreRunE`, which bottoms out in a shared `servenv` implementation:
 
 ```go title="internal/servenv/servenv.go"
 func (sv *ServEnv) CobraPreRunE(cmd *cobra.Command) error {
@@ -446,11 +399,11 @@ func (sv *ServEnv) CobraPreRunE(cmd *cobra.Command) error {
 }
 ```
 
-So the service-daemon flow is `Execute` → `PreRunE` (`CobraPreRunE`: load config + watchers) → `RunE` (`run` → `Init` → `RunDefault`). What `Init`/`RunDefault`/`servenv` actually do once `RunE` fires is the subject of [service anatomy](/go-guide/project/05-service-anatomy/).
+So the service-daemon flow is `Execute` → `PreRunE` (`CobraPreRunE`: load config + watchers) → `RunE` (`run` → `Init` → `RunDefault`). What `Init`/`RunDefault`/`servenv` actually do is [service anatomy](/go-guide/project/05-service-anatomy/).
 
 ### dbctld, the hybrid
 
-`dbctld` is a subcommand tool (it has a `GetRootCommand`), but one of its leaves — `server` — is itself a daemon. The root declares all the persistent flags and binds them in one big `BindFlags` call, then wires the subcommands:
+`dbctld` is a subcommand tool (it has a `GetRootCommand`), but one of its leaves — `server` — is itself a daemon. The root declares all persistent flags and binds them in one big `BindFlags` call, then wires the subcommands:
 
 ```go title="cmd/dbctld/command/root.go"
 AddServerCommand(root, pc)   // the daemon leaf (parallels the service binaries)
@@ -459,7 +412,7 @@ AddStartCommand(root, pc)
 // ... stop / restart / status / version / reload
 ```
 
-Most leaves use a sub-struct plus a `createCommand` helper, with the `PreRunE` validates / `RunE` does work split:
+Most leaves use a sub-struct plus a `createCommand` helper, with `PreRunE` validate / `RunE` does work split:
 
 ```go title="cmd/dbctld/command/start.go"
 func (s *DBCtlStartCmd) createCommand() *cobra.Command {
@@ -476,8 +429,6 @@ func (s *DBCtlStartCmd) createCommand() *cobra.Command {
 
 `dbctld` also shows a flag *alias* via `SetGlobalNormalizationFunc`, rewriting the deprecated `--init-db-sql-file` to `--pg-initdb-sql-files`.
 
----
-
 ## Plugin registration via blank imports
 
 Each service `cmd` directory has a tiny file that does nothing but import a package for its side effects:
@@ -490,31 +441,25 @@ import (
 )
 ```
 
-The blank `_` import runs the package's `init()` to register a topo backend, without creating a direct code dependency — the [import-for-side-effects idiom](/go-guide/language/01-packages-modules-imports/). This is how `topo.OpenServer("etcd", ...)` later finds the etcd backend without `cmd/` importing it explicitly.
-
----
+The blank `_` import runs the package's `init()` to register a topo backend, without a direct code dependency — the [import-for-side-effects idiom](/go-guide/language/01-packages-modules-imports/). This is how `topo.OpenServer("etcd", ...)` later finds the etcd backend without `cmd/` importing it explicitly.
 
 ## Checkpoints
 
 <details><summary>Why is <code>SilenceUsage = true</code> set inside <code>PersistentPreRunE</code> instead of when the command is constructed?</summary>
-Flag-parse errors happen before any hook runs, so leaving usage visible at construction time means a bad flag still prints the helpful usage block. Setting `SilenceUsage` only after parsing succeeds (inside the hook) means *application* errors print just the error, while flag errors still show usage. Setting it at construction would hide usage even on bad flags.</details>
+Flag-parse errors happen before any hook runs, so leaving usage visible at construction time means a bad flag still prints the helpful usage block. Setting <code>SilenceUsage</code> only after parsing succeeds (inside the hook) means *application* errors print just the error, while flag errors still show usage.</details>
 
 <details><summary>You add a new subcommand and give it its own <code>PersistentPreRunE</code>. What breaks?</summary>
-Config loading and telemetry init silently stop happening for that command. Cobra does not merge persistent hooks — a child's `PersistentPreRunE` overrides the parent's. The tools rely on only the root defining persistent hooks so every leaf inherits config-load. Define `PreRunE` on the leaf instead, or call the root's logic explicitly.</details>
+Config loading and telemetry init silently stop happening for that command. Cobra does not merge persistent hooks — a child's <code>PersistentPreRunE</code> overrides the parent's. Define <code>PreRunE</code> on the leaf instead, or call the root's logic explicitly.</details>
 
 <details><summary>Why does <code>platformctl getgateways</code> work but <code>platformctl init</code> fail?</summary>
-`getgateways` is wired flat onto the root by `AddTopoCommands` (one `AddCommand` hop). `init` is wired nested under the `cluster` group by `AddClusterCommand`, so its real path is `platformctl cluster init`. There is no top-level `init`.</details>
+`getgateways` is wired flat onto the root by <code>AddTopoCommands</code> (one <code>AddCommand</code> hop). `init` is wired nested under the <code>cluster</code> group by <code>AddClusterCommand</code>, so its real path is <code>platformctl cluster init</code>.</details>
 
 <details><summary>Why must <code>config.BindFlags</code> be called after the <code>cmd.Flags().String(...)</code> declarations?</summary>
-`BindFlags` panics if a Value maps to a flag that isn't yet defined on the flag set. The flags must exist first, so every command declares its pflags, then calls `BindFlags` last.</details>
-
----
+<code>BindFlags</code> panics if a Value maps to a flag that isn't yet defined on the flag set. The flags must exist first, so every command declares its pflags, then calls <code>BindFlags</code> last.</details>
 
 ## Next
 
 Continue to [config](/go-guide/project/03-config-and-flags/) for the full mechanics behind `config.Configure`, `Value[T]`, `BindFlags`, the `Registry`, and the flag > env > config > default precedence this page only sketched at the command layer.
-
----
 
 ## See also
 

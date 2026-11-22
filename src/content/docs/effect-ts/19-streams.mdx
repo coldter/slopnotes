@@ -1,6 +1,6 @@
 ---
 title: "Streams — Effectful Sequences Over Time"
-description: "Pull-based, chunked, backpressured Effect Streams — construction from every source, transformation with concurrency, consuming with Sinks, encoding channels (Ndjson & SchemaBinary), resource safety, and a paginated enrichment pipeline."
+description: "Pull-based, chunked, backpressured Effect Streams: construction from every source, transformation with concurrency, consuming with Sinks, encoding channels (Ndjson & SchemaBinary), resource safety, and a paginated pipeline."
 sidebar:
   order: 19
 ---
@@ -12,23 +12,21 @@ An `Effect<A,E,R>` produces one `A`. A `Stream<A,E,R>` produces many — lazily,
 
 | Model | Who drives | Buffering | Backpressure | Errors | Resource scope |
 |---|---|---|---|---|---|
-| `Promise<T>` / `async iterable` | producer pushes | none | ad-hoc (consumer must buffer) | untyped throws | manual `try/finally` |
+| `Promise<T>` / async iterable | producer pushes | none | ad-hoc (consumer must buffer) | untyped throws | manual try/finally |
 | `Observable` (Rx) | producer pushes | unbounded subscription | `buffer` operators | untyped | subscription cleanup |
-| `Array<T>` | fully eager | whole array in memory | none (materialized) | not applicable | none |
-| `Queue<A,E>` | channel (both) | bounded policy | `offer` suspends when full (see ch.15) | typed `E` + `Done` | queue lifecycle |
+| `Array<T>` | fully eager | whole array in memory | none (materialized) | n/a | none |
+| `Queue<A,E>` | channel (both) | bounded policy | `offer` suspends when full (ch.15) | typed `E` + `Done` | queue lifecycle |
 | `Stream<A,E,R>` | consumer pulls | chunked | pull waits for consumer | typed `E` | `Scope` per pull/operator |
-| `Stream` + `Sink<A,...>` | consumer + sink | chunked fold | sink drives pulls | typed | `Effect.scoped` |
-
-This chapter is the Stream system: mental model, construction from every source the runtime supports, transformation with concurrency, consumption via the `run*` family and `Sink`s, chunk semantics, encoding channels (`Ndjson`, `SchemaBinary`), resource safety, pubsub interop, error handling, and a realistic paginated pipeline.
+| `Stream` + `Sink` | consumer + sink | chunked fold | sink drives pulls | typed | `Effect.scoped` |
 
 ## Mental model — pull, chunked, backpressured
 
-A Stream's inner representation is a `Channel` (`packages/effect/src/Stream.ts:93`). Operationally:
+A Stream's inner representation is a `Channel`. Operationally:
 
 1. **Pull.** Each step requests the next `Chunk<A>` from upstream. Effect work between chunks is a suspension point — other fibers run, interruptions are observed, `TestClock` can move time.
-2. **Chunked.** Upstream emits `NonEmptyArray<A>` chunks; downstream maps run per element but the runtime batches transport. You choose logical batching (`Chunk` size), internals amortize effect overhead.
+2. **Chunked.** Upstream emits `NonEmptyArray<A>` chunks; downstream maps run per element but the runtime batches transport.
 3. **Backpressured.** A slow consumer simply does not pull — upstream work is not scheduled. No `buffer(∞)` hiding an OOM.
-4. **Scoped.** Each pull runs in a scope; callbacks, listeners, and platform handles are added as finalizers and tore down in LIFO order when the stream ends, fails, or is interrupted — same discipline as fibers ([ch.13](/effect-ts/13-fibers/)) and resources ([ch.12](/effect-ts/12-scopes-resources/)).
+4. **Scoped.** Each pull runs in a scope; callbacks, listeners, and platform handles are added as finalizers and torn down LIFO when the stream ends, fails, or is interrupted — same discipline as fibers (ch.13) and resources (ch.12).
 
 <Mermaid title="Pull: consumer drives; upstream suspends until asked" height={300} code={`
 sequenceDiagram
@@ -46,12 +44,14 @@ sequenceDiagram
   S-->>C: end
 `} />
 
-:::note[Streams vs Effects vs Queues]
-- One value → `Effect`.
-- Many values produced once → `Array` (materialized).
-- Many values flowing across time with backpressure → `Stream`.
-- Many values with shared producers / multiple consumer topologies → `Queue`/`PubSub` (ch.15), often *sourced* as `Stream.fromQueue` / `Stream.fromPubSub` when you want pipeline combinators over them.
-:::
+Producer suspends until the next pull — there is no buffered backlog.
+
+| Need | Reach for |
+|---|---|
+| One value | `Effect` |
+| Many values produced once | `Array` (materialized) |
+| Many values flowing across time with backpressure | `Stream` |
+| Shared producers / multiple consumer topologies | `Queue`/`PubSub` (ch.15), sourced as `Stream.fromQueue`/`Stream.fromPubSub` when you want pipeline combinators over them |
 
 ## Creating streams — the full catalog
 
@@ -81,16 +81,13 @@ declare const fetchUser: Effect.Effect<User, FetchError>
 type User = { id: string }
 class FetchError extends Error {}
 
-// one value from an effect
 const oneUser: Stream.Stream<User, FetchError> = Stream.fromEffect(fetchUser)
 
-// one fallback value into an effect
 const fromOption = Effect.succeed(42).pipe(Stream.fromEffect)
 
-// repeating an effect
 const polls: Stream.Stream<string, never> =
   Stream.fromEffect(Effect.succeed("ping")).pipe(
-    Stream.repeat(Schedule.forever) // Stream repeats effect on its element schedule
+    Stream.repeat(Schedule.forever)
   )
 
 // repeating with a dedicated schedule on an effect
@@ -98,11 +95,11 @@ const healthTicks: Stream.Stream<string, never> =
   Stream.fromEffectSchedule(
     Effect.succeed("ping"),
     Schedule.spaced("30 seconds")
-  ).pipe(Stream.take(3)) // => ["ping", "ping", "ping"] over 60s (virtual under TestClock)
+  ).pipe(Stream.take(3)) // => ["ping","ping","ping"] over 60s (virtual under TestClock)
 
 // from pull effect — manual chunk-per-pull control
 const fromPull: Stream.Stream<number> = Stream.fromPull(
-  Effect.succeed(() => Effect.succeed([[1, 2, 3]] as const)) // pull fn
+  Effect.succeed(() => Effect.succeed([[1, 2, 3]] as const))
 )
 
 // unwrap a lazy stream effect
@@ -139,16 +136,15 @@ const allItems: Stream.Stream<Item, FetchError> =
     })
   ).pipe(Stream.flatMap((items) => Stream.fromIterable(items)))
 
-// convenience when each API fetch returns exactly one "batch" that is already
-// the desired element type:
+// when each API fetch returns exactly one batch already in the element type:
 const pagesAsValues: Stream.Stream<Array<Item>, FetchError> =
   Stream.paginate(null as string | null, Effect.fn(function* (cursor) {
     const page = yield* fetchPage(cursor)
     const next = page.nextCursor === null ? Option.none() : Option.some(page.nextCursor)
-    return [[page.items] as Array<Array<Item>>, next] // chunk shape matches batch
+    return [[page.items] as Array<Array<Item>>, next]
   }))
 
-// when the page API itself is synchronous (no Effect), `unfold` covers it
+// synchronous page API → `unfold`
 const unfolded = Stream.unfold(0, (n) =>
   n >= 5 ? Option.none() : Option.some([n, n + 1] as const)
 )
@@ -162,26 +158,23 @@ import { Effect, Queue, Stream } from "effect"
 declare const element: HTMLElement
 class LetterError extends Error { constructor(readonly cause: unknown) { super("letter") } }
 
-// DOM / EventTarget
+// DOM / EventTarget — listener detached when stream ends/interrupted
 const clicks: Stream.Stream<PointerEvent> =
   Stream.fromEventListener<PointerEvent>(element, "click")
-// removal is scoped — listener detached when stream ends/interrupted
-// signatures in packages/effect/src/Stream.ts:1405:
-//   fromEventListener<A>(target: EventTarget, event: string, options?: AddEventListenerOptions)
+// fromEventListener<A>(target: EventTarget, event: string, options?: AddEventListenerOptions)
 
 // manual callback source — acquireRelease semantics, Queue.offerUnsafe inside
 const fromCallback: Stream.Stream<number> =
   Stream.callback<number>((queue) =>
     Effect.gen(function* () {
       const handler = (n: number) => Queue.offerUnsafe(queue, n)
-      // setup
       bus.on("tick", handler)
       // teardown when stream ends or is interrupted
       yield* Effect.addFinalizer(() => Effect.sync(() => bus.off("tick", handler)))
     })
   )
 
-// async iterable (Node ReadableStream branches, third-party SDK paginators, etc.)
+// async iterable (Node ReadableStream, third-party SDK paginators)
 const fromAI: Stream.Stream<string, LetterError> =
   Stream.fromAsyncIterable(
     asyncIterable(),
@@ -206,17 +199,15 @@ import type { Scope } from "effect"
 declare const letterQueue: Queue.Queue<string, LetterError>
 class LetterError extends Error {}
 
-const fromQ: Stream.Stream<string, LetterError | Cause.Done> =
-  Stream.fromQueue(letterQueue)
-  // Produced as channel — Done excluded? see Stream vs Queue note below
-// correctly: Stream.fromQueue(q) : Stream<A, Exclude<E, Cause.Done>>
+// Stream.fromQueue(q) : Stream<A, Exclude<E, Cause.Done>>
 // Queue's Done is converted to stream termination, not a stream error.
+const fromQ: Stream.Stream<string, LetterError> =
+  Stream.fromQueue(letterQueue)
 
 const fromPs: Stream.Stream<string> =
   Stream.fromPubSub(yield* PubSub.bounded<string>(1024))
 // scoped subscription internally — ends when pubsub shuts down
 
-// subscription variant (already subscribed)
 declare const sub: PubSub.Subscription<string>
 const fromSub: Stream.Stream<string> = Stream.fromSubscription(sub)
 
@@ -227,17 +218,16 @@ const nodeSource: Stream.Stream<Uint8Array, import("effect/Cause").UnknownError>
     onError: (cause) => new (class extends Error { _tag = "UnknownError"; cause = cause })() as any,
     closeOnDone: true // destroy Readable when stream ends (default true)
   })
-// signature (packages/platform/node-shared/src/NodeStream.ts):
-//   fromReadable<A = Uint8Array, E = UnknownError>(options: {
-//     evaluate: () => Readable | NodeJS.ReadableStream,
-//     onError?: (error: unknown) => E,
-//     chunkSize?: number, bufferSize?: number, closeOnDone?: boolean
-//   }): Stream<A, E>
+// fromReadable<A = Uint8Array, E = UnknownError>(options: {
+//   evaluate: () => Readable | NodeJS.ReadableStream,
+//   onError?: (error: unknown) => E,
+//   chunkSize?: number, bufferSize?: number, closeOnDone?: boolean
+// }): Stream<A, E>
 
 // Scheduling-shaped sources
-const ticks: Stream.Stream<void> = Stream.tick("1 seconds") // Stream<void> at interval
+const ticks: Stream.Stream<void> = Stream.tick("1 seconds")
 const scheduled: Stream.Stream<number> =
-  Stream.fromSchedule(Schedule.spaced("500 millis")) // Stream<Output> of schedule
+  Stream.fromSchedule(Schedule.spaced("500 millis"))
 
 import { Schedule } from "effect"
 ```
@@ -259,10 +249,6 @@ import { Schedule } from "effect"
 | `Stream.tick(interval)` | `Duration.Input → Stream<void>` | |
 | `Stream.fromSchedule(schedule)` | `Schedule → Stream<Output>` | |
 | `NodeStream.fromReadable({ evaluate, onError, closeOnDone })` | `Readable → Stream<A,E>` | scoped destroy |
-
-:::note[Queue Done vs Stream error]
-`Queue<A, E | Cause.Done>` vs `Stream<A, Exclude<E, Cause.Done>>`. A queue terminated by `Queue.end` completes with `Cause.Done`; `Stream.fromQueue` translates that into *successful stream termination* rather than an observable error. Map queue failures via `Queue.fail(e)` if consumers should see them as stream failures (`Stream.fail`-like behavior).
-:::
 
 ## Transforming — the operator catalog
 
@@ -313,9 +299,7 @@ const mapChunks: Stream.Stream<number> = source.pipe(
 | `Stream.scan(init, f)` / `scanEffect` | fold emitting intermediates | — |
 | `Stream.grouped(n)` / `groupedWithin(n, duration)` | window into nested stream | — |
 
-:::tip[Prefer chunk-level when the transformation is cheap]
-`mapChunks`/`mapArray`/`forEach`-style operators receive the internal chunk directly. For pure functions on hot streams, a chunk-level pass avoids per-element effect suspension and allocation — measure with `Stream.rechunk` if profiling shows chunk size variance is hurting branch prediction or collector throughput.
-:::
+For pure functions on hot streams, chunk-level APIs (`mapChunks`, `mapArray`, `runForEachArray`) avoid per-element effect suspension/allocation — measure with `Stream.rechunk` if profiling shows chunk-size variance hurting you.
 
 ### Taking, dropping, windowing
 
@@ -333,7 +317,6 @@ const effectWhile: Stream.Stream<number> = source.pipe(
 )
 const droppedWhile: Stream.Stream<number> = source.pipe(Stream.dropWhile((n) => n < 5))
 
-// by schedule / duration / predicate effect
 const timed: Stream.Stream<number> = source.pipe(Stream.timeout("5 seconds"))
 const grouped: Stream.Stream<Stream.Stream<number>> = source.pipe(Stream.grouped(10))
 const groupedTimed = source.pipe(Stream.groupedWithin(100, "500 millis"))
@@ -341,7 +324,7 @@ const groupedTimed = source.pipe(Stream.groupedWithin(100, "500 millis"))
 import { Effect } from "effect"
 ```
 
-`take`/`drop` are pull-aware: upstream not yet produced beyond the boundary is never executed — time- and resource-safe.
+`take`/`drop` are pull-aware: upstream beyond the boundary is never executed — time- and resource-safe.
 
 ### Concurrency within the stream
 
@@ -360,7 +343,7 @@ const enriched = ids.pipe(
   )
 )
 
-// flatMap parallelism — encloses Stream producing effectful inner streams
+// flatMap parallelism — inner streams
 const withInner: Stream.Stream<string> = Stream.range(1, 20).pipe(
   Stream.flatMap(
     (n) => Stream.fromEffect(Effect.succeed(`row:${n}`)),
@@ -368,18 +351,18 @@ const withInner: Stream.Stream<string> = Stream.range(1, 20).pipe(
   )
 )
 
-// ordering note: concurrency-merged results are emitted as inner streams complete;
-// input order is NOT preserved under unbounded concurrency. Bound with ordering
-// requirements by post-sorting or by sequential mapping outside the concurrency window.
+// ordering note: concurrency-merged results emit in *completion* order, not input
+// order under concurrency > 1. Bound with concurrency: 1, post-sort, or carry a
+// sequence number through the pipeline.
 ```
 
 :::caution[Concurrency without backpressure awareness still overwhelms sinks]
-`mapEffect(..., { concurrency: 8 })` bounds *in-flight* maps but not *produced* element rate. If the source is `Stream.range` (synchronous, finite) the burst is the collection size, not time-bound. Pair bursty sources with buffering/windowing or make the source itself rate-limited (`Stream.tick`, paginated fetch) before introducing inner concurrency.
+`mapEffect(..., { concurrency: 8 })` bounds *in-flight* maps but not *produced* element rate. If the source is `Stream.range` (synchronous, finite) the burst is the collection size, not time-bound. Pair bursty sources with buffering/windowing or make the source rate-limited (`Stream.tick`, paginated fetch) before adding inner concurrency.
 :::
 
 ## Consuming — the run* family and Sinks
 
-A Stream does nothing until run. Different collectors turn its emission into an `Effect`.
+A Stream does nothing until run. Different collectors turn emission into an `Effect`.
 
 ```ts title="src/stream-consume.ts"
 import { Effect, Option, Sink, Stream } from "effect"
@@ -387,18 +370,10 @@ import { Effect, Option, Sink, Stream } from "effect"
 const source: Stream.Stream<number, string> = Stream.make(1, 2, 3)
 
 const collected: Effect.Effect<Array<number>, string> = Stream.runCollect(source)
-// => Effect<[1,2,3]>
-
 const drained: Effect.Effect<void, string> = Stream.runDrain(source)
-// discard all, run for effects only
-
 const first: Effect.Effect<Option.Option<number>, string> = Stream.runHead(source)
-// => Some(1)
-
 const last: Effect.Effect<Option.Option<number>, string> = Stream.runLast(source)
-
 const counted: Effect.Effect<number, string> = Stream.runCount(source)
-
 const summed: Effect.Effect<number, string> = Stream.runSum(source as Stream.Stream<number, string>)
 
 const folded: Effect.Effect<number, string> =
@@ -408,7 +383,7 @@ const forEach: Effect.Effect<void, string> =
   Stream.runForEach(source, (n) => Effect.log(`saw ${n}`))
 
 const forEachWhile: Effect.Effect<void, string> =
-  Stream.runForEachWhile(source, (n) => Effect.succeed(n < 2)) // stop after predicate fails
+  Stream.runForEachWhile(source, (n) => Effect.succeed(n < 2))
 
 const str: Effect.Effect<string, string> =
   Stream.mkString(source.pipe(Stream.map(String)))
@@ -424,7 +399,7 @@ const headViaSink: Effect.Effect<Option.Option<number>, string> = Stream.run(sou
 const asAsyncIterable: Effect.Effect<AsyncIterable<number>, never, never> =
   Stream.toAsyncIterableEffect(source)
 const pull: Effect.Effect<() => Effect.Effect<import("effect/Chunk").Chunk<number>>> =
-  Stream.toPull(source) // manual pull loop — advanced, scopes handled via the returned effect's scope
+  Stream.toPull(source) // manual pull loop — advanced
 ```
 
 | Consumer | Result Effect |
@@ -441,7 +416,7 @@ const pull: Effect.Effect<() => Effect.Effect<import("effect/Chunk").Chunk<numbe
 | `Stream.toReadableStream` / `toReadableStreamEffect` | expose as Web `ReadableStream` |
 | `Stream.toAsyncIterableEffect` | expose as JS async iterable |
 
-`Sink` is a `Channel` that consumes chunks and produces a value (and optional leftovers). Built-ins in `packages/effect/src/Sink.ts`:
+`Sink` is a `Channel` that consumes chunks and produces a value (and optional leftovers):
 
 | Sink | Shape |
 |---|---|
@@ -455,13 +430,11 @@ const pull: Effect.Effect<() => Effect.Effect<import("effect/Chunk").Chunk<numbe
 | `Sink.every(pred)` / `some(pred)` | boolean fold |
 | `Sink.collectArray` / `collectAll` | gather |
 
-:::note[Stream is chunk-aware — maps run per element but Chunk batching is internal]
-Operators expose per-element semantics (`map`, `filter`, `flatMap` see each `A`), but the transport is `Chunk<A>` slices. That means a `map` closure is applied elementwise yet the runtime typically runs the *pull–process–emit* cycle once per upstream chunk rather than per element. Opting into batch-level APIs (`mapChunks`, `mapArray`, `runForEachArray`) lets you fold without per-element allocations when profiling warrants it; functional correctness does not depend on chunking.
-:::
+Operators expose per-element semantics (`map`, `filter`, `flatMap` see each `A`), but the transport is `Chunk<A>` slices — the pull–process–emit cycle typically runs once per upstream chunk rather than per element.
 
 ## Encoding channels — Ndjson & SchemaBinary pipelines
 
-Streams carry typed values; bytes on the wire need codecs. Effect provides `Channel`-based codecs in `effect/unstable/encoding` that plug into streams with `Stream.pipeThroughChannel` (or `Stream.pipeThrough`). The codecs are streaming-safe — framing handles split/merged chunks and ignores incomplete trailing splits appropriately.
+Streams carry typed values; bytes on the wire need codecs — `Channel`-based codecs in `effect/unstable/encoding` plug in via `Stream.pipeThroughChannel`. They're streaming-safe: framing handles split/merged chunks.
 
 ### Ndjson — newline-delimited JSON streams
 
@@ -472,18 +445,13 @@ import { Ndjson } from "effect/unstable/encoding"
 const Person = Schema.Struct({ name: Schema.String, age: Schema.Number })
 type Person = typeof Person.Type
 
-// simulated source: UTF-8 lines over a Readable or an async iterable
 declare const byteSource: Stream.Stream<Uint8Array, never>
 declare const stringSource: Stream.Stream<string, never>
 
 // decode → validate → work → re-encode pipeline
-
 const decoded: Stream.Stream<Person, import("effect/Schema").SchemaError | Ndjson.NdjsonError> =
   byteSource.pipe(
-    // byte → string per TextDecoder
     Stream.decodeText(),
-    // string chunk handling splits newlines (splitLines internal)
-    // ndjson decode schemaString: string → unknown JSON per line → Schema typed Person
     Stream.pipeThroughChannel(Ndjson.decodeSchemaString(Person)({ ignoreEmptyLines: true }))
   )
 
@@ -494,14 +462,14 @@ const adultsEncoded: Stream.Stream<string, typeof Person.Encoded> =
     Stream.pipeThroughChannel(Ndjson.encodeSchemaString(Person)())
   )
 
-// bytes variant — encode/decode operate on Uint8Array ndjson
+// bytes variant
 const adultBytes: Stream.Stream<Uint8Array, import("effect/Schema").SchemaError | Ndjson.NdjsonError> =
   decoded.pipe(
     Stream.filter((p) => p.age >= 18),
     Stream.pipeThroughChannel(Ndjson.encodeSchema(Person)())
   )
 
-// string-only ndjson (no byte transcoding)
+// string-only ndjson
 const stringOnly: Stream.Stream<Person, import("effect/Schema").SchemaError | Ndjson.NdjsonError> =
   stringSource.pipe(
     Stream.pipeThroughChannel(Ndjson.decodeSchemaString(Person)())
@@ -520,14 +488,14 @@ const resilient: Stream.Stream<Person, never> =
     Stream.catchTag("SchemaError", () => Stream.empty) // drop malformed rows
   )
 
-// splitLines / decodeText: Stream-stage helpers for text framing
+// splitLines / decodeText: text framing helpers
 const lines: Stream.Stream<string> = byteSource.pipe(
   Stream.decodeText(),   // Uint8Array → string (streaming TextDecoder)
   Stream.splitLines      // split on \n, handles chunk boundaries
 )
 ```
 
-| Ndjson channel constructor | Direction | Input Stream element | Output element | Errors |
+| Ndjson channel constructor | Direction | Input element | Output element | Errors |
 |---|---|---|---|---|
 | `Ndjson.decodeString(opts?)` | `Channel<string → unknown>` | `string` (line chunks) | `unknown` per line | `NdjsonError` |
 | `Ndjson.decode(opts?)` | `Channel<Uint8Array → unknown>` | `Uint8Array` (UTF-8) | `unknown` | `NdjsonError` |
@@ -539,13 +507,11 @@ const lines: Stream.Stream<string> = byteSource.pipe(
 | `Ndjson.encodeSchemaString(S)()` | `Channel<S.Type → string>` | `S.Type` | trailing-newline string | `SchemaError \| NdjsonError` |
 | `Ndjson.encodeSchema(S)()` | `Channel<S.Type → Uint8Array>` | `S.Type` | bytes | `SchemaError \| NdjsonError` |
 
-:::note[Every string line ends with a newline — trailing empty lines]
-`Ndjson.encode*` writes a trailing `\n` per element. When `ignoreEmptyLines` is false, a trailing newline decodes as an empty line and `JSON.parse("")` fails as `Unpack`. Pass `{ ignoreEmptyLines: true }` to `decodeSchemaString`/`decodeString`/`decode` when the upstream may produce trailing empty lines — which every normal Ndjson encoder does.
-:::
+`Ndjson.encode*` writes a trailing `\n` per element. When `ignoreEmptyLines` is false, a trailing newline decodes as an empty line and `JSON.parse("")` fails as `Unpack`. Pass `{ ignoreEmptyLines: true }` when upstream may produce trailing empty lines — which every normal Ndjson encoder does.
 
 ### SchemaBinary — compact row-oriented binary frames
 
-For density and schema-evolvable wire format, use `SchemaBinary` channels. The binary protocol is array-of-structs aware: a batch of records declares its shape once; repeated strings are dictionary-compressed across the batch.
+For density and schema-evolvable wire format, `SchemaBinary` channels use an array-of-structs-aware binary protocol: a batch declares its shape once; repeated strings are dictionary-compressed across the batch.
 
 ```ts title="src/stream-schemabinary.ts"
 import { Effect, Schema, Stream } from "effect"
@@ -577,8 +543,7 @@ const repack: Stream.Stream<Uint8Array, import("effect/Schema").SchemaError> =
     Stream.pipeThroughChannel(SchemaBinary.encode(Event)())
   )
 
-// combining codecs on a Duplex channel (send typed values both ways)
-// See `NodeStream.pipeThroughDuplex` for Node; `HttpClient` wraps similar for HTTP
+// combining codecs on a Duplex channel — see `NodeStream.pipeThroughDuplex` / `HttpClient`
 ```
 
 | Channel | Direction | Type header |
@@ -589,12 +554,12 @@ const repack: Stream.Stream<Uint8Array, import("effect/Schema").SchemaError> =
 `SchemaBinary` also exposes `toCodec(S)` for one-frame sync `encodeUnknownSync`/`decodeUnknownSync` outside streaming contexts. Wire options: `fingerprint: true` (compact positional layout with hash; smaller but peers must match schema exactly) vs default (self-describing row shape for evolution).
 
 :::caution[Pick the right boundary for framing]
-`Ndjson` is line-framed (one record per line) — good for log streams, incremental tailing, and line-oriented HTTP bodies. `SchemaBinary` is length-framed binary — denser, schema-aware, and not human-readable. Don't overlay `splitLines` on a `SchemaBinary` byte stream or vice versa: the framers differ. The `Channel.from*` ancestry of each codec guarantees split/merge safety only within its own encoding.
+`Ndjson` is line-framed (one record per line) — good for log streams, incremental tailing, line-oriented HTTP bodies. `SchemaBinary` is length-framed binary — denser, schema-aware, not human-readable. Don't overlay `splitLines` on a `SchemaBinary` byte stream or vice versa: the framers differ, and split/merge safety only holds within a codec's own encoding.
 :::
 
 ## Resource safety — scoped callbacks and channels
 
-Stream's `callback` source is **resource-safe by construction**. The constructor takes a function whose body runs in `Scope`:
+`Stream.callback` is **resource-safe by construction** — the constructor's body runs in a `Scope`:
 
 ```ts title="src/stream-resource.ts"
 import { Effect, Queue, Stream } from "effect"
@@ -608,8 +573,8 @@ const riskySource: Stream.Stream<number> =
       yield* Effect.log("source started")
     })
   )
-// handle cleared when: stream ends (natural completion), stream fails, or downstream
-// is interrupted (timeout, race loser, fiber interrupt). In all cases, LIFO finalizers unwind.
+// handle cleared when: stream ends, fails, or downstream is interrupted
+// (timeout, race loser, fiber interrupt). LIFO finalizers unwind in all cases.
 
 function scheduleEvery(ms: number, f: (n: number) => void) {
   let n = 0
@@ -618,7 +583,7 @@ function scheduleEvery(ms: number, f: (n: number) => void) {
 }
 function clearHandle(handle: object) { clearInterval(handle as unknown as number) }
 
-// for ad-hoc lifecycle outside `callback`, use acquireRelease scoped streams
+// ad-hoc lifecycle outside `callback` — acquireRelease scoped streams
 const fromFileLike = Stream.scoped(
   Effect.acquireRelease(
     Effect.sync(() => ({ read: () => "line", close: () => {} })),
@@ -627,11 +592,11 @@ const fromFileLike = Stream.scoped(
 )
 ```
 
-Any `Channel` pulled into a stream — `Channel.fromTransform`, `Channel.decodeText`, `Channel.splitLines`, `Ndjson.*`, `SchemaBinary.*`, `NodeStream.fromReadableChannel` — inherits the same scope discipline: their finalizers close, flush, and detach on termination.
+Any `Channel` pulled into a stream — `Channel.fromTransform`, `Channel.decodeText`, `Channel.splitLines`, `Ndjson.*`, `SchemaBinary.*`, `NodeStream.fromReadableChannel` — inherits the same scope discipline: finalizers close, flush, and detach on termination.
 
 ## PubSub / Queue → Stream interop
 
-Where queues distribute work (one item to one worker) and pubsubs broadcast information (one item to all subscribers), streams express *processing* over either:
+Queues distribute work (one item to one worker); pubsubs broadcast information (one item to all subscribers); streams express *processing* over either:
 
 ```ts title="src/stream-pubsub-queue.ts"
 import { Effect, PubSub, Queue, Stream } from "effect"
@@ -645,18 +610,17 @@ const fromQForEachWorker = Stream.fromQueue(queue).pipe(
   Stream.runForEach((t) => Effect.log(`work ${t.id}`))
 )
 
-// fan-out with the same bus as in ch.15's OrderEvents service
+// fan-out with a pubsub (ch.15's OrderEvents service pattern)
 declare const pubsub: PubSub.PubSub<OrderEvent>
 type OrderEvent = { orderId: string }
 
 const fromPS: Stream.Stream<OrderEvent> = Stream.fromPubSub(pubsub)
-// the stream's subscription is scoped: subscribe on pull start, unsubscribe on end/failure/interrupt
-// `replay: N` in PubSub construction still applies — late subscribers see buffered history (see ch.15)
+// subscription is scoped: subscribe on pull start, unsubscribe on end/failure/interrupt
+// `replay: N` in PubSub construction still applies — late subscribers see buffered history
 
 // streams also feed back into pubsubs/queues as sinks
 const toQueue: Effect.Effect<void, never> =
   Stream.fromIterable([1, 2, 3]).pipe(Stream.runIntoQueue(queue, { shutdown: true }))
-// runIntoQueue / runIntoPubSub / toPubSub / toQueue are first-class
 
 const completion: Effect.Effect<void> =
   Stream.fromIterable([1, 2, 3]).pipe(
@@ -665,11 +629,9 @@ const completion: Effect.Effect<void> =
   )
 ```
 
-`Stream.fromQueue(queue).pipe(Stream.make(1,2,3), Stream.runIntoQueue(...))` round-trips are zero-convention: producing and consuming under stream scopes gives you backpressure-composable pipelines over durable shared state when you need it, and purely stream-internal pipelines when you don't.
-
 ## Error handling — catch at the stream level
 
-Stream exposes `catch*` combinators mirroring Effect — without needing to interrupt iteration:
+Stream exposes `catch*` combinators mirroring Effect — without interrupting iteration:
 
 ```ts title="src/stream-errors.ts"
 import { Effect, Schema, Stream } from "effect"
@@ -691,13 +653,12 @@ const recovered: Stream.Stream<number, FatalError> =
     )
   )
 
-// multi-tag and predicate forms
 const multi: Stream.Stream<number, FatalError> =
   source.pipe(Stream.catchTags({
     TransientError: (e) => Stream.empty // absorb
   }))
 
-// when diagnoses share a TaggedError union, use reason-typed catching
+// reason-typed catching for TaggedError unions
 const reason: Stream.Stream<number, never> =
   source.pipe(Stream.catchReason("TransientError", (r) => Stream.succeed(-1)))
 
@@ -705,8 +666,6 @@ const reason: Stream.Stream<number, never> =
 const causeAware = source.pipe(
   Stream.catchCause((cause) => Stream.succeed(-1))
 )
-
-// combine with queue error-stashes or dead-letter pattern from ch.15
 ```
 
 | Combinator | Catches |
@@ -722,8 +681,6 @@ const causeAware = source.pipe(
 In v4 these derive from `Filter` + scheduling — the same machinery behind `Effect.catch*`.
 
 ## Choosing: Stream vs Queue vs Array vs async iterable
-
-A real program uses all four. Use the smallest abstraction that carries the needed guarantees:
 
 <Mermaid title="Decision: which collection-like thing?" height={420} code={`
 flowchart TD
@@ -747,20 +704,18 @@ flowchart TD
 |---|---|
 | Whole collection in memory, no time, no concurrency | `Array` / `Chunk` (plain) |
 | Map `A → Effect<B>` with concurrency, then collect | `Effect.forEach(items, f, { concurrency })` |
-| Producer outpaces consumer (or vice versa) with bounded memory | `Queue` (bounded suspend / dropping / sliding) + consumers; pull as `Stream.fromQueue` |
+| Producer outpaces consumer with bounded memory | `Queue` (bounded suspend / dropping / sliding) + consumers; pull as `Stream.fromQueue` |
 | Broadcast | `PubSub`; consume as `Stream.fromPubSub` when pipeline combinators needed |
-| Time-shaped source (tick, schedule, timeout), composable windowing, encoding channels | `Stream` |
+| Time-shaped source, composable windowing, encoding channels | `Stream` |
 | Need filtering/mapEffect-then-consume-as-pipeline | `Stream` (operators compose regardless of source) |
 | Interop with outside world (`Readable`, `EventTarget`, async SDK) | `Stream` constructors (`NodeStream.fromReadable`, `fromEventListener`, `fromAsyncIterable`) |
-| Need leftover-aware folding | `Sink` via `Stream.run(sink)` (`Sink.head`, `take`, `sum`, ...) |
+| Leftover-aware folding | `Sink` via `Stream.run(sink)` |
 
-:::tip[The ladder]
-Start with an `Array` pipeline. Add concurrency with `Effect.forEach`. When time enters (polling, batching, windowing, merging live sources) or backpressure is required, move to `Stream`. When *topology* enters (multiple differently-lifetime'd producers/consumers, broadcast, durability), promote to `Queue`/`PubSub` services sourced/consumed as streams.
-:::
+The ladder: start with an `Array` pipeline. Add concurrency with `Effect.forEach`. When time enters (polling, batching, windowing, merging live sources) or backpressure is required, move to `Stream`. When *topology* enters (multiple differently-lifetime'd producers/consumers, broadcast, durability), promote to `Queue`/`PubSub` services sourced/consumed as streams.
 
 ## Realistic pipeline — paginated API → stream → enrichment → filter → collect
 
-Put the whole surface together. Spec: the platform exposes a cursor-paginated listing API (`GET /items?cursor=…`) returning `Array<Listed>` plus `nextCursor`. Each listed item is then enriched through a rate-limited lookup effect; only qualifying items are kept. The pipeline must paginate until exhaustion, enrich with bounded concurrency, filter, and materialize.
+Spec: a cursor-paginated listing API (`GET /items?cursor=…`) returning `Array<Listed>` plus `nextCursor`. Each item is enriched through a rate-limited lookup; only qualifying items are kept. Paginate to exhaustion, enrich with bounded concurrency, filter, materialize.
 
 ```ts title="src/pipeline.ts"
 import { Effect, Option, Schedule, Schema, Stream } from "effect"
@@ -803,7 +758,10 @@ const apiRetry = Schedule.min([
   Schedule.spaced("4 seconds")
 ]).pipe(Schedule.jittered, Schedule.setInputType<ApiError>(), Schedule.while(({ input }) => input.retryable))
 
-const retryListPage = (cursor: string | null): Effect.Effect<ReturnType<typeof listPage> extends Effect.Effect<infer A, any, any> ? A : never, ApiError> =>
+const retryListPage = (cursor: string | null): Effect.Effect<
+  { items: ReadonlyArray<Listed>; nextCursor: string | null },
+  ApiError
+> =>
   listPage(cursor).pipe(Effect.retry(apiRetry))
 
 // ── streams ──
@@ -815,34 +773,32 @@ const listedStream: Stream.Stream<Listed, ApiError> =
     const next = page.nextCursor === null ? Option.none<string | null>() : Option.some(page.nextCursor)
     return [page.items, next] as const
   })).pipe(
-    // Each paginate step emitted a chunk `Array<Listed>` — flatten to per-element stream
+    // each paginate step emitted a chunk Array<Listed> — flatten to per-element stream
     Stream.flatMap((items) => Stream.fromIterable(items))
   )
 
-// Enrichment that retries transient fetch errors but fails through non-retryable ones
+// enrichment retries transient lookup failures per-item, bounded parallelism
 const enrichedStream: Stream.Stream<Enriched, ApiError | EnrichError> =
   listedStream.pipe(
     Stream.mapEffect(
       (item) =>
         enrich(item).pipe(
-          // Enrichment has its own local retry for transient lookup failures
           Effect.retry(
             Schedule.exponential("100 millis").pipe(
               Schedule.upTo({ times: 3 }),
               Schedule.setInputType<EnrichError>()
-              // enrichment here: assume all EnrichError are retryable — tighten with while() if not
             )
           )
         ),
-      { concurrency: 4 } // ← bound parallelism to the lookup service's rate limit
+      { concurrency: 4 } // bound parallelism to the lookup service's rate limit
     )
   )
 
-// Filter to qualified records, then materialize
+// filter to qualified records, then materialize (bounded!)
 const qualifiedPipeline: Effect.Effect<Array<Enriched>, ApiError | EnrichError> =
   enrichedStream.pipe(
     Stream.filter((e) => e.score > 42),
-    Stream.take(100), // guardrail: never materialize unboundedly in this report context
+    Stream.take(100), // never materialize unboundedly in this report context
     Stream.runCollect
   )
 
@@ -858,13 +814,9 @@ import { TestClock } from "effect/testing"
 import { it, expect } from "vitest"
 
 it("paginate→enrich→filter collects under virtual time", async () => {
-  // stub implementations via Effect.provideService would go here in real test
-  // listPage/enrich supplied by a Test layer returning deterministic pages
-
   const program = Effect.gen(function* () {
     const fiber = yield* Effect.fork(runPipeline)
-    // exponential backoffs for apiRetry (200ms, 400ms, ...) are virtual —
-    // advance past enough ticks that pagination + enrichment retries resolve
+    // exponential backoffs for apiRetry are virtual — advance past enough ticks
     yield* TestClock.adjust("10 seconds")
     return yield* fiber.await
   })
@@ -873,28 +825,27 @@ it("paginate→enrich→filter collects under virtual time", async () => {
   expect(Array.isArray(result)).toBe(true)
 })
 
-// bounded and alternative sinks
 const drained: Effect.Effect<void, ApiError | EnrichError> =
   enrichedStream.pipe(Stream.runDrain)
 ```
 
-### Why each choice
+Why each choice:
 
-- **`paginate` over `fromEffectSchedule`.** Pagination cursors are *data-driven* — the next cursor is inside the response, not a clock. `paginate` threads `Option<S>` cursor state; `fromEffectSchedule` drives on ticks alone.
-- **`flatMap(...fromIterable)` after `paginate`.** `paginate` steps in *pages* (`Array<Listed>` is one element per step). Consumers usually want *elements*; flattening at the boundary makes later `mapEffect` per-item reasoning natural. If page-level batching matters downstream, defer flattening.
-- **`mapEffect` with `concurrency: 4`.** Lookup is I/O-bound; 4 is a plausible per-route limit without collapsing to serial. Adjust with the same `Semaphore` discipline from ch.13 if the enrichment shares a pool with other code.
-- **`retry` inside `mapEffect`, not around the stream.** The lookup wrapped individually retries per-item transient failures; a retry *around* the whole stream would re-paginate and duplicate successfully enriched records. Scope failure handling to the element.
-- **`take(100)` before `runCollect`.** Materializing an unbounded remote source is how you OOM. Bounding at consumption site is the discipline — treat unconstrained `runCollect` like unbounded `Promise.all` and justify it.
-- **`TestClock.adjust` drives the whole sleep fabric.** Both `listPage` backoffs and the enrichment `exponential("100 millis")` retries are `Clock.sleep` underneath; moving virtual time once flushes both without real delays. Where `paginate` is cursor-driven, `TestClock` matters only for the retry delays, not for cursor advancement.
+- **`paginate` over `fromEffectSchedule`.** Pagination cursors are *data-driven* — the next cursor is inside the response, not a clock. `paginate` threads `Option<S>` cursor state.
+- **`flatMap(...fromIterable)` after `paginate`.** `paginate` steps in *pages* (`Array<Listed>` is one element per step). Consumers usually want *elements*; flattening at the boundary makes per-item reasoning natural.
+- **`mapEffect` with `concurrency: 4`.** Lookup is I/O-bound; adjust with the same `Semaphore` discipline from ch.13 if enrichment shares a pool.
+- **`retry` inside `mapEffect`, not around the stream.** Wrapping the element retries per-item transient failures; a retry *around* the whole stream would re-paginate and duplicate already-enriched records. Scope failure handling to the element.
+- **`take(100)` before `runCollect`.** Materializing an unbounded remote source is how you OOM. Treat unconstrained `runCollect` like unbounded `Promise.all` and justify it.
+- **`TestClock.adjust` drives the whole sleep fabric.** Both `listPage` backoffs and the enrichment retries are `Clock.sleep` underneath; moving virtual time once flushes both.
 
 :::caution[Order under concurrency is not input order]
-When `mapEffect` has concurrency > 1, emissions reflect *completion* order, not input order. A slow early item may appear after faster later items. If ordering is required, either set `concurrency: 1`, collect then sort, or keep a sequence number through the pipeline and `runFold`-collect into order-aware state.
+When `mapEffect` has concurrency > 1, emissions reflect *completion* order, not input order. If ordering is required, set `concurrency: 1`, collect then sort, or carry a sequence number through the pipeline and collect into order-aware state.
 :::
 
 ## Next
 
 <LinkCard
   title="20 · Schema — Foundations"
-  description="The shared type language of Effect v4: Spec vs Schema, Struct vs Class, strict vs struct, decoding, equality, and the boundary discipline that makes typed failures and platform codecs work."
+  description="The shared type language of Effect v4: Codec model, elementary types, Struct/Tuple/Array/Record/Union mechanics, runners and error reporting, and a complete domain example."
   href="/effect-ts/20-schema-foundations/"
 />

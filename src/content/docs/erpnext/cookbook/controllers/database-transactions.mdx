@@ -1,6 +1,6 @@
 ---
 title: Database Transaction Patterns
-description: Use savepoints, row-level locks, deadlock retries, and frappe.flags to run multi-document operations safely in Frappe.
+description: "Use savepoints, SELECT ... FOR UPDATE row locks, deadlock retries, and frappe.flags to run multi-document operations safely in Frappe."
 sidebar:
   order: 7
 ---
@@ -9,20 +9,13 @@ import { LinkCard } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** A ScoopJoy franchise provisioning routine touches several documents at
-once — warehouses, cost centers, loyalty programs, stock bins. You need partial
-rollback for the optional parts, atomic stock updates that survive concurrency,
-deadlock recovery, and a clean way to pass data between lifecycle hooks.
+**Problem:** A franchise provisioning routine touches several documents at once — warehouses, cost centers, loyalty programs, stock bins. You need partial rollback for optional parts, atomic stock updates under concurrency, deadlock recovery, and a clean way to pass data between lifecycle hooks.
 
-**Solution:** Lean on Frappe's transaction primitives — `frappe.db.savepoint`,
-`SELECT ... FOR UPDATE`, a deadlock-retry wrapper, and `frappe.flags` — and know
-exactly when Frappe commits for you versus when you must commit yourself.
+**Solution:** Use Frappe's transaction primitives — `frappe.db.savepoint`, `SELECT ... FOR UPDATE`, a deadlock-retry wrapper, and `frappe.flags` — and know when Frappe commits for you vs when you must commit yourself.
 
 ## Pattern 1: Savepoint for partial rollback
 
-Required infrastructure must all succeed or the whole request rolls back. Optional
-extras are wrapped in their own savepoint, so a failure rolls back only that block
-and the routine carries on.
+Required infrastructure must all succeed or the whole request rolls back. Optional extras each get their own savepoint, so a failure rolls back only that block:
 
 ```python title="apps/scoopjoy/scoopjoy/franchise_setup.py" {18-24}
 import frappe
@@ -108,19 +101,13 @@ def create_marketing_templates(agreement):
     }).insert(ignore_permissions=True)
 ```
 
-:::danger
-`frappe.db.rollback(save_point="loyalty_setup")` unwinds **only** the changes made
-after that savepoint — the required warehouse and cost center are untouched. A bare
-`frappe.db.rollback()` with no `save_point` discards the **entire** transaction,
-including the required infrastructure. Always pass the savepoint name when you want
-a partial rollback.
+:::danger[Partial vs full rollback]
+`frappe.db.rollback(save_point="loyalty_setup")` unwinds **only** changes made after that savepoint — the required warehouse and cost center are untouched. A bare `frappe.db.rollback()` with no `save_point` discards the **entire** transaction, including required infrastructure. Always pass the savepoint name for a partial rollback.
 :::
 
-## Pattern 2: Atomic operations with frappe.db.sql
+## Pattern 2: Atomic operations with SELECT ... FOR UPDATE
 
-A stock transfer reads a balance, checks it, then writes. If two transfers read the
-same balance concurrently, both can pass the check and oversell. `SELECT ... FOR
-UPDATE` takes a row-level lock so the second transfer waits for the first to finish.
+A stock transfer reads a balance, checks it, then writes — two concurrent transfers can both read the same balance and oversell. `SELECT ... FOR UPDATE` takes a row-level lock so the second transfer waits for the first to finish:
 
 ```python title="apps/scoopjoy/scoopjoy/inventory.py" {12-21}
 import frappe
@@ -132,7 +119,7 @@ def atomic_stock_transfer(source_warehouse, target_warehouse, item_code, qty):
     Atomic stock quantity update using a single SQL statement.
     Prevents race conditions where two transfers read the same balance.
     """
-    # Verify sufficient stock with a row-level lock (SELECT ... FOR UPDATE)
+    # Verify sufficient stock with a row-level lock
     current_qty = frappe.db.sql(
         """
         SELECT actual_qty
@@ -150,7 +137,7 @@ def atomic_stock_transfer(source_warehouse, target_warehouse, item_code, qty):
             f"need {qty}, have {flt(current_qty[0].actual_qty) if current_qty else 0}"
         )
 
-    # Atomic decrement + increment in two SQL statements
+    # Atomic decrement + increment
     frappe.db.sql(
         """
         UPDATE `tabBin`
@@ -170,17 +157,11 @@ def atomic_stock_transfer(source_warehouse, target_warehouse, item_code, qty):
     )
 ```
 
-:::note
-This example mutates `tabBin` directly for illustration. In real ERPNext, stock
-balances are maintained through Stock Entry / Stock Ledger documents — the takeaway
-is the `FOR UPDATE` locking pattern, not bypassing the ledger.
-:::
+This example mutates `tabBin` directly for illustration — in real ERPNext, balances move through Stock Entry / Stock Ledger documents. The takeaway is the `FOR UPDATE` locking pattern, not bypassing the ledger.
 
 ## Pattern 3: Deadlock retry
 
-Under high concurrency, MariaDB may abort a transaction with a deadlock or lock-wait
-timeout. The fix is not to avoid it but to retry with exponential backoff. The
-wrapper rolls back the failed attempt before sleeping, then re-runs the operation.
+Under high concurrency, MariaDB may abort a transaction with a deadlock or lock-wait timeout. The wrapper rolls back the failed attempt before sleeping, then re-runs with exponential backoff — and only retries deadlocks, re-raising everything else immediately:
 
 ```python title="apps/scoopjoy/scoopjoy/utils/retry.py" {15-16}
 import frappe
@@ -244,17 +225,9 @@ def bulk_update_prices(price_list, items_with_prices):
     with_deadlock_retry(do_update)
 ```
 
-:::caution
-Only retry on deadlocks and lock-wait timeouts. The wrapper re-raises every other
-exception immediately — retrying a real `ValidationError` would just burn cycles and
-mask the bug.
-:::
+## Pattern 4: frappe.flags for cross-hook communication
 
-## Pattern 4: frappe.flags for cross-function communication
-
-`frappe.flags` is a per-request scratchpad, cleared automatically when the request
-ends. Use it to hand a value computed in `validate()` to `on_submit()` without
-re-querying the database or stashing state on the document.
+`frappe.flags` is a per-request scratchpad, cleared automatically when the request ends. Use it to hand a value computed in `validate()` to `on_submit()` without re-querying the database — and namespace your keys (`scoopjoy_...`) so other apps can't clobber them:
 
 ```python title="apps/scoopjoy/scoopjoy/overrides/pos_invoice.py" {17-18,24-27}
 import frappe
@@ -278,7 +251,7 @@ class ScoopJoyPOSInvoice:
                 self.custom_franchise_agreement,
                 "royalty_percentage",
             )
-            # Store in flags — available within this request only, cleared automatically
+            # Stored in flags — available within this request only, cleared automatically
             frappe.flags.scoopjoy_royalty_amount = flt(self.grand_total) * flt(royalty_pct) / 100
             frappe.flags.scoopjoy_is_franchise_sale = True
 
@@ -298,11 +271,9 @@ class ScoopJoyPOSInvoice:
         frappe.flags.scoopjoy_cancelling_pos = True
 ```
 
-## Pattern 5: When `frappe.db.commit()` is needed vs automatic
+## Pattern 5: When commit() is needed vs automatic
 
-The single most common transaction bug is committing in the wrong place. Frappe
-already wraps web requests and doc events in a transaction; background work runs
-outside that lifecycle and must commit itself.
+Frappe already wraps web requests and doc events in a transaction; background work runs outside that lifecycle and must commit itself:
 
 | Context | Commit behaviour |
 | --- | --- |
@@ -318,9 +289,8 @@ outside that lifecycle and must commit itself.
 import frappe
 
 
-# Example: Background job that NEEDS explicit commits
+# Background job — must commit explicitly
 def reindex_franchise_data():
-    """Background job — must commit explicitly."""
     agreements = frappe.get_all("Franchise Agreement", pluck="name")
 
     for i, name in enumerate(agreements):
@@ -333,31 +303,18 @@ def reindex_franchise_data():
     frappe.db.commit()  # Final commit for remaining items
 
 
-# Example: Web request handler that does NOT need commit
+# Whitelisted web method — Frappe auto-commits on success
 @frappe.whitelist()
 def update_franchise_status(agreement, status):
-    """Whitelisted method — Frappe auto-commits on success."""
     frappe.db.set_value("Franchise Agreement", agreement, "agreement_status", status)
     # NO frappe.db.commit() here — Frappe handles it
     return {"status": "updated"}
 ```
 
 :::caution[Commit inside a doc event]
-Never call `frappe.db.commit()` inside `validate()`, `before_save()`, or any other
-doc event. A commit mid-event persists partial state even if a later step throws,
-defeating the atomic transaction the framework set up for you.
+Never call `frappe.db.commit()` inside `validate()`, `before_save()`, or any other doc event — a commit mid-event persists partial state even if a later step throws, defeating the atomic transaction the framework set up for you.
 :::
 
 :::note[Why this works]
-Savepoints let you attempt optional operations without risking the required ones.
-The `FOR UPDATE` clause in Pattern 2 takes a row-level lock, preventing concurrent
-reads of stale data. The `frappe.flags` pattern in Pattern 4 is the idiomatic way to
-pass computed data between lifecycle hooks within a single request without extra
-database queries.
-:::
-
-:::caution[Common mistake]
-Using `frappe.flags` with generic key names like `frappe.flags.skip_validation =
-True`. Other apps may use the same flag name and clobber each other. Always
-namespace your flags: `frappe.flags.scoopjoy_skip_validation`.
+Savepoints let you attempt optional operations without risking the required ones. `FOR UPDATE` takes a row-level lock so concurrent readers can't act on stale balances. The deadlock wrapper retries only deadlock/lock-wait errors with backoff. And `frappe.flags` passes computed data between lifecycle hooks within one request — no extra queries, no globals, always namespaced.
 :::

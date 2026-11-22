@@ -1,6 +1,6 @@
 ---
 title: Observability Stack
-description: Wire a FastAPI service with structlog JSON logging + request-id middleware, a Prometheus /metrics endpoint, and auto-instrumented OpenTelemetry tracing exported over OTLP.
+description: "Wire a FastAPI service with structlog JSON logging + request-id middleware, a Prometheus /metrics endpoint (counter + histogram + gauge), auto-instrumented OpenTelemetry tracing over OTLP, and /healthz + /readyz probes, with an OTel Collector + Prometheus docker-compose stack."
 sidebar:
   order: 1
 ---
@@ -14,48 +14,17 @@ import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
 
 ## Goal
 
-Take a tiny FastAPI service and make it *fully observable* across all three
-pillars at once: emit structured JSON logs where every line carries a request ID,
-expose a Prometheus `/metrics` endpoint with a request counter and a latency
-histogram, and auto-instrument OpenTelemetry tracing exported over OTLP to a
-collector. Add `/healthz` and `/readyz` probes. Then run an OTel Collector +
-Prometheus stack with Docker Compose and watch a single request light up all three
-pillars, joined by the same `trace_id`.
-
-If you've wired `pino` + `prom-client` + `@opentelemetry/sdk-node` in Node, or
-`zerolog` + `promhttp` + the OTel Go SDK, this is the same three pillars — but
-structlog's `contextvars` and OTel's one-call auto-instrumentation make the wiring
-notably lighter than the Go path.
-
-## What you'll practice
-
-- Configuring **structlog** once: ISO timestamps, JSON renderer, and a processor
-  that injects the active OTel `trace_id` into every log line.
-- A **request-ID middleware** that binds `request_id` to `contextvars` and echoes
-  it back in the `X-Request-Id` response header.
-- A **Prometheus middleware** recording `http_requests_total` (Counter) and
-  `http_request_duration_seconds` (Histogram), exposed via `make_asgi_app()`.
-- **OpenTelemetry** auto-instrumentation for FastAPI and httpx, exporting spans
-  over OTLP gRPC to a collector.
-- `/healthz` (liveness, dependency-free) and `/readyz` (readiness) endpoints.
-- Running an **OTel Collector + Prometheus** stack with `docker compose`.
+Make a tiny FastAPI service **fully observable** across all three pillars at once: structured JSON logs where every line carries a request ID (and a `trace_id` inside a request), a Prometheus `/metrics` endpoint with a request counter and latency histogram, and auto-instrumented OpenTelemetry tracing exported over OTLP to a collector. Add `/healthz` and `/readyz` probes. Then run an OTel Collector + Prometheus stack with Docker Compose and watch a single request light up all three pillars, joined by the same `trace_id`.
 
 ## Requirements
 
-- One `GET /work` endpoint that does a little work (a manual span + an outbound
-  `httpx` call) so there's something to trace and time.
-- Every log line is JSON and includes `request_id`; logs emitted inside a request
-  also include `trace_id`.
-- `/metrics` returns Prometheus exposition format with the request counter and
-  latency histogram.
+- One `GET /work` endpoint that does a little work (a manual span + an outbound `httpx` call) so there's something to trace and time.
+- Every log line is JSON and includes `request_id`; logs emitted inside a request also include `trace_id`.
+- `/metrics` returns Prometheus exposition format with the request counter and latency histogram.
 - Traces export to the collector over OTLP (`:4317`).
 - Graceful shutdown flushes the span exporter.
 
 ## The worked solution
-
-A small `uv` project. The observability lives in four focused modules —
-`logging_config.py`, `metrics.py`, `tracing.py`, and the middleware in `main.py` —
-so each pillar is isolated and easy to reason about.
 
 <FileTree>
 - observability-stack/
@@ -72,10 +41,6 @@ so each pillar is isolated and easy to reason about.
     - health.py /healthz + /readyz
     - main.py app wiring, request-id middleware, lifespan
 </FileTree>
-
-### pyproject.toml
-
-Create the project and add the dependencies in one go:
 
 ```bash
 uv init observability-stack && cd observability-stack
@@ -110,8 +75,7 @@ dev = ["ruff>=0.9", "ty>=0.0.1a1"]
 
 ### settings.py
 
-Config comes from the environment via `pydantic-settings` — `json_logs` flips the
-renderer, and the OTLP endpoint points at the collector.
+Config from the environment via `pydantic-settings` — `json_logs` flips the renderer, the OTLP endpoint points at the collector.
 
 ```python title="app/settings.py"
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -131,12 +95,9 @@ settings = Settings()
 
 ### logging_config.py
 
-structlog is configured once. The custom `add_trace_context` processor reads the
-active span and injects `trace_id`/`span_id` — this is what links a log line to its
-trace. The `merge_contextvars` processor pulls in the `request_id` bound by the
-middleware.
+structlog configured once. The custom `add_trace_context` processor reads the active span and injects `trace_id`/`span_id` — this is what links a log line to its trace. `merge_contextvars` pulls in the `request_id` bound by the middleware.
 
-```python title="app/logging_config.py" {7-14,22,30}
+```python title="app/logging_config.py"
 import logging
 
 import structlog
@@ -177,10 +138,9 @@ def configure_logging(*, json_logs: bool, level: str) -> None:
 
 ### metrics.py
 
-Module-level metric singletons (re-declaring a name raises `Duplicated timeseries`)
-plus the middleware that records them. `make_asgi_app()` is the `/metrics` handler.
+Module-level metric singletons (re-declaring a name raises `Duplicated timeseries`) plus the middleware that records them. `make_asgi_app()` is the `/metrics` handler.
 
-```python title="app/metrics.py" {6-16,42,45-50}
+```python title="app/metrics.py"
 import time
 
 from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
@@ -240,19 +200,14 @@ class PrometheusMiddleware:
 ```
 
 :::note[Why a histogram, not a summary]
-`http_request_duration_seconds` is a Histogram so Prometheus can compute quantiles
-*server-side across all instances* with `histogram_quantile(0.95, ...)`. A Summary
-computes quantiles client-side per process and can't be aggregated across replicas —
-useless once you scale past one pod. Default to histograms.
+`http_request_duration_seconds` is a Histogram so Prometheus can compute quantiles *server-side across all instances* with `histogram_quantile(0.95, ...)`. A Summary computes quantiles client-side per process and can't be aggregated across replicas — useless once you scale past one pod. Default to histograms.
 :::
 
 ### tracing.py
 
-One function wires the SDK and patches FastAPI + httpx. After this, every request
-is a span and every outbound `httpx` call is a child span with `traceparent`
-propagated automatically.
+One function wires the SDK and patches FastAPI + httpx. After this, every request is a span and every outbound `httpx` call is a child span with `traceparent` propagated automatically.
 
-```python title="app/tracing.py" {14-18,20-22}
+```python title="app/tracing.py"
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -277,8 +232,7 @@ def configure_tracing(app, *, service_name: str, otlp_endpoint: str) -> None:
 
 ### health.py
 
-Liveness is dependency-free; readiness would check real dependencies (here it's a
-stub that always passes — swap in a DB `SELECT 1` in a real service).
+Liveness is dependency-free; readiness would check real dependencies (stub here — swap in a DB `SELECT 1` in a real service).
 
 ```python title="app/health.py"
 from fastapi import APIRouter, Response, status
@@ -302,12 +256,9 @@ async def readyz(response: Response) -> dict[str, object]:
 
 ### main.py
 
-The wiring point: configure logging and tracing, add both middlewares, mount
-`/metrics`, register health routes, and flush the span exporter on shutdown. The
-request-ID middleware binds `request_id` to `contextvars` so every downstream log
-line carries it.
+The wiring point: configure logging and tracing, add both middlewares, mount `/metrics`, register health routes, and flush the span exporter on shutdown. The request-ID middleware binds `request_id` to `contextvars` so every downstream log line carries it.
 
-```python title="app/main.py" {17-21,24-43,46,49-50,58}
+```python title="app/main.py"
 import uuid
 from contextlib import asynccontextmanager
 
@@ -392,16 +343,12 @@ async def do_work() -> dict[str, object]:
 ```
 
 :::caution[Middleware order is execution order]
-Starlette runs the *last* `add_middleware` call as the outermost layer. We add
-`RequestContextMiddleware` after `PrometheusMiddleware` so context binding happens
-first — meaning the metrics layer (and everything inside) already sees the bound
-`request_id`. Add them in the wrong order and your earliest log lines miss the ID.
+Starlette runs the *last* `add_middleware` call as the outermost layer. We add `RequestContextMiddleware` after `PrometheusMiddleware` so context binding happens first — meaning the metrics layer (and everything inside) already sees the bound `request_id`. Add them in the wrong order and your earliest log lines miss the ID.
 :::
 
 ### docker-compose.yml
 
-Two services: the OTel Collector (receives OTLP, forwards traces) and Prometheus
-(scrapes the app's `/metrics`). The app runs on your host via `uv run`.
+Two services: the OTel Collector (receives OTLP, forwards traces) and Prometheus (scrapes the app's `/metrics`). The app runs on your host via `uv run`.
 
 ```yaml title="docker-compose.yml"
 services:
@@ -460,20 +407,13 @@ scrape_configs:
       - targets: ["host.docker.internal:8000"]
 ```
 
-:::tip[Swap the debug exporter for Jaeger]
-The collector's `debug` exporter just logs spans — handy for a first run. To *see*
-traces in a UI, add a Jaeger service (`jaegertracing/all-in-one`, UI on `:16686`,
-OTLP enabled) and point the collector's traces pipeline at it with an `otlp/jaeger`
-exporter. The app's code doesn't change at all — that's the "one SDK, many backends"
-promise in action.
-:::
+The collector's `debug` exporter just logs spans — handy for a first run. To *see* traces in a UI, add a Jaeger service (`jaegertracing/all-in-one`, UI on `:16686`, OTLP enabled) and point the collector's traces pipeline at it with an `otlp/jaeger` exporter — the app's code doesn't change at all. That's the "one SDK, many backends" promise in action.
 
 ## Run it
 
 <Steps>
 
-1. Start the telemetry backends (OTel Collector + Prometheus). Requires Docker with
-   the Compose plugin:
+1. Start the telemetry backends (OTel Collector + Prometheus). Requires Docker with the Compose plugin:
 
    ```bash
    docker compose up -d
@@ -507,8 +447,7 @@ promise in action.
    curl -i http://localhost:8000/work
    ```
 
-   The response carries an `X-Request-Id` header, and the service's stdout shows JSON
-   log lines with matching `request_id` *and* `trace_id` fields:
+   The response carries an `X-Request-Id` header, and the service's stdout shows JSON log lines with matching `request_id` *and* `trace_id` fields:
 
    ```json
    {"method": "GET", "path": "/work", "request_id": "a1b2...", "trace_id": "9f3c...", "event": "work requested", "level": "info", "timestamp": "2026-06-19T10:23:45.001Z"}
@@ -520,8 +459,7 @@ promise in action.
    curl -s http://localhost:8000/metrics | grep http_request
    ```
 
-   You'll see `http_requests_total{...}` and the
-   `http_request_duration_seconds_bucket{...}` series.
+   You'll see `http_requests_total{...}` and the `http_request_duration_seconds_bucket{...}` series.
 
 3. See the exported traces in the collector log:
 
@@ -549,18 +487,9 @@ promise in action.
 </Steps>
 
 :::tip[Stretch goals]
-- Add **SQLAlchemy auto-instrumentation** (`opentelemetry-instrumentation-sqlalchemy`)
-  and a real `/readyz` check that runs `SELECT 1` against the shared-infra Postgres
-  (`postgresql+asyncpg://dev:dev@localhost:5432/app`). Watch a query span nest inside
-  the request span.
-- Add a **Jaeger** service to the compose stack and point the collector at it, then
-  click through a `/work` trace in the Jaeger UI and confirm the `trace_id` matches
-  your log line.
-- Add a **custom business Counter** (e.g. `work_jobs_processed_total` tagged by
-  outcome) and graph it next to the HTTP RED metrics.
-- Switch logging off JSON in dev: set `APP_JSON_LOGS=false` and confirm structlog's
-  `ConsoleRenderer` gives you colorized, aligned output — same code, prettier dev UX.
-- Run **`opentelemetry-instrument uv run uvicorn app.main:app`** instead of calling
-  `configure_tracing` in code, configuring everything via `OTEL_*` env vars — the
-  zero-code auto-instrumentation path.
+- Add **SQLAlchemy auto-instrumentation** (`opentelemetry-instrumentation-sqlalchemy`) and a real `/readyz` check that runs `SELECT 1` against the shared-infra Postgres (`postgresql+asyncpg://dev:dev@localhost:5432/app`). Watch a query span nest inside the request span.
+- Add a **Jaeger** service to the compose stack and point the collector at it, then click through a `/work` trace in the Jaeger UI and confirm the `trace_id` matches your log line.
+- Add a **custom business Counter** (e.g. `work_jobs_processed_total` tagged by outcome) and graph it next to the HTTP RED metrics.
+- Switch logging off JSON in dev: set `APP_JSON_LOGS=false` and confirm structlog's `ConsoleRenderer` gives colorized, aligned output — same code, prettier dev UX.
+- Run **`opentelemetry-instrument uv run uvicorn app.main:app`** instead of calling `configure_tracing` in code, configuring everything via `OTEL_*` env vars — the zero-code auto-instrumentation path.
 :::

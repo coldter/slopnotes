@@ -1,22 +1,15 @@
 ---
 title: Transactional State — the Tx* Modules
-description: Lock-free composable transactions in Effect v4 — how Effect.tx journals TxRef reads and writes, conflict detection via version checks, Effect.txRetry blocking semantics, the full Tx* module inventory, and when STM beats Ref or queues.
+description: "Lock-free composable transactions in Effect v4: how Effect.tx journals TxRef reads/writes, conflict detection via version checks, Effect.txRetry blocking, the Tx* inventory, and when STM beats Ref or queues."
 sidebar:
   order: 16
 ---
 
 import { LinkCard } from "@astrojs/starlight/components";
 
-Two fibers need to move money between accounts: debit one, credit the other.
-With locks, you serialize everything and invent deadlock-avoidance rules. With
-raw refs, you get interleavings that lose money. STM (software transactional
-memory) offers a third way: write code as if it touches all variables
-atomically; the runtime detects conflicts and retries transparently.
+Two fibers moving money between accounts need `a.balance + b.balance === 100` to hold. Locks serialize everything and invent deadlock rules; raw refs lose money to interleavings. STM offers a third way: write code as if it touches all variables atomically; the runtime detects conflicts and retries transparently.
 
-v4 ships this natively in Effect. There is no separate `STM` monad anymore and
-no `STM<E, A>` type to lift from — transactions are **plain Effects**, delimited
-by `Effect.tx`, operating on `TxRef`s. This chapter documents exactly what's
-there, because the surface is leaner than v3 and honest about it.
+v4 ships this natively. There is no separate `STM` monad or `STM<E, A>` type — transactions are **plain Effects**, delimited by `Effect.tx`, operating on `TxRef`s.
 
 ## The problem, precisely
 
@@ -30,24 +23,11 @@ write A = 0                  write B = 50
 write B = 150                ...
 ```
 
-Any interleaving that lets one transfer read state another has half-written
-breaks conservation. Classic fixes:
-
-1. **A global mutex** around all balance mutations — correct, but every
-   unrelated account operation serializes behind it.
-2. **Per-account locks with an ordering discipline** — finer-grained, but now
-   lock ordering is a convention enforced by review, and one violation hangs
-   the system.
-3. **Optimistic concurrency**: each transaction snapshots what it reads,
-   computes privately, then commits only if nothing it read changed since the
-   snapshot. Conflicts are rare → retries are cheap; no locks exist at all.
-
-Effect v4 implements option 3.
+Any interleaving that lets one transfer read state another has half-written breaks conservation. Fixes: a global mutex (correct, serializes everything); per-account locks with ordering discipline (finer, but one violation hangs the system); or **optimistic concurrency** — snapshot what you read, compute privately, commit only if nothing you read changed since. Conflicts are rare → retries cheap; no locks exist. v4 implements option 3.
 
 ## The inventory
 
-All transactional modules live at the top level of `effect` (no unstable path,
-one version for the ecosystem). The family:
+All transactional modules live at the top level of `effect` (no unstable path). The family:
 
 | Module | What it transactionalizes |
 |---|---|
@@ -62,62 +42,35 @@ one version for the ecosystem). The family:
 | `TxReentrantLock` | reentrant mutual exclusion |
 | `TxSubscriptionRef` | ref + change stream, transactionally |
 
-Note the naming shift from v3: `STM`/`TRef`/`TQueue`/... → `TxRef`,
-`TxQueue`, .... The collections mirror their plain counterparts' APIs (`get`,
-`set`, `modify`, `size`, ...), so learning one is learning them all.
+Naming shift from v3: `STM`/`TRef`/`TQueue`/... → `TxRef`, `TxQueue`, .... The collections mirror their plain counterparts' APIs (`get`, `set`, `modify`, `size`, ...), so learning one is learning them all.
 
 ## How transactions actually work
 
-This section describes the real mechanism — worth understanding because its
-edge cases define your obligations as the author.
-
 ### The journal
 
-Every fiber running inside `Effect.tx` carries a `Transaction` service
-containing two fields: a **journal** (`Map<TxRef, {version, value}>`) and a
-**retry flag**. Each entry records, per accessed `TxRef`: the version observed
-at first access, and the pending new value if written.
+Every fiber inside `Effect.tx` carries a `Transaction` service with two fields: a **journal** (`Map<TxRef, {version, value}>`) and a **retry flag**. Each entry records, per accessed `TxRef`, the version observed at first access and the pending new value if written.
 
-- **Reads are recorded too.** `TxRef.get(ref)` journals `(ref.version)` without
-  a write. If another transaction later changes a value you merely *looked at*,
-  you're in conflict — this is what makes invariants spanning multiple refs
-  safe (the balance-conservation check reads both accounts, so any concurrent
-  change to either triggers retry).
-- **Writes go to the journal, not the ref.** Inside the transaction, subsequent
-  reads see your own writes; outside observers see nothing yet.
+- **Reads are recorded too.** `TxRef.get(ref)` journals `(ref.version)` without a write. If another transaction later changes a value you merely *looked at*, you're in conflict — this is what makes invariants spanning multiple refs safe (the balance-conservation check reads both accounts, so any concurrent change to either triggers retry).
+- **Writes go to the journal, not the ref.** Inside the transaction, subsequent reads see your own writes; outside observers see nothing yet.
 
 ### Commit and conflict detection
 
 When the outermost `Effect.tx` body completes:
 
-1. Validate: for every journaled ref, is `ref.version` still equal to the
-   recorded snapshot version? Any mismatch = conflict.
-2. No conflict + success: commit — write each journaled value into its ref,
-   bump its version, wake any transactions waiting on those refs.
-3. Conflict, or failure, or retry-flag set: discard the journal and run the
-   body again (failure exits instead — see below).
+1. Validate: for every journaled ref, is `ref.version` still equal to the recorded snapshot version? Any mismatch = conflict.
+2. No conflict + success: commit — write each journaled value into its ref, bump its version, wake transactions waiting on those refs.
+3. Conflict, or failure, or retry-flag set: discard the journal and run the body again (failure exits instead — see below).
 
-The whole validation-commit step is safe because it runs synchronously on one
-fiber: JS's single thread *is* the commit lock. There are no locks anywhere in
-userland; consistency comes from check-then-write being atomic on the event
-loop.
+The validation-commit step runs synchronously on one fiber: JS's single thread *is* the commit lock. No locks in userland; consistency comes from check-then-write being atomic on the event loop.
 
 ### Retry semantics
 
 Two distinct triggers cause a re-run:
 
-- **Conflict-driven:** another transaction committed a change to any ref you
-  journaled before you finished. Your result is discarded and the body reruns
-  against fresh state.
-- **Explicit blocking:** the body calls `Effect.txRetry` (usually after finding
-  data not-yet-satisfactory — an empty queue, insufficient balance). This sets
-  the flag and aborts the current attempt; crucially, the transaction then
-  **waits until some accessed ref actually changes** (it registers itself on
-  each journaled ref's waiter list and sleeps) rather than busy-looping. When
-  a committing transaction touches one of those refs, waiters are rescheduled.
+- **Conflict-driven:** another transaction committed a change to any ref you journaled before you finished. Your result is discarded and the body reruns against fresh state.
+- **Explicit blocking:** the body calls `Effect.txRetry` (usually after finding data not-yet-satisfactory — an empty queue, insufficient balance). This sets the flag and aborts the attempt; the transaction then **waits until some accessed ref actually changes** (it registers on each journaled ref's waiter list and sleeps) rather than busy-looping. When a committing transaction touches one of those refs, waiters are rescheduled.
 
-That second behavior is the crown jewel of STM: *blocking until state makes
-progress possible, with no condition variables and no missed-wakeup bugs.*
+That second behavior is the crown jewel of STM: *blocking until state makes progress possible, with no condition variables and no missed-wakeup bugs.*
 
 ### The lifecycle at a glance
 
@@ -154,21 +107,12 @@ const awaitBalance = Effect.gen(function* () {
 ```
 
 :::caution[Side effects re-run]
-Only `TxRef` operations are journaled. An ordinary `Effect.log`, HTTP call, or
-`Ref.update` inside a transaction executes **again on every retry**, and is
-never rolled back. Keep transaction bodies pure-with-respect-to-TxRefs:
-compute decisions, perform side effects *after* commit (outside `Effect.tx`),
-or push effects into a `TxDeferred` completed within the transaction. This is
-the same discipline database transactions teach.
+Only `TxRef` operations are journaled. An ordinary `Effect.log`, HTTP call, or `Ref.update` inside a transaction executes **again on every retry** and is never rolled back. Keep transaction bodies pure-with-respect-to-TxRefs: compute decisions, perform side effects *after* commit (outside `Effect.tx`), or push effects into a `TxDeferred` completed within the transaction. Same discipline as database transactions.
 :::
 
 ### Nesting and composition
 
-`Effect.tx` inside an active transaction does **not** open a nested boundary —
-it reuses the current journal and retry state. Composition falls out naturally:
-call helper functions that each wrap themselves in `Effect.tx`; compose ten of
-them; the outermost call commits everything atomically or nothing. This is the
-property impossible with per-variable locks and the reason STM exists.
+`Effect.tx` inside an active transaction does **not** open a nested boundary — it reuses the current journal and retry state. Call helper functions that each wrap themselves in `Effect.tx`; compose ten of them; the outermost call commits everything atomically or nothing. This is the property impossible with per-variable locks and the reason STM exists.
 
 ## `TxRef` API tour
 
@@ -193,15 +137,11 @@ const previous = yield* TxRef.modify(counter, (n) => [n, n + 1] as const)
 const cfg = TxRef.makeUnsafe({ attempts: 0 })
 ```
 
-`get` and `update` are literally defined in terms of `modify` — one primitive,
-four ergonomic shapes. All require an ambient transaction when executed
-directly (wrap them in `Effect.tx`); used inside a bigger transaction they
-join it.
+`get` and `update` are literally defined in terms of `modify` — one primitive, four ergonomic shapes. All require an ambient transaction when executed directly (wrap them in `Effect.tx`); inside a bigger transaction they join it.
 
 ## Worked example: atomic transfers
 
-Three accounts, invariant over total supply, concurrent transfers, plus a
-blocking withdrawal:
+Three accounts, invariant over total supply, concurrent transfers, plus a blocking withdrawal:
 
 ```ts
 import { Context, Effect, Layer, Schema, TxRef } from "effect"
@@ -287,28 +227,15 @@ const day = Effect.gen(function* () {
 }).pipe(Effect.provide(AccountsLive))
 ```
 
-Walk through the interesting failure mode: transfer-1 journals reads of
-`ledger` (via both `adjust` calls), computes debited+credited states, and just
-before commit, deposit's transaction commits its own version. Transfer-1's
-validation sees the version bump, discards, and reruns against post-deposit
-state — recomputing balances from truth rather than patching stale numbers.
-Total supply stays conserved without either party holding a lock across the
-critical region.
+Walk the interesting failure mode: transfer-1 journals reads of `ledger` (via both `adjust` calls), computes debited+credited states, and just before commit, deposit's transaction commits its own version. Transfer-1's validation sees the version bump, discards, and reruns against post-deposit state — recomputing balances from truth rather than patching stale numbers. Total supply stays conserved without either party holding a lock across the critical region.
 
 :::note[Granularity is yours]
-This example keeps one `TxRef<Map>` for simplicity, which serializes all
-transfers through a single version counter — conflicts retry generously. For
-hot paths, split into per-account `TxRef`s (or `TxHashMap`): transactions then
-conflict only when they genuinely touch the same accounts, which is exactly
-the contention profile you want. The correctness argument doesn't change —
-reads are journaled either way.
+This example keeps one `TxRef<Map>` for simplicity, which serializes all transfers through a single version counter — conflicts retry generously. For hot paths, split into per-account `TxRef`s (or `TxHashMap`): transactions then conflict only when they genuinely touch the same accounts. The correctness argument doesn't change — reads are journaled either way.
 :::
 
 ## Beyond refs: the collections in practice
 
-The wrappers matter because they give *structure-aware* conflict semantics and
-ergonomics. `TxHashMap` is representative — full Map-like API, all
-transaction-aware:
+`TxHashMap` is representative — full Map-like API, all transaction-aware:
 
 ```ts
 import { Effect, TxHashMap } from "effect"
@@ -329,13 +256,9 @@ const size = yield* TxHashMap.size(cache)
 const keys = yield* TxHashMap.keys(cache)
 ```
 
-Also available: `setMany`, `removeMany`, `union`, `modifyAt`, `snapshot`
-(read the whole structure into an immutable HashMap — useful for reporting),
-plus iteration over `entries`/`values`.
+Also available: `setMany`, `removeMany`, `union`, `modifyAt`, `snapshot` (read the whole structure into an immutable HashMap — useful for reporting), plus iteration over `entries`/`values`.
 
-`TxSemaphore` gives transactional permits — `acquire` can block via the
-retry mechanism, so "wait until resources free up" composes with other
-transactional conditions instead of needing a separate coordination channel:
+`TxSemaphore` gives transactional permits — `acquire` can block via the retry mechanism, so "wait until resources free up" composes with other transactional conditions instead of needing a separate coordination channel:
 
 ```ts
 import { Effect, TxSemaphore } from "effect"
@@ -349,10 +272,7 @@ const release = Effect.tx(TxSemaphore.release(slots))
 
 ### A transactional work queue
 
-`TxQueue` mirrors the plain queue's shape (`bounded`/`unbounded`/`dropping`/
-`sliding`, `offer`/`take`/`poll`/`takeAll`/`takeN`) but its operations are
-journal-aware. The difference shows when you combine queue operations with
-other state inside one transaction:
+`TxQueue` mirrors the plain queue's shape (`bounded`/`unbounded`/`dropping`/`sliding`, `offer`/`take`/`poll`/`takeAll`/`takeN`) but its operations are journal-aware. The difference shows when you combine queue operations with other state inside one transaction:
 
 ```ts
 import { Effect, TxHashMap, TxQueue } from "effect"
@@ -382,17 +302,7 @@ const scheduler = Effect.gen(function* () {
 })
 ```
 
-Note what replaced hand-rolled synchronization: `TxQueue.take` on an empty
-queue parks the whole transaction (`txRetry` semantics) until some other
-transaction offers work — no condition variable, no polling.
-
-The remaining modules follow the same recipe. `TxDeferred` is a one-shot cell
-whose completion is journaled (`succeed`/`fail`/`done` write through the
-transaction; `poll` reads an `Option<Result<A, E>>`) — so "complete X only if
-Y also commits" is expressible. `TxReentrantLock`, `TxPriorityQueue`,
-`TxPubSub`, `TxChunk`, and `TxSubscriptionRef` round out the family with the
-transactional takes on their namesakes; their APIs mirror the plain modules,
-so the inventory table above plus one source file each is all you need.
+`TxQueue.take` on an empty queue parks the whole transaction (`txRetry` semantics) until some other transaction offers work — no condition variable, no polling. The remaining modules follow the same recipe: `TxDeferred` (completion journaled — "complete X only if Y also commits" is expressible), `TxReentrantLock`, `TxPriorityQueue`, `TxPubSub`, `TxChunk`, `TxSubscriptionRef` — their APIs mirror the plain modules.
 
 ## STM vs the alternatives
 
@@ -407,36 +317,18 @@ so the inventory table above plus one source file each is all you need.
 
 Decision heuristics:
 
-- **Single mutable value, simple updates** → `Ref` (or `SynchronizedRef` when
-  updates need effects).
-- **Invariants spanning multiple values, or wait-until-possible logic** →
-  `TxRef`/STM. This is its irreplaceable niche: compositional atomicity with
-  built-in blocking.
-- **High-throughput command processing, rate limiting, work distribution** →
-  a queue with a single owning fiber ([chapter 15](/effect-ts/15-queues-pubsub/));
-  deterministic ordering, natural backpressure, trivially auditable.
+- **Single mutable value, simple updates** → `Ref` (or `SynchronizedRef` when updates need effects).
+- **Invariants spanning multiple values, or wait-until-possible logic** → `TxRef`/STM. Its irreplaceable niche: compositional atomicity with built-in blocking.
+- **High-throughput command processing, rate limiting, work distribution** → a queue with a single owning fiber (chapter 15); deterministic ordering, natural backpressure, trivially auditable.
 
 ## Honest status notes
 
-Things worth knowing before you build a bank on this:
+- **No standalone `STM` module** — no `STM<A, E>` type, no `atomically`. Transactions live in `Effect` (`tx`, `txRetry`) plus the `Tx*` modules. Search `TxRef`, not "STM".
+- **Errors don't roll back committed siblings.** A failing transaction simply doesn't commit its own journal — no partial rollback of *other* transactions, no isolation levels to configure. One journal, one snapshot, one retry loop.
+- **No automatic retry budgeting.** A pathologically contended transaction retries indefinitely by design (liveness-by-retry, standard STM). Bound hot spots structurally — finer-grained refs — rather than expecting a max-attempts knob.
+- The `Transaction` service is inspectable (`yield* Effect.Transaction`) should you need custom instrumentation of journal size or retry counts.
 
-- **There is no standalone `STM` module** — no `STM<A, E>` type, no
-  `atomically`. Transactions live entirely in `Effect` (`tx`, `txRetry`) plus
-  the `Tx*` modules. Code searching for "STM" finds nothing; search `TxRef`.
-- **Errors don't roll back committed siblings.** A failing transaction simply
-  doesn't commit its own journal — there is no partial rollback of *other*
-  transactions, and no isolation levels to configure. One journal, one
-  snapshot, one retry loop.
-- **No automatic retry budgeting.** A pathologically contended transaction
-  retries indefinitely by design (that's liveness-by-retry, standard STM).
-  Bound hot spots structurally — finer-grained refs — rather than expecting a
-  max-attempts knob.
-- The `Transaction` service is inspectable (`yield* Effect.Transaction`)
-  should you need custom instrumentation of journal size or retry counts.
-
-For most applications, the practical summary is: reach for STM when you have
-an invariant across more than one variable *and* want blocking semantics;
-otherwise `Ref` covers single cells and queues cover pipelines.
+Practical summary: reach for STM when you have an invariant across more than one variable *and* want blocking semantics; otherwise `Ref` covers single cells and queues cover pipelines.
 
 ## Next
 

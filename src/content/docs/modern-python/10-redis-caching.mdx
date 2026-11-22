@@ -1,6 +1,6 @@
 ---
 title: Redis & Caching
-description: Redis from async Python with redis-py's redis.asyncio — connection pools, cache-aside, a cache decorator, rate limiters, pub/sub, locks, and the stampede gotchas.
+description: "Redis from async Python with redis.asyncio — connection pools, cache-aside, a cache decorator, sliding-window rate limiters via Lua, pub/sub, distributed locks, and the stampede/TTL gotchas."
 sidebar:
   order: 10
 ---
@@ -8,31 +8,11 @@ sidebar:
 import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
 import Mermaid from "~/components/Mermaid.astro";
 
-You already know Redis from `ioredis` (TypeScript) or `go-redis` (Go) — set a key,
-read it back, slap a TTL on it, build a rate limiter out of `INCR`. None of that
-changes in Python. What changes is the client: you use the **`redis` package**
-(redis-py), and specifically its async client at **`redis.asyncio`**. It speaks the
-same `await`-everything dialect as the rest of your FastAPI app.
+You know Redis from `ioredis` (TS) or `go-redis` (Go) — set a key, read it, slap a TTL, build a rate limiter out of `INCR`. None of that changes in Python. What changes is the client: the **`redis`** package (redis-py), specifically its async client at **`redis.asyncio`** — `await`-everything, same dialect as the rest of your FastAPI app. (`aioredis` was merged into redis-py in 2.0 and is dead; `import aioredis` is history.)
 
-:::note[One name for the history books]
-If you searched for "python async redis" a few years ago you found **`aioredis`**.
-That project was **merged into redis-py in 2.0** and is now deprecated — `import
-aioredis` is dead. The modern path is one package, `redis`, with a sync client
-(`redis.Redis`) and an async one (`redis.asyncio.Redis`). Use the async one.
-:::
+Start Redis from the shared stack: `cd shared-infra && docker compose up -d redis` — connection `redis://localhost:6379`, no auth.
 
-:::note[Shared infrastructure]
-Redis comes from the shared Docker stack — see the
-[Dev Environment](/modern-python/01-dev-environment/) module. A one-line reminder:
-
-```bash
-cd shared-infra
-docker compose up -d redis
-# Connection: redis://localhost:6379, no auth
-```
-:::
-
-## The client landscape
+## The client comparison
 
 | Concern | ioredis (TS) | go-redis (Go) | redis-py async (Python) |
 |---|---|---|---|
@@ -44,26 +24,17 @@ docker compose up -d redis
 | Serialization | manual (JSON) | manual (JSON) | manual (JSON via Pydantic) |
 | Pipelines / transactions | `pipeline()` / `multi()` | `Pipeline` / `TxPipeline` | `client.pipeline()` |
 
-There's no Spring-`@Cacheable`-style framework annotation in the Python world.
-Caching is explicit: you write the get→miss→load→set yourself, or wrap it in a
-small decorator. That's a feature — there's no AOP proxy magic to debug, just a
-function.
+There's no Spring-`@Cacheable` framework annotation in Python — caching is explicit: you write the get→miss→load→set yourself, or wrap it in a small decorator. No AOP proxy magic to debug, just a function.
 
 ## Installing and connecting
 
-Add it to a `uv` project. `redis[hiredis]` pulls in the optional C parser, which
-roughly doubles throughput on large replies — always include it in production.
-
 ```bash
-uv add "redis[hiredis]"
+uv add "redis[hiredis]"   # hiredis = optional C parser, ~2x throughput on large replies
 ```
 
 ### from_url + the connection pool
 
-`redis.asyncio.from_url` is the one call you need. It does **not** open a socket
-eagerly — it builds a lazy `ConnectionPool`, and connections are created on first
-command. This is the equivalent of constructing a `go-redis` client or an `ioredis`
-instance: cheap, share one across your whole app.
+`redis.asyncio.from_url` is the one call you need. It does **not** open a socket eagerly — it builds a lazy `ConnectionPool`; connections are created on first command. Cheap, and you share one client across the whole app.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -118,22 +89,14 @@ name = await client.get("user:1:name")  # "Alice" (str, not b"Alice")
 </Tabs>
 
 :::caution[`decode_responses` is the gotcha everyone hits]
-By default redis-py returns **`bytes`**, not `str` — `await client.get(k)` gives
-you `b"Alice"`. Pass `decode_responses=True` and you get `str` back, which is what
-you want 95% of the time. The exception: if you store binary blobs (compressed
-JSON, msgpack, images) on *some* keys, you can't decode globally — create a second
-client without the flag for those keys, or decode per-call. Don't mix.
+By default redis-py returns **`bytes`** — `await client.get(k)` gives `b"Alice"`. Pass `decode_responses=True` and you get `str` back. Exception: if you store binary blobs on *some* keys, you can't decode globally — use a second client without the flag for those keys, or decode per-call. Don't mix.
 :::
 
 ### Lifespan integration with FastAPI
 
-Don't create a client per request and don't reach for a module global you forget to
-close. Open the pool in the FastAPI **lifespan** (covered in
-[Module 07](/modern-python/07-fastapi/)) and stash it on `app.state`. This is the
-Python equivalent of wiring a singleton `*redis.Client` into your Go server struct
-or constructing `ioredis` once at module load.
+Open the pool in the FastAPI **lifespan** (module 07) and stash it on `app.state` — one client per process, like a singleton `*redis.Client` in a Go server struct. The async client's shutdown method is `aclose()` (bare `close()` is deprecated); always `await` it in teardown so pool sockets close cleanly.
 
-```python title="app/main.py" {9-18,24-26}
+```python title="app/main.py"
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
@@ -180,18 +143,9 @@ async def ping(r: RedisDep) -> dict[str, bool]:
     return {"ok": await r.ping()}
 ```
 
-:::tip[`aclose`, not `close`]
-The async client's shutdown method is `aclose()` (the bare `close()` was deprecated
-to disambiguate from the sync client). Always `await` it in the lifespan teardown
-so the pool's sockets are returned cleanly — otherwise you'll see
-`ResourceWarning: unclosed connection` noise in tests.
-:::
-
 ## Core data types & commands
 
-The command names are identical to what you type in `redis-cli` and nearly
-identical across all three clients — the only real difference is `await` and method
-casing. Here's the type-by-type map:
+Command names are identical to `redis-cli` and nearly identical across all three clients — only `await` and casing differ:
 
 | Redis type | Commands | ioredis | go-redis | redis-py async |
 |---|---|---|---|---|
@@ -200,8 +154,6 @@ casing. Here's the type-by-type map:
 | List | `LPUSH/RPOP/LRANGE` | `lpush/rpop/lrange` | `LPush/RPop/LRange` | `lpush/rpop/lrange` |
 | Set | `SADD/SMEMBERS` | `sadd/smembers` | `SAdd/SMembers` | `sadd/smembers` |
 | Sorted set | `ZADD/ZRANGE` | `zadd/zrange` | `ZAdd/ZRange` | `zadd/zrange` |
-
-### Strings, hashes, lists, sets, sorted sets
 
 ```python title="data types"
 # --- String + counter ---
@@ -233,22 +185,11 @@ await r.zrevrange("leaderboard", 0, 2, withscores=True)  # top 3 [(b"alice",100.
 await r.zrevrank("leaderboard", "bob")            # 1 (0-based, 0 = highest)
 ```
 
-:::caution[Mind the empty-collection truthiness trap]
-A TS/Go dev's reflex is `if (await r.get(k))`. In Python that's correct for `None`,
-but `await r.lrange(k, 0, -1)` returns `[]` on a missing list and `await
-r.hgetall(k)` returns `{}` on a missing hash — both **falsy**, just like a populated
-collection is truthy. If you need to distinguish "missing" from "empty", check
-`await r.exists(k)` explicitly. (See the truthiness notes in
-[Data Structures & FP](/modern-python/03-data-structures-fp/).)
-:::
+One Python trap: `await r.lrange(k, 0, -1)` returns `[]` on a missing list and `hgetall` returns `{}` on a missing hash — both falsy, just like populated ones. If you must distinguish "missing" from "empty," check `await r.exists(k)` explicitly (module 03's truthiness rule).
 
 ### Serialization: JSON via Pydantic
 
-Redis stores bytes. To cache a domain object you serialize it. The 2026-Python
-answer is **Pydantic v2's `model_dump_json()` / `model_validate_json()`** (see
-[Module 04](/modern-python/04-pydantic/)) — it's fast (Rust core), handles
-`datetime`/`UUID`/`Decimal` correctly, and validates on the way back out so a
-corrupt or schema-drifted cache entry fails loudly instead of silently.
+Redis stores bytes. Cache a domain object by serializing with Pydantic v2's `model_dump_json()` / `model_validate_json()` (module 04) — fast (Rust core), handles `datetime`/`UUID`/`Decimal`, and validates on the way back out so a corrupt or schema-drifted entry fails loudly instead of silently:
 
 ```python title="serializing a model"
 from datetime import datetime
@@ -276,21 +217,14 @@ async def load_product(r, product_id: int) -> Product | None:
 ```
 
 :::caution[Never `pickle` untrusted data]
-Python's `pickle` can serialize *any* object, which is tempting — but unpickling
-executes arbitrary code embedded in the payload. A poisoned cache entry becomes
-remote code execution. **Never `pickle` anything that crosses a trust boundary**,
-and treat a shared Redis as a trust boundary (another service, a compromised key, a
-malicious tenant). Use JSON. Reach for `pickle` only for ephemeral, single-process,
-fully-trusted data — and even then, JSON or msgpack is usually better.
+`pickle` can serialize *any* object — but unpickling executes arbitrary code embedded in the payload. A poisoned cache entry becomes remote code execution. **Never `pickle` anything that crosses a trust boundary**, and treat a shared Redis as a trust boundary. Use JSON. Reach for `pickle` only for ephemeral, single-process, fully-trusted data — and even then JSON or msgpack is usually better.
 :::
 
 ## Cache-aside
 
-Cache-aside (a.k.a. lazy loading) is the pattern you'll use 90% of the time: on a
-read, check the cache; on a miss, load from the source and populate the cache with a
-TTL; on a write, invalidate. The app owns the cache — there's no read-through proxy.
+Cache-aside (lazy loading) is the pattern you'll use 90% of the time: on a read, check the cache; on a miss, load from the source and populate the cache with a TTL; on a write, invalidate.
 
-<Mermaid title="Cache-aside read path" code={`
+<Mermaid title="Cache-aside read path: hit returns cached; miss loads, sets with TTL, returns" code={`
 flowchart TB
   A["read(id)"] --> B["GET cache:id"]
   B -->|"hit"| C["return cached value (no DB hit)"]
@@ -359,10 +293,7 @@ async def get_product(r, db, product_id: int) -> Product | None:
 
 ### Invalidation: write the DB, then delete the key
 
-On a write, the safe default is **delete the cache key, don't update it**. Deleting
-forces the next read to repopulate from the source of truth; updating risks writing
-a stale value if two writers race. (Updating in place — write-through — is fine when
-you control the write path and want a warm cache; more below.)
+On a write, the safe default is **delete the cache key, don't update it** — the next read repopulates from the source of truth. And order matters: commit the DB **first**, then delete the key. Deleting before the commit lets a concurrent read slip in, miss the cache, read the *old* committed row, and repopulate the cache with stale data that lives until TTL (the "delayed double delete" is the paranoid extra pass):
 
 ```python title="invalidate on write"
 async def update_product(r, db, product_id: int, patch: ProductPatch) -> Product:
@@ -371,20 +302,9 @@ async def update_product(r, db, product_id: int, patch: ProductPatch) -> Product
     return product
 ```
 
-:::caution[Delete *after* the DB commit, not before]
-If you delete the cache key before the DB transaction commits, a concurrent read can
-slip in, miss the cache, read the **old** committed row, and repopulate the cache
-with stale data — which then lives until TTL. Order it: commit DB → delete key. For
-the truly paranoid, delete again a few hundred ms later (the "delayed double delete")
-to catch reads that interleaved with the commit.
-:::
-
 ### A reusable cache decorator
 
-Once you've written cache-aside twice, wrap it. A decorator turns any expensive
-async function into a cached one — this is the closest Python gets to Spring's
-`@Cacheable`, except it's twelve lines you can actually read. It keys on the function
-name plus arguments and stores the JSON.
+Wrap cache-aside in a decorator — the closest Python gets to Spring's `@Cacheable`, twelve readable lines. PEP 695 generics (`[**P, T]`) keep the wrapper fully typed:
 
 ```python title="app/cache.py"
 import functools
@@ -417,25 +337,17 @@ def cached(r: redis.Redis, *, ttl: int, prefix: str = "cache"):
     return decorator
 
 
-# Usage — note PEP 695 generics ([**P, T]) keep the wrapper fully typed.
+# Usage
 @cached(client, ttl=300, prefix="reports")
 async def expensive_report(year: int, region: str) -> dict[str, Any]:
     ...  # a 2-second aggregation query
 ```
 
-:::note[The keying caveat]
-Keying on `str(args)` is fine for scalars (`int`, `str`, `UUID`) but breaks for
-objects whose `repr` isn't stable or unique. For anything beyond scalars, hash a
-canonical representation (`hashlib.sha256(json.dumps(...).encode())`) or require
-callers to pass an explicit `key=` — exactly the same discipline you'd apply to a
-memoization key in TS or a `map[string]` cache key in Go.
-:::
+Keying caveat: `str(args)` is fine for scalars (`int`, `str`, `UUID`) but breaks for objects whose `repr` isn't stable or unique — hash a canonical representation (`hashlib.sha256(json.dumps(...).encode())`) or take an explicit `key=`, same discipline as a memoization key in TS or a `map[string]` cache key in Go.
 
 ### Write-through, briefly
 
-Write-through updates the cache *and* the database on every write, keeping the cache
-permanently warm. You trade write latency (two writes) for never serving a cold read.
-Use it for hot, read-heavy keys you control:
+Write-through updates the cache *and* the DB on every write, keeping the cache permanently warm — at the cost of two writes and the risk of caching a value the DB never committed. Use it only for hot, read-heavy keys you control:
 
 ```python title="write-through"
 async def set_product(r, db, product: Product) -> Product:
@@ -445,22 +357,11 @@ async def set_product(r, db, product: Product) -> Product:
     return saved
 ```
 
-The risk is the inverse of delete-on-write: if the cache write succeeds but a later
-DB write in the same logical operation fails, or two writers race, the cache can
-hold a value the DB never committed. Cache-aside-with-delete is the safer default;
-reach for write-through only when the warm-cache win is worth the coordination.
+Cache-aside-with-delete is the safer default.
 
 ## Rate limiting
 
-Rate limiting is the other canonical Redis job. The counter lives in Redis so
-**every instance of your service shares one limit per client** — which is the whole
-point, and what an in-memory `express-rate-limit` or `golang.org/x/time/rate`
-limiter can't do across a fleet.
-
-The non-negotiable property: the check must be **atomic**. A read-then-write race
-(read count → decide → increment) lets two concurrent requests both see "9 of 10"
-and both proceed. The fix is either a single atomic command (`INCR`) or a **Lua
-script**, which Redis runs as one indivisible operation.
+The counter lives in Redis so **every instance of your service shares one limit per client** — what an in-memory `express-rate-limit` or `golang.org/x/time/rate` can't do across a fleet. The check must be **atomic** (single `INCR` or one Lua script), otherwise a read-then-write race lets two concurrent requests both pass.
 
 | Algorithm | Data structure | Accuracy | Cost | Notes |
 |---|---|---|---|---|
@@ -470,9 +371,7 @@ script**, which Redis runs as one indivisible operation.
 
 ### Fixed window
 
-Bucket the clock into slices of `window` seconds, `INCR` the bucket, set `EXPIRE` on
-the first hit. Cheap, but a client can fire `limit` requests at the end of one window
-and `limit` more at the start of the next — `2 × limit` in a heartbeat.
+Bucket the clock into slices of `window` seconds, `INCR` the bucket, `EXPIRE` on first hit — one atomic Lua script. Cheap, but a client can fire `limit` requests at the end of one window and `limit` more at the start of the next:
 
 ```python title="app/ratelimit.py — fixed window"
 import time
@@ -496,10 +395,7 @@ async def fixed_window_allow(r, client_id: str, limit: int, window: int) -> bool
 
 ### Sliding window (sorted sets + Lua)
 
-Keep one sorted set per client where each member is a request and its **score is the
-timestamp**. On each request: drop members older than the window (`ZREMRANGEBYSCORE`),
-count what's left (`ZCARD`), reject if at limit, else add the request and refresh the
-TTL. Precise, and the whole sequence is one atomic Lua script.
+Keep one sorted set per client, members = requests, score = timestamp. On each request: prune old (`ZREMRANGEBYSCORE`), count (`ZCARD`), reject if at limit, else `ZADD` + refresh TTL — all one atomic script:
 
 ```python title="app/ratelimit.py — sliding window"
 import time
@@ -537,10 +433,7 @@ async def sliding_window_allow(r, client_id: str, limit: int, window: int) -> bo
 
 ### Token bucket
 
-A bucket holds up to `capacity` tokens, refilled at `rate` tokens/second. Each request
-spends one token; an empty bucket rejects. It allows bursts (up to `capacity`) while
-enforcing a long-run average — the model behind `golang.org/x/time/rate`. Store
-`tokens` and `last_refill` in a hash and reconcile lazily in Lua:
+A bucket holds up to `capacity` tokens, refilled at `rate`/second. Each request spends one; empty rejects. Allows bursts up to `capacity` while enforcing the long-run average — the model behind `golang.org/x/time/rate`. Store `tokens` + `last_refill` in a hash, reconcile lazily in Lua:
 
 ```lua title="Lua: token bucket"
 -- KEYS[1] = bucket hash   ARGV: capacity, refill_per_sec, now, requested
@@ -564,10 +457,7 @@ return allowed and 1 or 0
 
 ### As a FastAPI dependency
 
-In Express you'd register rate-limit middleware globally; in Go you'd wrap your
-`http.Handler`. FastAPI's idiomatic unit is a **dependency** — it runs before the
-route, can read the request, and can short-circuit by raising `HTTPException`. A
-dependency targets specific routes precisely; a middleware applies to everything.
+FastAPI's idiomatic unit is a **dependency** — it runs before the route, can read the request, and short-circuits with `HTTPException`. Use a dependency when limits vary per route; use `@app.middleware("http")` for one global blanket cap:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -626,24 +516,9 @@ async def search(q: str) -> list[str]:
   </TabItem>
 </Tabs>
 
-:::tip[Dependency vs middleware — when to pick which]
-Use a **dependency** when limits vary per route (5/min on search, 100/min on
-reads) — you attach it only where needed and it composes with auth dependencies.
-Use **middleware** when you want one global limit across the whole app regardless of
-route. FastAPI middleware (`@app.middleware("http")`) wraps every request, like the
-Go handler above; it's the right tool for a blanket per-IP cap.
-:::
-
 ## Pub/Sub
 
-Redis Pub/Sub is fire-and-forget real-time messaging: publish to a channel, every
-current subscriber gets it, and if nobody's listening the message vanishes. It's
-perfect for cache invalidation across instances and live UI nudges — and wrong for
-anything that must not be lost.
-
-The async client gives you a `pubsub()` object you consume with `async for` — the
-same `async for` you learned for streams in
-[Module 06](/modern-python/06-streams/).
+Fire-and-forget real-time messaging: publish to a channel, every current subscriber gets it, and if nobody's listening the message vanishes. Perfect for cross-instance cache invalidation and live UI nudges — wrong for anything that must not be lost. The async client gives a `pubsub()` object consumed with `async for` — the same `async for` as module 06's streams:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -676,7 +551,7 @@ for msg := range sub.Channel() {
 # --- Publisher (any client) ---
 await r.publish("invalidate", json.dumps({"key": "product:1"}))
 
-# --- Subscriber (typically a background task in the lifespan) ---
+# --- Subscriber (a supervised background task started in the lifespan) ---
 async def invalidation_listener(r) -> None:
     async with r.pubsub() as pubsub:
         await pubsub.subscribe("invalidate")
@@ -690,38 +565,15 @@ async def invalidation_listener(r) -> None:
   </TabItem>
 </Tabs>
 
-:::caution[A subscriber connection is special]
-While a connection is subscribed it can't issue normal commands — Redis dedicates it
-to delivering messages. With redis-py async you typically run the listener as a
-**supervised background task** (an `asyncio.Task` started in the lifespan and
-cancelled on shutdown — see the supervised-task pattern in
-[Module 06](/modern-python/06-streams/)), using a separate client/connection from the
-one your request handlers use for `GET`/`SET`.
-:::
+A subscribed connection can't issue normal commands — Redis dedicates it to messages. Run the listener as a supervised background task (started in lifespan, cancelled on shutdown — module 06) using a separate connection from the one request handlers use for `GET`/`SET`.
 
-### A note on Redis Streams
-
-Pub/Sub drops messages with no live subscriber. **Redis Streams** (`XADD` / `XREAD`
-/ consumer groups via `XREADGROUP`) is the durable, replayable cousin: messages
-persist, late consumers can read history, and consumer groups give you Kafka-style
-partitioned, acknowledged consumption with redelivery of un-acked messages. It's a
-genuine lightweight event log.
-
-But if you need durable events as a first-class architectural concern — ordering
-guarantees, long retention, many consumer groups, real throughput — reach for Kafka,
-covered next in [Module 11](/modern-python/11-kafka-events/). Rule of thumb: Streams
-for lightweight intra-app work queues you already have Redis for; Kafka when the
-event log *is* the system.
+**Redis Streams** (`XADD`/`XREAD`/consumer groups) is the durable, replayable cousin of pub/sub — messages persist, late consumers read history, consumer groups give Kafka-style partitioned, acknowledged consumption. A genuine lightweight event log. But for durable events as a first-class architectural concern — ordering guarantees, long retention, many consumer groups — reach for Kafka ([module 11](/modern-python/11-kafka-events/)). Rule of thumb: Streams for intra-app work queues you already have Redis for; Kafka when the event log *is* the system.
 
 ## Distributed locks & idempotency
 
 ### A simple lock with SET NX
 
-A distributed lock coordinates "only one worker does X at a time" across instances.
-The primitive is `SET key token NX EX ttl`: set-if-not-exists, with a TTL so a
-crashed holder doesn't deadlock the lock forever. Release by deleting **only if you
-still own it** — checked atomically in Lua, because a naive `GET`-then-`DEL` can
-delete a lock another worker acquired after yours expired.
+`SET key token NX EX ttl` coordinates "only one worker does X at a time" across instances. Release by deleting **only if you still own it** — checked atomically in Lua, because a naive `GET`-then-`DEL` can delete a lock another worker acquired after yours expired:
 
 ```python title="app/lock.py"
 import uuid
@@ -747,27 +599,13 @@ async def redis_lock(r, name: str, ttl: int = 10):
         await r.eval(RELEASE_LUA, 1, f"lock:{name}", token)  # release iff still ours
 ```
 
-:::caution[Honest take: this lock is "good enough", not bulletproof]
-Single-node `SET NX` is fine for "don't run this cron twice" or "serialize a cache
-rebuild". It is **not** safe for correctness-critical mutual exclusion: if the lock's
-TTL expires while your worker is still running (a long GC pause, a slow query), a
-second worker acquires it and now two run concurrently.
-
-**Redlock** (acquiring on N independent Redis masters) was proposed to harden this,
-but it's [contested](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) —
-it still relies on bounded clocks and pauses, and adds real complexity. The honest
-guidance: if losing the lock would corrupt data, don't rely on a Redis lock for
-correctness — use a fencing token (a monotonic counter the downstream resource
-checks) or a database transaction/advisory lock. Use Redis locks for efficiency
-(avoiding duplicate work), not for safety.
+:::caution[This lock is "good enough", not bulletproof]
+Single-node `SET NX` is fine for "don't run this cron twice." It is **not** safe for correctness-critical mutual exclusion: if the TTL expires while your worker is still running, a second worker acquires it and two run concurrently. **Redlock** was proposed to harden this but is contested — it still relies on bounded clocks and pauses. Honest guidance: if losing the lock would corrupt data, don't rely on a Redis lock for correctness — use a fencing token (a monotonic counter the downstream resource checks) or a DB advisory lock. Use Redis locks for *efficiency* (avoiding duplicate work), not for *safety*.
 :::
 
 ### Idempotency keys
 
-The flip side of locking: make a request safe to retry. The client sends an
-`Idempotency-Key` header; you `SET NX` it before doing the work and return the stored
-response on a replay. This is how Stripe-style "retrying a charge won't double-charge"
-works, and it's a handful of Redis commands.
+The flip side of locking: make a request safe to retry. The client sends an `Idempotency-Key` header; you `SET NX` it before doing the work and return the stored response on a replay — how Stripe-style "retry won't double-charge" works:
 
 ```python title="idempotency dependency"
 async def idempotent(request: Request) -> str | None:
@@ -788,11 +626,7 @@ async def idempotent(request: Request) -> str | None:
 
 ### Thundering herd / cache stampede
 
-When a hot key expires, every concurrent request misses at once and stampedes the
-database with the same expensive query — the **thundering herd**. The fix is
-**single-flight**: only one caller recomputes; the rest wait for that result. In Go
-this is `golang.org/x/sync/singleflight`; in Python you build it with an
-`asyncio.Lock` per key (in-process) plus a short Redis `SET NX` lock (cross-process).
+When a hot key expires, every concurrent request misses at once and stampedes the DB with the same expensive query. The fix is **single-flight**: one caller recomputes, the rest wait — an `asyncio.Lock` per key in-process (Go's `singleflight`), plus a short Redis `SET NX` lock cross-process:
 
 ```python title="single-flight cache-aside"
 import asyncio
@@ -818,9 +652,7 @@ async def get_single_flight(r, db, product_id: int) -> Product | None:
         return product
 ```
 
-For cross-instance herds, add jitter to your TTLs (`ex=300 + random.randint(0, 30)`)
-so a million keys set in the same deploy don't all expire in the same second, and/or
-gate the recompute with the Redis `SET NX` lock from above.
+For cross-instance herds, add jitter to TTLs (`ex=300 + random.randint(0, 30)`) so a million keys set in the same deploy don't all expire in the same second, and/or gate the recompute with the Redis `SET NX` lock.
 
 ### The rest of the checklist
 
@@ -832,19 +664,11 @@ gate the recompute with the Redis `SET NX` lock from above.
 | **`bytes` vs `str`** | `if value == "x"` silently false | `decode_responses=True` (or decode explicitly) |
 | **Empty vs missing** | `[]`/`{}` are falsy like missing | check `await r.exists(k)` when it matters |
 | **`pickle`** | RCE from a poisoned entry | JSON only across trust boundaries |
-| **Caching `None`** | one miss poisons the cache for the TTL | decide explicitly whether negatives are cached, and use a short TTL if so |
+| **Caching `None`** | one miss poisons the cache for the TTL | decide explicitly whether negatives are cached, short TTL if so |
 
-:::tip[TTL discipline is the whole game]
-The single highest-leverage habit: **every cache key has a TTL, and you can justify
-its number.** A cache without TTLs isn't a cache — it's a second database that drifts
-from the first and never reconciles. When in doubt, pick a *shorter* TTL: a cache
-miss is cheap, serving stale data for an hour is not.
-:::
+**TTL discipline is the whole game:** every cache key has a TTL, and you can justify its number. A cache without TTLs isn't a cache — it's a second database that drifts and never reconciles. When in doubt, pick a *shorter* TTL: a cache miss is cheap; serving stale data for an hour is not.
 
 ## Practice
-
-Wire cache-aside and a sliding-window limiter onto a real FastAPI service against
-the shared Redis instance.
 
 <CardGrid>
   <LinkCard

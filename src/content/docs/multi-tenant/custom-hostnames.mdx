@@ -1,6 +1,6 @@
 ---
 title: Custom Hostnames
-description: Letting tenants serve the app on their own domains via Cloudflare for SaaS, with TXT pre-verification, HTTP DCV, and a 60-second reconciler.
+description: "Serve tenants on their own domains via Cloudflare for SaaS — TXT pre-verification, HTTP DCV, a 60-second reconciler, and the internal lifecycle state machine."
 sidebar:
   order: 4
 ---
@@ -8,55 +8,26 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { Steps, Badge } from "@astrojs/starlight/components";
 
-A tenant on a default subdomain (`acme.app.example.com`) is fine for getting started,
-but customers eventually want the product to live on a domain they own, like
-`app.acme.com`. That means provisioning a TLS certificate for a hostname you don't
-control, tracking its issuance over minutes-to-days, and doing it without letting one
-tenant burn the platform's shared certificate quota. Cloudflare for SaaS handles the
-hostname and certificate machinery, and because the stack already runs on Workers the
-integration is a natural fit. The work that's left is a clean onboarding flow, an
-internal lifecycle state machine, and a reconciler that keeps the database honest
-about what Cloudflare actually did.
+Tenants eventually want the product on a domain they own (`app.acme.com`). That means provisioning a TLS cert for a hostname you don't control, tracking issuance over minutes-to-days, and not letting one tenant burn the shared cert quota. Cloudflare for SaaS handles the hostname/cert machinery; the remaining work is a clean onboarding flow, an internal lifecycle state machine, and a reconciler that keeps the database honest about what Cloudflare actually did.
 
 ## What Cloudflare for SaaS gives you
 
-Cloudflare for SaaS is bundled into the <Badge text="Pro" variant="note" /> and
-<Badge text="Business" variant="note" /> plans with no separate SKU. Each zone
-includes 100 custom hostnames, with `$0.10`/hostname overage and a hard ceiling of
-50,000 outside Enterprise. You provision a hostname with a single API call —
-`POST /zones/{zone_id}/custom_hostnames` — and Cloudflare auto-issues the SSL
-certificate via Domain Control Validation (DCV — how the CA confirms the domain is
-really under your control before it signs a cert for it).
+Bundled into <Badge text="Pro" variant="note" /> and <Badge text="Business" variant="note" /> plans with no separate SKU. Each zone includes 100 custom hostnames, `$0.10`/hostname overage, hard ceiling 50,000 outside Enterprise. Provision with one API call — `POST /zones/{zone_id}/custom_hostnames` — and Cloudflare auto-issues the SSL cert via Domain Control Validation (DCV — how the CA confirms the domain is really under your control).
 
-DCV comes in a few flavors. HTTP DCV is the simplest: Cloudflare validates the moment
-the tenant's CNAME (the DNS alias pointing `app.acme.com` at the platform) goes live,
-with no extra DNS record for the tenant to manage. That's the method this design uses.
-
-Two request fields look tempting but will bite you on Pro/Business:
+DCV flavors: **HTTP DCV** is simplest — Cloudflare validates the moment the tenant's CNAME goes live, no extra DNS record. That's the method this design uses.
 
 :::caution[Two Enterprise-only fields to never send]
-- **`certificate_authority`** is Enterprise-only. Setting it to `"google"` returns API
-  error `1459` on Pro/Business. Cloudflare's default CA selection — Google Trust
-  Services with a Let's Encrypt fallback per the domain's CAA records — applies
-  automatically, so let Cloudflare pick.
-- **`custom_metadata`** is not universally available; it's documented as an
-  Enterprise / account-team-enabled feature. Don't depend on it. Build your reverse
-  lookups on `cf_hostname_id` and `hostname` instead.
+- **`certificate_authority`** is Enterprise-only. Setting it to `"google"` returns API error `1459` on Pro/Business. Cloudflare's default CA selection (Google Trust Services with Let's Encrypt fallback per CAA records) applies automatically.
+- **`custom_metadata`** is not universally available (Enterprise / account-team-enabled). Don't depend on it — build reverse lookups on `cf_hostname_id` and `hostname`.
 :::
 
 ## The onboarding flow
 
-The naive approach is to call Cloudflare the instant a tenant types a hostname. That's
-exactly the abuse channel to avoid (see [Why TXT pre-verification](#why-txt-pre-verification)
-below). Instead the flow is two-phase. First the tenant proves they control the domain
-*on the platform's side* by adding a TXT record only the real owner could place — that's
-the **TXT pre-verification** gate. Only after that gate passes does the platform touch
-Cloudflare at all: it registers the hostname and asks the tenant to CNAME.
+Never call Cloudflare the instant a tenant types a hostname — that's the abuse channel (see [Why TXT pre-verification](#why-txt-pre-verification)). Two phases: the tenant proves domain control platform-side via a TXT record; only then does the platform touch Cloudflare.
 
 <Steps>
 
-1. **Tenant adds a TXT record (platform-side verification).** The tenant submits the
-   hostname:
+1. **Tenant adds a TXT record (platform-side verification).**
 
    ```http title="Add a pending hostname"
    POST /api/tenancy/hostnames
@@ -65,11 +36,7 @@ Cloudflare at all: it registers the hostname and asks the tenant to CNAME.
    { "hostname": "app.acme.com" }
    ```
 
-   A per-org rate limit applies — at most 10 pending hostnames at a time, and 50 per
-   day. The server inserts a `tenant_custom_hostname` row with
-   `lifecycle_status: "awaiting_txt"`, `verification_verified_at: NULL`, and
-   `cf_hostname_id: NULL`. No Cloudflare API call happens yet. The response carries a
-   per-org `verification_token` (a cuid) and the record to add:
+   Per-org rate limit: at most 10 pending hostnames at a time, 50/day. The server inserts a `tenant_custom_hostname` row with `lifecycle_status: "awaiting_txt"`, `verification_verified_at: NULL`, `cf_hostname_id: NULL`. **No Cloudflare API call yet.** The response carries a per-org `verification_token` (a cuid) and the record to add:
 
    ```text title="Verification instructions surfaced to the tenant"
    Add a DNS TXT record:
@@ -77,21 +44,15 @@ Cloudflare at all: it registers the hostname and asks the tenant to CNAME.
    Then click "Verify" to continue.
    ```
 
-2. **The platform verifies the TXT.** The tenant clicks "Verify":
+2. **The platform verifies the TXT.**
 
    ```http title="Verify the TXT record"
    POST /api/tenancy/hostnames/{id}/verify
    ```
 
-   The server resolves the TXT record over DNS-over-HTTPS
-   (`https://cloudflare-dns.com/dns-query`). On a match it sets
-   `verification_verified_at = now()` and writes a `hostname.verified` audit event
-   (CRITICAL, dual-scope).
+   The server resolves the TXT over DNS-over-HTTPS (`https://cloudflare-dns.com/dns-query`). On a match it sets `verification_verified_at = now()` and writes a `hostname.verified` audit event (CRITICAL, dual-scope).
 
-3. **The platform registers the hostname with Cloudflare.** Only after verification
-   does the server call the Cloudflare API. Note that HTTP DCV (`method: "http"`) is
-   what makes the later CNAME-only flow work, and `certificate_authority` is
-   deliberately absent:
+3. **The platform registers the hostname with Cloudflare.** Only after verification. HTTP DCV (`method: "http"`) makes the later CNAME-only flow work; `certificate_authority` is deliberately absent:
 
    ```ts title="apps/server — register the custom hostname" {3,7-8}
    await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/custom_hostnames`, {
@@ -104,9 +65,7 @@ Cloudflare at all: it registers the hostname and asks the tenant to CNAME.
    });
    ```
 
-   The row is updated with the returned `cf_hostname_id`,
-   `lifecycle_status: "pending_cloudflare"`, and the raw Cloudflare validation fields.
-   The tenant is now shown the CNAME to create:
+   The row is updated with the returned `cf_hostname_id`, `lifecycle_status: "pending_cloudflare"`, and the raw Cloudflare validation fields. The tenant is shown the CNAME to create:
 
    ```text title="CNAME instructions surfaced to the tenant"
    Create a CNAME record:
@@ -117,57 +76,27 @@ Cloudflare at all: it registers the hostname and asks the tenant to CNAME.
    /.well-known/pki-validation/ token shown below.
    ```
 
-4. **The reconciler tracks status.** A cron on `apps/server` runs every 60 seconds. It
-   polls non-terminal hostnames and stores the raw Cloudflare validation state
-   separately from the internal lifecycle status. See [The reconciler](#the-reconciler)
-   below.
+4. **The reconciler tracks status.** A cron on `apps/server` runs every 60 seconds, polling non-terminal hostnames and storing raw Cloudflare validation state separately from the internal lifecycle status. See [The reconciler](#the-reconciler).
 
-5. **Notification on activation.** When Cloudflare reports `status === "active"` and the
-   row was previously not active, the reconciler emits a `hostname.activated` audit
-   (CRITICAL, dual-scope) and sends a `HostnameVerifiedEmail` to the org's admins —
-   exactly once.
+5. **Notification on activation.** When Cloudflare reports `status === "active"` and the row wasn't previously active, the reconciler emits a `hostname.activated` audit (CRITICAL, dual-scope) and sends a `HostnameVerifiedEmail` to the org's admins — exactly once.
 
 </Steps>
 
 ### Why TXT pre-verification
 
-Here's the subtlety: HTTP DCV already protects the *certificate*. An attacker who
-submits `{ hostname: "app.competitor.com" }` can never finish issuance, because the
-competitor's server never serves the validation challenge. So why add a TXT gate at all?
-
-Because the *registration itself* is the resource being abused. Every
-`POST /zones/{zone_id}/custom_hostnames` consumes a slot in the platform's shared,
-zone-wide hostname quota and counts toward Cloudflare's abuse heuristics — regardless of
-whether the cert ever issues. One script firing thousands of competitor hostnames could
-exhaust the quota or get the whole zone flagged, hurting every legitimate tenant.
-
-The TXT record is a cheaper proof of control that runs entirely on the platform's side,
-*before* a single Cloudflare slot is spent. An attacker can't place
-`_app-example-verify.app.competitor.com` in a zone they don't own, so they never get
-past the gate — and Cloudflare is never touched on their behalf.
+HTTP DCV already protects the *certificate* — an attacker submitting `app.competitor.com` can never finish issuance, because the competitor's server never serves the validation challenge. But the *registration itself* is the resource being abused: every `POST /zones/{zone_id}/custom_hostnames` consumes a slot in the zone-wide hostname quota and counts toward Cloudflare's abuse heuristics, regardless of whether the cert issues. A script firing thousands of competitor hostnames could exhaust the quota or get the zone flagged. The TXT record is a cheaper proof of control on the platform's side, *before* a single Cloudflare slot is spent.
 
 ### The CNAME target
 
-Tenants CNAME to `customers.example.com`, a proxied CNAME on the platform's zone that
-points at the *fallback origin* — the single backend Cloudflare for SaaS routes every
-custom hostname to when no per-hostname origin is configured. It's set once at the zone
-level in the Cloudflare for SaaS config, so every tenant domain lands on the same
-Workers app.
+Tenants CNAME to `customers.example.com`, a proxied CNAME on the platform's zone pointing at the *fallback origin* — the single backend Cloudflare for SaaS routes every custom hostname to. Set once at zone level, so every tenant domain lands on the same Workers app.
 
 :::caution[Don't point tenants at the wrong target]
-The CNAME target is `customers.example.com`, *not* `<worker>.workers.dev` and *not*
-`app.example.com.cdn.cloudflare.net`. The latter is undocumented and is not the
-recommended pattern.
+The CNAME target is `customers.example.com`, *not* `<worker>.workers.dev` and *not* `app.example.com.cdn.cloudflare.net` (undocumented, not recommended).
 :::
 
 ## The internal lifecycle
 
-Cloudflare's own validation states are noisy and its timeouts are not infinite — a
-hostname that never validates moves through `Moved` and is eventually `Deleted` after a
-7-day backoff. So the database keeps the raw Cloudflare state in `cf_status` /
-`cf_ssl_status` *and* maps it onto a small internal lifecycle enum that the rest of the
-system reasons about. Decoupling the two is what lets the product survive Cloudflare
-renaming or adding states.
+Cloudflare's own validation states are noisy and its timeouts aren't infinite — an unvalidated hostname moves through `Moved` and is eventually `Deleted` after a 7-day backoff. So the database keeps the raw Cloudflare state in `cf_status` / `cf_ssl_status` *and* maps it onto a small internal lifecycle enum. Decoupling the two lets the product survive Cloudflare renaming or adding states.
 
 <Mermaid title="Custom-hostname lifecycle" height={460} code={`
 stateDiagram-v2
@@ -183,17 +112,11 @@ stateDiagram-v2
   deleted --> [*]
 `} />
 
-The terminal-ish states are `active` (working), `moved` (Cloudflare detached it but
-hasn't deleted yet), `deleted` (tombstoned in the database — never hard-deleted, for
-audit/history), and `error` (a recoverable validation failure the tenant can fix).
+Terminal-ish states: `active` (working), `moved` (CF detached but not yet deleted), `deleted` (tombstoned in the DB — never hard-deleted, for audit), `error` (recoverable validation failure).
 
 ## The reconciler
 
-Polling is the source of truth. The reconciler is a `scheduled` handler that picks up
-every registered-but-not-terminal hostname, asks Cloudflare for its current state, and
-writes the mapped lifecycle status plus the raw Cloudflare fields back into the row in
-a transaction. A `null` response from Cloudflare means the hostname was deleted after
-its backoff, which tombstones the row.
+Polling is the source of truth. A `scheduled` handler picks up every registered-but-not-terminal hostname, asks Cloudflare for its current state, and writes the mapped lifecycle status plus raw fields back in a transaction. A `null` response means Cloudflare deleted it after the backoff — tombstone the row.
 
 ```ts title="apps/server/src/workflows/hostname-reconciler.ts" {8-11,21,26}
 // Phase A standalone; folded into customHostnameLifecycle.reconcileAll() in Phase C.
@@ -242,69 +165,40 @@ export default {
 };
 ```
 
-A few operational details that aren't obvious from the code:
+Operational details that aren't obvious from the code:
 
-- **Cron and Hyperdrive.** Wrap the handler body in `withDrizzleClient(...)` exactly
-  like a request handler. `placement.mode: "smart"` does *not* apply to scheduled
-  handlers, so you accept the latency to the Hyperdrive pool's region.
-- **Trace sampling.** The server worker samples traces at 1% by default. For the
-  `scheduled` handler, bump that to 100% — cron runs are rare (1440/day) and traced
-  runs are the only forensics you get. Add per-row structured logs as a second layer.
+- **Cron and Hyperdrive.** Wrap the handler body in `withDrizzleClient(...)` exactly like a request handler. `placement.mode: "smart"` does *not* apply to scheduled handlers, so you accept latency to the Hyperdrive pool's region.
+- **Trace sampling.** The server worker samples traces at 1% by default; bump the `scheduled` handler to 100% — cron runs are rare (1440/day) and traced runs are the only forensics you get. Add per-row structured logs as a second layer.
 
 :::note[The scaling cliff at ~6,000 pending hostnames]
-The reconciler processes 100 rows/min, so `100 × 60 = 6,000` is the maximum sustained
-backlog it can keep up with. Beyond that, the design switches to a Queue fan-out: the
-cron enqueues batches and a queue consumer (the same `apps/server` worker) processes
-them with concurrency. That's <Badge text="deferred to v2" variant="caution" /> — the
-60-second cron is sufficient until the platform is well past 6,000 hostnames stuck in a
-non-terminal state at once.
+The reconciler processes 100 rows/min, so `100 × 60 = 6,000` is the maximum sustained backlog it can keep up with. Beyond that, switch to a Queue fan-out: the cron enqueues batches and a queue consumer (the same `apps/server` worker) processes them with concurrency. <Badge text="deferred to v2" variant="caution" /> — the 60-second cron suffices until well past 6,000 hostnames stuck in a non-terminal state at once.
 :::
 
 ### Webhooks as a latency optimization
 
-Cloudflare for SaaS offers webhooks for hostname/SSL state changes — validation,
-issuance, deployment, deletion, and renewal. The v1 design stays on polling as the
-source of truth; webhook integration is a low-risk latency optimization to consider if
-faster activation notifications matter, without waiting for the next 60-second scan.
-Either way, the reconciler remains the durability backstop.
+Cloudflare for SaaS offers webhooks for hostname/SSL state changes (validation, issuance, deployment, deletion, renewal). v1 stays on polling as the source of truth; webhooks are a low-risk latency optimization if faster activation notifications matter. Either way, the reconciler remains the durability backstop.
 
 ## The Cloudflare API token
 
-A single token, stored as a Cloudflare Secret (`CLOUDFLARE_API_TOKEN`), drives all of
-this. Its scopes are deliberately narrow: `Zone:Read`,
-`SSL and Certificates:Edit`, and `Custom Hostnames:Edit` — on the SaaS zone only, never
-account-wide. The runbook rotates it quarterly.
+One token, stored as a Cloudflare Secret (`CLOUDFLARE_API_TOKEN`), drives all of this. Scopes deliberately narrow: `Zone:Read`, `SSL and Certificates:Edit`, `Custom Hostnames:Edit` — on the SaaS zone only, never account-wide. The runbook rotates it quarterly.
 
 :::tip[v2 hardening: split read and write tokens]
-Consider splitting into a read token (used by the reconciler) and a write token (used
-by admin actions). It narrows the blast radius if either leaks.
+Split into a read token (reconciler) and a write token (admin actions) to narrow the blast radius if either leaks.
 :::
 
 ## Failure modes worth designing for
 
-A few real-world conditions need explicit handling in the UI and the reconciler.
-
 ### The TLS error window
 
-When a tenant flips their CNAME, traffic immediately reaches the platform while the
-certificate is still being issued, so the browser sees a TLS handshake error for
-roughly 2-5 minutes. Two mitigations are surfaced in the admin UI, and tenants choose:
-
-- The UI warns up-front during onboarding, and most tenants accept the brief errors.
-- Optional pre-validation via `/.well-known/pki-validation/{token}` served on the
-  tenant's *existing* origin **before** they flip DNS eliminates the window entirely.
+When a tenant flips their CNAME, traffic reaches the platform while the cert is still issuing — the browser sees a TLS handshake error for ~2–5 minutes. Two mitigations, tenant chooses: accept the brief errors (warned up-front in the UI), or pre-validate via `/.well-known/pki-validation/{token}` served on the tenant's *existing* origin **before** flipping DNS, eliminating the window.
 
 :::caution[The create response may omit validation records]
-If the `POST` create response omits `ssl.validation_records[]`, fetch the hostname
-again with a delayed follow-up `GET` before surfacing the pre-validation token. Don't
-assume the create body contains it.
+If the `POST` create response omits `ssl.validation_records[]`, fetch the hostname again with a delayed follow-up `GET` before surfacing the pre-validation token. Don't assume the create body contains it.
 :::
 
 ### CAA records block issuance
 
-If the tenant's apex zone has CAA records that don't permit `pki.goog` or
-`letsencrypt.org`, issuance silently fails and Cloudflare returns a `caa_error` in
-`verification_errors`. The UI surfaces the required records:
+If the tenant's apex zone has CAA records that don't permit `pki.goog` or `letsencrypt.org`, issuance silently fails and Cloudflare returns a `caa_error` in `verification_errors`. The UI surfaces the required records:
 
 ```text title="Required CAA records"
 Add to your DNS:
@@ -314,48 +208,29 @@ Add to your DNS:
 
 ### Tenant on another CDN
 
-A tenant already fronted by Fastly or Akamai may have DNS obfuscation that breaks DCV;
-the hostname won't validate. Document this so support recognizes it.
+A tenant already fronted by Fastly or Akamai may have DNS obfuscation that breaks DCV — the hostname won't validate. Document it so support recognizes it.
 
 ### Apex tenant domains
 
-Apex domains like `acme.com` itself are not supported in v1 — apex proxying for
-tenant-owned domains requires Cloudflare Enterprise BYOIP. Tenants must use a subdomain
-such as `app.acme.com` or `acme-portal.acme.com`.
+Apex domains like `acme.com` itself aren't supported in v1 — apex proxying for tenant-owned domains requires Cloudflare Enterprise BYOIP. Tenants must use a subdomain (`app.acme.com`, `acme-portal.acme.com`).
 
 ### API rate limit
 
-The Cloudflare API rate limit is 1200 requests per 5 minutes globally. At 6,000 pending
-hostnames the reconciler stays within budget, but bursts could trip it, so the API
-wrapper uses exponential backoff.
+The Cloudflare API rate limit is 1200 requests per 5 minutes globally. At 6,000 pending hostnames the reconciler stays within budget, but bursts could trip it — the API wrapper uses exponential backoff.
 
 ## Deletion
 
-Deletion never hard-deletes the row — the history is kept for audit. It is also guarded
-so a tenant can't accidentally lock themselves out:
+Never hard-deletes the row — history is kept for audit. Also guarded so a tenant can't lock themselves out:
 
 ```http title="Delete a custom hostname"
 DELETE /api/tenancy/hostnames/{id}
 ```
 
-The service guard refuses if removing this hostname would leave the org with no access
-path — that is, there's no other custom hostname *and* `enforceSSO` is configured for a
-host other than the default subdomain. Otherwise it:
-
-- Calls `DELETE` on the Cloudflare API.
-- Sets `lifecycle_status = 'deleted'` (the row is tombstoned, not removed).
-- Writes a `hostname.deleted` audit event (CRITICAL, dual-scope).
-- Invalidates the cache via service-binding fan-out — the positive cache for the
-  hostname is purged in both `apps/server` and `apps/auth`, the same mechanism covered
-  in [Tenant Resolution](/multi-tenant/tenant-resolution/#cache-invalidation).
+The service guard refuses if removing this hostname would leave the org with no access path (no other custom hostname *and* `enforceSSO` configured for a host other than the default subdomain). Otherwise it: calls `DELETE` on the Cloudflare API; sets `lifecycle_status = 'deleted'` (tombstoned, not removed); writes a `hostname.deleted` audit event (CRITICAL, dual-scope); invalidates the cache via service-binding fan-out (see [Tenant Resolution](/multi-tenant/tenant-resolution/#cache-invalidation)).
 
 ## The schema
 
-The table is the single record of both the platform's view (the lifecycle status,
-verification token and timestamp) and Cloudflare's raw view (`cf_status`,
-`cf_ssl_status`, `verification_errors`). The composite index on
-`(lifecycle_status, last_reconciled_at)` is what makes the reconciler's "oldest
-non-terminal rows first" query cheap.
+One table holds both views — the platform's (lifecycle status, verification token/timestamp) and Cloudflare's raw (`cf_status`, `cf_ssl_status`, `verification_errors`). The composite index on `(lifecycle_status, last_reconciled_at)` makes the reconciler's "oldest non-terminal rows first" query cheap.
 
 ```sql title="tenant_custom_hostnames (Drizzle definition)"
 tenantCustomHostnames = pgTable("tenant_custom_hostnames", {
@@ -378,25 +253,15 @@ tenantCustomHostnames = pgTable("tenant_custom_hostnames", {
 ]);
 ```
 
-The full schema and the phased migration order live in
-[Schema & Migrations](/multi-tenant/schema-migrations/).
+Full schema and phased migration order: [Schema & Migrations](/multi-tenant/schema-migrations/).
 
 ## Gotchas worth remembering
 
-- **The create response may not include `validation_records`.** To surface
-  pre-validation tokens, do a delayed follow-up `GET` rather than assuming the `POST`
-  body contains them.
-- **Validation timeout is 7 days, not infinite.** Cloudflare moves a hostname through
-  `Moved` and later `Deleted` if validation never completes, so the database must keep
-  the raw Cloudflare state and map it into a separate internal lifecycle.
-- **Tenants on another CDN won't validate.** Fastly/Akamai DNS obfuscation breaks DCV.
-- **The API rate limit is 1200/5min globally.** Fine at 6,000 pending hostnames, but
-  bursts can trip it — use exponential backoff in the API wrapper.
-- **No `certificate_authority` field on the request body** — it's Enterprise-only.
-  Don't send it even when you think the default should be Google; let Cloudflare pick.
-- **No `custom_metadata` field either** — treat it as unavailable unless the account is
-  explicitly entitled. Look up by `cf_hostname_id` or `hostname`.
-- **Wildcard custom certs (e.g. `*.acme.com`) are Enterprise-only.** Only single
-  hostnames in v1.
-- **The CNAME target is `customers.example.com`** (proxied on the platform zone), not
-  the worker URL.
+- **The create response may not include `validation_records`** — do a delayed follow-up `GET` rather than assuming the `POST` body contains them.
+- **Validation timeout is 7 days, not infinite** — Cloudflare moves a hostname through `Moved` then `Deleted`; keep the raw Cloudflare state and map it into a separate internal lifecycle.
+- **Tenants on another CDN won't validate** — Fastly/Akamai DNS obfuscation breaks DCV.
+- **API rate limit is 1200/5min globally** — fine at 6,000 pending, but bursts can trip it; use exponential backoff.
+- **No `certificate_authority` field** — Enterprise-only. Let Cloudflare pick the CA.
+- **No `custom_metadata` field** — treat as unavailable unless explicitly entitled; look up by `cf_hostname_id` or `hostname`.
+- **Wildcard custom certs (`*.acme.com`) are Enterprise-only** — only single hostnames in v1.
+- **The CNAME target is `customers.example.com`** (proxied on the platform zone), not the worker URL.

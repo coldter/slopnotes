@@ -1,6 +1,6 @@
 ---
 title: Event-Driven with Kafka
-description: Build event-driven Python with aiokafka — async producers/consumers, consumer groups, dead letter queues, idempotency, and event sourcing.
+description: "Event-driven Python with aiokafka — async producers/consumers as `async for`, consumer groups, keys and partitions, manual-commit at-least-once, dead letter queues, idempotent consumers, and schema discipline."
 sidebar:
   order: 11
 ---
@@ -8,70 +8,25 @@ sidebar:
 import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
 import Mermaid from "~/components/Mermaid.astro";
 
-You've driven Kafka from TypeScript (`kafkajs`) or Go (`sarama` /
-`confluent-kafka-go`). In Python the modern, async-native choice is **`aiokafka`**:
-an `asyncio` producer and consumer that plug straight into the `async`/`await`
-world you built in [Async & Concurrency](/modern-python/05-async-concurrency/) and
-[Streams](/modern-python/06-streams/). No thread pools, no callback bridges — a
-consumer is literally `async for msg in consumer`.
-
-This module is about the *patterns*, not just the API: the event-driven mental
-model, delivery semantics, dead letter queues, idempotent consumers, a sober look
-at event sourcing and exactly-once, and how to wire all of this into a FastAPI app
-without shooting yourself in the foot.
-
-:::note[Shared infrastructure]
-Start Kafka from the guide's shared stack (see [Dev Environment](/modern-python/01-dev-environment/)):
-
-```bash
-cd shared-infra
-docker compose up -d kafka kafka-ui
-# Kafka broker (KRaft, no ZooKeeper): localhost:29092
-# Kafka UI:                          http://localhost:8090
-```
-
-Kafka 4 runs in **KRaft** mode — no ZooKeeper. One broker, no auth, perfect for
-local dev. Use `replicas=1` everywhere; in production you'd run 3+.
-:::
-
-## The client: which library
-
-| Library | Style | Use it when |
-|---|---|---|
-| **`aiokafka`** | Pure-Python, `asyncio`-native | **Default** for async apps (FastAPI, asyncio workers). What we teach here. |
-| `confluent-kafka` | C wrapper (librdkafka), blocking | Highest throughput, richest config; but its API is sync — you'd run it in a thread pool. |
-| `kafka-python` | Pure-Python, sync | Legacy/simple scripts. No async. Maintenance has been spotty. |
+In Python the modern async-native Kafka client is **`aiokafka`**: an `asyncio` producer and consumer that plug into the async world from modules 05/06 — a consumer is literally `async for msg in consumer`. Start Kafka from the shared stack: `cd shared-infra && docker compose up -d kafka kafka-ui` (broker on localhost:29092, Kafka UI on http://localhost:8090). Kafka 4 runs **KRaft** (no ZooKeeper); use `replicas=1` in dev.
 
 ```bash
 uv add aiokafka pydantic
 ```
 
-`aiokafka` reimplements the Kafka protocol on top of `asyncio`, so its calls are
-coroutines — `await producer.send_and_wait(...)`, `async for msg in consumer`.
-That's the whole reason to pick it over `confluent-kafka` in an async service: no
-event-loop-blocking C calls, no executor juggling.
+## The client: which library
 
-:::tip[Do you even need Kafka?]
-Kafka is a durable, replayable, partitioned log — powerful, but heavy to operate.
-For lighter needs, reach for something smaller first:
+| Library | Style | Use it when |
+|---|---|---|
+| **`aiokafka`** | Pure-Python, `asyncio`-native | **Default** for async apps. Its calls are coroutines — `await producer.send_and_wait(...)`, `async for msg in consumer`. No loop-blocking C calls. |
+| `confluent-kafka` | C wrapper (librdkafka), blocking | Highest throughput, richest config; sync API — run it in a thread pool. |
+| `kafka-python` | Pure-Python, sync | Legacy/simple scripts. No async. |
 
-- **NATS** (`nats-py`) — blazing-fast pub/sub and request/reply; JetStream adds
-  persistence. Great for service-to-service messaging without Kafka's ops weight.
-- **Redis Streams** (`redis.asyncio`, see [Redis & Caching](/modern-python/10-redis-caching/))
-  — consumer groups and acks built in, and you very likely already run Redis.
-
-Choose Kafka when you genuinely need a long-retention, replayable event log with
-high-throughput consumer groups. Otherwise a Redis Stream or NATS subject is less
-to run.
-:::
+Do you even need Kafka? For lighter needs: **NATS** (`nats-py`, JetStream adds persistence) for fast service-to-service messaging, or **Redis Streams** (module 10) if you already run Redis. Choose Kafka when you genuinely need a long-retention, replayable event log with high-throughput consumer groups.
 
 ## The mental model: events vs request/response
 
-Coming from HTTP/gRPC, your reflex is **request/response**: the caller waits for a
-reply, and the callee must be up *right now*. Event-driven flips that. A producer
-appends a fact to a log and moves on; consumers read it later, at their own pace,
-maybe more than once, maybe years later. The producer doesn't know — or care — who
-reads it.
+Request/response: the caller waits, and the callee must be up *right now*. Event-driven flips that — a producer appends a fact to a log and moves on; consumers read later, at their own pace, maybe more than once. The producer doesn't know or care who reads it.
 
 | | Request/response (HTTP, gRPC) | Event-driven (Kafka) |
 |---|---|---|
@@ -82,32 +37,21 @@ reads it.
 | Fan-out | One call, one handler | One event, N independent consumer groups |
 | Shape | "Do this and tell me the result" | "This happened" (a fact in past tense) |
 
-The naming convention follows the model: events are **facts in the past tense** —
-`OrderPlaced`, `PaymentCaptured`, `UserRegistered` — not commands (`PlaceOrder`).
-A command can be rejected; a fact already happened.
+Events are **facts in the past tense** — `OrderPlaced`, `PaymentCaptured` — not commands (`PlaceOrder`). A command can be rejected; a fact already happened.
 
 ### Topics, partitions, consumer groups, offsets
 
-Five concepts carry almost everything. If you've used Kafka from any language these
-are identical — only the client API changes.
-
 | Concept | What it is | Analogy |
 |---|---|---|
-| **Topic** | Named, append-only log of messages | A Go channel name / an event "table" |
+| **Topic** | Named, append-only log of messages | A channel name / an event "table" |
 | **Partition** | One ordered shard of a topic. Order is guaranteed *within* a partition, not across. | A single-writer log file |
 | **Offset** | A message's position in its partition (monotonic int) | Array index / a bookmark |
 | **Key** | Optional bytes; same key → same partition → ordered | Shard key |
-| **Consumer group** | A set of consumers that *share* a topic's partitions; each partition goes to exactly one member | A worker pool with sticky assignment |
+| **Consumer group** | Consumers sharing a topic's partitions; each partition goes to exactly one member | A worker pool with sticky assignment |
 
-Two rules that explain most surprises:
+Two rules that explain most surprises: **ordering is per-partition** (key by `order_id` so one order's events land on the same partition, in sequence), and **parallelism is capped by partition count** (10 consumers on a 6-partition topic leaves 4 idle — pick partitions for your target concurrency up front).
 
-1. **Ordering is per-partition.** Want all events for one order processed in order?
-   Key by `order_id` so they land on the same partition.
-2. **Parallelism is capped by partition count.** A group of 10 consumers on a
-   6-partition topic leaves 4 idle. Pick partitions for your target concurrency up
-   front — they're hard to change later.
-
-<Mermaid title="Topics, partitions & consumer groups" code={`
+<Mermaid title="Producer keys by order_id into 3 partitions; each partition is owned by exactly one group member with its own offset" code={`
 flowchart LR
   Prod["producer<br/>(key = order_id)"]
   subgraph Topic["topic: orders (3 partitions)"]
@@ -127,18 +71,13 @@ flowchart LR
   P2 -->|"owns + own offset"| B
 `} />
 
-The **offset is the only state a consumer keeps.** "Where am I in each partition?"
-Commit it and a restart resumes there; reset it to replay. Everything about
-delivery guarantees comes down to *when* you commit relative to *when* you process.
+The **offset is the only state a consumer keeps** — "where am I in each partition?" Commit it and a restart resumes there; reset it to replay. Delivery guarantees come down to *when* you commit relative to *when* you process.
 
 ## Producing events
 
 ### A typed event model with Pydantic
 
-Don't ship raw dicts onto a topic — once a message is on the log, its shape is a
-contract other services depend on. Model events as Pydantic v2 (see
-[Pydantic](/modern-python/04-pydantic/)) and serialize with `model_dump_json()`,
-which gives you `bytes`-ready JSON and validation on the way back in.
+Don't ship raw dicts onto a topic — a message's shape is a contract other services depend on. Model events as Pydantic v2 (module 04) and serialize with `model_dump_json()`:
 
 ```python title="app/events.py"
 from datetime import datetime, timezone
@@ -162,8 +101,7 @@ class OrderPlaced(BaseModel):
 
 ### `AIOKafkaProducer`
 
-The producer is an async object: `await producer.start()`, send, `await
-producer.stop()`. Serialization is just turning your model into `bytes`.
+The producer is an async object: `await producer.start()`, send, `await producer.stop()`. Serialization is just turning your model into `bytes`:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -231,23 +169,11 @@ async def publish_order(producer: AIOKafkaProducer, event: OrderPlaced) -> None:
   </TabItem>
 </Tabs>
 
-Across all three you build the message and send it yourself — there's no
-framework-magic serializer like the JVM world's `JsonSerializer`. The Python
-difference is that everything is a coroutine: `send_and_wait` returns when the
-broker has acked, so an `await` failing is your delivery error.
-
-:::tip[`send` vs `send_and_wait`]
-`producer.send(...)` returns a future immediately (fire-and-batch — fast, you don't
-know yet if it landed). `producer.send_and_wait(...)` awaits the broker ack. Use
-`send_and_wait` when the caller needs delivery confirmation (e.g. inside a request
-handler); use `send` + batching for high-throughput firehoses where you check
-futures later.
-:::
+`send_and_wait` awaits the broker ack — use it when the caller needs delivery confirmation (inside a request handler); `send` returns a future immediately for high-throughput firehoses where you check futures later.
 
 ### Keys & partitioning
 
-The key decides the partition (`partition = hash(key) % num_partitions`). It's how
-you get ordering where you need it.
+The key decides the partition (`partition = hash(key) % num_partitions`) — how you get ordering where you need it:
 
 | Key | Effect | Use for |
 |---|---|---|
@@ -266,35 +192,23 @@ await producer.send_and_wait("metrics", key=None, value=payload)
 
 ### Delivery semantics & idempotence
 
-Kafka offers three guarantees; you choose with config and commit timing.
-
 | Guarantee | Meaning | How you get it |
 |---|---|---|
 | At-most-once | May lose, never duplicates | Commit offset *before* processing |
 | **At-least-once** | Never lose, may duplicate | Commit *after* processing (the sane default) |
-| Exactly-once | Processed once | Transactions + idempotent consumer (costly — see below) |
+| Exactly-once | Processed once | Transactions + idempotent consumer (costly) |
 
-Set **`enable_idempotence=True`** on the producer (it implies `acks="all"`). This
-stops *producer-side* duplicates: on an internal retry after a network blip, the
-broker dedups by `(producer_id, sequence_number)`, so a flaky connection doesn't
-write the same event twice. It does **not** dedup your application re-sending the
-same logical event — that's your job (give each event an `event_id` and dedup on
-the consumer).
+Set **`enable_idempotence=True`** on the producer (implies `acks="all"`). It stops *producer-side* duplicates — on an internal retry after a network blip, the broker dedups by `(producer_id, sequence_number)`. It does **not** dedup your application re-sending the same logical event — give each event an `event_id` and dedup on the consumer.
 
 :::caution[Idempotent producer ≠ exactly-once pipeline]
-`enable_idempotence=True` is cheap and you should basically always set it. But it
-only covers the producer→broker hop. End-to-end exactly-once (consume → process →
-produce, atomically) needs Kafka transactions, and even then "once" only holds
-*inside Kafka* — the moment you touch Postgres or call an external API, you're back
-to needing an idempotent consumer. Plan for at-least-once and dedup. More below.
+`enable_idempotence=True` is cheap and almost always on, but it only covers the producer→broker hop. End-to-end exactly-once (consume → process → produce, atomically) needs Kafka transactions, and even then "once" holds only *inside Kafka* — the moment you touch Postgres or call an external API, you're back to needing an idempotent consumer. Plan for at-least-once and dedup.
 :::
 
 ## Consuming events
 
 ### `AIOKafkaConsumer` and `async for`
 
-This is where Python's async model shines. A consumer is an async iterator — the
-poll loop you hand-write in `kafkajs` or `sarama` *is* the `async for`.
+The poll loop you hand-write in `kafkajs` or `sarama` *is* the `async for`:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -362,53 +276,34 @@ async def consume() -> None:
   </TabItem>
 </Tabs>
 
-`async for msg in consumer` polls the broker, hands you decoded `ConsumerRecord`s
-(`.key`, `.value`, `.topic`, `.partition`, `.offset`, `.headers`), and never blocks
-the event loop. Other coroutines run between messages. This is the same cold,
-pull-driven iteration from the [Streams](/modern-python/06-streams/) module — a
-Kafka consumer is just an async stream whose source is a partitioned log.
+`async for msg in consumer` hands you `ConsumerRecord`s (`.key`, `.value`, `.topic`, `.partition`, `.offset`, `.headers`) and never blocks the loop. It's the same cold, pull-driven iteration as module 06 — a Kafka consumer is just an async stream whose source is a partitioned log.
 
 ### Manual vs auto commit
 
-The single most important consumer decision. **Commit = "I'm done with everything
-up to this offset; don't redeliver it."**
+**Commit = "I'm done with everything up to this offset; don't redeliver it."** The single most important consumer decision:
 
 | Mode | Config | Guarantee | Risk |
 |---|---|---|---|
 | Auto commit | `enable_auto_commit=True` (timer, default 5s) | At-most-once-ish | Commits on a timer, *not* after processing — crash after commit but before work = **lost message** |
-| **Manual commit** | `enable_auto_commit=False` + `await consumer.commit()` | At-least-once | Crash before commit = **redelivery** (so make handlers idempotent) |
+| **Manual commit** | `enable_auto_commit=False` + `await consumer.commit()` | At-least-once | Crash before commit = **redelivery** (fine if handlers are idempotent) |
 
 ```python
 # Auto-commit trap: the offset advances on a timer regardless of whether
 # handle() finished. A crash mid-handle silently drops the message.
 consumer = AIOKafkaConsumer(..., enable_auto_commit=True)   # convenient, lossy
 
-# Manual: commit only after the work is durably done. Worst case is a
-# redelivery on crash — which is fine if handle() is idempotent.
+# Manual: commit only after the work is durably done.
 consumer = AIOKafkaConsumer(..., enable_auto_commit=False)
 async for msg in consumer:
     await handle(msg)
     await consumer.commit()
 ```
 
-Prefer **manual commit + at-least-once + idempotent handlers**. It's the
-combination that survives crashes without losing data, and it's far simpler to
-reason about than exactly-once.
-
-:::tip[Commit in batches for throughput]
-Committing after *every* message is a round-trip per message. For high throughput,
-process a batch and commit once at the end — you trade a slightly larger
-redelivery window on crash for far fewer commits. `aiokafka`'s `getmany()` fetches
-a batch explicitly when you want that control.
-:::
+Prefer **manual commit + at-least-once + idempotent handlers**. For throughput, process a batch and commit once at the end (`aiokafka`'s `getmany()` fetches a batch explicitly) — you trade a slightly larger redelivery window for far fewer commits.
 
 ### Graceful shutdown
 
-A consumer is a long-running worker — it must stop *cleanly* so it commits offsets
-and leaves the group (triggering a fast rebalance instead of a 10s session
-timeout). This is the same shutdown discipline from
-[Async & Concurrency](/modern-python/05-async-concurrency/): catch the signal,
-break the loop, run cleanup in `finally`.
+A consumer is a long-running worker — stop it cleanly so it commits offsets and leaves the group (fast rebalance, not a 10s session timeout). Catch the signal, break the loop, run cleanup in `finally` (module 05's shutdown discipline):
 
 ```python title="app/worker.py"
 import asyncio
@@ -448,22 +343,15 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-`consumer.stop()` in the `finally` is the whole point: it flushes any pending
-commit and sends a graceful `LeaveGroup`, so Kafka reassigns your partitions in
-milliseconds rather than waiting out the session timeout.
+`consumer.stop()` in the `finally` flushes pending commits and sends a graceful `LeaveGroup`, so Kafka reassigns your partitions in milliseconds.
 
 ## Dead letter queues: never block on a poison message
 
-Some messages will never succeed — malformed JSON, a schema you can't parse, a
-business rule that rejects them forever. These are **poison messages**. If your
-handler just throws and you don't commit, Kafka redelivers the *same* message
-forever and the partition is stuck — head-of-line blocking that halts every good
-message behind it.
+Some messages never succeed — malformed JSON, an unparseable schema, a business rule that rejects them forever. If your handler just throws and you don't commit, Kafka redelivers the *same* message forever and the partition is stuck — head-of-line blocking behind every good message.
 
-The production pattern is **retry transient failures a few times, then divert
-poison messages to a Dead Letter Queue** (a separate topic) and move on.
+The pattern: **retry transient failures a few times, then divert poison messages to a Dead Letter Queue** topic and move on.
 
-<Mermaid title="Retry and dead-letter flow" code={`
+<Mermaid title="handle() ok → commit; transient → retry with backoff; poison or exhausted → orders.DLQ, then commit either way" code={`
 flowchart TB
   Orders["orders"] --> Consumer["consumer"]
   Consumer --> Handle["handle()"]
@@ -475,10 +363,7 @@ flowchart TB
   DLQ --> DLQConsumer["DLQ consumer:<br/>log / store / alert / replay"]
 `} />
 
-Unlike Spring Kafka's `DeadLetterPublishingRecoverer`, `aiokafka` has **no built-in
-DLQ** — you wire it explicitly, which is honestly clearer about what's happening.
-Classify the error, retry the transient ones, and republish the rest to the DLQ
-with the failure reason in headers.
+`aiokafka` has **no built-in DLQ** (unlike Spring Kafka's `DeadLetterPublishingRecoverer`) — you wire it explicitly, which is clearer about what's happening. Classify the error, retry the transient ones, republish the rest to the DLQ with the failure reason in headers:
 
 ```python title="app/dlq.py"
 import asyncio
@@ -536,29 +421,11 @@ async def process_with_retries(event: OrderPlaced) -> None:
             delay *= 2
 ```
 
-Two rules make this robust:
-
-- **Commit no matter what.** Whether the message was processed or parked on the
-  DLQ, you've *dealt with it* — advance the offset so the partition keeps flowing.
-- **Separate poison from transient.** A validation error (`PoisonMessage`) will
-  never succeed; retrying it just wastes the backoff window before the inevitable
-  DLQ. A DB timeout *might* succeed next time — retry those.
-
-:::tip[Retry topics vs in-process retries]
-The in-process backoff above blocks the partition while it sleeps. For
-higher-throughput pipelines, the alternative is **retry topics**: on failure,
-republish to `orders.retry.5s`, `orders.retry.30s`, … (each consumed by a delayed
-consumer) and only land on the DLQ after the chain. This keeps the main topic
-flowing — no message waits behind a retrying one — at the cost of more topics to
-operate. Start in-process; graduate to retry topics when one slow message starts
-hurting throughput.
-:::
+Two rules make this robust: **commit no matter what** (whether processed or parked on the DLQ, you've dealt with it — advance the offset), and **separate poison from transient** (a validation error will never succeed; a DB timeout might). For high-throughput pipelines, graduate from in-process backoff to **retry topics** (`orders.retry.5s`, `orders.retry.30s`…) so one slow message never blocks the main topic.
 
 ## Idempotent consumers (the at-least-once survival kit)
 
-At-least-once means **your handler will occasionally see the same event twice** —
-a redelivery after a crash, a producer resend. The fix isn't exactly-once
-machinery; it's making `handle()` safe to run twice. Two techniques, often combined:
+At-least-once means **your handler will occasionally see the same event twice** — a redelivery after a crash, a producer resend. Make `handle()` safe to run twice:
 
 ```python title="app/idempotency.py"
 # 1. Dedup table: record event_ids you've handled, in the SAME transaction as
@@ -590,17 +457,13 @@ await db.execute(
 )
 ```
 
-The dedup-table approach needs a stable, producer-assigned **`event_id`** (not the
-Kafka offset — a republish to a DLQ or retry topic changes the offset but is the
-same logical event). That's exactly why `OrderPlaced` carries one.
+The dedup-table approach needs a stable, producer-assigned **`event_id`** (not the Kafka offset — a republish to a DLQ or retry topic changes the offset but is the same logical event). That's why `OrderPlaced` carries one.
 
 ### Event sourcing, briefly
 
-A close cousin: instead of storing current state and mutating it, store the
-**stream of events** as the source of truth and derive state by replaying them.
-Kafka's durable, ordered, replayable log is a natural fit for the event store.
+Store the **stream of events** as the source of truth and derive state by replaying them — Kafka's durable, ordered, replayable log is a natural event store:
 
-<Mermaid title="Event sourcing: events fold into projections" code={`
+<Mermaid title="Events are the source of truth; projections are derived by folding/replaying the log and can be rebuilt from offset 0" code={`
 flowchart TB
   subgraph Events["events (source of truth, append-only)"]
     direction LR
@@ -615,42 +478,22 @@ flowchart TB
 `} />
 
 - **Events** are immutable facts; you only ever append.
-- **Projections** (a.k.a. read models) are *derived* views — a consumer folds the
-  event stream into whatever shape a query needs (a Postgres table, a Redis cache).
-  Because they're derived, you can **drop and rebuild** a projection by replaying
-  the log from offset 0, or build a brand-new view of historical data.
-- Projection-building consumers **must be idempotent** — you'll replay events when
-  rebuilding, so applying the same event twice has to be safe.
+- **Projections** (read models) are *derived* — a consumer folds the event stream into whatever shape a query needs (a Postgres table, a Redis cache). Because they're derived, you can **drop and rebuild** a projection by replaying from offset 0, or build a brand-new view of historical data.
+- Projection-building consumers **must be idempotent** — you'll replay events when rebuilding.
 
 :::caution[Honest take on event sourcing and exactly-once]
-Full event sourcing is powerful but it is *not* a free upgrade. You inherit real
-costs: schema evolution on events you can never delete, snapshotting so replays
-don't take forever, eventual consistency between the log and every projection, and
-genuinely hard debugging. Adopt it where the audit log and replayability are the
-product (ledgers, workflow engines) — not as a default architecture.
+Full event sourcing is powerful but not a free upgrade: schema evolution on events you can never delete, snapshotting so replays stay fast, eventual consistency between log and projections, genuinely hard debugging. Adopt it where the audit log and replayability are the product (ledgers, workflow engines) — not as a default architecture.
 
-And on **exactly-once**: Kafka's transactions give you exactly-once *within Kafka*
-(consume-transform-produce, all-or-nothing). The instant a side effect leaves
-Kafka — a row in Postgres, a charge on Stripe, an email — that guarantee evaporates.
-The honest, boring, correct answer for almost every service is **at-least-once
-delivery plus idempotent consumers**. Reach for transactions only for
-Kafka-to-Kafka pipelines that truly can't tolerate a duplicate.
+And on **exactly-once**: Kafka's transactions give you exactly-once *within Kafka* (consume-transform-produce, all-or-nothing). The instant a side effect leaves Kafka — a row in Postgres, a Stripe charge, an email — that guarantee evaporates. The honest answer for almost every service is **at-least-once delivery plus idempotent consumers**. Reach for transactions only for Kafka-to-Kafka pipelines that truly can't tolerate a duplicate.
 :::
 
 ## Schema discipline
 
-A message on a topic is a contract with every current and future consumer. Treat
-event schemas like a public API.
+A message on a topic is a contract with every current and future consumer. Treat event schemas like a public API:
 
-- **Add fields, don't break them.** New fields must have defaults so old consumers
-  (which ignore them) and new messages (which omit them) both deserialize. Pydantic
-  models with defaults give you this for free. Never rename or retype a field —
-  that's a remove + add, and it breaks existing messages on the log.
-- **Be lenient on read.** Configure the model to ignore unknown fields so a
-  newer producer's extra field doesn't crash an older consumer.
-- **Version explicitly.** Carry a `schema_version` on the event (as `OrderPlaced`
-  does). For a truly breaking change, prefer a new versioned topic (`orders.v2`)
-  and run both consumers during migration over silently mutating `v1`.
+- **Add fields, don't break them.** New fields must have defaults so old consumers (which ignore them) and new messages (which omit them) both deserialize — Pydantic defaults give you this free. Never rename or retype a field: that's a remove + add and it breaks existing messages on the log.
+- **Be lenient on read.** `extra="ignore"` so a newer producer's extra field doesn't crash an older consumer.
+- **Version explicitly.** Carry a `schema_version` on the event. For a truly breaking change, prefer a new versioned topic (`orders.v2`) and run both consumers during migration over silently mutating `v1`.
 
 ```python title="app/events.py"
 from pydantic import BaseModel, ConfigDict
@@ -669,24 +512,12 @@ class OrderPlaced(BaseModel):
 ```
 
 :::tip[Schema Registry / Avro — when JSON isn't enough]
-At organizational scale, teams put a **Schema Registry** (Confluent's, or the
-open-source Apicurio) in front of topics with **Avro** or **Protobuf** payloads.
-The registry *enforces* compatibility — a producer literally cannot ship an
-incompatible schema — and Avro is smaller and faster on the wire than JSON. In
-Python you'd use `confluent-kafka`'s `AvroSerializer` for this. It's the right call
-for many teams sharing many topics; it's overkill for a single service learning the
-ropes. Start with versioned Pydantic JSON, adopt a registry when schema drift
-across teams becomes a real problem.
+At organizational scale, teams put a **Schema Registry** (Confluent's, or open-source Apicurio) in front of topics with **Avro** or **Protobuf** payloads — the registry *enforces* compatibility, and Avro is smaller and faster on the wire than JSON (in Python via `confluent-kafka`'s `AvroSerializer`). Right call for many teams sharing many topics; overkill for one service learning the ropes. Start with versioned Pydantic JSON; adopt a registry when schema drift across teams becomes a real problem.
 :::
 
 ## Integrating with FastAPI
 
-The natural question: where does Kafka live in a web app? The answer is split.
-
-**Producer → in the app, via lifespan.** The web process produces events as a side
-effect of handling requests (place an order → emit `OrderPlaced`). Create one
-producer at startup, share it across requests, close it at shutdown — the same
-lifespan pattern you'd use for a DB pool.
+**Producer → in the app, via lifespan.** The web process produces events as a side effect of handling requests (place an order → emit `OrderPlaced`). One producer at startup, shared across requests, closed at shutdown — same lifespan pattern as a DB pool:
 
 ```python title="app/main.py"
 from contextlib import asynccontextmanager
@@ -721,26 +552,9 @@ async def place_order(req: Request) -> dict[str, str]:
     return {"order_id": event.order_id, "status": "accepted"}
 ```
 
-**Consumer → a separate worker process.** Do *not* run the consumer loop inside the
-web process. Why:
-
-- **Different scaling axes.** Web pods scale on request rate; consumers scale on
-  partition count and processing lag. Coupling them wastes resources and caps your
-  consumer parallelism at your web replica count.
-- **`async for` is an infinite loop.** It would fight your request handlers for the
-  event loop, and a slow message would add latency to HTTP traffic.
-- **Independent lifecycle.** You want to deploy, restart, or scale the consumer
-  without bouncing the API, and vice versa.
-
-So the consumer is its own entrypoint — `python -m app.worker` (the `worker.py`
-above) — deployed as a separate Deployment/process that scales independently. The
-web app *writes* to Kafka; the worker *reads*. The order-pipeline sub-project builds
-exactly this split.
+**Consumer → a separate worker process.** Do *not* run the consumer loop inside the web process: web pods scale on request rate, consumers on partition count and lag (coupling them wastes resources and caps consumer parallelism); `async for` is an infinite loop that would fight request handlers for the event loop; and you want to deploy/restart each independently. The consumer is its own entrypoint — `python -m app.worker` — deployed as a separate process. The web app *writes* to Kafka; the worker *reads*. The order-pipeline sub-project builds exactly this split.
 
 ## Practice
-
-Build the real thing: a producer emitting events, a consumer maintaining a
-projection, and retry + dead-letter handling for the messages that go bad.
 
 <CardGrid>
   <LinkCard

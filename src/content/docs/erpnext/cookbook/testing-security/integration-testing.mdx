@@ -1,6 +1,6 @@
 ---
 title: Integration Testing Patterns
-description: Test multi-step business workflows in Frappe, including document lifecycle, GL/stock ledger impacts, scheduled tasks, and workflow transitions.
+description: "Test multi-step business workflows in Frappe — document lifecycle, GL/stock ledger impacts, scheduled tasks, and workflow transitions — with IntegrationTestCase."
 sidebar:
   order: 2
 ---
@@ -9,11 +9,9 @@ import { LinkCard, Steps } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** Test complete business flows: franchise onboarding -> first order -> royalty calculation -> payment.
+**Problem:** Test the complete business flow: franchise onboarding → first order → royalty calculation → payment.
 
-**Solution:** Write an integration test using Frappe's `IntegrationTestCase` class. This class wraps each test method in a database transaction and rolls it back at the end of the test.
-
-Create the test file at `apps/scoopjoy/scoopjoy/tests/test_franchise_onboarding_flow.py`:
+**Solution:** One integration test file on `IntegrationTestCase`, which wraps each test method in a savepoint and rolls back at the end — even submitted documents with GL/SLE entries vanish after the test. Each test is self-contained and creates its own data:
 
 ```python title="apps/scoopjoy/scoopjoy/tests/test_franchise_onboarding_flow.py"
 import frappe
@@ -51,8 +49,7 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
 
     @classmethod
     def _setup_master_data(cls):
-        """Create items and customer needed across all tests."""
-        # Ensure test items exist
+        """Create items needed across all tests."""
         for item_data in [
             {"item_code": "MANGO-SORBET-500ML", "item_name": "Mango Sorbet 500ml",
              "item_group": "Finished Goods", "stock_uom": "Nos", "valuation_rate": 120},
@@ -82,18 +79,16 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
         self.assertEqual(agreement.franchise_outlet, outlet.name)
         self.assertEqual(agreement.status, "Active")
 
-        # Outlet should reflect agreement linkage
         outlet.reload()
         self.assertEqual(outlet.active_agreement, agreement.name)
 
-    # --- Step 2: First Order (Sales Invoice) ---
+    # --- Step 2: First Order (Sales Order) ---
 
     def test_step2_first_sales_order(self):
         """Franchise places first order; verify document lifecycle."""
         outlet = create_test_outlet(outlet_name="Order Flow Outlet")
         agreement = create_test_agreement(outlet=outlet, royalty_percentage=8.0)
 
-        # Create Sales Order
         so = frappe.get_doc(
             {
                 "doctype": "Sales Order",
@@ -101,58 +96,39 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
                 "company": self.COMPANY,
                 "delivery_date": add_days(today(), 3),
                 "items": [
-                    {
-                        "item_code": "MANGO-SORBET-500ML",
-                        "qty": 100,
-                        "rate": 200,
-                        "warehouse": self.WAREHOUSE,
-                    },
-                    {
-                        "item_code": "CHOCO-CONE-PACK6",
-                        "qty": 50,
-                        "rate": 350,
-                        "warehouse": self.WAREHOUSE,
-                    },
+                    {"item_code": "MANGO-SORBET-500ML", "qty": 100, "rate": 200, "warehouse": self.WAREHOUSE},
+                    {"item_code": "CHOCO-CONE-PACK6", "qty": 50, "rate": 350, "warehouse": self.WAREHOUSE},
                 ],
             }
         )
         so.insert(ignore_permissions=True)
 
-        # Test Draft state
-        self.assertEqual(so.docstatus, 0)
+        self.assertEqual(so.docstatus, 0)  # Draft
         self.assertEqual(so.status, "Draft")
 
-        # Submit
         so.submit()
         so.reload()
         self.assertEqual(so.docstatus, 1)
 
-        # Verify totals
         expected_total = (100 * 200) + (50 * 350)  # 37,500
         self.assertEqual(so.grand_total, expected_total)
 
         return so
 
-    # --- Step 3: Document Lifecycle (Submit -> Cancel -> Amend) ---
+    # --- Step 3: Document lifecycle (submit -> cancel -> amend) ---
 
     def test_step3_document_lifecycle(self):
-        """Test full lifecycle: draft -> submit -> cancel -> amend."""
+        """Draft -> submit (GL entries balance) -> cancel (reversal entries) -> amend."""
         outlet = create_test_outlet(outlet_name="Lifecycle Outlet")
         agreement = create_test_agreement(outlet=outlet, royalty_percentage=8.0)
 
-        # Create and submit Sales Invoice
         si = frappe.get_doc(
             {
                 "doctype": "Sales Invoice",
                 "customer": outlet.linked_customer,
                 "company": self.COMPANY,
                 "items": [
-                    {
-                        "item_code": "MANGO-SORBET-500ML",
-                        "qty": 50,
-                        "rate": 200,
-                        "warehouse": self.WAREHOUSE,
-                    },
+                    {"item_code": "MANGO-SORBET-500ML", "qty": 50, "rate": 200, "warehouse": self.WAREHOUSE},
                 ],
                 "update_stock": 1,
             }
@@ -161,7 +137,7 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
         si.submit()
         si.reload()
 
-        # Verify GL entries were created
+        # GL entries created on submit
         gl_entries = frappe.get_all(
             "GL Entry",
             filters={"voucher_no": si.name, "is_cancelled": 0},
@@ -169,17 +145,16 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
         )
         self.assertTrue(len(gl_entries) > 0, "GL entries should be created on submit")
 
-        # Verify debit == credit (accounting equation)
+        # Accounting equation: debit == credit
         total_debit = sum(flt(e.debit) for e in gl_entries)
         total_credit = sum(flt(e.credit) for e in gl_entries)
         self.assertEqual(total_debit, total_credit)
 
-        # Cancel
         si.cancel()
         si.reload()
         self.assertEqual(si.docstatus, 2)
 
-        # Verify cancellation GL entries
+        # Cancellation produced reversal entries
         cancel_gl = frappe.get_all(
             "GL Entry",
             filters={"voucher_no": si.name, "is_cancelled": 1},
@@ -187,7 +162,6 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
         )
         self.assertTrue(len(cancel_gl) > 0, "Cancellation GL entries should exist")
 
-        # Amend
         amended = frappe.copy_doc(si)
         amended.amended_from = si.name
         amended.items[0].qty = 60  # changed quantity
@@ -195,16 +169,13 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
         self.assertEqual(amended.docstatus, 0)  # draft
         self.assertTrue(amended.amended_from)
 
-    # --- Step 4: Royalty Calculation ---
+    # --- Step 4: Royalty calculation ---
 
     def test_step4_royalty_calculation(self):
         """Monthly royalty computed from submitted invoices."""
         outlet = create_test_outlet(outlet_name="Royalty Outlet")
-        agreement = create_test_agreement(
-            outlet=outlet, royalty_percentage=8.0
-        )
+        agreement = create_test_agreement(outlet=outlet, royalty_percentage=8.0)
 
-        # Create two invoices for the month
         for qty, rate in [(100, 200), (50, 350)]:
             si = frappe.get_doc(
                 {
@@ -213,19 +184,13 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
                     "company": self.COMPANY,
                     "posting_date": today(),
                     "items": [
-                        {
-                            "item_code": "MANGO-SORBET-500ML",
-                            "qty": qty,
-                            "rate": rate,
-                            "warehouse": self.WAREHOUSE,
-                        }
+                        {"item_code": "MANGO-SORBET-500ML", "qty": qty, "rate": rate, "warehouse": self.WAREHOUSE}
                     ],
                 }
             )
             si.insert(ignore_permissions=True)
             si.submit()
 
-        # Trigger royalty calculation
         from scoopjoy.scoopjoy.doctype.royalty_invoice.royalty_invoice import (
             generate_monthly_royalty,
         )
@@ -241,46 +206,35 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
         self.assertEqual(flt(royalty.royalty_amount, 2), expected_royalty)
         self.assertEqual(royalty.franchise_outlet, outlet.name)
 
-    # --- Step 5: Stock Ledger Verification ---
+    # --- Step 5: Stock ledger verification ---
 
     def test_step5_stock_ledger_entries(self):
-        """Verify stock ledger entries after delivery."""
+        """Verify stock ledger entries after a Material Receipt."""
         outlet = create_test_outlet(outlet_name="Stock Outlet")
 
-        # Create Stock Entry to add initial stock
         se = frappe.get_doc(
             {
                 "doctype": "Stock Entry",
                 "stock_entry_type": "Material Receipt",
                 "company": self.COMPANY,
                 "items": [
-                    {
-                        "item_code": "MANGO-SORBET-500ML",
-                        "qty": 500,
-                        "t_warehouse": self.WAREHOUSE,
-                        "basic_rate": 120,
-                    }
+                    {"item_code": "MANGO-SORBET-500ML", "qty": 500, "t_warehouse": self.WAREHOUSE, "basic_rate": 120}
                 ],
             }
         )
         se.insert(ignore_permissions=True)
         se.submit()
 
-        # Verify Stock Ledger Entry
         sle = frappe.get_all(
             "Stock Ledger Entry",
-            filters={
-                "voucher_no": se.name,
-                "item_code": "MANGO-SORBET-500ML",
-                "is_cancelled": 0,
-            },
+            filters={"voucher_no": se.name, "item_code": "MANGO-SORBET-500ML", "is_cancelled": 0},
             fields=["actual_qty", "warehouse", "valuation_rate"],
         )
         self.assertEqual(len(sle), 1)
         self.assertEqual(sle[0].actual_qty, 500)
         self.assertEqual(sle[0].warehouse, self.WAREHOUSE)
 
-    # --- Step 6: Testing Scheduled Tasks ---
+    # --- Step 6: Scheduled tasks ---
 
     def test_step6_scheduled_agreement_expiry_check(self):
         """Scheduled task marks expired agreements."""
@@ -296,23 +250,21 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
             status="Active",
         )
 
-        # Run the scheduled task directly
         from scoopjoy.scoopjoy.tasks import check_agreement_expiry
 
-        check_agreement_expiry()
+        check_agreement_expiry()  # call the task directly — no need to wait for the scheduler
 
         agreement.reload()
         self.assertEqual(agreement.status, "Expired")
 
-    # --- Step 7: Simulating Time Passage ---
+    # --- Step 7: Simulating time passage ---
 
     @patch("scoopjoy.scoopjoy.tasks.now_datetime")
     def test_step7_time_based_logic(self, mock_now):
-        """Simulate future date to test time-dependent logic."""
+        """Patch now_datetime to pretend it's 2028."""
         from datetime import datetime
         from scoopjoy.scoopjoy.tasks import check_agreement_expiry
 
-        # Pretend it's 2028
         mock_now.return_value = datetime(2028, 6, 1, 10, 0, 0)
 
         outlet = create_test_outlet(
@@ -330,79 +282,51 @@ class TestFranchiseOnboardingFlow(IntegrationTestCase):
         agreement.reload()
         self.assertEqual(agreement.status, "Expired")
 
-    # --- Step 8: Testing Workflow Transitions ---
+    # --- Step 8: Workflow transitions ---
 
     def test_step8_workflow_transitions(self):
-        """Test workflow: Draft -> Under Review -> Approved -> Active."""
+        """Workflow: Draft -> Under Review -> Approved; Approved -> Draft must fail."""
         outlet = create_test_outlet(
             outlet_name="Workflow Outlet",
             status="Draft",
             do_not_submit=True,
         )
 
-        # Apply workflow transition
         frappe.set_user("Administrator")
-        apply_workflow = frappe.get_doc(
-            {
-                "doctype": "Franchise Outlet",
-                "name": outlet.name,
-            }
-        )
         outlet.reload()
 
-        # Transition: Draft -> Under Review
         outlet.status = "Under Review"
         outlet.save()
         self.assertEqual(outlet.status, "Under Review")
 
-        # Transition: Under Review -> Approved
         outlet.status = "Approved"
         outlet.save()
         self.assertEqual(outlet.status, "Approved")
 
-        # Invalid transition: Approved -> Draft (should fail)
         with self.assertRaises(ValidationError):
             outlet.status = "Draft"
             outlet.save()
 ```
 
-### Test Suite Breakdown
+### What each step covers
 
-<Steps>
+| Step | Asserts |
+|---|---|
+| 1. Onboarding | Outlet + agreement created and cross-linked (`active_agreement`) |
+| 2. First order | Sales Order Draft (docstatus 0) → submit (docstatus 1), `grand_total` math correct |
+| 3. Lifecycle | Submit creates GL entries with debit == credit; cancel creates reversal entries; amend creates a draft |
+| 4. Royalty | `generate_monthly_royalty` computes 8% of 37,500 = 3,000 correctly |
+| 5. Stock ledger | Material Receipt creates one Stock Ledger Entry with correct qty/warehouse |
+| 6. Scheduled task | Calling `check_agreement_expiry()` directly expires past-due agreements |
+| 7. Time travel | `@patch("...now_datetime")` to 2028 drives time-based logic without waiting |
+| 8. Workflow | Legal transitions save; Approved → Draft raises `ValidationError` |
 
-1. **Setup Master Data**
-   The `setUpClass` method runs once before any tests are executed. We use `_setup_master_data` to ensure core items (`MANGO-SORBET-500ML` and `CHOCO-CONE-PACK6`) exist. `EXTRA_TEST_RECORD_DEPENDENCIES` specifies that standard mock records for `Item`, `Customer`, `Warehouse`, `Company`, `Cost Center`, and `Account` should be loaded before tests run.
-
-2. **Franchise Onboarding**
-   `test_step1_outlet_creation_and_agreement` ensures that when a new franchise outlet is created, we can bind it to a signed franchise agreement, verifying the statuses and active agreement links.
-
-3. **First Sales Order**
-   `test_step2_first_sales_order` creates a `Sales Order` in `Draft` state (docstatus `0`), submits it (docstatus `1`), and verifies that the `grand_total` math matches the expected item totals.
-
-4. **Document Lifecycle Transitions**
-   `test_step3_document_lifecycle` tests the full lifecycle of a `Sales Invoice`: inserting, submitting, checking that corresponding General Ledger (GL) entries balance, cancelling (which reverses the GL entries), and creating an amended draft.
-
-5. **Royalty Calculation**
-   `test_step4_royalty_calculation` posts multiple invoices for an outlet and verifies that our custom utility `generate_monthly_royalty` calculates the franchise royalty percentage correctly.
-
-6. **Stock Ledger Verification**
-   `test_step5_stock_ledger_entries` inserts a stock receipt via a `Stock Entry` and verifies that the transaction creates a corresponding `Stock Ledger Entry` with the correct quantities and valuations.
-
-7. **Scheduled Tasks**
-   `test_step6_scheduled_agreement_expiry_check` executes a background task directly to ensure it correctly transitions agreements past their end date to `Expired`.
-
-8. **Simulating Time Passage**
-   `test_step7_time_based_logic` patches `now_datetime` to pretend we are in the year 2028, verifying that the expiry scheduled task executes correctly in the "future".
-
-9. **Workflow Transitions**
-   `test_step8_workflow_transitions` tests permissions and transitions of a custom document state machine (`Draft -> Under Review -> Approved`). It also verifies that invalid transitions (like moving from `Approved` back to `Draft`) raise a `ValidationError`.
-
-</Steps>
+`EXTRA_TEST_RECORD_DEPENDENCIES` loads standard mock records (Item, Customer, Warehouse, Company, Cost Center, Account) before the tests run.
 
 :::note[Why this works]
-Each test method covers one step in the business flow but is self-contained (creates its own data). `IntegrationTestCase` wraps each test in a savepoint, so even submitted documents with GL/SLE entries get rolled back. The `@patch` decorator lets you control time-dependent logic without waiting.
+Each test method covers one step of the business flow but is self-contained (creates its own data). `IntegrationTestCase` wraps each test in a savepoint, so even submitted documents with GL/SLE entries get rolled back. `@patch` controls time-dependent logic without waiting.
 :::
 
 :::caution[Common mistake]
-Forgetting to call `doc.reload()` after submit/cancel — the in-memory object does not reflect server-side changes (like auto-generated GL entries or status updates from controller hooks).
+Forgetting `doc.reload()` after submit/cancel — the in-memory object doesn't reflect server-side changes (auto-generated GL entries, status updates from controller hooks).
 :::

@@ -1,6 +1,6 @@
 ---
 title: Bulk Data Operations
-description: Import tens of thousands of records into Frappe with chunked inserts, validation, progress tracking, and error reporting.
+description: "Import tens of thousands of records with chunked bulk_insert, a separate validation pass, progress over realtime, and a downloadable error report."
 sidebar:
   order: 8
 ---
@@ -9,35 +9,22 @@ import { LinkCard, FileTree, Steps } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** Import 50,000 historical ScoopJoy transactions from a CSV file
-without timing out, crashing, or corrupting data.
+**Problem:** Import 50,000 historical ScoopJoy transactions from a CSV without timing out, crashing, or corrupting data.
 
-**Solution:** A complete bulk import pipeline with chunked processing, progress
-tracking, validation, and error reporting. The work happens in three files: a
-server-side import pipeline, a benchmark to prove the throughput, and a client
-page that triggers the job and shows progress.
+**Solution:** A bulk import pipeline running in a `long`-queue background job: read the CSV streaming, validate every row in a separate pass (abort if >10% fail), insert survivors in chunks of 1,000 with `bulk_insert`, fall back to row-by-row only when a chunk fails. Three files: the server pipeline, a benchmark, and a client page with a progress bar.
 
 <FileTree>
 - scoopjoy/scoopjoy/
   - utils/
-    - **bulk_import.py** the import pipeline (validate → chunk → insert)
-    - bulk_benchmark.py compares insert methods
+    - **bulk_import.py** — the import pipeline (validate → chunk → insert)
+    - bulk_benchmark.py — compares insert methods
   - public/js/
-    - bulk_import.js the trigger page with a progress bar
+    - bulk_import.js — the trigger page with a progress bar
 </FileTree>
 
 ## The import pipeline
 
-The whole job runs in a background worker so an HTTP request never blocks on a
-50,000-row import. In Express you would push this onto a Bull queue; in Frappe
-you hand it to `frappe.enqueue` on the `long` queue. The pipeline reads the CSV,
-validates every row in a separate pass, then inserts the survivors in chunks —
-falling back to row-by-row only when a chunk fails, so one bad row never sinks
-the whole batch.
-
-The entry point is whitelisted and only enqueues — it returns immediately. Note
-the `frappe.has_permission(...)` gate: `bulk_insert` skips permission checks, so
-you must check up front yourself.
+The whitelisted entry point only enqueues and returns immediately. Note the `frappe.has_permission(...)` gate up front — `bulk_insert` skips permission checks, so you must check yourself:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_import.py" {15-20}
 import frappe
@@ -66,9 +53,7 @@ def enqueue_bulk_import(file_url):
     return {"status": "queued", "message": "Import job has been queued. Check progress bar."}
 ```
 
-The worker function orchestrates the four steps. The abort threshold is the key
-safety valve: if more than 10% of rows fail validation, the import bails out
-before inserting anything rather than committing a half-broken dataset.
+The worker orchestrates four steps. The abort threshold is the safety valve: if more than 10% of rows fail validation, the import bails before inserting anything:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_import.py" {18-23,28-37}
 def run_bulk_import(file_url):
@@ -86,7 +71,7 @@ def run_bulk_import(file_url):
         if len(errors) > len(valid_rows) * 0.1:  # >10% error rate
             frappe.publish_progress(
                 100, title="Bulk Import",
-                description=f"Aborted: {len(errors)} validation errors (>{10}% threshold)"
+                description=f"Aborted: {len(errors)} validation errors (>10% threshold)"
             )
             return
 
@@ -125,12 +110,11 @@ def run_bulk_import(file_url):
     )
 ```
 
-Reading the CSV is streamed — the `DictReader` iterates rather than slurping the
-whole file, with a hard cap at 100,000 rows as a runaway guard.
+CSV reading is streamed (the `DictReader` iterates rather than slurping the file), with a hard cap at 100,000 rows as a runaway guard:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_import.py"
 def _read_csv_streaming(file_url):
-    """Memory-efficient CSV reading -- iterate, don't load all at once."""
+    """Memory-efficient CSV reading — iterate, don't load all at once."""
     file_doc = frappe.get_doc("File", {"file_url": file_url})
     file_path = file_doc.get_full_path()
 
@@ -148,9 +132,7 @@ def _read_csv_streaming(file_url):
     return rows
 ```
 
-Validation runs as a single pass over all rows. The trick to keeping it fast is
-pre-fetching the valid link targets (outlets, items, customers) into Python sets
-once, so each row checks membership in memory instead of hitting the database.
+Validation is a single pass over all rows. The speed trick: pre-fetch the valid link targets (outlets, items, customers) into Python sets once, so each row checks membership in memory instead of hitting the database:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_import.py" {10-12}
 def _validate_rows(rows):
@@ -208,17 +190,13 @@ def _validate_rows(rows):
     return valid, errors
 ```
 
-The fast path is `_insert_chunk`. It builds in-memory docs, stamps the fields
-that `bulk_insert` will not generate for you (`name`, `creation`, `modified`,
-`owner`, `modified_by`), then writes them in one shot. `bulk_insert` skips
-hooks, autoname, and validation — that is exactly why it is fast, and why the
-separate validation pass above is mandatory.
+The fast path is `_insert_chunk`. It builds in-memory docs, stamps the fields `bulk_insert` will not generate for you (`name`, `creation`, `modified`, `owner`, `modified_by`), then writes them in one shot. `bulk_insert` skips hooks, autoname, and validation — that's exactly why it's fast, and why the separate validation pass is mandatory:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_import.py" {22-27,30-31}
 def _insert_chunk(chunk):
     """
     Bulk insert a chunk using frappe's bulk_insert.
-    No hooks, no validation -- raw speed.
+    No hooks, no validation — raw speed.
     """
     docs = []
     timestamp = now()
@@ -250,9 +228,7 @@ def _insert_chunk(chunk):
     frappe.db.commit()
 ```
 
-When a chunk insert throws, the pipeline drops to `_insert_chunk_safe`, which
-inserts row by row through the normal ORM so it can pinpoint and skip the
-offending rows while keeping the good ones.
+When a chunk insert throws, the pipeline drops to `_insert_chunk_safe`, which inserts row by row through the normal ORM so it can pinpoint and skip the offending rows while keeping the good ones:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_import.py"
 def _insert_chunk_safe(chunk):
@@ -285,9 +261,7 @@ def _insert_chunk_safe(chunk):
     return inserted, errors
 ```
 
-Validation failures are written to a downloadable CSV and pushed to the user
-over realtime, so the importer gets an actionable error report instead of a
-silent partial import.
+Validation failures are written to a downloadable CSV and pushed to the user over realtime — an actionable error report instead of a silent partial import:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_import.py"
 def _report_validation_errors(errors):
@@ -306,7 +280,6 @@ def _report_validation_errors(errors):
             err["data"].get("item_code", ""),
         ])
 
-    # Save as a file
     content = output.getvalue()
     file_doc = frappe.get_doc({
         "doctype": "File",
@@ -324,7 +297,7 @@ def _report_validation_errors(errors):
 
 
 def _create_import_log(total, inserted, validation_errors, insert_errors):
-    """Create a log document for audit trail."""
+    """Create a log document for the audit trail."""
     frappe.get_doc({
         "doctype": "Comment",
         "comment_type": "Info",
@@ -344,9 +317,7 @@ def _create_import_log(total, inserted, validation_errors, insert_errors):
 
 ## Benchmark: insert methods compared
 
-To prove the throughput claim, this script races three approaches over the same
-record count. Run it from the bench console to see the numbers on your own
-hardware.
+Run from the bench console to see the numbers on your own hardware:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_benchmark.py"
 import frappe
@@ -422,7 +393,6 @@ def benchmark_insert_methods(n=5000):
             1, 100, 100, timestamp, timestamp, "Administrator", "Administrator"
         ))
 
-    # Insert in chunks
     for j in range(0, len(values), 1000):
         chunk = values[j:j + 1000]
         placeholders = ", ".join(["%s"] * len(chunk[0]))
@@ -449,9 +419,7 @@ def benchmark_insert_methods(n=5000):
     return results
 ```
 
-The relative ordering is the lesson: raw `executemany` is fastest, `bulk_insert`
-is a close and far more ergonomic second, and a `doc.insert()` loop is roughly
-**30x slower** because it pays ORM, hook, and autoname overhead on every row.
+The ordering is the lesson — raw `executemany` is fastest, `bulk_insert` is a close and far more ergonomic second, and a `doc.insert()` loop is ~30x slower because it pays ORM, hook, and autoname overhead per row:
 
 ```text title="Benchmark output"
 Benchmark: 5000 records
@@ -468,10 +436,7 @@ For 50,000 records:
 
 ## Client-side: trigger the import with a progress bar
 
-A custom Desk page provides the upload field and start button. The whitelisted
-method returns instantly; progress streams in over the realtime channel that
-`frappe.publish_progress` writes to, and the `bulk_import_errors` listener
-surfaces the downloadable error report when validation finds problems.
+A custom Desk page provides the upload field and start button. The whitelisted method returns instantly; progress streams over the realtime channel that `frappe.publish_progress` writes to, and the `bulk_import_errors` listener surfaces the downloadable error report:
 
 ```javascript title="scoopjoy/scoopjoy/public/js/bulk_import.js" {30-39}
 frappe.pages["bulk-import"].on_page_load = function (wrapper) {
@@ -524,29 +489,22 @@ frappe.pages["bulk-import"].on_page_load = function (wrapper) {
 ```
 
 :::note[Why this works]
-`bulk_insert` bypasses Frappe's ORM overhead — no hooks, no autoname, no
-permission checks — for maximum throughput. The chunked approach prevents memory
-exhaustion: at 1000 records per chunk, memory usage stays flat regardless of
-total import size. The separate validation pass catches errors before any
-inserts happen, avoiding partial imports.
+`bulk_insert` bypasses Frappe's ORM overhead — no hooks, no autoname, no permission checks — for maximum throughput. Chunking at 1,000 records keeps memory flat regardless of import size. The separate validation pass catches errors before any inserts, avoiding partial imports.
 :::
 
 :::caution[Common mistake]
-Calling `frappe.db.commit()` after every single insert. Each commit forces a
-disk sync (fsync). Committing once per chunk (1000 rows) is 1000x fewer fsyncs.
-But don't skip commits entirely — if the worker crashes after 49,000 rows, you
-lose everything.
+Calling `frappe.db.commit()` after every single insert — each commit forces an fsync. Committing once per chunk (1,000 rows) is 1,000x fewer fsyncs. But don't skip commits entirely: if the worker crashes after 49,000 rows, you lose everything.
 :::
 
 ## Quick reference: performance checklist
 
 | Symptom | Diagnosis | Recipe |
 |---|---|---|
-| Page loads slowly | N+1 queries in server log | [5.5](/erpnext/cookbook/queries-performance/n-plus-1-elimination/) |
-| Report takes 10+ seconds | Full table scan (check EXPLAIN) | [5.6](/erpnext/cookbook/queries-performance/database-indexing/) |
-| Dashboard query is inherently expensive | Need pre-aggregated data | [5.7](/erpnext/cookbook/queries-performance/materialized-view/) |
-| Same expensive query runs repeatedly | Add caching layer | [5.4](/erpnext/cookbook/queries-performance/redis-caching/) |
-| Bulk import times out | Using `doc.insert()` in a loop | [5.8](/erpnext/cookbook/queries-performance/bulk-data-operations/) |
-| Complex query is hard to maintain as raw SQL | Use `frappe.qb` | [5.1](/erpnext/cookbook/queries-performance/query-builder/) |
-| Need a visual report with charts | Script Report | [5.2](/erpnext/cookbook/queries-performance/script-report-scorecard/) |
-| Need a quick SQL-based report | Query Report | [5.3](/erpnext/cookbook/queries-reports-performance/query-reports-sql/) |
+| Page loads slowly | N+1 queries in server log | [N+1 Elimination](/erpnext/cookbook/queries-performance/n-plus-1-elimination/) |
+| Report takes 10+ seconds | Full table scan (check EXPLAIN) | [Database Indexing](/erpnext/cookbook/queries-performance/database-indexing/) |
+| Dashboard query is inherently expensive | Need pre-aggregated data | [Materialized View](/erpnext/cookbook/queries-performance/materialized-view/) |
+| Same expensive query runs repeatedly | Add a caching layer | [Redis Caching](/erpnext/cookbook/queries-performance/redis-caching/) |
+| Bulk import times out | Using `doc.insert()` in a loop | [Bulk Data Operations](/erpnext/cookbook/queries-performance/bulk-data-operations/) |
+| Complex query is hard to maintain as raw SQL | Use `frappe.qb` | [Query Builder](/erpnext/cookbook/queries-performance/query-builder/) |
+| Need a visual report with charts | Script Report | [Script Report Scorecard](/erpnext/cookbook/queries-performance/script-report-scorecard/) |
+| Need a quick SQL-based report | Query Report | [Query Reports (SQL)](/erpnext/cookbook/queries-performance/query-reports-sql/) |

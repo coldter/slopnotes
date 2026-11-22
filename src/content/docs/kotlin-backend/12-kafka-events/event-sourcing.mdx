@@ -1,6 +1,6 @@
 ---
 title: Event Sourcing Lite
-description: Build an event-sourced bank account where every state change is a Kafka event, replayed into a PostgreSQL read model.
+description: "Build an event-sourced bank account where every state change is a Kafka event replayed into a PostgreSQL read model."
 sidebar:
   order: 2
 ---
@@ -13,27 +13,13 @@ import { Tabs, TabItem, Steps, FileTree, LinkCard } from "@astrojs/starlight/com
   href="/kotlin-backend/12-kafka-events/"
 />
 
-## Goal
-
-Build a small event-sourced system: every change to a bank account is an
-immutable event published to Kafka, and the account's "current state" is a
-**projection** rebuilt by replaying those events into a PostgreSQL read model.
-Nothing mutates a row in place — the event stream is the source of truth, and the
-projection is just a cache you can throw away and rebuild.
-
-If you're coming from a CRUD-with-an-ORM background, this is the inversion: instead
-of `UPDATE accounts SET balance = ?`, you append a `MoneyDeposited` event and let a
-consumer fold it into the read model. The log is the database.
+Model a bank account as an append-only stream of Kafka events. The "current state" is a **projection** rebuilt by replaying events into Postgres — the log is the source of truth, the projection is a disposable cache.
 
 ## How it fits together
 
-Commands hit a REST API, the command handler validates them against the current
-projection and emits events to a Kafka topic. A projector consumes that topic,
-writes each event to an append-only `event_log`, and updates the
-`account_projections` read model. Queries read from the projection, never from the
-log.
+Commands hit a REST API → validate against the projection → emit events to Kafka. A projector consumes the topic, appends to an `event_log`, and folds each event into `account_projections`. Queries read the projection, never the log.
 
-<Mermaid title="Event-sourcing flow" code={`
+<Mermaid title="Event-sourcing flow — POST returns 202, projector folds events into the read model async" code={`
 flowchart LR
   C["REST client"] -->|"POST /api/accounts/{id}/deposit"| H["Command Handler"]
   H -->|"validate vs projection"| H
@@ -44,32 +30,22 @@ flowchart LR
   Q["GET /api/accounts/{id}"] --> R
 `} height={420} />
 
-:::note
-Writes are **asynchronous**. A `POST` returns `202 Accepted` with status
-`PROCESSING` the instant the event is published — the projection catches up a
-moment later when the consumer processes it. This is the read-your-writes caveat
-of event sourcing, and it's why every command endpoint here returns `202`, not
-`200`.
+:::note[Async writes]
+POST returns `202 Accepted` the instant the event is published — the projection catches up when the consumer processes it. Every command endpoint returns `202`, not `200`.
 :::
 
 ## Requirements
 
 <Steps>
 
-1. Define the domain events: `AccountCreated`, `MoneyDeposited`, `MoneyWithdrawn`,
-   `AccountClosed`.
-2. Implement a command handler that validates each command and publishes an event
-   to Kafka.
-3. Implement a projector that consumes events and updates the
-   `account_projections` table.
-4. Store every event in an append-only `event_log` table.
-5. Serve the query endpoint from the projection table, not the event log.
-6. Make the consumer **idempotent** — replaying the same event must not double the
-   balance (use topic-partition-offset as a stable event ID).
+1. Define domain events: `AccountCreated`, `MoneyDeposited`, `MoneyWithdrawn`, `AccountClosed`.
+2. Command handler validates each command and publishes an event to Kafka.
+3. Projector consumes events and updates `account_projections`.
+4. Store every event in an append-only `event_log`.
+5. Serve queries from the projection, not the log.
+6. Make the consumer idempotent — replaying the same event must not double the balance (use topic-partition-offset as a stable event ID).
 
 </Steps>
-
-The REST surface:
 
 | Method | URL | Description |
 |---|---|---|
@@ -77,13 +53,10 @@ The REST surface:
 | POST | `/api/accounts/{id}/deposit` | Deposit money |
 | POST | `/api/accounts/{id}/withdraw` | Withdraw money |
 | POST | `/api/accounts/{id}/close` | Close the account |
-| GET | `/api/accounts/{id}` | Current account state (from the projection) |
-| GET | `/api/accounts/{id}/events` | Event history for an account |
+| GET | `/api/accounts/{id}` | Current state (from projection) |
+| GET | `/api/accounts/{id}/events` | Event history |
 
 ## The worked solution
-
-A single Spring Boot module. The event definitions, command handler, and projector
-are the interesting parts; the controller and repository are thin glue.
 
 <FileTree>
 - event-sourcing/
@@ -105,11 +78,7 @@ are the interesting parts; the controller and repository are thin glue.
 
 ### The events
 
-The four state changes are modelled as a `sealed class` hierarchy — Kotlin's answer
-to a TypeScript discriminated union or a Go interface with a fixed set of
-implementers. Because the set is closed, the `when` in the projector can be checked
-for exhaustiveness by the compiler. Every event carries an `accountId` and a
-`timestamp`; the rest of the fields are event-specific.
+A `sealed class` hierarchy — the `when` in the projector is compiler-checked for exhaustiveness.
 
 ```kotlin title="src/main/kotlin/com/example/event/AccountEvent.kt"
 package com.example.event
@@ -147,9 +116,9 @@ data class AccountClosed(
 ) : AccountEvent()
 ```
 
-These travel over Kafka as JSON. Spring's `JsonSerializer` writes a type header so
-the matching `JsonDeserializer` can rebuild the concrete subclass on the consumer
-side — that's why `application.yml` trusts `com.example.*`:
+### application.yml
+
+Events travel as JSON with a type header. The account id is the Kafka key, so all events for one account land on the same partition and process in order.
 
 ```yaml title="src/main/resources/application.yml" {16-26}
 server:
@@ -182,10 +151,6 @@ spring:
       ack-mode: record
 ```
 
-The account key is the Kafka message key, so all events for one account land on the
-same partition and are processed **in order** — essential when balance changes
-depend on prior ones. The topic is declared with 6 partitions:
-
 ```kotlin title="src/main/kotlin/com/example/config/KafkaConfig.kt"
 @Configuration
 class KafkaConfig {
@@ -205,11 +170,7 @@ class KafkaConfig {
 
 ### The command handler (write side)
 
-The command handler is the only place that validates business rules. It reads the
-**current state from the projection** (via the repository), checks the invariants,
-and — only if they hold — publishes an event. Note what it does *not* do: it never
-writes the balance itself. The new balance only exists once the projector has
-consumed the event.
+Validates against the current projection, then publishes an event. It never writes the balance itself — the projector does.
 
 ```kotlin title="src/main/kotlin/com/example/producer/AccountCommandHandler.kt" {15-21,28-37,39-49}
 package com.example.producer
@@ -229,8 +190,8 @@ class AccountCommandHandler(
 
     fun createAccount(ownerId: String, ownerName: String): String {
         val accountId = UUID.randomUUID().toString()
-        val event = AccountCreated(accountId, ownerId, ownerName)
-        kafkaTemplate.send(KafkaConfig.ACCOUNT_EVENTS_TOPIC, accountId, event)
+        kafkaTemplate.send(KafkaConfig.ACCOUNT_EVENTS_TOPIC, accountId,
+            AccountCreated(accountId, ownerId, ownerName))
         return accountId
     }
 
@@ -239,10 +200,8 @@ class AccountCommandHandler(
         val acct = accounts.findById(accountId)
             .orElseThrow { IllegalArgumentException("Account not found") }
         require(acct.status != "CLOSED") { "Account is closed" }
-        kafkaTemplate.send(
-            KafkaConfig.ACCOUNT_EVENTS_TOPIC, accountId,
-            MoneyDeposited(accountId, amount)
-        )
+        kafkaTemplate.send(KafkaConfig.ACCOUNT_EVENTS_TOPIC, accountId,
+            MoneyDeposited(accountId, amount))
     }
 
     fun withdraw(accountId: String, amount: Double) {
@@ -251,34 +210,21 @@ class AccountCommandHandler(
             .orElseThrow { IllegalArgumentException("Account not found") }
         require(acct.status != "CLOSED") { "Account is closed" }
         require(acct.balance >= amount) { "Insufficient funds" }
-        kafkaTemplate.send(
-            KafkaConfig.ACCOUNT_EVENTS_TOPIC, accountId,
-            MoneyWithdrawn(accountId, amount)
-        )
+        kafkaTemplate.send(KafkaConfig.ACCOUNT_EVENTS_TOPIC, accountId,
+            MoneyWithdrawn(accountId, amount))
     }
 
     fun closeAccount(accountId: String, reason: String) {
         val acct = accounts.findById(accountId)
             .orElseThrow { IllegalArgumentException("Account not found") }
         require(acct.status != "CLOSED") { "Account already closed" }
-        kafkaTemplate.send(
-            KafkaConfig.ACCOUNT_EVENTS_TOPIC, accountId,
-            AccountClosed(accountId, reason)
-        )
+        kafkaTemplate.send(KafkaConfig.ACCOUNT_EVENTS_TOPIC, accountId,
+            AccountClosed(accountId, reason))
     }
 }
 ```
 
-`require(condition) { "message" }` is Kotlin's argument-precondition helper: it
-throws `IllegalArgumentException` with that message when the condition is false —
-the idiomatic guard clause, like an early `throw new Error(...)` in TS or
-`if !ok { return err }` in Go.
-
 ### The projection (read model)
-
-The read model is a plain JPA entity. Its fields are `var` (mutable) because the
-projector folds events into it; the events themselves are immutable, the projection
-is the running total.
 
 ```kotlin title="src/main/kotlin/com/example/model/AccountProjection.kt"
 @Entity
@@ -301,10 +247,7 @@ interface AccountRepository : JpaRepository<AccountProjection, String>
 
 ### The projector (consume + project)
 
-This is the heart of the system. The `@KafkaListener` receives each `AccountEvent`,
-**deduplicates** it by its topic-partition-offset, appends it to `event_log`, then
-folds it into the projection. The `when (event)` is exhaustive over the sealed
-hierarchy, so adding a new event type later is a compile error until you handle it.
+Deduplicates by topic-partition-offset, appends to `event_log`, then folds into the projection.
 
 ```kotlin title="src/main/kotlin/com/example/consumer/AccountProjector.kt" {19-27,31-36,46-49,55-58}
 package com.example.consumer
@@ -342,8 +285,7 @@ class AccountProjector(
 
         when (event) {                                  // fold into the read model
             is AccountCreated -> accounts.save(
-                AccountProjection(event.accountId, event.ownerId, event.ownerName)
-            )
+                AccountProjection(event.accountId, event.ownerId, event.ownerName))
             is MoneyDeposited -> update(event.accountId) { it.balance += event.amount }
             is MoneyWithdrawn -> update(event.accountId) { it.balance -= event.amount }
             is AccountClosed -> update(event.accountId) { it.status = "CLOSED" }
@@ -360,18 +302,9 @@ class AccountProjector(
 }
 ```
 
-The idempotency trick is the key takeaway. Kafka guarantees *at-least-once*
-delivery, so the same event can arrive twice (a rebalance, a redeployment with
-`auto-offset-reset: earliest`, a manual replay). The `(topic, partition, offset)`
-triple uniquely identifies a delivered record, so storing it as a `UNIQUE` column
-lets the consumer skip anything it has already applied — without that guard, a
-replay would deposit the money twice.
+Kafka guarantees at-least-once delivery, so the same event can arrive twice. The `(topic, partition, offset)` triple uniquely identifies a record — storing it as a `UNIQUE` column lets the consumer skip already-applied events.
 
 ### The append-only log
-
-Flyway creates two tables. `account_projections` is the disposable read model;
-`event_log` is the durable source of truth — append-only, with the `event_id`
-`UNIQUE` constraint backing the idempotency check.
 
 ```sql title="src/main/resources/db/migration/V1__create_account_projections.sql"
 CREATE TABLE IF NOT EXISTS account_projections (
@@ -398,17 +331,11 @@ CREATE INDEX idx_event_log_account_id ON event_log(account_id);
 CREATE INDEX idx_event_log_timestamp ON event_log(timestamp);
 ```
 
-:::tip[Why keep the log at all?]
-Because you can **rebuild the projection from scratch** by replaying `event_log`
-through the same `when` fold. Got a bug in the balance math? Fix the projector, drop
-`account_projections`, replay the log, done. The read model is derived data; the
-events are the truth. That's the whole pitch of event sourcing.
+:::tip[Why keep the log?]
+Rebuild the projection from scratch by replaying `event_log` through the same `when` fold. Fix a balance bug → drop `account_projections`, replay, done. The read model is derived data; the events are the truth.
 :::
 
 ### The controller
-
-Thin glue: parse the request, call the command handler, return `202 Accepted`.
-Queries read straight from the repository (the projection), never from the log.
 
 ```kotlin title="src/main/kotlin/com/example/controller/AccountController.kt" {21-27,53-61}
 @RestController
@@ -426,9 +353,8 @@ class AccountController(
     @PostMapping
     fun createAccount(@RequestBody request: CreateAccountRequest): ResponseEntity<Map<String, String>> {
         val accountId = commandHandler.createAccount(request.ownerId, request.ownerName)
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(
-            mapOf("accountId" to accountId, "status" to "PROCESSING")
-        )
+        return ResponseEntity.status(HttpStatus.ACCEPTED)
+            .body(mapOf("accountId" to accountId, "status" to "PROCESSING"))
     }
 
     @PostMapping("/{id}/deposit")
@@ -464,10 +390,6 @@ class AccountController(
 
 ## Run and test
 
-This exercise needs Kafka and PostgreSQL running. Bring them up from the shared
-infra stack first (see the [Event-Driven with Kafka](/kotlin-backend/12-kafka-events/)
-module for the full setup).
-
 <Steps>
 
 1. Start the infrastructure:
@@ -477,13 +399,13 @@ module for the full setup).
    docker compose up -d postgres kafka kafka-ui
    ```
 
-2. Run the app (starts on port 8086):
+2. Run the app (port 8086):
 
    ```bash
    ./gradlew bootRun
    ```
 
-3. Create an account — the response gives you the `accountId`:
+3. Create an account:
 
    ```bash
    curl -X POST http://localhost:8086/api/accounts \
@@ -491,7 +413,7 @@ module for the full setup).
      -d '{"ownerId": "user-1", "ownerName": "Alice"}'
    ```
 
-4. Deposit and withdraw (substitute the real `id`):
+4. Deposit and withdraw:
 
    ```bash
    curl -X POST http://localhost:8086/api/accounts/{id}/deposit \
@@ -501,8 +423,7 @@ module for the full setup).
      -H "Content-Type: application/json" -d '{"amount": 25.50}'
    ```
 
-5. Read the current state (from the projection) and the event history (from the
-   log):
+5. Read the state and event history:
 
    ```bash
    curl http://localhost:8086/api/accounts/{id}
@@ -511,18 +432,13 @@ module for the full setup).
 
 </Steps>
 
-:::note
-Give the projector a beat after each `POST`. The command returns `202` before the
-event has been consumed, so a `GET` fired immediately after may show the previous
-balance — the read model is eventually consistent with the log.
+:::note[Give the projector a beat after each POST]
+The command returns `202` before the event is consumed, so a `GET` fired immediately may show the previous balance — the read model is eventually consistent.
 :::
 
 :::tip[Stretch goals]
-- Add a `GET /api/accounts/{id}/rebuild` that drops the projection row and replays
-  `event_log` to reconstruct it — proof the log is the source of truth.
+- Add `GET /api/accounts/{id}/rebuild` that drops the projection row and replays `event_log`.
 - Snapshot the projection every N events so replay doesn't start from zero.
-- Add an `optimistic` version column to `account_projections` and reject commands
-  built on stale state (full optimistic concurrency).
-- Emit a `MoneyTransferred` saga spanning two accounts and keep it consistent across
-  partitions.
+- Add an optimistic version column and reject commands built on stale state.
+- Emit a `MoneyTransferred` saga spanning two accounts.
 :::

@@ -1,6 +1,6 @@
 ---
 title: File Upload & Processing Pipeline
-description: Accept CSV uploads, validate and process them in a background worker, and stream live progress back to the browser over WebSocket.
+description: "Accept CSV uploads, validate and batch them into Sales Invoices on a long-queue worker, and stream progress to the browser over Socket.IO."
 sidebar:
   order: 6
 ---
@@ -10,17 +10,11 @@ import Mermaid from "~/components/Mermaid.astro";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** ScoopJoy outlets submit daily sales as CSV files. You need to accept
-each upload, validate it, turn the rows into Sales Invoices in bulk, and report
-progress and errors back to the uploader without timing out the request.
+**Problem:** Outlets submit daily sales as CSV. Accept each upload, validate it, turn rows into Sales Invoices in bulk, and report progress without timing out the request.
 
-**Solution:** Split the work into four pieces — a thin upload endpoint that accepts
-the file and enqueues a job, a background worker that parses and posts invoices, a
-real-time progress channel over WebSocket, and a status endpoint the client can
-poll. The endpoint returns a `job_id` immediately; the heavy lifting happens on a
-`long` queue worker.
+**Solution:** Four pieces — a thin upload endpoint that saves the file and enqueues a job, a `long`-queue worker that parses and posts invoices, a realtime progress channel over Socket.IO, and a status endpoint the client polls. The endpoint returns a `job_id` immediately.
 
-<Mermaid title="Bulk upload pipeline" height={420} code={`
+<Mermaid title="Upload pipeline: endpoint → File + long queue → worker → invoices, progress over Socket.IO, status from Redis" height={420} code={`
 flowchart LR
   C["Outlet client"] -->|"POST CSV + outlet"| EP["Upload endpoint"]
   EP -->|"save"| F["File DocType"]
@@ -35,26 +29,19 @@ flowchart LR
   W --> R
 `} />
 
-This recipe lives in one module plus a client script:
-
 <FileTree>
 - ice_cream_shop/
   - api/
     - v1/
-      - **bulk_upload.py** upload endpoint + background processor
+      - **bulk_upload.py** — upload endpoint + background processor
   - public/
     - js/
-      - bulk_upload_progress.js realtime progress listener
+      - bulk_upload_progress.js — realtime progress listener
 </FileTree>
 
 ## Step 1: Upload endpoint
 
-The endpoint does only fast work — argument checks, a header sniff, persisting the
-file, and enqueuing the job. It rate-limits to 10 uploads per 5 minutes, validates
-that the `outlet` exists, confirms the file is a `.csv`, and reads it with
-`utf-8-sig` so a leading BOM from Excel exports is stripped. It then stashes a job
-record in Redis (keyed `bulk_upload:{job_id}`) and returns a `status_url` for
-polling.
+Fast work only — argument checks, header sniff, file save, enqueue. Rate-limited to 10 uploads per 5 minutes; reads the file with `utf-8-sig` to strip Excel BOMs. Job state lives in Redis (`bulk_upload:{job_id}`, 24h TTL), so the status endpoint is a cheap cache read — no extra DocType needed:
 
 ```python title="ice_cream_shop/api/v1/bulk_upload.py" {3-4,57-60}
 import frappe
@@ -172,19 +159,11 @@ def get_job_status(job_id=None):
     return success(data=status)
 ```
 
-The `outlet` is sent as a multipart form field, so it arrives in `frappe.form_dict`;
-the file itself comes in on `frappe.request.files` under the key `file`. Because the
-job state lives in Redis with a 24-hour TTL, the status endpoint is a cheap cache
-read — no extra DocType needed just to track progress.
+The `outlet` arrives in `frappe.form_dict` (multipart form field); the file comes via `frappe.request.files["file"]`.
 
 ## Step 2: Background CSV processor
 
-This is the worker `frappe.enqueue` calls. It runs as the uploading user
-(`frappe.set_user`), parses the file with `csv.DictReader`, validates each row, then
-groups rows by `(customer, date, payment_mode)` so each group becomes a single
-coherent Sales Invoice. The two highlighted lines are the heart of the durability
-strategy — commit after every successful invoice, roll back a failing one
-individually.
+The worker runs as the uploading user, parses with `csv.DictReader`, validates each row, and groups rows by `(customer, date, payment_mode)` so each group becomes one coherent Sales Invoice. Commit after every successful invoice; roll back a failing one individually:
 
 ```python title="ice_cream_shop/api/v1/bulk_upload.py (continued)" {91-92}
 import csv
@@ -348,15 +327,9 @@ def process_sales_csv(job_id, file_name, outlet, user):
     return final_status
 ```
 
-Validation errors are collected per row rather than raised, so one malformed line
-never aborts the run. Progress is pushed every 100 rows on the
-`bulk_upload_progress` channel, and a final `bulk_upload_complete` event carries the
-counts plus the first 100 errors.
+Row errors are collected, not raised, so one malformed line never aborts the run. Progress publishes every 100 rows on `bulk_upload_progress`; `bulk_upload_complete` carries the counts plus the first 100 errors.
 
 ## Step 3: curl examples
-
-Upload with a multipart form, then poll the returned `status_url`. The response is
-wrapped in Frappe's standard `message` envelope.
 
 ```bash
 # --- Upload CSV ---
@@ -365,41 +338,16 @@ curl -X POST 'https://erp.scoopjoy.com/api/method/ice_cream_shop.api.v1.bulk_upl
   -F 'outlet=SJ-MUM-001' \
   -F 'file=@daily_sales_march15.csv'
 
-# Response:
-# {
-#   "message": {
-#     "status": "success",
-#     "data": {
-#       "job_id": "a1b2c3d4e5f6",
-#       "file_name": "daily_sales_SJ-MUM-001_2025-03-15.csv",
-#       "total_rows": 847,
-#       "status_url": "/api/method/ice_cream_shop.api.v1.bulk_upload.get_job_status?job_id=a1b2c3d4e5f6"
-#     },
-#     "message": "Upload accepted. Processing 847 rows in background."
-#   }
-# }
+# Response (standard message envelope):
+# {"message": {"status": "success", "data": {"job_id": "a1b2c3d4e5f6",
+#   "file_name": "daily_sales_SJ-MUM-001_2025-03-15.csv", "total_rows": 847,
+#   "status_url": "/api/method/ice_cream_shop.api.v1.bulk_upload.get_job_status?job_id=a1b2c3d4e5f6"},
+#   "message": "Upload accepted. Processing 847 rows in background."}}
 
-# --- Check Job Status ---
+# --- Poll status ---
 curl -X GET 'https://erp.scoopjoy.com/api/method/ice_cream_shop.api.v1.bulk_upload.get_job_status?job_id=a1b2c3d4e5f6' \
   -H 'Authorization: token abc1234xyz:secret9876'
-
-# Response (in progress):
-# {
-#   "message": {
-#     "status": "success",
-#     "data": {
-#       "status": "processing",
-#       "total_rows": 847,
-#       "processed": 400,
-#       "succeeded": 12,
-#       "failed": 2,
-#       "errors": [...]
-#     }
-#   }
-# }
 ```
-
-A sample CSV looks like this:
 
 ```text title="daily_sales_march15.csv"
 customer,item_code,qty,rate,payment_mode,date
@@ -411,10 +359,7 @@ Walk-in Customer,CONE-WAF-001,3,80.00,Cash,2025-03-15
 
 ## Step 4: Client-side progress listener
 
-In Express you might open an SSE stream or poll an endpoint; in Frappe the realtime
-channel is already wired through Socket.IO, so the client just subscribes to the two
-events the worker publishes. Register this script via `hooks.py` with
-`app_include_js`.
+Frappe's realtime channel is already wired through Socket.IO — subscribe to the two events the worker publishes. Register via `hooks.py` with `app_include_js`:
 
 ```javascript title="ice_cream_shop/public/js/bulk_upload_progress.js"
 // Include via hooks.py: app_include_js = ["ice_cream_shop/public/js/bulk_upload_progress.js"]
@@ -448,15 +393,9 @@ frappe.realtime.on("bulk_upload_complete", (data) => {
 ```
 
 :::note[Why this works]
-The upload endpoint returns immediately with a job ID, so the HTTP request never
-times out. `frappe.enqueue` with `queue="long"` runs the heavy CSV processing in a
-background worker. `frappe.publish_realtime` pushes progress updates over WebSocket
-to the browser, and grouping rows by `(customer, date, payment_mode)` minimizes the
-number of invoices created while keeping each one logically coherent.
+The endpoint returns immediately with a job ID, so the request never times out. `frappe.enqueue(queue="long")` runs the heavy parsing in a background worker, `frappe.publish_realtime` pushes progress over WebSocket, and grouping rows by `(customer, date, payment_mode)` minimizes invoice count while keeping each invoice coherent.
 :::
 
 :::caution[Common mistake]
-Processing all rows in a single database transaction. If row 5,000 out of 10,000
-fails, you lose all 4,999 successful rows. Always commit after each invoice with
-`frappe.db.commit()` and roll back individual failures with `frappe.db.rollback()`.
+Processing all rows in one database transaction — if row 5,000 of 10,000 fails, you lose the 4,999 good ones. Commit per invoice with `frappe.db.commit()` and roll back individual failures with `frappe.db.rollback()`.
 :::

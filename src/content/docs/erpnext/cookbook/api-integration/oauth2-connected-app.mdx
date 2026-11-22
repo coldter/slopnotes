@@ -1,6 +1,6 @@
 ---
 title: OAuth2 Connected App
-description: Connect ScoopJoy to Google Calendar using Frappe's Connected App DocType for OAuth2 token storage, automatic refresh, and a scheduled sync job.
+description: "Connect ScoopJoy to Google Calendar via Frappe's Connected App DocType — encrypted Token Cache storage, automatic refresh, and a scheduled sync job."
 sidebar:
   order: 7
 ---
@@ -10,18 +10,11 @@ import { LinkCard, Steps } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** ScoopJoy wants to sync franchise employees' Google Workspace
-calendars into ERPNext so shift schedules and outlet events line up — which means
-talking to Google's API over OAuth2 and keeping access tokens fresh.
+**Problem:** Sync franchise employees' Google Workspace calendars into ERPNext — OAuth2 against Google's API with tokens kept fresh.
 
-**Solution:** Use Frappe's built-in `Connected App` DocType for OAuth2 token
-management, build a client that refreshes tokens automatically, and schedule a
-sync job via `hooks.py`. Frappe stores the access and refresh tokens in the
-`Token Cache` DocType (encrypted at rest), so you never roll your own token store.
+**Solution:** Frappe's built-in `Connected App` DocType handles the OAuth2 flow and stores access/refresh tokens in `Token Cache` (encrypted at rest). Build a client that refreshes proactively and a scheduled sync job via `hooks.py`.
 
-The OAuth2 handshake plus the recurring refresh looks like this:
-
-<Mermaid title="OAuth2 authorization and token refresh" height={460} code={`
+<Mermaid title="OAuth2 handshake + proactive token refresh before each API call" height={460} code={`
 sequenceDiagram
   participant U as User (Desk)
   participant F as Frappe (Connected App)
@@ -45,10 +38,7 @@ sequenceDiagram
 
 ## Step 1: Create the Connected App
 
-A one-time setup script registers the Connected App with Google's endpoints and
-scopes. The `client_id` and `client_secret` are read from `site_config.json`
-(via `frappe.conf`) rather than hard-coded, and the `redirect_uri` points at
-Frappe's built-in OAuth2 callback.
+One-time setup script. `client_id`/`client_secret` come from `site_config.json` via `frappe.conf` — never hard-coded — and `redirect_uri` points at Frappe's built-in OAuth2 callback:
 
 ```python title="scoopjoy/setup/google_calendar.py"
 import frappe
@@ -83,16 +73,11 @@ def setup_google_connected_app():
     frappe.msgprint(f"Authorize at: {frappe.utils.get_url()}/app/connected-app/{app.name}")
 ```
 
-After running this, visit the Connected App in Desk and click **Authorize** to
-walk through the consent flow shown in the diagram above. The resulting tokens
-land in `Token Cache`, keyed by Connected App and user.
+Then open the Connected App in Desk and click **Authorize** to walk the consent flow. Tokens land in `Token Cache`, keyed by Connected App and user.
 
-## Step 2: Google Calendar integration module
+## Step 2: Google Calendar client
 
-The client wraps the Connected App. The interesting method is `_get_token`: it
-reads the user's `Token Cache` document and, if the token has under 5 minutes of
-life left (`get_expires_in() < 300`), refreshes it through the Connected App's
-own `get_token()` helper before any request goes out.
+`_get_token` reads the user's `Token Cache` doc and, if fewer than 5 minutes of life remain (`get_expires_in() < 300`), refreshes via the Connected App's `get_token()` before any request goes out:
 
 ```python title="scoopjoy/integrations/google_calendar.py" {44-58}
 import frappe
@@ -128,7 +113,6 @@ class GoogleCalendarClient:
         """
         user = user or frappe.session.user
 
-        # Get the token document for this user
         token_name = frappe.db.get_value(
             "Token Cache",
             {"connected_app": self.connected_app.name, "user": user},
@@ -143,9 +127,8 @@ class GoogleCalendarClient:
 
         token_doc = frappe.get_doc("Token Cache", token_name)
 
-        # Check if token is expired (with 5-minute buffer)
+        # Expired (with 5-minute buffer)? Refresh via the Connected App
         if token_doc.get_expires_in() < 300:
-            # Use Connected App's built-in refresh
             try:
                 token_doc = self.connected_app.get_token(
                     token_doc.get("refresh_token"),
@@ -175,7 +158,7 @@ class GoogleCalendarClient:
         response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
 
         if response.status_code == 401:
-            # Token might have been revoked -- clear and retry once
+            # Token might have been revoked
             frappe.log_error(title="Google Calendar 401", message=response.text)
             raise frappe.AuthenticationError("Google Calendar authentication failed")
 
@@ -207,16 +190,11 @@ class GoogleCalendarClient:
         )
 ```
 
-The `get_password("access_token")` call decrypts the token on read — Frappe keeps
-it encrypted in the `Token Cache` row. Every API call routes through `_request`,
-which attaches the `Bearer` header and treats a `401` as a revoked grant.
+`get_password("access_token")` decrypts the token on read — it's encrypted in the `Token Cache` row. Every API call routes through `_request`, which attaches the `Bearer` header and treats a `401` as a revoked grant.
 
 ## Step 3: Scheduled sync job
 
-The scheduled job fans out over every user who has authorized Google Calendar
-(one `Token Cache` row each), pulls the past week and next month of events, and
-upserts them into Frappe's `Event` DocType. A `custom_google_event_id` field is
-the idempotency key so re-runs update rather than duplicate.
+Fans out over every authorized user (one `Token Cache` row each), pulls past-week + next-month events, and upserts them into Frappe's `Event` DocType. `custom_google_event_id` is the idempotency key so re-runs update rather than duplicate:
 
 ```python title="scoopjoy/integrations/google_calendar.py (continued)"
 def sync_franchise_calendars():
@@ -224,7 +202,6 @@ def sync_franchise_calendars():
     Scheduled job: sync Google Calendar events to/from Frappe Events.
     Runs every 30 minutes.
     """
-    # Get all users who have authorized Google Calendar
     authorized_users = frappe.get_all(
         "Token Cache",
         filters={
@@ -283,7 +260,6 @@ def _sync_user_calendar(client, user):
         if not start:
             continue
 
-        # Check if we already have this event
         existing = frappe.db.get_value(
             "Event",
             {"custom_google_event_id": google_event_id, "owner": user},
@@ -313,13 +289,9 @@ def _sync_user_calendar(client, user):
     frappe.db.commit()
 ```
 
-## Step 4: hooks.py configuration
-
-Wire the job into the scheduler with a cron entry, and keep the OAuth credentials
-in `site_config.json` — never in code.
+## Step 4: hooks.py + site_config.json
 
 ```python title="scoopjoy/hooks.py"
-# Scheduler for Google Calendar sync
 scheduler_events = {
     "cron": {
         "*/30 * * * *": [  # Every 30 minutes
@@ -329,8 +301,6 @@ scheduler_events = {
 }
 ```
 
-The credentials live in `site_config.json`, read at runtime via `frappe.conf`:
-
 ```json title="sites/scoopjoy.localhost/site_config.json"
 {
   "google_client_id": "xxxxx.apps.googleusercontent.com",
@@ -339,18 +309,9 @@ The credentials live in `site_config.json`, read at runtime via `frappe.conf`:
 ```
 
 :::note[Why this works]
-Frappe's `Connected App` DocType handles the full OAuth2 flow: authorization URL
-generation, the code-for-token exchange, and token storage in `Token Cache`. The
-`get_expires_in()` method on the token document reports how many seconds remain
-until expiry, which is what enables proactive refresh before a request rather than
-reacting to a `401`. Keeping `google_client_id` and `google_client_secret` in
-`site_config.json` keeps secrets out of version control.
+`Connected App` handles the full OAuth2 flow — authorization URL, code-for-token exchange, storage in `Token Cache`. `get_expires_in()` reports seconds until expiry, enabling proactive refresh before a request instead of reacting to a `401`. Credentials in `site_config.json` stay out of version control.
 :::
 
 :::caution[Common mistake]
-Storing OAuth tokens in custom fields on the `User` DocType. Use Frappe's built-in
-`Token Cache` DocType — it encrypts the access and refresh tokens at rest and
-provides expiry tracking. Rolling your own token storage is both insecure and
-redundant.
+Storing OAuth tokens in custom fields on the `User` DocType. Use the built-in `Token Cache` — it encrypts access/refresh tokens at rest and tracks expiry. Rolling your own token store is insecure and redundant.
 :::
-

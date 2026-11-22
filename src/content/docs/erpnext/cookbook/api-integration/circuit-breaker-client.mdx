@@ -1,6 +1,6 @@
 ---
 title: External API Client with Circuit Breaker
-description: Build a resilient Frappe API client with Redis caching, a circuit breaker, rate limiting, and exponential-backoff retries.
+description: "Build a resilient API client with a Redis-backed circuit breaker, rate limiter, caching, and exponential-backoff retries for an unreliable supplier API."
 sidebar:
   order: 5
 ---
@@ -10,34 +10,24 @@ import { LinkCard, FileTree } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** ScoopJoy integrates with a third-party dairy-supplier inventory API
-that's unreliable and rate-limited. Hammering it with retries when it's already
-down wastes worker time and risks getting your API key banned.
+**Problem:** ScoopJoy's dairy-supplier inventory API is unreliable and rate-limited — blind retries waste workers and risk an API-key ban.
 
-**Solution:** Build a reusable API client with Redis-backed caching, a circuit
-breaker, per-endpoint rate limiting, and exponential-backoff retries. The circuit
-breaker is the heart of it: after enough consecutive failures it stops calling the
-service entirely, then probes for recovery before reopening the floodgates.
-
-The client and its consumers live in a few small modules under the `scoopjoy` app:
+**Solution:** A reusable client with Redis-backed caching, a circuit breaker, per-endpoint rate limiting, and backoff retries. After enough failures the breaker stops calling the service entirely, then probes for recovery before reopening.
 
 <FileTree>
 - apps/scoopjoy/scoopjoy/
   - utils/
-    - **api_client.py** the resilient client + circuit breaker + rate limiter
+    - **api_client.py** — client + circuit breaker + rate limiter
   - integrations/
-    - supplier_sync.py the background job that uses the client
-  - hooks.py registers the scheduler event
+    - supplier_sync.py — background job that uses the client
+  - hooks.py — registers the scheduler event
 </FileTree>
 
 ## Circuit breaker states
 
-The breaker is a three-state machine. It starts `closed` (calls flow through). After
-`failure_threshold` failures it trips to `open` and rejects calls outright. Once
-`recovery_timeout` elapses it moves to `half_open` and allows a single probe request:
-success closes the circuit again, failure reopens it.
+Three-state machine: `closed` (calls flow) → `open` after `failure_threshold` failures (calls rejected) → `half_open` once `recovery_timeout` elapses (one probe allowed; success closes, failure reopens):
 
-<Mermaid title="Circuit breaker state machine" height={360} code={`
+<Mermaid title="Circuit breaker: closed → open → half_open → closed" height={360} code={`
 stateDiagram-v2
   [*] --> Closed
   Closed --> Open: failures >= threshold
@@ -49,13 +39,7 @@ stateDiagram-v2
 
 ## Step 1: The resilient client
 
-The whole client lives in one module. The `CircuitBreaker` and `APIRateLimiter`
-classes both persist their state in `frappe.cache` (Redis) so every Gunicorn worker
-shares the same view, and `ExternalAPIClient` wires them together with retries.
-
-The `CircuitBreaker` stores `{"state", "failures", "last_failure"}` as JSON in Redis.
-`can_execute()` is where the state transitions happen: an `open` circuit flips to
-`half_open` once the recovery window passes and lets a single probe through.
+`CircuitBreaker` and `APIRateLimiter` persist state in `frappe.cache` (Redis) so every Gunicorn worker shares one view; `ExternalAPIClient` wires them together with retries. The breaker stores `{"state", "failures", "last_failure"}` as JSON; `can_execute()` drives the transitions — an `open` circuit flips to `half_open` after the recovery window and lets one probe through:
 
 ```python title="scoopjoy/scoopjoy/utils/api_client.py" {38-54}
 import frappe
@@ -103,7 +87,7 @@ class CircuitBreaker:
             return True
 
         if state["state"] == self.STATE_OPEN:
-            # Has the recovery timeout elapsed? If so, allow one probe.
+            # Recovery timeout elapsed? Allow one probe.
             if time.time() - state["last_failure"] > self.recovery_timeout:
                 state["state"] = self.STATE_HALF_OPEN
                 self._set_state(state)
@@ -319,17 +303,11 @@ class ExternalAPIClient:
         return self._request("DELETE", endpoint, **kwargs)
 ```
 
-Note how the gates run in order: circuit breaker, then rate limiter, then cache. A
-4xx client error (other than `429`) calls `record_success()` and re-raises — a bad
-request is *your* bug, not a sign the supplier is down, so it must not trip the
-breaker. Connection errors, timeouts, 5xx, and `429` all count as failures and feed
-the retry loop with jittered exponential backoff.
+Gate order: circuit breaker → rate limiter → cache. A 4xx (except `429`) calls `record_success()` and re-raises — a bad request is your bug, not a sign the supplier is down. Connection errors, timeouts, 5xx, and 429 feed the retry loop with jittered exponential backoff.
 
-## Step 2: Using the client — supplier stock sync
+## Step 2: Supplier stock sync job
 
-A factory builds a client configured from `ScoopJoy Settings` (note the
-`get_password` call to read the encrypted API key), and the background job pages
-through the supplier's inventory, updating matching `Item` records.
+A factory builds the client from `ScoopJoy Settings` (`get_password` reads the encrypted key); the job pages through supplier inventory and updates matching Items:
 
 ```python title="scoopjoy/scoopjoy/integrations/supplier_sync.py"
 import frappe
@@ -437,15 +415,9 @@ def _create_low_stock_alert(item_code, supplier_sku, qty):
         }).insert(ignore_permissions=True)
 ```
 
-When the breaker is open the very first `client.get(...)` raises `ConnectionError`,
-the loop breaks immediately, and the job logs and exits instead of grinding through
-hundreds of doomed retries.
+When the breaker is open, the first `client.get(...)` raises `ConnectionError`, the loop breaks immediately, and the job exits cleanly instead of grinding through doomed retries.
 
 ## Step 3: Schedule it
-
-Register the sync as a cron-based scheduler event so it runs every four hours. See
-[Scheduled Tasks](/erpnext/cookbook/controllers/scheduled-tasks/) for more on
-scheduler events.
 
 ```python title="scoopjoy/scoopjoy/hooks.py"
 scheduler_events = {
@@ -457,19 +429,12 @@ scheduler_events = {
 }
 ```
 
+See [Scheduled Tasks](/erpnext/cookbook/controllers/scheduled-tasks/) for scheduler events.
+
 :::note[Why this works]
-The circuit breaker prevents cascading failures — if the supplier API is down, your
-ERP stops wasting workers retrying every request and fails fast instead. The
-Redis-backed cache (`frappe.cache`) makes repeated fetches of the same data within
-the TTL window instant. Rate limiting keeps you under the supplier's quota so you
-don't get banned. Because all three pieces store their state in Redis, they behave
-correctly across every Gunicorn worker.
+The breaker stops cascading failures — when the supplier API is down, the ERP fails fast instead of burning workers on retries. The Redis cache makes repeat fetches within the TTL instant, and rate limiting keeps you under quota. All state lives in Redis, so it's consistent across every Gunicorn worker.
 :::
 
 :::caution[Common mistake]
-Reaching for Python's `functools.lru_cache` to cache API responses. In Frappe's
-multi-worker architecture each Gunicorn worker has its own memory, so an
-`lru_cache` is never shared — one worker's "cache hit" is another's cache miss, and
-the circuit breaker state would diverge per worker too. Always use `frappe.cache`
-(Redis) for any state that must be shared across workers.
+Don't use `functools.lru_cache` for API responses or breaker state — each Gunicorn worker has its own memory, so `lru_cache` is never shared and state diverges per worker. Use `frappe.cache` (Redis) for anything that must be shared across workers.
 :::

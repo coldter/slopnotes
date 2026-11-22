@@ -1,6 +1,6 @@
 ---
 title: Consensus, Orchestration & Failover
-description: How a real system detects a dead database leader and elects a new one — built from goroutines, channels, contexts, and careful locking.
+description: "The orchestrator detects a dead leader and elects a new one via a recruit → promote/setPrimary protocol — every goroutine has an owner, every RPC a deadline tied to one shutdown context, and split-brain is guarded at five independent points."
 sidebar:
   order: 8
 ---
@@ -8,25 +8,15 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
 
-**What you will learn:** how a failover orchestrator detects a dead leader and elects a new one, and how that workflow is built from goroutines, buffered channels, mutexes, and a tree of cancellable contexts — the way real distributed-systems concurrency is wired in Go.
-
-**Prerequisites:** this builds directly on [concurrency](/go-guide/language/07-concurrency/) (goroutines, channels, fan-out/fan-in, `sync.WaitGroup`), [context](/go-guide/language/08-context/) (cancellation, deadlines, context trees), and [sync & memory model](/go-guide/language/09-sync-and-memory-model/) (mutex, `sync.Cond`, `sync.Map`, lock granularity). It also leans on [generics](/go-guide/language/06-generics/), [interfaces](/go-guide/language/03-interfaces-composition/), and [errors](/go-guide/language/05-errors/), and references [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/) and [service anatomy](/go-guide/project/05-service-anatomy/).
-
----
-
-In the example system's cluster, the `orchestrator` is the brain that keeps a PostgreSQL shard available. When the primary dies, it is the component that notices, picks a survivor, and re-points everyone at the new leader. Get that wrong and you get split-brain (two primaries accepting writes) or data loss. So this is where the codebase's concurrency discipline is at its most deliberate: every goroutine has an owner, every RPC has a deadline tied to a parent context, and shared state is either cloned or guarded.
-
-This page is the most concurrency-dense in the project track, and it rewards a top-down read. We'll go: the protocol vocabulary, then the three-loop engine that owns the goroutine lifecycles, then the worked election state machine, then the supporting primitives, and finally the safety properties that keep it from corrupting the cluster.
+The `orchestrator` is the brain that keeps a PostgreSQL shard available: when the primary dies, it notices, picks a survivor, and re-points everyone at the new leader. Get that wrong and you get split-brain or data loss, so the concurrency discipline here is at its most deliberate: every goroutine has an owner, every RPC has a deadline tied to a parent context, and shared state is cloned or guarded.
 
 :::note[Leader vs primary]
-The codebase is careful with these two words. *Leader/follower* is the consensus-elected role; *primary/standby* is the PostgreSQL replication mode. The consensus layer elects a **leader**; that leader's pooler then promotes its Postgres to **primary**. See the [glossary](/go-guide/reference/glossary/).
+*Leader/follower* is the consensus-elected role; *primary/standby* is the PostgreSQL replication mode. The consensus layer elects a **leader**; that leader's pooler then promotes its Postgres to **primary**. See the [glossary](/go-guide/reference/glossary/).
 :::
-
----
 
 ## The contract: the appointment protocol
 
-Everything the coordinator does is implemented against a handful of gRPC RPCs on the pooler. The appointment protocol itself is small — *recruit, then concurrently promote and inform* — and it's worth reading because the shape of the protocol is what makes the concurrency safe.
+Everything the coordinator does is implemented against a handful of gRPC RPCs on the pooler — *recruit, then concurrently promote and inform*:
 
 ```proto title="proto/consensusservice.proto"
 // Appointment protocol: Recruit, then concurrent Promote (to the leader) and
@@ -46,10 +36,10 @@ rpc Promote(consensusdata.PromoteRequest) returns (consensusdata.PromoteResponse
 rpc SetPrimary(consensusdata.SetPrimaryRequest) returns (consensusdata.SetPrimaryResponse);
 ```
 
-Two of the messages carry the load-bearing safety semantics:
+Two messages carry the load-bearing safety semantics:
 
-- **`CoordinatorProposal`** bundles a `TermRevocation` (the authority to act — "revoke all terms below N"), the proposed leader address, and the full proposed rule. The coordinator must revoke previous terms *before* it may propose. That's how a stale coordinator's proposals get rejected: their term is below the new revocation floor.
-- **`SetPrimaryRequest`** is the idempotency anchor. Its contract is worth quoting verbatim:
+- **`CoordinatorProposal`** bundles a `TermRevocation` ("revoke all terms below N" — the authority to act), the proposed leader address, and the full proposed rule. The coordinator must revoke previous terms *before* it may propose; that's how a stale coordinator's proposals get rejected (their term is below the new revocation floor).
+- **`SetPrimaryRequest`** is the idempotency anchor — its contract, verbatim:
 
 ```proto title="proto/consensusdata.proto"
 // ... if the supplied rule is strictly higher it applies the
@@ -58,15 +48,11 @@ Two of the messages carry the load-bearing safety semantics:
 // against out-of-order delivery from stale recovery rounds.
 ```
 
-That "strictly higher rule" guarantee means a duplicate or late `SetPrimary` from an earlier, slower recovery round is a harmless no-op. Hold onto that — it's exactly why the coordinator can safely fire RPCs at nodes it isn't sure about (see the election section below).
-
-The cohort, term/`TermRevocation`, quorum, and `DurabilityPolicy` vocabulary all live in these proto files. See [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/) for how the `.proto` becomes the typed client the coordinator calls.
-
----
+That "strictly higher rule" guarantee means a duplicate or late `SetPrimary` from an earlier, slower recovery round is a harmless no-op — which is exactly why the coordinator can safely fire RPCs at nodes it isn't sure about.
 
 ## The engine: three loops, one store, one shutdown context
 
-The engine is the simplest possible structure for a job like this: three loops at different cadences, all communicating through a single in-memory store. The loops never call each other directly — they coordinate *only* through the shared store, which keeps their interactions trivially reasoned-about.
+Three loops at different cadences, all communicating through a single in-memory store. The loops never call each other directly — they coordinate *only* through the shared store:
 
 <Mermaid title="The three-loop engine" height={360} code={`
 flowchart TB
@@ -110,11 +96,10 @@ type Engine struct {
 }
 ```
 
-Two things are worth internalising here.
+Two things to internalize:
 
-**Two mutexes, two invariants.** `mu` guards `shardWatchTargets` (config reload); `detectedProblemsMu` guards `detectedProblems` (read by metrics and gRPC handlers). They are *not* interchangeable. The rule is one mutex per independent piece of mutable state — finer granularity means less contention and clearer reasoning. Using a single lock for both would couple a slow gRPC diagnostics read to a config reload for no reason. See [lock granularity](/go-guide/language/09-sync-and-memory-model/).
-
-**A single `shutdownCtx`** is the root of the cancellation tree for the entire service. `Stop()` cancels it, then stops each runner:
+- **Two mutexes, two invariants.** `mu` guards `shardWatchTargets` (config reload); `detectedProblemsMu` guards `detectedProblems` (read by metrics and gRPC handlers). They are *not* interchangeable — one mutex per independent piece of mutable state means less contention and clearer reasoning. `GetDetectedProblems` `copy()`s the slice under the lock before returning, so external readers get an isolated snapshot.
+- **A single `shutdownCtx`** is the root of the cancellation tree. `Stop()` cancels it, then stops each runner:
 
 ```go title="internal/orchestrator/recovery/engine.go"
 func (re *Engine) Stop() {
@@ -128,15 +113,9 @@ func (re *Engine) Stop() {
 
 Everything downstream — every per-RPC deadline in an election — is derived from this one context. Cancel the root and the whole tree unwinds.
 
-:::tip[Return a copy, not the field]
-`GetDetectedProblems` `copy()`s the slice under the lock before returning it. External readers get an isolated snapshot and can never mutate engine state behind the lock's back. This is the same defensive-copy instinct as the store's `proto.Clone` further down.
-:::
-
 ### `PeriodicRunner`: the loop primitive that owns the goroutine
 
-Each loop is a `*timer.PeriodicRunner`. This is the canonical "goroutine lifecycle owned by a parent context" idiom, hand-built so that **`Stop()` is synchronous**: when it returns, the in-flight callback is guaranteed done.
-
-Its machinery is a small state machine (`stopped` / `running` / `stopping`) guarded by a `sync.Mutex` plus `sync.Cond`, with a `sync.WaitGroup` tracking the one in-flight callback and a `context.CancelFunc` to interrupt it. Two methods carry the safety reasoning.
+Each loop is a `*timer.PeriodicRunner` — the canonical "goroutine lifecycle owned by a parent context" idiom, hand-built so **`Stop()` is synchronous**: when it returns, the in-flight callback is guaranteed done. Its machinery is a small state machine (`stopped`/`running`/`stopping`) guarded by a `sync.Mutex` plus `sync.Cond`, with a `sync.WaitGroup` tracking the one in-flight callback and a `context.CancelFunc` to interrupt it.
 
 `execute()` implements **backpressure**:
 
@@ -162,10 +141,7 @@ func (r *PeriodicRunner) execute() {
 }
 ```
 
-Two deliberate choices:
-
-- The callback runs **with the lock released**. A recovery cycle can take seconds (it makes RPCs); holding `mu` across it would block `Stop()` and every `Running()` check.
-- The next tick is scheduled **only after the current callback returns**. There is never more than one cycle in flight. This backpressure prevents a slow recovery cycle from piling up overlapping cycles that would race each other on the shared store.
+Two deliberate choices: the callback runs **with the lock released** (a recovery cycle can take seconds — it makes RPCs — and holding `mu` across it would block `Stop()`), and the next tick is scheduled **only after the current callback returns** — never more than one cycle in flight, so a slow cycle can't pile up overlapping cycles that race each other on the shared store.
 
 `Stop()` waits *outside* the lock:
 
@@ -197,16 +173,12 @@ func (r *PeriodicRunner) Stop() {
 ```
 
 :::caution[Gotcha — never hold a lock while waiting on something that needs the lock]
-`Stop()` releases `r.mu` *before* `r.wg.Wait()`. Why? Because `execute()` re-acquires `r.mu` after its callback returns (to call `scheduleNext` and set state). If `Stop()` held the lock while waiting on the `WaitGroup`, and `execute()` was blocked trying to acquire that same lock, neither would ever proceed — a textbook deadlock. The cancel happens *under* the lock (to interrupt), but the wait happens *outside* it. This is one of the most common locking traps; see [sync & memory model](/go-guide/language/09-sync-and-memory-model/).
+`Stop()` releases `r.mu` *before* `r.wg.Wait()`. Why? Because `execute()` re-acquires `r.mu` after its callback returns (to call `scheduleNext` and set state). If `Stop()` held the lock while waiting on the `WaitGroup`, and `execute()` was blocked trying to acquire that same lock, neither would ever proceed — a textbook deadlock. Cancel happens *under* the lock (to interrupt), but the wait happens *outside* it.
 :::
-
-The `stopping` state plus `sync.Cond` lets a concurrent `Start()` block until a `Stop()` fully finishes, so `Start`/`Stop`/`Start` cycles are safe.
-
----
 
 ## From detection to election: the recovery cycle
 
-The recovery loop's callback is `performRecoveryCycle`. It is a classic **fan-out / fan-in with `sync.WaitGroup`**: detect problems, group them by shard, then process each shard concurrently.
+The recovery loop's callback is `performRecoveryCycle` — a classic **fan-out / fan-in with `sync.WaitGroup`**: detect problems, group by shard, then process each shard concurrently:
 
 <Mermaid title="The recovery cycle" height={560} code={`
 flowchart TB
@@ -240,19 +212,11 @@ for _, shardProblems := range problemsByShard {
 wg.Wait()
 ```
 
-Shards are independent failure domains, so they recover in parallel; `wg.Wait()` makes the whole cycle synchronous, so the backpressure above measures real cycle time.
-
-Detection itself is interface-driven. `analysis.DefaultAnalyzers(...)` returns analyzers that each `Analyze` a shard view and emit problems. The "leader is dead" decision lives in its own analyzer, and it is mostly *suppression of false positives* — a great window into distributed-systems edge cases. It declines to fail over if, for example, replicas are still connected to the supposedly dead leader, or if the "deadness" is just TCP-keepalive staleness:
-
-```go title="internal/orchestrator/recovery/analysis/leader_is_dead_analyzer.go"
-// Suppress failover during a known pg_promote() window.
-```
-
-When it does fire, it emits one shard-scoped problem at `PriorityEmergency` whose recovery action is an `AppointLeaderAction`. That action is the bridge into consensus.
+Shards are independent failure domains, so they recover in parallel; `wg.Wait()` makes the whole cycle synchronous, so the backpressure above measures real cycle time. Detection is interface-driven: `analysis.DefaultAnalyzers(...)` returns analyzers that each `Analyze` a shard view and emit problems. The "leader is dead" decision lives in its own analyzer and is mostly *suppression of false positives* — it declines to fail over if, e.g., replicas are still connected to the supposedly dead leader, or the "deadness" is just TCP-keepalive staleness (`leader_is_dead_analyzer.go`). When it fires, it emits one shard-scoped problem at `PriorityEmergency` whose recovery action is an `AppointLeaderAction`.
 
 ### `attemptRecovery`: re-validate, then bound the action
 
-Before acting on a detected problem, `attemptRecovery` re-checks it against *fresh* store state, then wraps the action in a deadline:
+Before acting, `attemptRecovery` re-checks the problem against *fresh* store state, then wraps the action in a deadline:
 
 ```go title="internal/orchestrator/recovery/recovery_loop.go"
 // Force re-poll to validate the problem still exists
@@ -265,23 +229,17 @@ defer cancel()
 err = problem.RecoveryAction.Execute(ctx, problem)
 ```
 
-`recheckProblem` is an **idempotency guard**: in the roughly one second between detection and action, the cluster may have self-healed (or another orchestrator may have acted). Acting on stale state is how you cause unnecessary failovers, so it re-runs analysis on current store state and bails if the problem is gone.
-
-The action's timeout comes from its own metadata. For appointment:
+`recheckProblem` is an **idempotency guard**: in the ~1s between detection and action, the cluster may have self-healed (or another orchestrator may have acted) — acting on stale state causes unnecessary failovers. The action's timeout comes from its own metadata; for appointment:
 
 ```go title="internal/orchestrator/recovery/actions/appoint_leader.go"
 Timeout: 2*timeouts.RuleWriteTimeout + 5*time.Second,
 ```
 
-This is **context-tree composition done right**. The action context must be long enough to cover its two *sequential* RPC phases (Recruit, then Promote/SetPrimary), each bounded by `RuleWriteTimeout`, plus margin. Size it shorter and the outer deadline would cancel a phase mid-flight; detach it (use `context.Background()`) and a `Stop()` couldn't cancel an in-flight election. See [context](/go-guide/language/08-context/).
-
-`AppointLeaderAction.Execute` gathers the cohort, re-verifies that no healthy primary already exists, then calls into the coordinator. That hands off to the worked example below.
-
----
+This is **context-tree composition done right**: the action context must cover its two *sequential* RPC phases (Recruit, then Promote/SetPrimary), each bounded by `RuleWriteTimeout`, plus margin. Size it shorter and the outer deadline cancels a phase mid-flight; detach it (`context.Background()`) and a `Stop()` couldn't cancel an in-flight election.
 
 ## The worked example: the election state machine
 
-This is the heart of the chapter. `coordinatorLedRuleChange.Run` implements the appointment protocol as a four-phase state machine. The same code serves both failover and bootstrap, parameterised by callbacks (`tryBuildProposal`, `checkProposalPossible`) that the coordinator wires up.
+`coordinatorLedRuleChange.Run` implements the appointment protocol as a four-phase state machine — the same code serves both failover and bootstrap:
 
 <Mermaid title="The appointment state machine" height={560} code={`
 stateDiagram-v2
@@ -317,7 +275,7 @@ func (r *coordinatorLedRuleChange) dispatchRecruit(ctx context.Context, cohort [
 }
 ```
 
-One goroutine per cohort member, each writing its result to a channel. The channel capacity is `len(cohort)` — **exactly the number of producers**. This is load-bearing, not incidental (see Phase 2).
+One goroutine per cohort member, each writing its result to a channel buffered to `len(cohort)` — **exactly the number of producers** (load-bearing, see Phase 2).
 
 ### Phase 2 — fan-in with early commit
 
@@ -342,10 +300,10 @@ func (r *coordinatorLedRuleChange) collectRecruitsAndBuildProposal(/* ... */) (*
 }
 ```
 
-The coordinator accumulates each recruit's `ConsensusStatus` (which carries that node's WAL position) and, after *each* arrival, asks `tryBuildProposal` whether a durability-quorum-satisfying proposal exists yet. The moment one does, it commits to that leader and returns — **without waiting for the slowest nodes**. This is consensus-correct because only *committed* writes are durable across the quorum, and the chosen leader carries every committed write by definition.
+The coordinator accumulates each recruit's `ConsensusStatus` (which carries that node's WAL position) and, after *each* arrival, asks `tryBuildProposal` whether a durability-quorum-satisfying proposal exists yet. The moment one does, it commits and returns — **without waiting for the slowest nodes**. That's consensus-correct because only *committed* writes are durable across the quorum, and the chosen leader carries every committed write by definition.
 
 :::caution[Gotcha — buffered channel sizing is what makes early-return safe]
-When `collectRecruitsAndBuildProposal` returns at the first viable proposal, it stops reading the channel. The goroutines for slow nodes haven't sent yet. Because the channel is **buffered to `len(cohort)`**, each of those goroutines can still write its one result and exit — the buffer has a slot reserved for every producer. If the channel were *unbuffered*, those goroutines would block forever on the send (no reader will ever come back), leaking a goroutine per slow node on every election. Buffer capacity = number of producers is the idiom for "fire-and-forget fan-out where the consumer may leave early." See [concurrency](/go-guide/language/07-concurrency/).
+When `collectRecruitsAndBuildProposal` returns at the first viable proposal, it stops reading the channel. The goroutines for slow nodes haven't sent yet — because the channel is **buffered to `len(cohort)`**, each can still write its one result and exit (the buffer has a slot reserved for every producer). If it were *unbuffered*, those goroutines would block forever on the send — a leaked goroutine per slow node on every election. Buffer capacity = number of producers is the idiom for "fire-and-forget fan-out where the consumer may leave early."
 :::
 
 The coordinator never invents a leader: it picks the most-advanced node that still satisfies the durability quorum. The trade-off: uncommitted WAL on a late-arriving, more-advanced node is discarded (that node gets `pg_rewind`'d on rejoin) rather than preserved — correct, because uncommitted means not durable.
@@ -358,7 +316,7 @@ promoteResults := r.dispatchPromote(ctx, cohort, propReq, leaderKey)
 leaderErr := r.waitForPromotes(ctx, cohort, promoteResults)
 ```
 
-`dispatchPromote` again fans out into a buffered `chan promoteResult` of size `len(cohort)`: the leader gets `Promote`, everyone else gets `SetPrimary`. `waitForPromotes` then drains all of them, with one asymmetry:
+`dispatchPromote` again fans out into a buffered `chan promoteResult` of size `len(cohort)`: the leader gets `Promote`, everyone else `SetPrimary`. `waitForPromotes` drains all of them, with one asymmetry:
 
 ```go title="internal/orchestrator/consensus/rule_change.go"
 for range len(cohort) {
@@ -373,7 +331,7 @@ for range len(cohort) {
 ```
 
 :::caution[Gotcha — wait for all promotes, but fail fast on the leader]
-Phase 4 deliberately waits for *every* `Promote`/`SetPrimary`, not just the leader's. The rule change is committed once the leader's `Promote` succeeds (which means a durability quorum endorsed it). Returning early would let `Run`'s context cancel the in-flight *non-leader* RPCs — but those nodes still need to *learn* the new primary, or they'd need re-wiring next cycle. So we wait. The exception: if the *leader's* `Promote` fails, there is no new primary for anyone to learn about, so we return immediately. Notice that Phase 3 sends to *all* members, even ones that never answered Recruit — `SetPrimary`'s idempotent "strictly-higher-rule" semantics make that safe and ensure a slow or partitioned node still learns the new term.
+Phase 4 deliberately waits for *every* `Promote`/`SetPrimary`, not just the leader's. The rule change commits once the leader's `Promote` succeeds (a durability quorum endorsed it). Returning early would let `Run`'s context cancel the in-flight *non-leader* RPCs — but those nodes still need to *learn* the new primary, or they'd need re-wiring next cycle. The exception: if the *leader's* `Promote` fails, there is no new primary for anyone to learn about, so we return immediately. Phase 3 sends to *all* members, even ones that never answered Recruit — `SetPrimary`'s idempotent "strictly-higher-rule" semantics make that safe.
 :::
 
 ### Per-RPC deadline composition
@@ -389,15 +347,11 @@ func (r *coordinatorLedRuleChange) recruit(ctx context.Context, /* ... */) *clus
 }
 ```
 
-The full chain is `engine.shutdownCtx` → recovery cycle `ctx` → `attemptRecovery`'s `WithTimeout(ctx, action.Timeout)` → per-RPC `WithTimeout(ctx, RuleWriteTimeout)`. Cancel the engine and every in-flight `Recruit`/`Promote` unwinds. The `defer cancel()` on each RPC releases its timer immediately on return, so timers don't pile up. This is the context tree from [context](/go-guide/language/08-context/) made concrete.
-
----
+The full chain is `engine.shutdownCtx` → recovery cycle `ctx` → `attemptRecovery`'s `WithTimeout(ctx, action.Timeout)` → per-RPC `WithTimeout(ctx, RuleWriteTimeout)`. Cancel the engine and every in-flight `Recruit`/`Promote` unwinds. The `defer cancel()` on each RPC releases its timer immediately on return.
 
 ## Supporting concurrency primitives
 
 ### `ProtoStore[K, V]` — thread-safe shared state via deep-clone
-
-The store every loop reads and writes is generic:
 
 ```go title="internal/orchestrator/store/store.go"
 type ProtoStore[K comparable, V proto.Message] struct {
@@ -423,11 +377,9 @@ func (s *ProtoStore[K, V]) Get(key K) (V, bool) {
 }
 ```
 
-This is the **defend against shared mutable state by handing out copies** pattern. A caller can mutate what it gets back without ever touching the canonical copy under the lock, so there is no aliasing between goroutines. It uses generics with a `proto.Message` constraint, so the same store works for every proto type (see [generics](/go-guide/language/06-generics/)).
+The **defend-against-shared-mutable-state-by-handing-out-copies** pattern: a caller can mutate what it gets back without ever touching the canonical copy under the lock. Why mutex+map and not `sync.Map`? `sync.Map` is tuned for write-once-read-many, but the recovery engine is **write-heavy** (health updates every few seconds, topology churn), where `sync.Map`'s optimizations don't pay off. (The coordinator's `policyCache`, a durability-policy-per-database cache written once and read many times, is a *legitimate* `sync.Map` use — same codebase, two tools chosen by access pattern.)
 
-Why mutex+map and not `sync.Map`? `sync.Map` is tuned for write-once-read-many, but the recovery engine is **write-heavy** (health updates every few seconds, topology churn), where `sync.Map`'s optimisations don't pay off.
-
-`DoUpdate` gives an atomic read-modify-write under one lock acquisition:
+`DoUpdate` gives an atomic read-modify-write under one lock acquisition — and **does not create keys on purpose**: it skips absent keys so it can't *resurrect* a pooler the maintenance loop just forgot. "Fixing" that to upsert reintroduces ghost poolers that recovery would try to fail over to:
 
 ```go title="internal/orchestrator/store/store.go"
 func (s *ProtoStore[K, V]) DoUpdate(key K, fn func(value V) V) {
@@ -443,15 +395,9 @@ func (s *ProtoStore[K, V]) DoUpdate(key K, fn func(value V) V) {
 }
 ```
 
-:::caution[Gotcha — `DoUpdate` does not create keys, on purpose]
-It skips absent keys so it can't *resurrect* a pooler the maintenance loop just forgot. `applySnapshot`/`markConnected`/`markDisconnected` rely on the watcher having created the entry first. "Fix" this to upsert and you reintroduce ghost poolers that recovery will try to fail over to.
-:::
-
-Compare this to the coordinator's `policyCache`, a `sync.Map`: a durability-policy-per-database cache that is written once and read many times — a *legitimate* `sync.Map` use. Same codebase, two different shared-state tools chosen by access pattern. That's the lesson.
-
 ### `HealthStream` — a long-lived goroutine per pooler
 
-Detection needs fresh data, which comes from one long-lived gRPC stream per pooler. `Start` launches it:
+Detection needs fresh data, which comes from one long-lived gRPC stream per pooler. `Start` launches it, and the goroutine **removes itself from the map via `defer`** when it exits, so `Stop` only calls `entry.cancel()` and lets the goroutine clean up — no shared deletion race:
 
 ```go title="internal/orchestrator/recovery/health_stream.go"
 hs.wg.Go(func() {
@@ -464,11 +410,7 @@ hs.wg.Go(func() {
 })
 ```
 
-:::note[Go 1.25: `WaitGroup.Go`]
-`hs.wg.Go(func(){...})` uses the `WaitGroup.Go` method added in Go 1.25 (this codebase targets 1.25) — it does the `Add(1)` / `defer Done()` for you. See [concurrency](/go-guide/language/07-concurrency/).
-:::
-
-The goroutine **removes itself from the map via `defer`** when it exits, so `Stop` only has to call `entry.cancel()` and let the goroutine clean up — no shared deletion race. `runStream` loops over a retry iterator and reads current pooler metadata from the store on each reconnect (so host/port changes are picked up):
+(`hs.wg.Go(...)` is the Go 1.25 `WaitGroup.Go` — it does the `Add(1)`/`defer Done()` for you.) `runStream` loops over a retry iterator and reads current pooler metadata from the store on each reconnect (so host/port changes are picked up):
 
 ```go title="internal/orchestrator/recovery/health_stream.go"
 r := retry.New(streamReconnectInitialBackoff, streamReconnectMaxBackoff, retry.WithInitialDelay())
@@ -480,11 +422,7 @@ for _, err := range r.Attempts(ctx) {
 }
 ```
 
-:::note[Go 1.23: range-over-func iterator]
-`r.Attempts(ctx)` returns `func(yield func(int, error) bool)` — a range-over-func iterator (Go 1.23). Internally it `select`s on a timer vs `ctx.Done()`, so the backoff is itself cancellable; `Reset()` restarts the backoff after a stream stays healthy. See [stdlib & idioms](/go-guide/language/10-stdlib-and-idioms/).
-:::
-
-The subtle part is the **staleness watchdog** inside `streamOnce`:
+(`r.Attempts(ctx)` is a Go 1.23 range-over-func iterator; internally it `select`s on a timer vs `ctx.Done()`, so the backoff is itself cancellable.) The subtle part is the **staleness watchdog** inside `streamOnce`:
 
 ```go title="internal/orchestrator/recovery/health_stream.go"
 watchdogCtx, cancelWatchdog := context.WithCancel(ctx)
@@ -521,12 +459,12 @@ stream, err := hs.rpcClient.ManagerHealthStream(watchdogCtx, poolerHealth.Pooler
 ```
 
 :::caution[Gotcha — gRPC keepalive can't catch a stuck-but-alive server]
-If the pooler's server goroutine hangs while the TCP connection stays alive, keepalive sees a healthy socket and no snapshots arrive — the engine would silently work off stale data. The watchdog is a second goroutine holding a timer; each received message resets it via the **buffered (cap 1)** `resetCh`, so the recv loop never blocks on the watchdog. If the timer fires first, it cancels `watchdogCtx`, which is the context passed to the stream, so `Recv()` returns an error and `runStream` reconnects. Buffering `resetCh` to 1 is the same fire-and-forget pattern as the recruit channel: the producer (recv loop) must never block on the consumer (watchdog).
+If the pooler's server goroutine hangs while the TCP connection stays alive, keepalive sees a healthy socket and no snapshots arrive — the engine would silently work off stale data. The watchdog is a second goroutine holding a timer; each received message resets it via the **buffered (cap 1)** `resetCh`, so the recv loop never blocks on the watchdog. If the timer fires first, it cancels `watchdogCtx` — the context passed to the stream — so `Recv()` returns an error and `runStream` reconnects. Buffering `resetCh` to 1 is the same fire-and-forget pattern as the recruit channel: the producer (recv loop) must never block on the consumer (watchdog).
 :::
 
 ### `timeouts` — deadlines as documented constants
 
-All the deadlines live in one place, with rationale comments. The numbers were tuned against real failover tests:
+All the deadlines live in one place, with rationale comments tuned against real failover tests:
 
 ```go title="internal/timeouts/rpc.go"
 const RuleWriteTimeout = 30 * time.Second                    // per election RPC
@@ -535,9 +473,7 @@ const DefaultSnapshotInterval = 5 * time.Second              // proactive snapsh
 const PollResponseWait = 500 * time.Millisecond              // cap on poll-for-fresh-snapshot
 ```
 
-Centralising them keeps the action timeout (`2*RuleWriteTimeout + 5s`) and the per-RPC timeout in lockstep — change one constant and the relationship holds.
-
----
+Centralizing them keeps the action timeout (`2*RuleWriteTimeout + 5s`) and the per-RPC timeout in lockstep.
 
 ## Observability and the anti-split-brain safeguards
 
@@ -560,9 +496,7 @@ func Emit(ctx context.Context, logger *slog.Logger, outcome Outcome, event Event
 }
 ```
 
-`Outcome` is `Started`/`Success`/`Failed`; `Failed` logs at ERROR, the rest at INFO; `ctx` is threaded for OpenTelemetry correlation (see [errors across boundaries & observability](/go-guide/project/09-errors-and-observability/)). The interface lets any typed event plug in — see [interfaces](/go-guide/language/03-interfaces-composition/).
-
-The event for a promotion is `PrimaryPromotion`:
+`Outcome` is `Started`/`Success`/`Failed`; `Failed` logs at ERROR, the rest at INFO; `ctx` is threaded for OpenTelemetry correlation. The promotion event:
 
 ```go title="internal/eventlog/events.go"
 type PrimaryPromotion struct {
@@ -574,11 +508,11 @@ type PrimaryPromotion struct {
 }
 ```
 
-`RecruitMs`/`PromoteMs` are **pointers** so they can be "not applicable" (`nil`) on the `Started` event and on a recruitment failure that never reached the promote phase. `Run` splits latency into the two phases using a **monotonic clock** (`time.Since`), so wall-clock adjustments don't corrupt the numbers. It emits `Started` *before* any RPC and `Success`/`Failed` at the end.
+`RecruitMs`/`PromoteMs` are **pointers** so they can be "not applicable" (`nil`) on the `Started` event and on a recruitment failure that never reached promote. `Run` splits latency into the two phases using a monotonic clock (`time.Since`), so wall-clock adjustments don't corrupt the numbers.
 
 ### Idempotency is enforced at every layer
 
-Split-brain prevention is not assumed — it's defended at multiple independent points, and removing any one re-opens the door:
+Split-brain prevention is defended at multiple independent points — removing any one re-opens the door:
 
 | Guard | What it prevents |
 |---|---|
@@ -594,25 +528,21 @@ const backoffWindow = 4 * time.Second
 // ... if a cohort member accepted a revocation within 4s, return UNAVAILABLE and abort.
 ```
 
-`AppointLeader` is documented idempotent precisely because these guards make a retried election safe. That's what lets `attemptRecovery` mark the action retryable.
-
----
+`AppointLeader` is documented idempotent precisely because these guards make a retried election safe — which is what lets `attemptRecovery` mark the action retryable.
 
 ## Checkpoints
 
 <details><summary>Why is the <code>recruited</code> channel in <code>dispatchRecruit</code> buffered with capacity <code>len(cohort)</code>, and what fails if it's unbuffered?</summary>
-`collectRecruitsAndBuildProposal` commits at the first viable proposal and stops reading. The goroutines for slow nodes still need to send their one result and exit. With a buffer of `len(cohort)` (one slot per producer) every goroutine can send and return even after the consumer left. Unbuffered, those goroutines would block forever on the send — a leaked goroutine per slow node on every election.</details>
+<code>collectRecruitsAndBuildProposal</code> commits at the first viable proposal and stops reading. The goroutines for slow nodes still need to send their one result and exit. With a buffer of <code>len(cohort)</code> (one slot per producer) every goroutine can send and return even after the consumer left. Unbuffered, those goroutines would block forever on the send — a leaked goroutine per slow node on every election.</details>
 
 <details><summary>Why does <code>PeriodicRunner.Stop()</code> call <code>r.wg.Wait()</code> after releasing <code>r.mu</code>?</summary>
-`execute()` re-acquires `r.mu` after its callback finishes. If `Stop()` held `r.mu` while waiting on the `WaitGroup`, `execute()` would block forever trying to acquire `r.mu` and the `WaitGroup` would never reach zero — deadlock. Cancel under the lock (to interrupt), but wait outside it.</details>
+<code>execute()</code> re-acquires <code>r.mu</code> after its callback finishes. If <code>Stop()</code> held <code>r.mu</code> while waiting on the <code>WaitGroup</code>, <code>execute()</code> would block forever trying to acquire <code>r.mu</code> and the <code>WaitGroup</code> would never reach zero — deadlock. Cancel under the lock (to interrupt), but wait outside it.</details>
 
 <details><summary>Phase 4 waits for every cohort member's RPC but returns immediately if the leader's fails. Why the asymmetry?</summary>
-The rule change commits when the leader's `Promote` succeeds. Non-leader `SetPrimary`s still need to complete so those nodes learn the new primary (avoiding re-wiring next cycle), so we wait for them. But if the leader fails, there is no new primary for anyone to learn about, so waiting buys nothing — fail fast.</details>
+The rule change commits when the leader's <code>Promote</code> succeeds. Non-leader <code>SetPrimary</code>s still need to complete so those nodes learn the new primary (avoiding re-wiring next cycle), so we wait for them. But if the leader fails, there is no new primary for anyone to learn about, so waiting buys nothing — fail fast.</details>
 
 <details><summary>Why use a mutex+map <code>ProtoStore</code> for pooler state but a <code>sync.Map</code> for the policy cache?</summary>
-Access pattern. Pooler state is write-heavy (health/topology churn every few seconds), where `sync.Map`'s write-once-read-many optimisations don't help and `proto.Clone`-on-access is what's actually needed. The policy cache is written once per database and read many times — the textbook `sync.Map` case.</details>
-
----
+Access pattern. Pooler state is write-heavy (health/topology churn every few seconds), where <code>sync.Map</code>'s write-once-read-many optimizations don't help and <code>proto.Clone</code>-on-access is what's actually needed. The policy cache is written once per database and read many times — the textbook <code>sync.Map</code> case.</details>
 
 ## Exercises
 
@@ -620,9 +550,9 @@ Access pattern. Pooler state is write-heavy (health/topology churn every few sec
 
 1. **Trace the failover end-to-end.** Starting from a dead leader, follow the path through the real files and write down, at each hop, *which context deadline is set* and *which goroutines are spawned*: `leader_is_dead_analyzer.go` `Analyze` → `recovery_loop.go` `performRecoveryCycle` (the `sync.WaitGroup` fan-out) → `attemptRecovery` (`recheckProblem` + `WithTimeout`) → `actions/appoint_leader.go` `Execute` → `consensus/coordinator.go` `AppointLeader`/`runFailover` → `consensus/rule_change.go` `Run` (the four phases).
 
-2. **Concurrency audit of `rule_change.go`.** In your own words, explain (a) why `recruited` is buffered to `len(cohort)`, (b) what would deadlock or leak if it were unbuffered, and (c) why `collectRecruitsAndBuildProposal` may return before reading all `len(cohort)` results.
+2. **Concurrency audit of `rule_change.go`.** Explain (a) why `recruited` is buffered to `len(cohort)`, (b) what would deadlock or leak if it were unbuffered, and (c) why `collectRecruitsAndBuildProposal` may return before reading all `len(cohort)` results.
 
-3. **Lock-discipline diagram.** Read `periodic_runner.go` `Stop()` and `execute()`. Draw the lock acquire/release timeline for a `Stop()` that races an in-flight callback, and explain exactly where a deadlock would appear if `wg.Wait()` were moved inside the held lock. Then define "backpressure" in this context and name the bug it prevents under a slow recovery cycle.
+3. **Lock-discipline diagram.** Read `periodic_runner.go` `Stop()` and `execute()`. Draw the lock acquire/release timeline for a `Stop()` that races an in-flight callback, and explain exactly where a deadlock would appear if `wg.Wait()` were moved inside the held lock. Then define "backpressure" here and name the bug it prevents under a slow recovery cycle.
 
 4. **Deadline-chain grep.** Run `grep -rn "context.WithTimeout" internal/orchestrator`. For each hit, identify the parent context and the timeout value, then explain how the chain ties back to `engine.shutdownCtx` so a `Stop()` cancels an in-flight election. Cross-check that `appoint_leader.go`'s `Metadata().Timeout` (`2*RuleWriteTimeout + 5s`) is at least the two sequential `RuleWriteTimeout` phases in `rule_change.go`.
 
@@ -630,13 +560,9 @@ Access pattern. Pooler state is write-heavy (health/topology churn every few sec
 
 </Steps>
 
----
-
 ## Next
 
 Continue to [errors across boundaries & observability](/go-guide/project/09-errors-and-observability/) to see how `Emit`, OpenTelemetry spans, and `errx` wrapping turn this subsystem's events into traces and structured errors.
-
----
 
 ## See also
 

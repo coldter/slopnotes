@@ -1,25 +1,18 @@
 ---
 title: Iterators & Generators
-description: The JavaScript iteration protocol at full depth — iterators, iterables, typed generators, yield* delegation, early exit, and why coroutines are a library feature. The foundation Effect builds on.
+description: "The generator protocol underneath `Effect.gen`: `next()`/`throw()`/`return()`, the three type parameters, and `yield*` delegation."
 sidebar:
   order: 1
 ---
 
 import { LinkCard } from "@astrojs/starlight/components";
 
-You probably know generators well enough to use them. This chapter closes the
-remaining gaps, because Effect v4's entire authoring experience — `yield*`,
-`Effect.gen`, `Effect.fn` — is a direct consumer of these mechanics, and the
-subtleties (return values of `next()`, delegation semantics, the three type
-parameters of `Generator`, what happens on early termination) are exactly the
-things people half-know.
+`Effect.gen`, `Effect.fn`, and every `yield*` consume the JS generator protocol directly. Master these mechanics and the rest follows.
 
 ## The two protocols
 
-There are two distinct protocols that constantly get conflated:
-
 ```ts
-// The Iterator protocol — a cursor over values
+// Iterator protocol — a one-shot cursor over values
 interface Iterator<T, TReturn = any, TNext = undefined> {
   next(...args: [] | [TNext]): IteratorResult<T, TReturn>
 }
@@ -28,7 +21,7 @@ type IteratorResult<T, TReturn = any> =
   | { done: false; value: T }
   | { done: true; value: TReturn }
 
-// The Iterable protocol — "I can hand out a fresh iterator"
+// Iterable protocol — "hand out a fresh iterator"
 interface Iterable<T> {
   [Symbol.iterator](): Iterator<T>
 }
@@ -37,45 +30,25 @@ interface Iterable<T> {
 interface IterableIterator<T> extends Iterator<T>, Iterable<T> {}
 ```
 
-An **iterator** is a one-shot cursor: call `next()` repeatedly until `done`.
-An **iterable** is a factory: every `[Symbol.iterator]()`
-call yields a *fresh* cursor, which is why arrays can be iterated many times.
-Generators return objects that are both — each call to the generator function
-creates an independent cursor.
+An **iterator** is a one-shot cursor. An **iterable** is a factory — each `[Symbol.iterator]()` returns a fresh cursor, so arrays iterate many times. Generators return objects that are both.
 
 :::caution[One-shot vs restartable]
-A generator *function* is restartable; a generator *object* is not. After a
-generator object completes, every subsequent `.next()` returns
-`{ done: true, value: undefined }` forever. This distinction matters later:
-`Effect.gen` runs the generator body **once per effect execution**, calling
-the generator function again each time — that's what makes effects re-runnable.
+A generator *function* is restartable; a generator *object* is not. After it completes, every `.next()` returns `{ done: true, value: undefined }` forever. `Effect.gen` re-invokes the generator function **once per effect execution** — that's what makes effects re-runnable.
 :::
 
-## The full shape of `next()`
+## `next()` drives both directions
 
-Most developers know `next()` returns `{ value, done }`. The subtleties:
-
-1. **Values flow in both directions.** `next(arg)` makes `arg` the value of
-   the *currently suspended `yield` expression*. Generators are the only JS
-   construct where the callee injects values into the caller's expression
-   position — this bidirectional channel is precisely what Effect exploits to
-   feed success values back into your `const x = yield* ...` lines.
-
-2. **`throw()` and `return()` complete the generator from outside.**
-   `iterator.throw(err)` makes the suspended `yield` expression *throw* `err`
-   (your `try/catch` inside the generator sees it);
-   `iterator.return(v)` forces `done: true` with value `v`, running `finally`
-   blocks along the way. The Effect runtime uses both paths to inject failures
-   and to unwind generators when a fiber is interrupted.
+1. **Values flow both ways.** `next(arg)` makes `arg` the value of the suspended `yield` expression — the only JS construct where the callee injects into the caller's expression. Effect uses this to feed success values into `const x = yield* ...`.
+2. **`throw(err)` and `return(v)` complete the generator from outside.** `throw` makes the suspended `yield` raise `err` (your `try/catch` sees it); `return(v)` forces `done: true` with `v`, running `finally` blocks. The runtime uses both to inject failures and unwind interrupted fibers.
 
 ```ts
 function* demo() {
   try {
-    const received = yield 1 // suspends here
+    const received = yield 1
     console.log("got:", received)
     yield 2
   } finally {
-    console.log("cleanup ran") // runs on return()/throw()/GC-completion
+    console.log("cleanup ran") // runs on return()/throw()/completion
   }
 }
 
@@ -94,43 +67,28 @@ interface Generator<Y = unknown, R = unknown, N = unknown>
 }
 ```
 
-- `Y` — the type of values **yielded** out
-- `R` — the **return** type when done
-- `N` — the type the caller may pass **into** `next()`
-
-TypeScript infers all three from the body:
+- `Y` — type of values **yielded** out
+- `R` — **return** type when done
+- `N` — type the caller passes **into** `next()`
 
 ```ts
 function* counter(): Generator<number, string, void> {
   let i = 0
   while (i < 3) {
-    const _ignored = yield i++ // yield returns void here
+    const _ignored = yield i++
   }
   return "done"
 }
 ```
 
-When you use `yield x` (not `yield*`), TS types the yield-expression's value
-as `N`. When you write `yield* expr`, TS uses the *delegated* iterable's own
-`N` — this is how `yield* someEffect` gets its `A` type into your variable.
+`yield x` types the expression as `N`. `yield* expr` uses the delegate's own `N` — that's how `yield* someEffect` gets its `A` into your variable.
 
-## `yield*` — delegation, not syntax sugar
+## `yield*` delegates fully
 
-`yield*` delegates to another iterable/iterator:
-
-- It drives the inner iterator **to completion**, forwarding every `next()`
-  argument *into* it and every yielded value *out of* it.
-- Its expression value is the inner iterator's **return value** — so
-  `const a = yield* genReturningNumber()` types `a` as `number`.
-- Exceptions thrown by the inner iterator propagate out.
-- Crucially: if the outer generator receives `return()` while suspended
-  inside a `yield*`, the inner iterator also gets `return()` — unwinding
-  propagates through delegation chains, running inner `finally` blocks.
-
-That last point is load-bearing for cancellation: when Effect interrupts a
-fiber running your `Effect.gen` body, it calls `return()` on the current
-iterator, which cascades through any active `yield*` — though for Effects the
-runtime handles cleanup through finalizers rather than generator `finally`.
+- Drives the inner iterator to completion, forwarding `next()` args in and yielded values out.
+- Expression value = the inner iterator's **return value** (`const a = yield* gen()` types `a` as the return type).
+- Inner exceptions propagate out.
+- If the outer gets `return()` while suspended in a `yield*`, the inner gets `return()` too — unwinding cascades through delegation, running inner `finally` blocks. This is how cancellation reaches nested generators.
 
 ```ts
 function* inner(): Generator<number, number, void> {
@@ -145,18 +103,11 @@ function* outer(): Generator<number, number, void> {
 }
 ```
 
-Note what `yield*` did *not* do: it did not flatten laziness away magically.
-Delegation is synchronous control-flow plumbing — whoever *drives* the outer
-iterator is unknowingly driving the inner one too. Hold that thought.
+Delegation is synchronous control-flow plumbing: whoever drives the outer iterator drives the inner one too.
 
-## Generators as interpreters: building async/await by hand
+## Build async/await by hand
 
-Here's the trick that unlocks all of Effect: **a generator is a resumable
-function, and whoever holds the iterator decides what `yield`ed values mean.**
-
-`async/await` is exactly this pattern baked into engines: transpile-era code
-(`regenerator`, co.js) interpreted generators before we had native support.
-Let's write a coroutine runner for thunks:
+A generator is a resumable function; whoever holds the iterator decides what yielded values mean. `async/await` is this pattern baked into engines. Here's a coroutine runner for thunks:
 
 ```ts
 type Thunk<A> = () => Promise<A>
@@ -166,7 +117,6 @@ function run<A>(genFn: () => Generator<Thunk<any>, A, any>): Promise<A> {
     const it = genFn()
     function step(next: IteratorResult<Thunk<any>, A>): void {
       if (next.done) return resolve(next.value)
-      // Interpret the yielded thunk: run it, feed result back in
       next.value().then(
         (value) => step(it.next(value)),
         (error) => step(it.throw!(error))
@@ -185,57 +135,36 @@ const program = function* () {
 run(program).then(console.log)
 ```
 
-Twenty lines, and we have: imperative-looking async code, errors flowing
-through normal `try/catch`, and a *program that is a value* (the generator
-factory) separate from its *execution* (the runner). Everything specific to
-promises lives in one function — swap the interpreter and the same body means
-something else.
-
-That is the entire conceptual jump to Effect:
+Twenty lines give you: imperative-looking async, errors through normal `try/catch`, and a program that is a value separate from its execution. Swap the interpreter and the same body means something else.
 
 | toy runner | Effect runtime |
 |---|---|
 | `Thunk<A>` yielded | `Effect<A, E, R>` descriptions yielded |
-| feeds resolved promise value back via `next(value)` | feeds success `A` via `next(a)` |
-| rejects → `it.throw(error)` | fails → resumes the generator so the `yield*` raises the typed error |
-| no cancellation | interrupts → unwinds the iterator, runs finalizers |
-| no context | threads a `Context` through, satisfying `R` |
+| resolved value fed back via `next(value)` | success `A` via `next(a)` |
+| reject → `it.throw(error)` | fail → resumes generator so `yield*` raises the typed error |
+| no cancellation | interrupt → unwinds iterator, runs finalizers |
+| no context | threads `Context` through, satisfying `R` |
 | no scheduling | cooperative scheduler, fiber budget, keep-alive |
 
-The difference is that Effect's interpreter is a production-grade fiber
-runtime — and because yielded values are inert *descriptions*, the same body
-can be executed eagerly, inspected, retried, timed, traced, or run under a
-virtual clock without changing a line.
+Effect's interpreter is a production-grade fiber runtime. Because yielded values are inert descriptions, the same body runs eagerly, or is inspected, retried, timed, traced, or run under a virtual clock.
 
-## Performance notes worth knowing
+## Performance notes
 
-- Generators have engine-level fast paths (V8 optimizes them well), but each
-  `yield` is still a real suspension — an object allocation for the result
-  wrapper plus a state-machine transition.
-- Effect's `Effect.gen` doesn't use `for await` or helper libraries; it
-  drives `iterator.next(value)` directly in a loop (see next chapter), which
-  keeps the overhead to the minimum the protocol allows.
-- `yield*` on an Effect is *not* a nested run — there is no recursion, no
-  stack growth. Delegation is flattened at the iterator level; the runtime
-  sees one linear sequence of instructions. Deeply nested `gen` bodies do not
-  risk stack overflow the way naive promise-recursion can.
+- Each `yield` is a real suspension — a result-wrapper allocation plus a state-machine transition. V8 optimizes generators well, but it's not free.
+- `Effect.gen` drives `iterator.next(value)` directly in a loop — no `for await`, no helper libraries. Overhead stays at the protocol minimum.
+- `yield*` on an Effect is **not** a nested run — no recursion, no stack growth. Delegation flattens at the iterator level; the runtime sees one linear instruction sequence. Deeply nested `gen` bodies don't risk stack overflow.
 
-## What to remember
+## Remember
 
-1. `next(value)` injects; `throw(err)` raises; `return(v)` unwinds — the
-   driver controls the generator's reality.
-2. `yield*` delegates fully: values, arguments, exceptions, and early
-   completion all pass through, and its expression value is the delegate's
-   return value.
-3. A generator *body* is a blueprint; the iterator instance is the single
-   execution. Re-runnable programs re-invoke the body.
-4. Interpreters give `yield`ed values meaning. Effect's meaning: "suspend
-   this fiber until this described computation produces a result."
+1. `next(value)` injects; `throw(err)` raises; `return(v)` unwinds — the driver controls the generator.
+2. `yield*` delegates values, args, exceptions, and early completion; its value is the delegate's return.
+3. The body is a blueprint; the iterator is the single execution. Re-runnable programs re-invoke the body.
+4. Interpreters give yielded values meaning. Effect's meaning: "suspend this fiber until this described computation produces a result."
 
 ## Next
 
 <LinkCard
   title="02 · The Effect Model"
-  description="With the machinery understood: what an Effect value is, the A/E/R triple, laziness, and the run* entry points."
+  description="The A/E/R triple against Promise, laziness, and the run* entry points."
   href="/effect-ts/02-the-effect-model/"
 />

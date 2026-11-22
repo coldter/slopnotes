@@ -1,6 +1,6 @@
 ---
 title: Streams & Background Work
-description: Async generators, asyncio.Queue backpressure, hand-built stream operators, and supervised background tasks — Python's answer to Kotlin Flow and Go channels.
+description: "Async generators as cold pull-driven streams, asyncio.Queue(maxsize) for backpressure and fan-out/fan-in, hand-built operators, and supervised background tasks with clean cancellation."
 sidebar:
   order: 6
 ---
@@ -8,17 +8,7 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-[Module 05](/modern-python/05-async-concurrency/) gave you `async`/`await`,
-`TaskGroup`, timeouts, and cancellation — the tools for running a *finite* set of
-concurrent operations and waiting for them. This module is about **streams**:
-data that arrives over time, one item at a time, possibly forever — and the
-**background work** that processes it.
-
-If you've reached for RxJS Observables, Kotlin `Flow`, or a Go channel pipeline,
-you already have the mental model. Python's primitive is humbler and more
-built-in than any of those: a function with `yield` in it. An **async generator**
-is a lazy, backpressure-aware, cancellable async stream, and `async for` is how
-you consume one. There's no library to import — it's syntax.
+[Module 05](/modern-python/05-async-concurrency/) covered running a *finite* set of concurrent operations. This module is about **streams** — data arriving over time, possibly forever — and the background work that processes it. The primitive is humbler than RxJS/Kotlin Flow/Go channels and built into the language: a function with `yield` in it. An **async generator** is a lazy, backpressure-aware, cancellable async stream; `async for` consumes it.
 
 ## The mental model
 
@@ -33,25 +23,16 @@ you consume one. There's no library to import — it's syntax.
 | Cancellation | `AbortController` / `unsubscribe()` | `close(ch)` / `ctx.Done()` | cancel the task; `GeneratorExit` |
 | Cleanup | `finally` in the generator | `defer close(ch)` | `finally` / `aclose()` |
 
-Two distinct shapes hide in that table, and the whole module hinges on telling
-them apart:
+Two shapes hide in that table:
 
-- **Pull-based streams** (async generators) — *cold*. Nothing runs until a
-  consumer pulls with `async for`. The consumer sets the pace; the producer
-  suspends at `yield` until asked for the next value. This is Kotlin `Flow` and
-  RxJS cold Observables.
-- **Push-based queues** (`asyncio.Queue`) — *hot*. A producer task runs on its
-  own and pushes items in; a consumer task pulls them out. The queue's `maxsize`
-  is your backpressure knob. This is a Go channel.
+- **Pull-based streams** (async generators) — *cold*. Nothing runs until a consumer pulls with `async for`; the producer suspends at `yield` until asked for more. Kotlin `Flow` / RxJS cold Observables.
+- **Push-based queues** (`asyncio.Queue`) — *hot*. A producer task runs on its own and pushes items in; `maxsize` is the backpressure knob. A Go channel.
 
-You build pipelines out of async generators, and you decouple producers from
-consumers (fan-out, fan-in, hot sources) with queues. Let's build both.
+Build pipelines from async generators; decouple producers from consumers with queues.
 
 ## Async generators: lazy async streams
 
-A regular generator yields values lazily and synchronously. Make the function
-`async def` and you can `await` *between* yields — now it's an async generator,
-and you consume it with `async for`.
+Make a function `async def` and you can `await` *between* yields — an async generator consumed with `async for`. Annotate the return as `AsyncIterator[T]` from `collections.abc` (not `Coroutine` — an async generator is not a coroutine; you don't `await` it, you `async for` over it).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -121,29 +102,11 @@ asyncio.run(main())
   </TabItem>
 </Tabs>
 
-**Key differences:**
+Key differences: TS is near-identical (`async function*` + `for await`). Go has no generators — the goroutine is *hot* (runs immediately), `close(ch)` signals done, cancellation is manual via `ctx`. Python's async generator is *cold*: calling `ticker(3)` runs nothing; the body advances only when `async for` pulls. Cancelling the consuming task delivers `GeneratorExit` at the current `yield`.
 
-- **TS**: `async function*` + `for await`. Same idea, near-identical syntax.
-- **Go**: no generators at all — you fake a stream with a channel and a
-  goroutine. The goroutine is *hot* (runs immediately); `close(ch)` is your
-  "stream done"; cancellation is manual via `ctx`.
-- **Python**: `async def` with `yield` makes the function an async generator.
-  It's *cold* — calling `ticker(3)` runs nothing; the body only advances when
-  `async for` pulls. Cancellation is automatic (cancel the consuming task and
-  the generator gets a `GeneratorExit` at its current `yield`).
+### Cold, like Kotlin Flow — but single-use
 
-:::note[Type hints for async streams]
-Annotate the return as `AsyncIterator[T]` (or `AsyncGenerator[T, None]` if you
-want to be explicit about the send/return types) from `collections.abc`. `ty`
-and `mypy` both understand that a `yield` inside an `async def` produces an async
-generator. Don't write `Coroutine` — an async generator is not a coroutine; you
-don't `await` it, you `async for` over it.
-:::
-
-### Cold, like Kotlin Flow
-
-Just like a Kotlin `Flow` or an RxJS cold Observable, an async generator does
-nothing until consumed, and each consumption restarts it from scratch:
+An async generator does nothing until consumed, and each consumption restarts it:
 
 ```python
 async def source() -> AsyncIterator[int]:
@@ -165,18 +128,11 @@ async def main() -> None:
         print("second pass", x)
 ```
 
-:::caution[Generators are single-use; Flows are re-runnable]
-This is the one place the Flow analogy leaks. A Kotlin `Flow` *value* can be
-collected many times — each `.collect{}` re-runs the builder. A Python async
-generator *object* is exhausted after one `async for`. The re-runnable
-equivalent is the **function**: call `source()` again for a fresh stream. If you
-need a value you can iterate repeatedly, wrap the factory, not the generator.
-:::
+Unlike a Kotlin `Flow` value (re-collectable), a Python async generator *object* is exhausted after one `async for`. The re-runnable equivalent is the **function**: call `source()` again for a fresh stream.
 
 ### Async comprehensions
 
-Comprehensions go async too: use `async for` inside them. Handy for draining a
-stream into a list, or building one stream from another inline.
+Comprehensions go async too — `async for` inside them. The list form `[... async for ...]` is the equivalent of `flow.toList()`: it runs the cold stream to completion and collects. Use only on bounded streams; an infinite generator hangs it forever.
 
 ```python
 # Drain an async stream into a list (terminal — like Flow.toList())
@@ -195,18 +151,9 @@ async for y in squared:
 evens = [x async for x in ticker(10) if x % 2 == 0]
 ```
 
-The list comprehension form `[... async for ...]` is the idiomatic Python
-equivalent of `flow.toList()` or RxJS `lastValueFrom(toArray())` — it *runs* the
-cold stream to completion and collects the results. Use it only on bounded
-streams; an infinite generator will hang it forever.
-
 ## Building stream operators by hand
 
-Kotlin gives you `.map`, `.filter`, `.buffer`, `.debounce` as built-in `Flow`
-operators. RxJS gives you a hundred of them. Python's stdlib gives you... `async
-for` and `yield`. That's deliberate: an operator is *just an async generator that
-consumes another async generator*. You write the handful you need, and they
-compose exactly like a Unix pipe.
+Python's stdlib gives you `async for` and `yield` — an operator is *just an async generator that consumes another async generator*. Write the handful you need; they compose like a Unix pipe. (If you need dozens, reach for [`aiostream`](https://aiostream.readthedocs.io/) — the RxJS for asyncio, `uv add aiostream`, with `stream.map`/`.filter`/`.merge`/`.chunks` and `|` pipe syntax.)
 
 ### map and filter
 
@@ -241,7 +188,7 @@ func mapStage(in <-chan int, f func(int) int) <-chan int {
   <TabItem label="Python">
 
 ```python
-from collections.abc import AsyncIterator, Callable, Awaitable
+from collections.abc import AsyncIterator, Callable
 
 
 async def amap[T, R](
@@ -264,28 +211,11 @@ async def afilter[T](
   </TabItem>
 </Tabs>
 
-Note the PEP 695 generics (`def amap[T, R](...)`) — no `TypeVar` boilerplate.
-Each operator takes a source stream and returns a new stream; nothing executes
-until the final `async for` pulls. That's the cold, pull-driven model paying off:
-`afilter` only asks `amap` for a value when its own consumer asks it for one.
+Note the PEP 695 generics (`def amap[T, R](...)`) — no `TypeVar` boilerplate. Each operator returns an `AsyncIterator`; nothing executes until the final `async for` pulls. `afilter` only asks `amap` for a value when its own consumer asks it for one.
 
 ### Composing into a pipeline
 
-Because each operator returns an `AsyncIterator`, you nest them — the innermost
-call is the source, each wrapping call is a stage:
-
-```python
-async def main() -> None:
-    pipeline = afilter(
-        amap(ticker(10), lambda x: x * 2),
-        lambda x: x > 5,
-    )
-    async for x in pipeline:
-        print(x)   # 6, 8, 10, 12, ... (skips 2, 4)
-```
-
-Nested calls read inside-out, which gets ugly fast. A tiny `pipe` helper flips it
-to read top-to-bottom, like a Kotlin operator chain or a `.pipe()` in RxJS:
+Operators nest inside-out; a tiny `pipe` helper reads top-to-bottom like a Kotlin operator chain or RxJS `.pipe()`:
 
 ```python
 from collections.abc import AsyncIterator, Callable
@@ -309,7 +239,7 @@ async def main() -> None:
         print(x)
 ```
 
-<Mermaid title="Async generator pipeline (pull-driven)" code={`
+<Mermaid title="Async generator pipeline — demand flows backwards" code={`
 flowchart LR
   S["ticker(10)"] -->|"async for"| M["amap: x*2"]
   M -->|"async for"| F["afilter: x>5"]
@@ -319,15 +249,11 @@ flowchart LR
   M -.->|"pulls next"| S
 `} height={320} />
 
-The dashed arrows are the point: demand flows *backwards*. The consumer pulls,
-which pulls the filter, which pulls the map, which pulls the source. No item is
-produced until someone downstream wants it — backpressure for free.
+The dashed arrows are the point: demand flows *backwards*. The consumer pulls, which pulls the filter, which pulls the map, which pulls the source. No item is produced until someone downstream wants it — backpressure for free.
 
 ### batch (chunked)
 
-Grouping a stream into fixed-size batches is the single most useful custom
-operator for backends — you batch rows before a bulk `INSERT`, events before a
-flush. Kotlin calls it `chunked`; RxJS calls it `bufferCount`.
+Grouping a stream into fixed-size batches is the most useful custom operator for backends — bulk `INSERT`s, event flushes. Kotlin calls it `chunked`; RxJS calls it `bufferCount`:
 
 ```python
 from collections.abc import AsyncIterator
@@ -354,9 +280,7 @@ async def main() -> None:
 
 ### throttle and debounce
 
-These are time-based and where people usually reach for a library — but they're
-small. **Throttle** emits at most once per interval (rate limiting a firehose);
-**debounce** waits for a quiet gap before emitting the latest (search-as-you-type).
+Time-based operators. **Throttle** emits at most once per interval (rate limiting); **debounce** waits for a quiet gap, then emits the latest (search-as-you-type):
 
 ```python
 import asyncio
@@ -408,25 +332,11 @@ async def debounce[T](src: AsyncIterator[T], delay: float) -> AsyncIterator[T]:
 _DONE = object()  # module-level sentinel
 ```
 
-Debounce is the first operator that needs an internal task and queue, because it
-has to *consume ahead* of what it emits (to know when the source went quiet). It
-also shows the cleanup discipline this module keeps hammering: the `finally`
-cancels the feeder task no matter how the consumer leaves.
-
-:::tip[Don't hand-roll the whole operator library — `aiostream` exists]
-If you find yourself building a dozen operators, reach for
-[`aiostream`](https://aiostream.readthedocs.io/) (`uv add aiostream`). It's the
-closest thing to RxJS for asyncio: `stream.map`, `.filter`, `.merge`, `.take`,
-`.chunks`, time operators, and a `|` pipe syntax. The point of writing them by
-hand here is to *understand* that an operator is just an async generator — once
-that clicks, reach for the library.
-:::
+Debounce is the first operator that needs an internal task and queue — it must *consume ahead* of what it emits to know when the source went quiet. Its `finally` cancels the feeder task no matter how the consumer leaves.
 
 ### merge: fan-in of multiple streams
 
-Merging interleaves several streams into one as values arrive — RxJS `merge`,
-Kotlin `merge`, the Go fan-in pattern. You can't `async for` two generators at
-once, so you spin up a task per source feeding a shared queue:
+Interleave several streams into one as values arrive — RxJS `merge`, Kotlin `merge`, the Go fan-in pattern. You can't `async for` two generators at once, so spin up a task per source feeding a shared queue:
 
 ```python
 import asyncio
@@ -458,29 +368,20 @@ async def merge[T](*sources: AsyncIterator[T]) -> AsyncIterator[T]:
         runner.cancel()
 ```
 
-This is the bridge from cold pull-based generators to hot push-based queues —
-which is exactly the next section.
+This is the bridge from cold pull-based generators to hot push-based queues.
 
 ## Backpressure with `asyncio.Queue`
 
-An async generator's backpressure is implicit: the producer can't get ahead
-because it's suspended at `yield`. But sometimes you *want* the producer to run
-ahead — to decouple a bursty source from a steady consumer, or to fan work out to
-several workers. That's what `asyncio.Queue` is for, and it's the direct analog
-of a **buffered Go channel**.
+An async generator's backpressure is implicit (the producer is suspended at `yield`). Sometimes you *want* the producer to run ahead — decouple a bursty source from a steady consumer, fan work out to workers. `asyncio.Queue` is the direct analog of a **buffered Go channel**.
 
-The single most important parameter is `maxsize`. A bounded queue (`maxsize > 0`)
-gives you backpressure: when the queue is full, `await queue.put(x)` *suspends*
-the producer until a consumer makes room. An unbounded queue (`maxsize=0`,
-the default) will happily grow until you run out of memory if the producer
-outpaces the consumer — a real production incident, not a hypothetical.
+`maxsize` is the key parameter. A bounded queue (`maxsize > 0`) gives backpressure: when full, `await queue.put(x)` *suspends* the producer until a consumer makes room. Unbounded (`maxsize=0`, the default) grows until OOM if the producer outpaces the consumer — a real production incident.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
 
 ```ts
-// Node has no built-in bounded async queue. You either use a library
-// (e.g. async generators with a semaphore) or a stream with highWaterMark:
+// Node has no built-in bounded async queue — use a stream's highWaterMark
+// or a library.
 import { Readable } from "node:stream";
 const stream = new Readable({ highWaterMark: 100 /* backpressure */ });
 ```
@@ -529,34 +430,16 @@ async def consumer() -> None:
   </TabItem>
 </Tabs>
 
-**Key differences:**
-
-- **Go**: the buffered channel *is* the bounded queue, and `close(ch)` cleanly
-  signals "no more values" to every `range` loop. Idiomatic and complete.
-- **Python**: `asyncio.Queue(maxsize=n)` mirrors the buffered channel, but it has
-  **no close** — there is no built-in "done" signal. You signal completion
-  yourself, usually with a **sentinel** object, or with `join()`/`task_done()`
-  bookkeeping. This trips up Go developers constantly.
-- **TS**: no first-class bounded async queue in the stdlib; you lean on Node
-  streams' `highWaterMark` or a library.
-
 :::caution[`asyncio.Queue` has no `close()` — Go devs, read this twice]
-A Go channel's `close()` does double duty: it unblocks every receiver and ends
-their `range` loop. `asyncio.Queue` has neither. A consumer doing `await
-queue.get()` on an empty, "finished" queue just waits forever. You **must** send
-an explicit done-signal. The two clean idioms:
+A Go channel's `close()` unblocks every receiver and ends their `range` loop. `asyncio.Queue` has neither — a consumer doing `await queue.get()` on an empty, "finished" queue waits forever. You **must** send an explicit done-signal. Two clean idioms:
 
-1. **Sentinel** — `put` a unique object (one per consumer if you have several),
-   and `break` when you `get` it.
-2. **`join()` / `task_done()`** — the producer calls `await queue.join()` to wait
-   until every item has been marked `task_done()`, then cancels the consumer
-   tasks. Use this when you don't know the item count up front.
+1. **Sentinel** — `put` a unique object (one per consumer if you have several), `break` when you `get` it.
+2. **`join()` / `task_done()`** — the producer awaits `queue.join()` until every item is marked `task_done()`, then cancels the consumer tasks. Use when you don't know the item count up front.
 :::
 
 ### Producer / consumer pipeline
 
-Here's the full bounded producer/consumer, supervised by a `TaskGroup` so a
-crash in either side tears down both cleanly:
+The full bounded producer/consumer, supervised by a `TaskGroup` so a crash on either side tears down both cleanly:
 
 ```python title="pipeline.py"
 import asyncio
@@ -593,17 +476,11 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Watch the output: the producer races ahead until `queue.qsize()` hits 5, then
-*stalls* — `await queue.put(...)` is suspended — until the slow consumer drains
-one. That stall is backpressure working. Bump `maxsize` to `0` and the producer
-will blast all 20 items in before the consumer finishes its first, and the queue
-balloons. This is the lesson; feel it by changing the number.
+Watch the output: the producer races ahead until `queue.qsize()` hits 5, then *stalls* — `await queue.put(...)` is suspended — until the slow consumer drains one. That stall is backpressure working. Bump `maxsize` to `0` and the producer blasts all 20 items in before the consumer finishes its first, and the queue balloons.
 
 ### Fan-out / fan-in
 
-To go faster, fan the work out to N consumer tasks pulling from one queue, then
-fan their results back into a results queue. This is a goroutine worker pool, or
-RxJS `mergeMap` with a concurrency limit.
+Fan work out to N consumer tasks pulling from one queue, then fan results back into a results queue — a goroutine worker pool, or RxJS `mergeMap` with a concurrency limit:
 
 ```python title="fanout.py"
 import asyncio
@@ -650,7 +527,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-<Mermaid title="Fan-out / fan-in with bounded queues" code={`
+<Mermaid title="Fan-out / fan-in: the 'one sentinel per worker' detail is the Python tax for the missing close()" code={`
 flowchart LR
   P["producer / feed"] --> Q["jobs Queue<br/>maxsize=10"]
   Q --> W0["worker w0"]
@@ -664,17 +541,9 @@ flowchart LR
   R --> C["collector"]
 `} height={360} />
 
-The "one sentinel per worker" detail is the Python tax for the missing
-`close()`: each worker consumes exactly one sentinel and exits, so you send N of
-them. (The cleaner alternative for unknown counts: `await jobs.join()` then
-`tg.create_task` cancellation — but inside a `TaskGroup`, sentinels keep every
-task finishing on its own, which `TaskGroup` prefers.)
+Each worker consumes exactly one sentinel and exits, so you send N of them.
 
 ## Long-running background tasks
-
-A stream pipeline is one kind of background work. The other is the detached
-worker: a task you kick off that runs alongside your request handlers — a metrics
-flusher, a cache warmer, a queue drainer. This is where Python's footguns live.
 
 ### `create_task` and the "fire and forget" trap
 
@@ -729,23 +598,12 @@ def spawn(coro) -> asyncio.Task:
 </Tabs>
 
 :::caution[The #1 asyncio background-task bug]
-This is the asyncio gotcha that bites everyone, and it's worse than the TS
-floating-promise problem. The event loop holds only a **weak reference** to tasks
-created with `create_task`. If you don't keep your own strong reference, the
-garbage collector can destroy the task before it finishes — and you get a cryptic
-`Task was destroyed but it is pending!` warning, or nothing at all. Always store
-the task (the `set` + `add_done_callback` idiom above), or — far better — use a
-`TaskGroup`, which owns the references for you.
+The event loop holds only a **weak reference** to tasks created with `create_task`. If you don't keep your own strong reference, the GC can destroy the task before it finishes — a cryptic `Task was destroyed but it is pending!` warning, or nothing at all. Always store the task (the `set` + `add_done_callback` idiom above), or — far better — use a `TaskGroup`, which owns the references for you.
 :::
 
 ### `TaskGroup` for supervised background work
 
-For background tasks with a *known lifetime* (the life of a request, a batch, a
-test), `asyncio.TaskGroup` is the right tool, exactly as in
-[Module 05](/modern-python/05-async-concurrency/). It keeps strong references,
-propagates exceptions, and cancels siblings on failure. The catch: the `async
-with` block *waits for every task to finish* before exiting — so it's for work
-that ends, not for daemons that run forever.
+For background tasks with a *known lifetime* (a request, a batch, a test), `TaskGroup` keeps strong references, propagates exceptions, and cancels siblings on failure. The catch: the `async with` block *waits for every task* — it's for work that ends, not daemons:
 
 ```python
 import asyncio
@@ -761,10 +619,7 @@ async def handle_batch(items: list[int]) -> None:
 
 ### Graceful shutdown of a daemon task
 
-For a task that runs for the lifetime of the *service* (not a request), you own
-it explicitly: keep the reference, cancel it on shutdown, and `await` it so its
-`finally` cleanup runs. This is the pattern FastAPI's `lifespan` wraps for you
-(forward reference: [Module 07](/modern-python/07-fastapi/)).
+For a task that runs for the lifetime of the *service*, you own it explicitly: keep the reference, cancel it on shutdown, and `await` it so its `finally` cleanup runs. This is the pattern FastAPI's `lifespan` wraps for you (module 07):
 
 ```python
 import asyncio
@@ -794,19 +649,12 @@ async def main() -> None:
 ```
 
 :::caution[Never swallow `CancelledError`]
-When you catch `asyncio.CancelledError` to do cleanup, you **must** re-raise it
-(`raise`). Swallowing it tells asyncio "I refused to cancel," which breaks
-`TaskGroup` shutdown, hangs your graceful-shutdown `await`, and leaks the task.
-The pattern is: catch it, do the minimal cleanup, re-raise. This is the asyncio
-equivalent of not swallowing a Go `ctx.Done()` signal.
+When you catch `asyncio.CancelledError` to do cleanup, you **must** re-raise it (`raise`). Swallowing it tells asyncio "I refuse to cancel," which breaks `TaskGroup` shutdown, hangs your graceful-shutdown `await`, and leaks the task. Catch it, do minimal cleanup, re-raise — the asyncio equivalent of not swallowing a Go `ctx.Done()` signal.
 :::
 
 ## Periodic work: the interval loop
 
-The asyncio-native "do this every N seconds" is a `while True` + `await
-asyncio.sleep(n)`, run as a background task. It's the equivalent of
-`setInterval` (TS) or a `time.Ticker` loop (Go) — but it's a real cancellable
-coroutine, so cleanup is structured.
+The asyncio-native "every N seconds" is `while True` + `await asyncio.sleep(n)`, run as a background task — the equivalent of `setInterval` (TS) or a `time.Ticker` loop (Go), but a real cancellable coroutine:
 
 ```python
 import asyncio
@@ -819,37 +667,14 @@ async def every(interval: float, fn) -> None:
         try:
             await fn()
         except Exception:
-            log.exception("periodic task failed")   # don't let one failure kill the loop
+            log.exception("periodic task failed")   # one failure must not kill the loop
 ```
 
-:::tip[Where real apps reach for a scheduler]
-An in-process interval loop is perfect for lightweight periodic work (cache
-refresh, heartbeats, metric flushes) that lives and dies with one process. It is
-**not** a job queue: it has no persistence, no retries across restarts, no
-distribution across workers, no cron expressions. When you need those, reach for:
-
-- **[APScheduler](https://apscheduler.readthedocs.io/)** — in-process cron/interval
-  scheduler, optional persistent job stores. The "grown-up `setInterval`."
-- **[Arq](https://arq-docs.helpmanual.io/)** — async-native task queue on Redis.
-  The modern asyncio answer to Celery; great fit for a FastAPI app.
-- **Celery** — the heavyweight, battle-tested task queue. Historically sync; the
-  modern alternative most async-first teams pick is Arq.
-
-This module stays deliberately **in-process** — distributed events and Kafka are
-[Module 11](/modern-python/11-kafka-events/). Reach for a worker when work must
-survive a restart or scale past one process.
-:::
+An in-process loop suits lightweight periodic work (cache refresh, heartbeats, metric flushes) that dies with the process. It is **not** a job queue — no persistence, retries across restarts, distribution, or cron. For those: **[APScheduler](https://apscheduler.readthedocs.io/)** (in-process cron scheduler), **[Arq](https://arq-docs.helpmanual.io/)** (async task queue on Redis — the modern asyncio answer to Celery), or **Celery** (the battle-tested heavyweight). Distributed events and Kafka are [module 11](/modern-python/11-kafka-events/).
 
 ## Cancellation and cleanup in streams
 
-Because async generators can run forever and hold resources (a file handle, a DB
-cursor, a websocket), cleanup is not optional. Two mechanisms cover it.
-
-### `finally` runs on cancellation
-
-When the consumer stops early (a `break`, a cancellation, an exception
-downstream), Python throws `GeneratorExit` *into the generator at its suspended
-`yield`*. Your `finally` block runs — this is where you close resources.
+Async generators can run forever and hold resources (file handle, DB cursor, websocket), so cleanup matters. When the consumer stops early (a `break`, cancellation, downstream exception), Python throws `GeneratorExit` *into the generator at its suspended `yield`* — your `finally` runs:
 
 ```python
 from collections.abc import AsyncIterator
@@ -876,13 +701,7 @@ async def main() -> None:
             break          # triggers GeneratorExit → finally → file closed
 ```
 
-### `aclose()` for explicit, deterministic cleanup
-
-A plain `async for` that runs to completion or `break`s will *eventually* close
-the generator — but "eventually" depends on the GC, and on the event loop still
-running. For deterministic cleanup (and to avoid "coroutine ignored
-GeneratorExit" warnings at shutdown), close it yourself with `aclose()`, or use
-`contextlib.aclosing` to make it `async with`-scoped:
+A plain `async for` that breaks will *eventually* close the generator — but "eventually" depends on the GC and a running loop. For deterministic cleanup, close it yourself: `await gen.aclose()`, or use `contextlib.aclosing` to make it `async with`-scoped (like Go's `defer close(ch)`):
 
 ```python
 import asyncio
@@ -890,33 +709,18 @@ from contextlib import aclosing
 
 
 async def main() -> None:
-    # aclosing() guarantees gen.aclose() runs when the block exits,
-    # exactly like Go's `defer close(ch)` or a Kotlin Flow's onCompletion.
+    # aclosing() guarantees gen.aclose() runs when the block exits.
     async with aclosing(tail_file("app.log")) as stream:
         async for line in stream:
             print(line)
             if "FATAL" in line:
                 break
-    # gen.aclose() has run here: the file is closed, finally executed,
-    # deterministically, before we move on.
+    # gen.aclose() has run here: file closed, finally executed, deterministically.
 ```
-
-**Key differences:**
-
-- **Go**: `defer close(ch)` in the producer goroutine; consumers see the closed
-  channel. Cleanup is the producer's job and runs at function exit.
-- **Kotlin**: `Flow` cleanup goes in `onCompletion {}` / `flow {}`'s own
-  `try/finally`; cancelling the collector triggers it.
-- **Python**: `try/finally` inside the generator, and `aclosing()` at the
-  consumer for deterministic, scoped teardown. Prefer `aclosing` over relying on
-  the GC.
 
 ## Streaming responses (preview)
 
-The payoff for all of this on the web tier: an async generator *is* a streaming
-HTTP response. Server-Sent Events (SSE), chunked responses, and streamed LLM
-tokens are all "yield bytes/events over time," and FastAPI consumes an async
-generator directly.
+The web-tier payoff: an async generator *is* a streaming HTTP response. SSE, chunked responses, streamed LLM tokens — all "yield bytes over time," and FastAPI consumes an async generator directly:
 
 ```python
 # Preview — full treatment in Module 07.
@@ -937,12 +741,7 @@ async def stream() -> StreamingResponse:
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 ```
 
-The same async generator that powered your in-memory pipeline becomes an
-HTTP stream with zero changes to the generator itself — the cold, pull-driven
-model means FastAPI pulls one chunk, sends it, and pulls the next only when the
-socket is ready. Backpressure all the way to the client.
-[Module 07](/modern-python/07-fastapi/) does this properly: SSE, `StreamingResponse`,
-and cancellation when the client disconnects.
+The same async generator that powered your in-memory pipeline becomes an HTTP stream with zero changes — the cold, pull-driven model means FastAPI pulls one chunk, sends it, and pulls the next only when the socket is ready. Backpressure all the way to the client. [Module 07](/modern-python/07-fastapi/) does this properly: SSE, `StreamingResponse`, and cancellation when the client disconnects.
 
 ## Choosing the right tool
 
@@ -959,10 +758,6 @@ and cancellation when the client disconnects.
 | A rich operator library | **`aiostream`** | Don't reinvent RxJS |
 
 ## Practice
-
-Build a real in-process streaming pipeline end to end — an async-generator source,
-transform stages, bounded queues for backpressure, a windowed aggregator, and
-graceful shutdown.
 
 <CardGrid>
   <LinkCard

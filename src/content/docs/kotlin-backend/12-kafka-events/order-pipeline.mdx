@@ -1,6 +1,6 @@
 ---
 title: "Order Processing Pipeline"
-description: Build a Spring Kafka producer/consumer pipeline with retries and a Dead Letter Topic for failed orders.
+description: "Build a Spring Kafka producer/consumer pipeline with exponential-backoff retries and a Dead Letter Topic for failed orders."
 sidebar:
   order: 1
 ---
@@ -10,41 +10,11 @@ import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
 
 <LinkCard title="← Event-Driven with Kafka" href="/kotlin-backend/12-kafka-events/" />
 
-## Goal
-
-Build an async order pipeline on Spring Kafka: a REST endpoint publishes an
-`OrderEvent` to an `orders` topic, a consumer processes it (validate → persist →
-update status), and anything that fails is retried with exponential backoff and
-ultimately parked on a Dead Letter Topic (`orders.DLT`) for inspection. It's the
-canonical "accept fast, process later, never silently drop a message" backend
-pattern.
-
-If you've built a queue worker in TS (BullMQ) or Go (a channel + worker pool),
-this is the same shape — but Kafka gives you the durable log, consumer groups for
-horizontal scale, and Spring Kafka wires the retry/DLT machinery for you.
-
-## What you'll build
-
-<Steps>
-
-1. An `OrderProducer` that publishes `OrderEvent` messages to the `orders` topic.
-2. An `OrderConsumer` (`@KafkaListener`) that validates the order, saves it to
-   Postgres, and moves its status `CREATED → PROCESSING → COMPLETED`.
-3. Exponential-backoff retry (1s initial, 2x multiplier, capped at 15s elapsed).
-4. A Dead Letter Topic (`orders.DLT`) that catches messages after retries are
-   exhausted.
-5. A `DLTConsumer` that logs the failure and stores it in a `failed_orders` table.
-6. A `GET /api/orders/{id}/status` endpoint to poll processing status.
-
-</Steps>
+Build an async order pipeline: REST publishes an `OrderEvent` to `orders`, a consumer validates → persists → updates status, and failures retry with exponential backoff then land on `orders.DLT`. The POST returns `202` immediately.
 
 ## Pipeline topology
 
-The producer and consumer never talk directly — Kafka's log sits between them, so
-the POST returns immediately (`202 Accepted`) while processing happens
-asynchronously. Failures get retried, then diverted to the DLT.
-
-<Mermaid title="Order pipeline topology" code={`
+<Mermaid title="Order pipeline — POST returns 202, consumer processes async, failures go to DLT" code={`
 flowchart LR
   POST["POST /api/orders"] --> PROD["OrderProducer"]
   PROD -->|"orders topic"| K["Kafka"]
@@ -56,9 +26,6 @@ flowchart LR
 `} />
 
 ## The worked solution
-
-A standard Spring Boot layout — controller, producer, consumer, config, plus JPA
-model and Flyway migration:
 
 <FileTree>
 - order-pipeline/
@@ -90,9 +57,7 @@ model and Flyway migration:
 
 ### The message: OrderEvent.kt
 
-The payload is a plain `data class`. Every field has a default — that matters for
-Kafka's `JsonDeserializer`, which needs a no-arg constructor to reconstruct the
-object on the consumer side. `OrderItem` is nested and serialized inline.
+Every field has a default — `JsonDeserializer` needs a no-arg constructor.
 
 ```kotlin title="src/main/kotlin/com/example/event/OrderEvent.kt"
 package com.example.event
@@ -117,15 +82,7 @@ data class OrderItem(
 
 ### Topics + retry + DLT: KafkaConfig.kt
 
-This is where the resilience lives. Two `NewTopic` beans declare the topics (Spring
-creates them on startup via `KafkaAdmin`). The `orders` topic gets 6 partitions for
-parallelism; the DLT needs only 1.
-
-The `DefaultErrorHandler` is the heart of it: when a `@KafkaListener` throws, this
-handler retries on the configured `ExponentialBackOff` (1s, then 2s, then 4s…
-capped at 15s total elapsed), and once retries are exhausted the
-`DeadLetterPublishingRecoverer` republishes the failed record to
-`<topic>.DLT` — here, `orders.DLT`.
+`DefaultErrorHandler` retries on `ExponentialBackOff` (1s → 2s → 4s…, capped at 15s), then `DeadLetterPublishingRecoverer` republishes to `<topic>.DLT`.
 
 ```kotlin title="src/main/kotlin/com/example/config/KafkaConfig.kt" {16-17,20-25,40-49}
 package com.example.config
@@ -149,45 +106,28 @@ class KafkaConfig {
 
     @Bean
     fun ordersTopic(): NewTopic = TopicBuilder
-        .name(ORDERS_TOPIC)
-        .partitions(6)
-        .replicas(1)
-        .build()
+        .name(ORDERS_TOPIC).partitions(6).replicas(1).build()
 
     @Bean
     fun deadLetterTopic(): NewTopic = TopicBuilder
-        .name(ORDERS_DLT_TOPIC)
-        .partitions(1)
-        .replicas(1)
-        .build()
+        .name(ORDERS_DLT_TOPIC).partitions(1).replicas(1).build()
 
     @Bean
     fun kafkaErrorHandler(kafkaTemplate: KafkaTemplate<String, Any>): DefaultErrorHandler {
         val recoverer = DeadLetterPublishingRecoverer(kafkaTemplate)
-
-        val backoff = ExponentialBackOff(1000L, 2.0).apply {
-            maxElapsedTime = 15000L
-        }
-
+        val backoff = ExponentialBackOff(1000L, 2.0).apply { maxElapsedTime = 15000L }
         return DefaultErrorHandler(recoverer, backoff)
     }
 }
 ```
 
 :::tip[Don't retry non-retryable errors]
-A malformed payload or a validation failure won't get better on retry — retrying
-it just wastes 15 seconds before it lands on the DLT anyway. In production you'd
-call `addNotRetryableExceptions(IllegalArgumentException::class.java, ...)` on the
-error handler so those go straight to the DLT. Reserve retries for *transient*
-failures (DB blip, network timeout).
+A malformed payload won't get better on retry. Call `addNotRetryableExceptions(IllegalArgumentException::class.java, ...)` so those go straight to the DLT. Reserve retries for transient failures (DB blip, network timeout).
 :::
 
 ### Publishing: OrderProducer.kt
 
-A thin wrapper over `KafkaTemplate<String, Any>`. The send takes a **key**
-(`event.orderId`) and a **value** (the event). The key controls partitioning — all
-events for the same `orderId` land on the same partition and are therefore
-processed in order.
+The key (`event.orderId`) controls partitioning — all events for one order land on the same partition, in order.
 
 ```kotlin title="src/main/kotlin/com/example/producer/OrderProducer.kt" {16,22}
 package com.example.producer
@@ -199,9 +139,7 @@ import org.springframework.kafka.core.KafkaTemplate
 import org.springframework.stereotype.Service
 
 @Service
-class OrderProducer(
-    private val kafkaTemplate: KafkaTemplate<String, Any>
-) {
+class OrderProducer(private val kafkaTemplate: KafkaTemplate<String, Any>) {
     private val logger = LoggerFactory.getLogger(javaClass)
 
     fun sendOrder(event: OrderEvent) {
@@ -211,13 +149,9 @@ class OrderProducer(
 }
 ```
 
-### The REST entrypoint: OrderController.kt
+### REST entrypoint: OrderController.kt
 
-The POST handler generates an `orderId`, builds the event, fires it at the
-producer, and returns `202 Accepted` *immediately* — it does not wait for
-processing. That's the async contract: the client gets an id and polls
-`/{id}/status` later. The nested `CreateOrderRequest` is the request body shape
-(Jackson + the Kotlin module deserialize it).
+POST generates an `orderId`, fires the event, returns `202 Accepted` immediately. The client polls `/{id}/status`.
 
 ```kotlin title="src/main/kotlin/com/example/controller/OrderController.kt" {25-39,41-45}
 package com.example.controller
@@ -248,16 +182,12 @@ class OrderController(
     fun createOrder(@RequestBody request: CreateOrderRequest): ResponseEntity<Map<String, String>> {
         val orderId = UUID.randomUUID().toString()
         val event = OrderEvent(
-            orderId = orderId,
-            userId = request.userId,
-            amount = request.amount,
-            items = request.items,
-            status = "CREATED"
+            orderId = orderId, userId = request.userId, amount = request.amount,
+            items = request.items, status = "CREATED"
         )
         orderProducer.sendOrder(event)
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(
-            mapOf("orderId" to orderId, "status" to "ACCEPTED")
-        )
+        return ResponseEntity.status(HttpStatus.ACCEPTED)
+            .body(mapOf("orderId" to orderId, "status" to "ACCEPTED"))
     }
 
     @GetMapping("/{id}/status")
@@ -270,12 +200,7 @@ class OrderController(
 
 ### Consuming: OrderConsumer.kt
 
-The `@KafkaListener` is the worker. Spring deserializes the JSON value straight
-into an `OrderEvent` parameter, so you write plain business logic. The key move is
-that **throwing an exception is your error signal** — Spring's `DefaultErrorHandler`
-catches it, retries per the backoff, and routes to the DLT when retries run out.
-So an invalid order just throws `IllegalArgumentException` and the framework does
-the rest.
+Throwing an exception is your error signal — `DefaultErrorHandler` catches it, retries, and routes to the DLT. An invalid order just throws `IllegalArgumentException` via `require`.
 
 ```kotlin title="src/main/kotlin/com/example/consumer/OrderConsumer.kt" {23-27}
 package com.example.consumer
@@ -288,46 +213,30 @@ import org.springframework.kafka.annotation.KafkaListener
 import org.springframework.stereotype.Component
 
 @Component
-class OrderConsumer(
-    private val orderService: OrderService
-) {
+class OrderConsumer(private val orderService: OrderService) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
 
-    @KafkaListener(
-        topics = [KafkaConfig.ORDERS_TOPIC],
-        groupId = "order-processor"
-    )
+    @KafkaListener(topics = [KafkaConfig.ORDERS_TOPIC], groupId = "order-processor")
     fun processOrder(event: OrderEvent) {
         logger.info("Processing order: orderId={}, userId={}, amount={}", event.orderId, event.userId, event.amount)
 
-        // Validate — an invalid order throws, so it goes to retry then the DLT
+        // Validate — throws → retry → DLT
         require(event.userId > 0 && event.amount > 0 && event.items.isNotEmpty()) {
             "Invalid order: $event"
         }
 
-        // Persist and advance status CREATED -> PROCESSING -> COMPLETED
         orderService.processOrder(event)
-
         logger.info("Order processed successfully: orderId={}", event.orderId)
     }
 }
 ```
 
-:::note[Why a `require` and not an `if`?]
-`require(condition) { "message" }` throws `IllegalArgumentException` with the lazy
-message when the condition is false — it's Kotlin's idiomatic precondition check,
-the same role as a guard clause in Go that returns an error. Because it throws, it
-plugs directly into the Kafka retry/DLT flow with no extra wiring.
+:::note[Why `require` and not `if`?]
+`require(condition) { "message" }` throws `IllegalArgumentException` — it plugs directly into the Kafka retry/DLT flow with no extra wiring.
 :::
 
 ### Persisting: Order.kt, OrderRepository.kt, OrderService.kt
-
-The order is stored via Spring Data JPA. `Order` is the `@Entity` (note `status`
-and `updatedAt` are `var` — they change as the order advances). `OrderRepository`
-is a one-line interface; Spring generates the implementation. `OrderService`
-validates, saves, and advances the status, and answers status queries for the
-controller.
 
 ```kotlin title="src/main/kotlin/com/example/model/Order.kt"
 package com.example.model
@@ -359,9 +268,6 @@ import org.springframework.stereotype.Repository
 interface OrderRepository : JpaRepository<Order, String>
 ```
 
-The service ties it together: save the order as `PROCESSING`, do the work, then
-flip it to `COMPLETED`. The status query backs the polling endpoint.
-
 ```kotlin title="src/main/kotlin/com/example/service/OrderService.kt"
 package com.example.service
 
@@ -372,20 +278,16 @@ import org.springframework.stereotype.Service
 import java.time.Instant
 
 @Service
-class OrderService(
-    private val orderRepository: OrderRepository
-) {
+class OrderService(private val orderRepository: OrderRepository) {
 
     fun processOrder(event: OrderEvent) {
         val order = Order(
-            orderId = event.orderId,
-            userId = event.userId,
-            amount = event.amount,
-            status = "PROCESSING"
+            orderId = event.orderId, userId = event.userId,
+            amount = event.amount, status = "PROCESSING"
         )
         orderRepository.save(order)
 
-        // ... fulfilment work would go here ...
+        // ... fulfilment work ...
 
         order.status = "COMPLETED"
         order.updatedAt = Instant.now()
@@ -393,27 +295,13 @@ class OrderService(
     }
 
     fun getOrderStatus(orderId: String): String =
-        orderRepository.findById(orderId)
-            .map { it.status }
-            .orElse("UNKNOWN")
+        orderRepository.findById(orderId).map { it.status }.orElse("UNKNOWN")
 }
 ```
 
-:::note[This is the answer-key direction]
-In the starter project `OrderConsumer`, `OrderService`, and `DLTConsumer` ship as
-TODO stubs — the snippets above are the worked-out implementation the tasks ask
-for. The producer, controller, `KafkaConfig` (topics + retry + DLT recoverer),
-event/entity classes, `application.yml`, and the Flyway migration are already
-complete in the scaffold.
-:::
-
 ### Handling dead letters: DLTConsumer.kt
 
-A second `@KafkaListener` on the DLT, in its own consumer group. When the
-`DeadLetterPublishingRecoverer` republishes a failed record it attaches headers —
-`KafkaHeaders.DLT_ORIGINAL_TOPIC` and `KafkaHeaders.DLT_EXCEPTION_MESSAGE` — which
-you read with `@Header` to record exactly what failed and why. The intent is to log
-the failure and persist it to the `failed_orders` table for manual review.
+A second `@KafkaListener` on the DLT. The recoverer attaches `DLT_ORIGINAL_TOPIC` and `DLT_EXCEPTION_MESSAGE` headers.
 
 ```kotlin title="src/main/kotlin/com/example/consumer/DLTConsumer.kt" {23-31}
 package com.example.consumer
@@ -431,33 +319,20 @@ class DLTConsumer {
 
     private val logger = LoggerFactory.getLogger(javaClass)
 
-    @KafkaListener(
-        topics = [KafkaConfig.ORDERS_DLT_TOPIC],
-        groupId = "dlt-processor"
-    )
+    @KafkaListener(topics = [KafkaConfig.ORDERS_DLT_TOPIC], groupId = "dlt-processor")
     fun processDLT(
         record: ConsumerRecord<String, Any>,
         @Header(KafkaHeaders.DLT_ORIGINAL_TOPIC, required = false) originalTopic: String?,
         @Header(KafkaHeaders.DLT_EXCEPTION_MESSAGE, required = false) errorMessage: String?
     ) {
-        logger.error(
-            "Dead letter received: originalTopic={}, key={}, error={}",
-            originalTopic, record.key(), errorMessage
-        )
-
+        logger.error("Dead letter: originalTopic={}, key={}, error={}",
+            originalTopic, record.key(), errorMessage)
         // Store in failed_orders table for manual review
     }
 }
 ```
 
-### Wiring: application.yml
-
-No serialization code anywhere — it's all config. The producer uses Spring Kafka's
-`JsonSerializer`; the consumer uses `JsonDeserializer` with
-`spring.json.trusted.packages` whitelisting `com.example.*` so it'll deserialize
-your event types. `acks: all` + `enable.idempotence: true` give you safe,
-exactly-once-ish publishing; `concurrency: 3` runs three listener threads against
-the 6-partition topic.
+### application.yml
 
 ```yaml title="src/main/resources/application.yml"
 server:
@@ -495,10 +370,6 @@ spring:
       concurrency: 3
 ```
 
-The schema is owned by Flyway, not Hibernate (`ddl-auto: validate` only checks the
-entity matches). Two tables: `orders` for the happy path and `failed_orders` for
-dead letters.
-
 ```sql title="src/main/resources/db/migration/V1__create_orders.sql"
 CREATE TABLE IF NOT EXISTS orders (
     order_id   VARCHAR(36)  PRIMARY KEY,
@@ -523,19 +394,19 @@ CREATE TABLE IF NOT EXISTS failed_orders (
 
 <Steps>
 
-1. Start Kafka and Postgres from the shared infra (one-time per session):
+1. Start Kafka and Postgres:
 
    ```bash
    cd shared-infra && docker compose up -d postgres kafka kafka-ui
    ```
 
-2. Boot the app (starts on port 8085):
+2. Boot the app (port 8085):
 
    ```bash
    ./gradlew bootRun
    ```
 
-3. Create a valid order — it returns `202` with an `orderId`:
+3. Create a valid order — returns `202` with an `orderId`:
 
    ```bash
    curl -X POST http://localhost:8085/api/orders \
@@ -543,7 +414,7 @@ CREATE TABLE IF NOT EXISTS failed_orders (
      -d '{"userId": 1, "amount": 99.99, "items": [{"productId": "prod-1", "quantity": 2, "price": 49.99}]}'
    ```
 
-4. Poll its status (async, so give it a moment):
+4. Poll status:
 
    ```bash
    curl http://localhost:8085/api/orders/{id}/status
@@ -557,18 +428,13 @@ CREATE TABLE IF NOT EXISTS failed_orders (
      -d '{"userId": -1, "amount": -100, "items": []}'
    ```
 
-6. Open Kafka UI at `http://localhost:8090` to watch the `orders` and `orders.DLT`
-   topics fill up.
+6. Watch `orders` and `orders.DLT` fill up in Kafka UI at `http://localhost:8090`.
 
 </Steps>
 
 :::tip[Stretch goals]
-- Persist dead letters: complete `DLTConsumer` to write the failed record (with
-  `original_topic`, `error_message`, and the raw payload as `JSONB`) into the
-  `failed_orders` table.
-- Mark non-retryable exceptions (`IllegalArgumentException`, `JsonParseException`)
-  on the error handler so bad payloads skip the 15s retry window.
-- Implement `GET /api/orders` to return all processed orders from the repository.
-- Add a manual "replay from DLT" endpoint that republishes a failed order back onto
-  the `orders` topic once the underlying issue is fixed.
+- Persist dead letters into `failed_orders` with original topic, error message, and JSONB payload.
+- Mark `IllegalArgumentException`/`JsonParseException` as non-retryable so bad payloads skip the 15s retry window.
+- Add `GET /api/orders` returning all processed orders.
+- Add a "replay from DLT" endpoint that republishes a failed order to `orders`.
 :::

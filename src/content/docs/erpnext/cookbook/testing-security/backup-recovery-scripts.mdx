@@ -1,6 +1,6 @@
 ---
 title: Database Backup & Recovery Scripts
-description: Automate Frappe site backups to AWS S3 with GPG encryption, retention rotation, and recovery verification.
+description: "Automate Frappe site backups to AWS S3 with GPG encryption, GFS retention rotation, and a restore-and-validate script — plus a P1/P2/P3 recovery runbook."
 sidebar:
   order: 7
 ---
@@ -9,26 +9,22 @@ import { LinkCard, FileTree } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-:::note[Problem]
-Build automated backup with S3 upload, encryption, and point-in-time recovery for ScoopJoy's production database and files.
-:::
+**Problem:** Automated backup with S3 upload, encryption, and point-in-time recovery for ScoopJoy's production database and files.
 
-### Solution
-
-For ScoopJoy's production infrastructure, we implement a robust backup system comprised of an automated Python backup script, a corresponding recovery/verification script, and a cron deployment script. The files are organized as follows:
+**Solution:** Three scripts — a Python backup automation (bench backup → GPG encrypt → S3 with KMS → GFS rotation), a restore/verify script, and a cron installer — plus a DR runbook:
 
 <FileTree>
 - docs/
-  - disaster-recovery-runbook.txt Runbook documentation
+  - disaster-recovery-runbook.txt — runbook for emergencies
 - scripts/
-  - backup_to_s3.py Backup automation script
-  - restore_from_s3.py Restore automation script
-  - setup_backup_cron.sh Cron job installation script
+  - backup_to_s3.py — backup automation
+  - restore_from_s3.py — restore automation
+  - setup_backup_cron.sh — cron job installation
 </FileTree>
 
-#### Automated Backup Script
+## Automated backup script
 
-The backup script, `backup_to_s3.py`, automates running the `bench backup` command, encrypts the resulting archives with GPG, uploads them to AWS S3 using server-side KMS encryption, and applies a grandfather-father-son (GFS) retention rotation policy.
+`backup_to_s3.py` runs `bench backup`, GPG-encrypts each archive, uploads to S3 with server-side KMS encryption, and applies a grandfather-father-son retention policy (7 daily / 4 weekly / 12 monthly):
 
 ```python title="scripts/backup_to_s3.py"
 #!/usr/bin/env python3
@@ -104,20 +100,18 @@ def run_bench_backup(site: str, with_files: bool = True) -> dict:
     if not latest_files:
         raise FileNotFoundError("No backup files found")
 
-    # Get the timestamp prefix from the latest SQL file
     latest_sql = latest_files[0]
-    prefix = latest_sql.name.split("_")[0]  # e.g., "20260320_120000"
+    prefix = latest_sql.name.split("_")[0]  # e.g. "20260320_120000"
 
     backup_paths = {"database": str(latest_sql)}
 
-    # Find matching files backup
     for pattern in ["*-files.tar.gz", "*-private-files.tar.gz"]:
         matches = list(backup_dir.glob(f"{prefix}*{pattern.split('*')[1]}"))
         if matches:
             key = "public_files" if "private" not in pattern else "private_files"
             backup_paths[key] = str(matches[0])
 
-    # Include site_config.json
+    # Include site_config.json — it holds the encryption key
     site_config = Path(BENCH_PATH) / "sites" / site / "site_config.json"
     if site_config.exists():
         backup_paths["site_config"] = str(site_config)
@@ -126,7 +120,7 @@ def run_bench_backup(site: str, with_files: bool = True) -> dict:
 
 
 def encrypt_file(filepath: str) -> str:
-    """Encrypt a file with GPG. Returns path to encrypted file."""
+    """Encrypt a file with GPG. Returns path to the encrypted file."""
     encrypted_path = f"{filepath}.gpg"
     cmd = [
         "gpg",
@@ -148,7 +142,7 @@ def encrypt_file(filepath: str) -> str:
 
 
 def upload_to_s3(filepath: str, site: str) -> str:
-    """Upload a file to S3 with date-based prefix."""
+    """Upload a file to S3 with a date-based prefix."""
     s3 = boto3.client("s3", region_name=S3_REGION)
     now = datetime.now()
 
@@ -172,11 +166,10 @@ def upload_to_s3(filepath: str, site: str) -> str:
 
 
 def apply_rotation_policy(site: str):
-    """Delete old backups based on retention policy."""
+    """Delete old backups based on the retention policy."""
     s3 = boto3.client("s3", region_name=S3_REGION)
     prefix = f"{S3_PREFIX}/{site}/"
 
-    # List all backup dates
     paginator = s3.get_paginator("list_objects_v2")
     all_keys = []
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
@@ -206,7 +199,6 @@ def apply_rotation_policy(site: str):
     for i in range(KEEP_WEEKLY):
         week_start = today - timedelta(days=today.weekday() + 7 * i)
         sunday = week_start + timedelta(days=6)
-        # Find closest available date
         for d in sorted(dates_with_keys.keys(), reverse=True):
             if abs((d - sunday).days) <= 1:
                 dates_to_keep.add(d)
@@ -220,20 +212,18 @@ def apply_rotation_policy(site: str):
             month += 12
             year -= 1
         first_of_month = datetime(year, month, 1).date()
-        # Find closest available date
         for d in sorted(dates_with_keys.keys()):
             if d.month == first_of_month.month and d.year == first_of_month.year:
                 dates_to_keep.add(d)
                 break
 
-    # Delete backups not in retention set
+    # Delete backups not in the retention set
     keys_to_delete = []
     for date, keys in dates_with_keys.items():
         if date not in dates_to_keep:
             keys_to_delete.extend(keys)
 
     if keys_to_delete:
-        # S3 delete in batches of 1000
         for i in range(0, len(keys_to_delete), 1000):
             batch = keys_to_delete[i : i + 1000]
             s3.delete_objects(
@@ -246,7 +236,7 @@ def apply_rotation_policy(site: str):
 
 
 def send_alert(subject: str, body: str):
-    """Send email alert on failure."""
+    """Send an email alert on failure."""
     if not SMTP_USER:
         log.warning("SMTP not configured, skipping email alert")
         return
@@ -299,7 +289,7 @@ def main():
         if not args.no_rotate:
             apply_rotation_policy(args.site)
 
-        # Step 5: Cleanup local encrypted files
+        # Step 5: Clean up local encrypted files
         if not args.no_encrypt:
             for key, path in upload_paths.items():
                 if path.endswith(".gpg"):
@@ -328,9 +318,9 @@ if __name__ == "__main__":
     main()
 ```
 
-#### Recovery and Validation Script
+## Recovery and validation script
 
-To restore the site and verify database integrity, the `restore_from_s3.py` script downloads the backup files from S3, decrypts them using GPG, restores the site structure, and runs post-restore sanity checks.
+`restore_from_s3.py` downloads the backup from S3, decrypts with GPG, restores `site_config.json` first (it holds the encryption key), restores the DB + files, runs migrate, then validates:
 
 ```python title="scripts/restore_from_s3.py"
 #!/usr/bin/env python3
@@ -366,20 +356,16 @@ def list_available_backups(site: str, date: str = None) -> list:
     s3 = boto3.client("s3", region_name=S3_REGION)
     prefix = f"{S3_PREFIX}/{site}/"
     if date:
-        # date format: 2026-03-20 -> 2026/03/20
-        date_path = date.replace("-", "/")
-        prefix += f"{date_path}/"
+        prefix += date.replace("-", "/") + "/"  # 2026-03-20 -> 2026/03/20/
 
     response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-    objects = response.get("Contents", [])
-    return sorted(objects, key=lambda x: x["LastModified"], reverse=True)
+    return sorted(response.get("Contents", []), key=lambda x: x["LastModified"], reverse=True)
 
 
 def download_from_s3(s3_key: str, local_dir: str) -> str:
-    """Download a file from S3 to local directory."""
+    """Download a file from S3 to a local directory."""
     s3 = boto3.client("s3", region_name=S3_REGION)
-    filename = os.path.basename(s3_key)
-    local_path = os.path.join(local_dir, filename)
+    local_path = os.path.join(local_dir, os.path.basename(s3_key))
 
     log.info(f"Downloading s3://{S3_BUCKET}/{s3_key} -> {local_path}")
     s3.download_file(S3_BUCKET, s3_key, local_path)
@@ -387,7 +373,7 @@ def download_from_s3(s3_key: str, local_dir: str) -> str:
 
 
 def decrypt_file(filepath: str) -> str:
-    """Decrypt a GPG-encrypted file. Returns path to decrypted file."""
+    """Decrypt a GPG-encrypted file. Returns path to the decrypted file."""
     if not filepath.endswith(".gpg"):
         return filepath  # not encrypted
 
@@ -451,14 +437,13 @@ for dt in ['User', 'DocType', 'Franchise Outlet', 'Franchise Agreement']:
         results[dt] = {{'count': 0, 'ok': False, 'error': str(e)}}
 
 # Check 2: Admin user exists
-admin = frappe.db.exists('User', 'Administrator')
-results['admin_exists'] = admin is not None
+results['admin_exists'] = frappe.db.exists('User', 'Administrator') is not None
 
 # Check 3: Site config is intact
 results['site_name'] = frappe.local.site
 results['db_name'] = frappe.conf.db_name
 
-# Check 4: Check for encryption key (needed for password fields)
+# Check 4: Encryption key present (needed for password fields)
 results['encryption_key_present'] = bool(frappe.conf.get('encryption_key'))
 
 import json
@@ -523,22 +508,19 @@ def main():
 
     log.info(f"Found {len(backups)} backup files for {args.date}:")
     for obj in backups:
-        size_mb = obj["Size"] / (1024 * 1024)
-        log.info(f"  {obj['Key']} ({size_mb:.1f} MB)")
+        log.info(f"  {obj['Key']} ({obj['Size'] / (1024 * 1024):.1f} MB)")
 
     if args.dry_run:
-        log.info("Dry run -- exiting without restore")
+        log.info("Dry run — exiting without restore")
         return
 
     # Step 2: Download files
     with tempfile.TemporaryDirectory(prefix="scoopjoy-restore-") as tmpdir:
         downloaded = {}
         for obj in backups:
-            key = obj["Key"]
-            local_path = download_from_s3(key, tmpdir)
+            local_path = download_from_s3(obj["Key"], tmpdir)
 
-            # Categorize files
-            basename = os.path.basename(key).lower()
+            basename = os.path.basename(obj["Key"]).lower()
             if ".sql" in basename:
                 downloaded["database"] = local_path
             elif "public" in basename and "files" in basename:
@@ -556,11 +538,11 @@ def main():
         for key in list(downloaded.keys()):
             downloaded[key] = decrypt_file(downloaded[key])
 
-        # Step 4: Restore site_config.json first (contains encryption key)
+        # Step 4: Restore site_config.json first (contains the encryption key)
         if "site_config" in downloaded:
+            import shutil
             site_config_dest = Path(BENCH_PATH) / "sites" / args.site / "site_config.json"
             log.info(f"Restoring site_config.json to {site_config_dest}")
-            import shutil
             shutil.copy2(downloaded["site_config"], str(site_config_dest))
 
         # Step 5: Restore database and files
@@ -582,9 +564,8 @@ def main():
             for check, result in checks.items():
                 status = "PASS" if result.get("ok") else "FAIL"
                 log.info(f"  [{status}] {check}")
-            all_ok = all(r.get("ok", False) for r in checks.values())
-            if not all_ok:
-                log.warning("Some validation checks failed -- review manually")
+            if not all(r.get("ok", False) for r in checks.values()):
+                log.warning("Some validation checks failed — review manually")
 
     log.info("=== Restore process complete ===")
 
@@ -593,9 +574,9 @@ if __name__ == "__main__":
     main()
 ```
 
-#### Cron Setup Script
+## Cron setup script
 
-To schedule the backups daily, we use `setup_backup_cron.sh` to install the cron job under the `frappe` system user and configure log rotation.
+Installs the daily 2:00 AM backup cron under the `frappe` user and configures log rotation:
 
 ```bash title="scripts/setup_backup_cron.sh"
 #!/bin/bash
@@ -607,23 +588,21 @@ BENCH_USER="frappe"
 # Daily backup at 2:00 AM IST
 DAILY_CRON="0 2 * * * /usr/bin/python3 ${SCRIPT_DIR}/backup_to_s3.py --site erp.scoopjoy.com >> /var/log/scoopjoy/backup.log 2>&1"
 
-# Verify the script exists
 if [ ! -f "${SCRIPT_DIR}/backup_to_s3.py" ]; then
     echo "ERROR: backup_to_s3.py not found in ${SCRIPT_DIR}"
     exit 1
 fi
 
-# Add cron job for the bench user
+# Add cron job for the bench user (idempotent: remove old entry first)
 (crontab -u ${BENCH_USER} -l 2>/dev/null | grep -v "backup_to_s3.py"; echo "${DAILY_CRON}") | crontab -u ${BENCH_USER} -
 
 echo "Cron job installed:"
 crontab -u ${BENCH_USER} -l | grep backup_to_s3
 
-# Create log directory
+# Log directory + rotation
 mkdir -p /var/log/scoopjoy
 chown ${BENCH_USER}:${BENCH_USER} /var/log/scoopjoy
 
-# Setup log rotation
 cat > /etc/logrotate.d/scoopjoy-backup << 'EOF'
 /var/log/scoopjoy/backup.log {
     weekly
@@ -638,9 +617,9 @@ EOF
 echo "Log rotation configured"
 ```
 
-#### Disaster Recovery Runbook
+## Disaster recovery runbook
 
-Store this markdown-formatted runbook as `docs/disaster-recovery-runbook.txt` for DevOps reference during emergencies. It covers full site recovery (P1), data corruption recovery (P2), and partial data recovery (P3).
+Store as `docs/disaster-recovery-runbook.txt` for P1/P2/P3 emergencies:
 
 ```text title="docs/disaster-recovery-runbook.txt"
 # ScoopJoy ERP Disaster Recovery Runbook
@@ -687,11 +666,11 @@ Store this markdown-formatted runbook as `docs/disaster-recovery-runbook.txt` fo
 #    sudo bench setup production frappe
 #    bench setup lets-encrypt erp.scoopjoy.com
 #
-# 10. Update DNS records to point to new server IP
+# 10. Update DNS records to point to the new server IP
 #
 # === P2: Data Corruption Recovery ===
 #
-# 1. Take a backup of the corrupted state (for forensics):
+# 1. Back up the corrupted state (for forensics):
 #    bench --site erp.scoopjoy.com backup --with-files
 #
 # 2. Identify corruption scope:
@@ -702,7 +681,7 @@ Store this markdown-formatted runbook as `docs/disaster-recovery-runbook.txt` fo
 # 3. Restore from last known good backup:
 #    python3 scripts/restore_from_s3.py --site erp.scoopjoy.com --date <LAST_GOOD_DATE>
 #
-# 4. Replay any transactions entered after backup date (manual process)
+# 4. Replay any transactions entered after the backup date (manual)
 #
 # === P3: Partial Data Recovery ===
 #
@@ -710,13 +689,13 @@ Store this markdown-formatted runbook as `docs/disaster-recovery-runbook.txt` fo
 #    bench new-site temp-restore.local
 #    python3 scripts/restore_from_s3.py --site temp-restore.local --date <DATE>
 #
-# 2. Export specific data from temp site:
+# 2. Export specific data from the temp site:
 #    bench --site temp-restore.local execute frappe.client.get_list \
 #      --args '["Sales Invoice", {"posting_date": [">=", "2026-03-15"]}]'
 #
-# 3. Import into production site
+# 3. Import into the production site
 #
-# 4. Drop temp site:
+# 4. Drop the temp site:
 #    bench drop-site temp-restore.local --force
 #
 # === RTO/RPO Targets ===
@@ -729,9 +708,9 @@ Store this markdown-formatted runbook as `docs/disaster-recovery-runbook.txt` fo
 ```
 
 :::note[Why this works]
-The backup script runs `bench backup` (which handles MariaDB dumps and file archives), encrypts with GPG (asymmetric encryption so the backup server never holds the private key), uploads to S3 with KMS server-side encryption (belt and suspenders), and applies a rotation policy that keeps 7 daily + 4 weekly + 12 monthly snapshots. The restore script reverses every step and validates the result.
+The backup script runs `bench backup` (MariaDB dump + file archives), encrypts with GPG (asymmetric — the backup server never holds the private key), uploads to S3 with KMS server-side encryption (belt and suspenders), and rotates 7 daily + 4 weekly + 12 monthly snapshots. The restore script reverses every step and validates the result.
 :::
 
 :::caution[Common mistake]
-Forgetting to backup `site_config.json` — it contains the `encryption_key` that Frappe uses to encrypt password fields in the database. Without it, restored passwords are unreadable and all users must reset. Also, not testing your restore process regularly — an untested backup is not a backup.
+Forgetting to back up `site_config.json` — it contains the `encryption_key` Frappe uses to encrypt password fields. Without it, restored passwords are unreadable and every user must reset. And: not testing restores regularly — an untested backup is not a backup.
 :::

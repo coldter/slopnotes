@@ -1,6 +1,6 @@
 ---
 title: Scheduled Task Recipes
-description: Wire up daily, hourly, 15-minute, weekly, and monthly scheduled tasks in Frappe with cron and named intervals — kept idempotent and lightweight.
+description: "Wire up daily, hourly, 15-minute, weekly, and monthly scheduled tasks via scheduler_events with cron and named intervals — idempotent and lightweight."
 sidebar:
   order: 4
 ---
@@ -9,22 +9,13 @@ import { LinkCard } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** ScoopJoy's franchise operation needs five different recurring jobs —
-daily royalty invoicing, hourly POS stock sync, a 15-minute outlet heartbeat check,
-a weekly performance digest, and monthly franchise-fee invoices. Each runs on its
-own cadence and must be safe to re-run.
+**Problem:** Five recurring jobs on five cadences — daily royalty invoicing, hourly POS stock sync, a 15-minute outlet heartbeat check, a weekly digest, monthly fee invoices — each safe to re-run.
 
-**Solution:** Declare every task in `scheduler_events` inside `hooks.py`, mixing
-named intervals (`hourly`, `weekly`, `monthly`) with cron expressions for finer
-control. Frappe's scheduler dispatches each dotted path on its cadence; the task
-functions themselves stay idempotent and lightweight.
+**Solution:** Declare every task in `scheduler_events` in `hooks.py`, mixing named intervals (`hourly`, `weekly`, `monthly`) with cron expressions. Task functions stay idempotent and lightweight — heavy work goes to `frappe.enqueue`.
 
 ## Registering the schedule
 
-The `scheduler_events` dict maps a cadence to a list of dotted Python paths. The
-`cron` key takes a nested dict of cron expressions — here `0 6 * * *` (daily at
-6 AM) and `*/15 * * * *` (every 15 minutes) — while `hourly`, `weekly`, and
-`monthly` are Frappe's named intervals.
+The `scheduler_events` dict maps a cadence to dotted Python paths; the `cron` key takes a nested dict of cron expressions:
 
 ```python title="apps/scoopjoy/scoopjoy/hooks.py" {2-11}
 scheduler_events = {
@@ -53,12 +44,9 @@ scheduler_events = {
 }
 ```
 
-### Task (a): Daily Royalty Invoice Generation
+### Task (a): Daily royalty invoices — cron `0 6 * * *`
 
-Driven by the `0 6 * * *` cron entry. It pulls active franchise agreements, then
-creates one royalty Sales Invoice per franchise from yesterday's POS sales. The
-`frappe.db.exists` guard at the top of `create_royalty_invoice` makes the whole run
-idempotent — a re-run on the same date creates nothing.
+Pulls active agreements, then creates one royalty Sales Invoice per franchise from yesterday's POS sales. The `frappe.db.exists` guard makes the run idempotent — a re-run on the same date creates nothing:
 
 ```python title="apps/scoopjoy/scoopjoy/tasks/royalty.py"
 import frappe
@@ -104,7 +92,7 @@ def generate_daily_royalty_invoices():
 
 def create_royalty_invoice(agreement, date):
     """Create a single royalty invoice for one franchise agreement."""
-    # Check if already created (idempotent)
+    # Idempotency: skip if already created for this date
     existing = frappe.db.exists(
         "Sales Invoice",
         {
@@ -116,7 +104,7 @@ def create_royalty_invoice(agreement, date):
     if existing:
         return None
 
-    # Calculate yesterday's total POS sales for this franchise
+    # Yesterday's total POS sales for this franchise
     total_sales = frappe.db.sql(
         """
         SELECT COALESCE(SUM(grand_total), 0) as total
@@ -163,12 +151,9 @@ def create_royalty_invoice(agreement, date):
     return invoice
 ```
 
-### Task (b): Hourly POS Stock Sync
+### Task (b): Hourly POS stock sync — `hourly`
 
-The `hourly` task is the textbook lightweight dispatcher: it counts active outlets,
-then hands the heavy work to a background job via `frappe.enqueue` on the `long`
-queue. Using a fixed `job_id` plus `deduplicate=True` means a slow run won't pile up
-duplicate jobs.
+The textbook lightweight dispatcher: count active outlets, hand the heavy work to a `long`-queue background job. A fixed `job_id` + `deduplicate=True` means a slow run won't pile up duplicates:
 
 ```python title="apps/scoopjoy/scoopjoy/tasks/stock.py" {17-23}
 import frappe
@@ -201,11 +186,9 @@ def hourly_pos_stock_sync():
     frappe.logger("scoopjoy").info(f"Hourly stock sync enqueued for {active_count} outlets.")
 ```
 
-### Task (c): Outlet Heartbeat Check (Every 15 Minutes)
+### Task (c): Outlet heartbeat check — cron `*/15 * * * *`
 
-Driven by `*/15 * * * *`. Each run flags outlets whose last heartbeat is older than
-30 minutes, flips their status to `Offline` only on a transition, and sends a single
-consolidated alert rather than one email per outlet.
+Flags outlets whose last heartbeat is older than 30 minutes, flips status to `Offline` only on a transition, and sends one consolidated alert rather than an email per outlet:
 
 ```python title="apps/scoopjoy/scoopjoy/tasks/health.py"
 import frappe
@@ -216,8 +199,7 @@ from frappe.utils import now_datetime, time_diff_in_seconds
 def check_outlet_heartbeat():
     """
     Cron: every 15 minutes.
-    Check if franchise POS terminals have reported in recently.
-    Flag outlets that haven't sent data in 30+ minutes.
+    Flags outlets that haven't sent data in 30+ minutes.
     """
     threshold_seconds = 1800  # 30 minutes
 
@@ -240,7 +222,7 @@ def check_outlet_heartbeat():
         if seconds_since > threshold_seconds:
             offline_outlets.append(outlet)
 
-            # Update status only if it was previously online
+            # Update status only on transition to Offline
             current_status = frappe.db.get_value(
                 "Franchise Agreement", outlet.name, "custom_outlet_status"
             )
@@ -285,12 +267,9 @@ def get_operations_team_emails():
     )
 ```
 
-### Task (d): Weekly Performance Digest
+### Task (d): Weekly performance digest — `weekly`
 
-The `weekly` task builds a per-franchise sales summary for the previous seven days,
-emails each franchise manager their digest, then sends HQ a consolidated report.
-Each agreement is wrapped in its own `try/except` so one bad franchise doesn't abort
-the whole batch.
+Builds a per-franchise sales summary for the previous 7 days, emails each manager their digest, then sends HQ a consolidated report. Each agreement gets its own `try/except` so one bad franchise doesn't abort the batch:
 
 ```python title="apps/scoopjoy/scoopjoy/tasks/reports.py"
 import frappe
@@ -323,7 +302,6 @@ def send_weekly_performance_digest():
             summary = build_franchise_summary(agreement, week_start, week_end)
             all_summaries.append(summary)
 
-            # Send individual digest to franchise manager
             frappe.sendmail(
                 recipients=[agreement.franchise_manager_email],
                 subject=_("ScoopJoy Weekly Digest: {0} ({1} to {2})").format(
@@ -337,7 +315,6 @@ def send_weekly_performance_digest():
                 title=_("Weekly Digest Error: {0}").format(agreement.franchise_name),
             )
 
-    # Consolidated HQ report
     if all_summaries:
         send_hq_consolidated_report(all_summaries, week_start, week_end)
 
@@ -398,12 +375,9 @@ def send_hq_consolidated_report(summaries, week_start, week_end):
         )
 ```
 
-### Task (e): Monthly Franchise Fee Invoices
+### Task (e): Monthly franchise fee invoices — `monthly`
 
-The `monthly` task creates one recurring franchise-fee invoice per active agreement.
-The `frappe.db.exists` check — keyed on the agreement, the `Monthly Franchise Fee`
-invoice type, and a `between` filter on the current month — keeps it idempotent and
-tracks how many were skipped.
+One recurring fee invoice per active agreement, with an `frappe.db.exists` check keyed on agreement + invoice type + current month keeping it idempotent:
 
 ```python title="apps/scoopjoy/scoopjoy/tasks/billing.py" {26-36}
 import frappe
@@ -435,7 +409,7 @@ def create_monthly_franchise_fee_invoices():
 
     for agreement in agreements:
         try:
-            # Idempotency: check if invoice already exists for this month
+            # Idempotency: skip if this month's fee invoice already exists
             existing = frappe.db.exists(
                 "Sales Invoice",
                 {
@@ -491,16 +465,9 @@ def create_monthly_franchise_fee_invoices():
 ```
 
 :::note[Why this works]
-The `scheduler_events` configuration mixes named intervals (`hourly`, `weekly`,
-`monthly`) with cron syntax for finer control. Each task is idempotent — running the
-same task twice in the same period produces no duplicates. The scheduler tasks call
-`frappe.db.commit()` because they run outside the request lifecycle as background
-workers, where Frappe does not auto-commit for you.
+`scheduler_events` mixes named intervals (`hourly`, `weekly`, `monthly`) with cron syntax for finer control. Each task is idempotent — running the same task twice in the same period produces no duplicates. Scheduler tasks call `frappe.db.commit()` because they run outside the request lifecycle, where Frappe does not auto-commit.
 :::
 
 :::caution[Common mistake]
-Putting heavy processing directly in scheduler task functions. Scheduler tasks should
-be lightweight dispatchers that validate preconditions and enqueue background jobs
-for heavy work (see Task (b)). If a scheduler task runs too long, it blocks the other
-scheduled tasks on the same worker.
+Putting heavy processing directly in scheduler task functions. Scheduler tasks should be lightweight dispatchers that validate preconditions and enqueue background jobs for heavy work (see Task (b)). A long-running scheduler task blocks other scheduled tasks on the same worker.
 :::

@@ -1,6 +1,6 @@
 ---
 title: Incoming Webhook Handler with Idempotency
-description: Receive delivery-partner webhooks safely with HMAC verification, idempotency keys, and correct HTTP status codes — no duplicate records on retries.
+description: "Receive delivery-partner webhooks safely — HMAC verification over the raw body, a unique idempotency key, honest HTTP status codes, and a full audit log."
 sidebar:
   order: 3
 ---
@@ -9,21 +9,13 @@ import { LinkCard, Steps } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** ScoopJoy's delivery partner POSTs order status updates to your ERP.
-Their API retries on timeout, so the same `delivery.status_changed` event can
-arrive two or three times. You need to ingest these updates without creating
-duplicate records or double-applying state.
+**Problem:** ScoopJoy's delivery partner POSTs order-status updates and retries on timeout — the same event can arrive 2–3 times. Ingest without duplicates or double-applied state.
 
-**Solution:** Expose a whitelisted guest endpoint that does three things before it
-touches your data: verify an HMAC signature on the raw body, reject duplicates by a
-unique idempotency key, and return honest HTTP status codes so the sender knows
-whether to retry. Every call gets logged for an audit trail.
+**Solution:** A whitelisted guest endpoint that, before touching data: verifies the HMAC signature on the raw body, rejects duplicates by a unique idempotency key, and returns honest HTTP status codes so the sender knows whether to retry. Every call is logged for audit.
 
 ## Step 1: Incoming Webhook Log DocType
 
-The audit log is the backbone of idempotency. The `idempotency_key` field is
-marked `unique` and `reqd` — that single constraint is what guarantees we can never
-record the same delivery event twice, even under a race.
+The audit log is the backbone of idempotency — `idempotency_key` is `unique` + `reqd`, so the same event can never be recorded twice, even under a race:
 
 ```json title="scoopjoy/scoopjoy/doctype/incoming_webhook_log/incoming_webhook_log.json" {5}
 {
@@ -46,22 +38,13 @@ record the same delivery event twice, even under a race.
 }
 ```
 
-## Step 2: Webhook Handler Endpoint
+## Step 2: Webhook handler endpoint
 
-This is the centerpiece. The handler runs as a guest (`allow_guest=True`) because
-the delivery partner has no Frappe login — trust comes from the HMAC signature, not
-a session. The flow is: validate headers, verify the signature, short-circuit on a
-duplicate key, log, then dispatch by event type.
+Runs as guest (`allow_guest=True`) — the partner has no Frappe login, so trust comes from the HMAC signature, not a session. Flow: validate headers → verify signature → short-circuit duplicates → log → dispatch by event type.
 
-A few details worth calling out:
-
-- **Read the raw body, not `frappe.form_dict`.** HMAC must be computed over the
-  exact bytes the partner signed, so we use `frappe.request.get_data()`.
-- **The duplicate check returns `200`, not an error.** Telling the sender "already
-  processed" with a success code stops its retry loop — a `4xx`/`5xx` would make it
-  keep hammering you.
-- **Every branch updates the log and commits.** `Received` → `Processed` /
-  `Failed` / `Ignored`, giving you a full audit trail regardless of outcome.
+- **Read the raw body, not `frappe.form_dict`** — the HMAC must be computed over the exact bytes the partner signed, so use `frappe.request.get_data()`.
+- **Duplicates return `200`, not an error** — a success code stops the sender's retry loop; a 4xx/5xx would make it hammer you again.
+- **Every branch updates the log and commits** — `Received` → `Processed` / `Failed` / `Ignored`, a full audit trail regardless of outcome.
 
 ```python title="scoopjoy/scoopjoy/api/v1/webhooks.py" {54-55,67-78}
 import frappe
@@ -111,7 +94,7 @@ def delivery_update():
         frappe.local.response["http_status_code"] = 401
         return {"status": "error", "message": "Invalid signature"}
 
-    # Step 4: Check idempotency -- reject duplicates
+    # Step 4: Check idempotency — reject duplicates
     if frappe.db.exists("Incoming Webhook Log", {"idempotency_key": idempotency_key}):
         existing = frappe.db.get_value(
             "Incoming Webhook Log",
@@ -119,7 +102,7 @@ def delivery_update():
             ["status", "processing_result"],
             as_dict=True,
         )
-        # Return 200 (not an error) -- the request was already processed
+        # Return 200 (not an error) — the request was already processed
         frappe.local.response["http_status_code"] = 200
         return {
             "status": "duplicate",
@@ -185,10 +168,7 @@ def delivery_update():
         return {"status": "error", "message": "Internal processing error"}
 ```
 
-The event handlers map the partner's vocabulary onto ScoopJoy's Sales Invoice
-custom fields. They raise `ValueError` for unknown orders or statuses — and because
-the dispatcher wraps them in `try/except`, a raise becomes a logged `Failed` plus an
-HTTP `500`, which is exactly the signal that tells the partner to retry later.
+The event handlers map the partner's vocabulary onto Sales Invoice custom fields. They raise `ValueError` for unknown orders/statuses — the dispatcher turns that into a logged `Failed` plus HTTP `500`, which is exactly the signal telling the partner to retry later:
 
 ```python title="scoopjoy/scoopjoy/api/v1/webhooks.py"
 def _handle_delivery_status(payload):
@@ -249,34 +229,28 @@ def _handle_delivery_cancelled(payload):
         "custom_delivery_status": "Cancelled",
     })
 
-    # Add comment with cancellation reason
     doc = frappe.get_doc("Sales Invoice", order_id)
     doc.add_comment("Info", f"Delivery cancelled: {payload.get('reason', 'No reason given')}")
 
     return {"order_id": order_id, "status": "Cancelled"}
 ```
 
-The handler expects a JSON body shaped like
-`{"event": "delivery.status_changed", "order_id": "ACC-SINV-2025-00042", "status": "delivered", ...}`,
-with the partner's signed digest in the `X-Webhook-Signature` header and the unique
-key in `X-Idempotency-Key`.
+Expected body: `{"event": "delivery.status_changed", "order_id": "ACC-SINV-2025-00042", "status": "delivered", ...}` with the signed digest in `X-Webhook-Signature` and the unique key in `X-Idempotency-Key`.
 
 ## Step 3: Test it with curl
 
 <Steps>
 
-1. Generate a valid HMAC signature over the exact payload bytes. The `SECRET` must
-   match `delivery_partner_webhook_secret` in your `site_config.json`.
+1. Generate a valid HMAC signature over the exact payload bytes. `SECRET` must match `delivery_partner_webhook_secret` in `site_config.json`:
 
    ```bash
-   # Must match site_config.json > delivery_partner_webhook_secret
    SECRET="my-delivery-partner-secret"
    PAYLOAD='{"event":"delivery.status_changed","delivery_id":"DEL-12345","order_id":"ACC-SINV-2025-00042","status":"delivered","delivered_at":"2025-03-15T14:30:00Z","driver_name":"Rajesh K."}'
 
    SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
    ```
 
-2. Send the webhook. The first call processes and returns success.
+2. Send the webhook — first call processes and returns success:
 
    ```bash
    curl -X POST 'https://erp.scoopjoy.com/api/method/scoopjoy.api.v1.webhooks.delivery_update' \
@@ -284,13 +258,11 @@ key in `X-Idempotency-Key`.
      -H "X-Webhook-Signature: $SIGNATURE" \
      -H 'X-Idempotency-Key: webhook-del-12345-status-001' \
      -d "$PAYLOAD"
-
    # {"message": {"status": "success", "message": "Webhook processed",
    #   "data": {"order_id": "ACC-SINV-2025-00042", "delivery_status": "Delivered"}}}
    ```
 
-3. Resend the identical request. The unique key short-circuits it as a duplicate —
-   still HTTP `200`, so the partner stops retrying.
+3. Resend the identical request — the unique key short-circuits it as a duplicate, still HTTP `200` so the partner stops retrying:
 
    ```bash
    curl -X POST 'https://erp.scoopjoy.com/api/method/scoopjoy.api.v1.webhooks.delivery_update' \
@@ -298,12 +270,10 @@ key in `X-Idempotency-Key`.
      -H "X-Webhook-Signature: $SIGNATURE" \
      -H 'X-Idempotency-Key: webhook-del-12345-status-001' \
      -d "$PAYLOAD"
-
    # {"message": {"status": "duplicate", "message": "Already processed (status: Processed)"}}
    ```
 
-4. Send a tampered request with a bad signature. The HMAC check rejects it with
-   HTTP `401` before any data is touched.
+4. Send a tampered request with a bad signature — rejected with HTTP `401` before any data is touched:
 
    ```bash
    curl -X POST 'https://erp.scoopjoy.com/api/method/scoopjoy.api.v1.webhooks.delivery_update' \
@@ -311,23 +281,15 @@ key in `X-Idempotency-Key`.
      -H 'X-Webhook-Signature: sha256=invalid' \
      -H 'X-Idempotency-Key: webhook-test-bad-sig' \
      -d "$PAYLOAD"
-
    # HTTP 401 -> {"message": {"status": "error", "message": "Invalid signature"}}
    ```
 
 </Steps>
 
 :::note[Why this works]
-The idempotency key, stored as a `unique` field, prevents duplicate processing even
-when the delivery partner retries. HMAC verification ensures the payload hasn't been
-tampered with in transit. Returning HTTP `200` for duplicates tells the sender "I
-got it" so it stops retrying. And every webhook is logged regardless of outcome,
-giving you a full audit trail.
+The unique idempotency key prevents duplicate processing even on partner retries. HMAC verification ensures the payload wasn't tampered with in transit. Returning HTTP `200` for duplicates tells the sender "got it" so it stops retrying. Every webhook is logged regardless of outcome — a full audit trail.
 :::
 
 :::caution[Common mistake]
-Using `frappe.form_dict` to read the body of an incoming webhook. `form_dict` is
-parsed from query params and form data — it won't contain the raw JSON body, and
-the HMAC computed over it won't match. Use `frappe.request.get_data()` for the raw
-bytes, then `json.loads()` to parse.
+Reading the webhook body with `frappe.form_dict` — it's parsed from query params and form data, won't contain the raw JSON body, and the HMAC computed over it won't match. Use `frappe.request.get_data()` for the raw bytes, then `json.loads()`.
 :::

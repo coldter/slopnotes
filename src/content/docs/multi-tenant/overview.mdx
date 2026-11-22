@@ -1,6 +1,6 @@
 ---
 title: Multi-Tenant SaaS on Cloudflare
-description: Turning a single-tenant template into a production multi-tenant SaaS on Cloudflare Workers — topology, tenant isolation, SSO, and operator onboarding.
+description: "Turn a single-tenant template into a multi-tenant SaaS on Cloudflare Workers — three workers, host-based tenant resolution, per-tenant SSO, and operator onboarding."
 sidebar:
   order: 0
 ---
@@ -8,48 +8,19 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-Most products start single-tenant: there's one customer, so "the customer" is
-implied everywhere — one set of users, one login page, one database where every row
-belongs to the same company. Then you sell to a second customer, and a third. Now you
-need many customers, each with **their own URL** (`app.acme.com`), **their own
-login** (Acme's employees sign in through Acme's SSO), and **their own data** (Acme
-can never see Globex's rows). The structure looks like a small extension — add a
-`tenant_id` column, right? — but the moment two customers share one deployment,
-host resolution, CSRF rules, SSO registration, and custom-domain lifecycle all turn
-into deliberate design problems with real security stakes. This guide walks through
-one complete, production-grade design for getting it right on **Cloudflare Workers**
-(Cloudflare's serverless platform that runs your code at the network edge, close to
-users).
+Selling to a second customer means each org needs **its own URL** (`app.acme.com`), **its own login** (Acme's SSO), and **its own data** (Acme never sees Globex's rows). Adding a `tenant_id` column isn't enough — host resolution, CSRF rules, SSO registration, and custom-domain lifecycle all become security problems. This guide is one complete, production-grade design on **Cloudflare Workers**.
 
 :::note[Who this is for]
-You're comfortable with general backend work — HTTP, REST, SQL, JWTs, basic auth
-flows. You do **not** need to already know Cloudflare's edge platform or the security
-nuances of multi-tenancy; the guide introduces those from the ground up. We assume
-solid fundamentals and teach the tenancy-specific parts.
+You know general backend work — HTTP, REST, SQL, JWTs, basic auth flows. No prior Cloudflare or multi-tenancy knowledge needed.
 :::
 
-The end state is a SaaS where:
+End state: each org has its own URL (default subdomain or custom domain), configures its own OIDC SSO with email/password fallback, and all tenant data/sessions/cookies/JWTs are isolated per host. Operators onboard tenants through a separate admin panel behind Cloudflare Access.
 
-1. **Each organization has its own URL** — a default subdomain (`acme.app.example.com`)
-   or a tenant-owned custom domain (`app.acme.com`).
-2. **Each organization configures its own SSO** (OIDC), with email/password as the
-   fallback and a per-org toggle to enforce SSO.
-3. **All tenant data, sessions, cookies, and JWTs are isolated** per host and org.
-4. **Operators onboard tenants** through a separate admin panel behind Cloudflare
-   Access; tenant admins then manage their own members.
-
-It's built on a Worker-native stack: **Better Auth** for identity, **Drizzle** over
-**PostgreSQL via Hyperdrive** (Hyperdrive is Cloudflare's Postgres connection pooler,
-which lets edge Workers reuse database connections instead of opening a fresh one per
-request), **Hono** for the Workers, and **TanStack Router/Query** on the front end.
-There's a single shared database with row-level org isolation — no per-tenant
-sharding.
+Stack: **Better Auth** for identity, **Drizzle** over **PostgreSQL via Hyperdrive** (Cloudflare's Postgres connection pooler — edge Workers reuse DB connections instead of opening one per request), **Hono** for the Workers, **TanStack Router/Query** on the front end. One shared database with row-level org isolation — no per-tenant sharding.
 
 ## Architecture at a glance
 
-The system is **three Workers plus two static SPAs**, sharing one Postgres and one
-Better Auth instance. The boundaries encode the security model: tenants and
-operators never share a session, a worker, or a cookie domain.
+**Three Workers plus two static SPAs**, sharing one Postgres and one Better Auth instance. Tenants and operators never share a session, a worker, or a cookie domain.
 
 <Mermaid title="System topology" height={460} code={`
 flowchart TB
@@ -66,26 +37,16 @@ flowchart TB
   Auth --> DB["PostgreSQL via Hyperdrive"]
 `} />
 
-Five deployable units: three Hono Workers (`apps/auth`, `apps/server`, `apps/admin`)
-and two static SPAs (`apps/app`, `apps/admin-ui`) served through Workers Static
-Assets. The admin SPA ships with the admin worker; the tenant SPA is served by
-`apps/server` via a service binding, so custom-domain visitors get the same assets.
-The full topology and routing rules are in
-[Architecture & Topology](/multi-tenant/architecture/).
+Five deployable units: three Hono Workers (`apps/auth`, `apps/server`, `apps/admin`) and two static SPAs (`apps/app`, `apps/admin-ui`) served through Workers Static Assets. The admin SPA ships with the admin worker; the tenant SPA is served by `apps/server` via a service binding. Full topology in [Architecture & Topology](/multi-tenant/architecture/).
 
-## How the work is structured
-
-The design is delivered in four phases, each independently deployable. Phase 0 de-risks
-the integration points that depend on current Better Auth and Cloudflare behavior;
-Phase A puts the tenancy boundary in place from day one; Phase B adds the operator
-panel and the web split; Phase C finishes the architectural consolidations.
+## The phases
 
 | Phase | Goal | Outcome |
 |-------|------|---------|
-| **0 — Validation spike** | Prove the riskiest integrations (SSO schema, OIDC registration, custom-hostname lifecycle) against the real toolchain | Confidence before building |
+| **0 — Validation spike** | Prove the riskiest integrations (SSO schema, OIDC registration, custom-hostname lifecycle) | Confidence before building |
 | **A — Core multi-tenancy** | Tenant resolution, per-tenant SSO, custom hostnames, scoped JWTs/sessions | Multi-tenant traffic works (closed beta) |
 | **B — Admin panel + web split** | Operator worker behind CF Access, operator-led onboarding, two SPAs, per-tenant branding | Production-ready onboarding |
-| **C — Architectural deepening** | Five deep-module consolidations (tenancy, tokens, tenant ops, operator auth, hostname lifecycle) | Coherent at the module boundary |
+| **C — Architectural deepening** | Deep-module consolidations (tenancy, tokens, tenant ops, operator auth, hostname lifecycle) | Coherent at the module boundary |
 
 ## The chapters
 
@@ -104,27 +65,15 @@ panel and the web split; Phase C finishes the architectural consolidations.
 
 ## Operating principles
 
-These invariants hold across the whole design — they're the lens for every chapter:
-
 - **Three workers + two static SPAs.** New domains get new modules, not new workers.
-- **Per-host cookies.** No `Domain` attribute, no `crossSubDomainCookies`. `SameSite`
-  is defense in depth, not the isolation boundary.
-- **CSRF and origin checks are first-class.** Sibling tenant subdomains are same-site
-  by browser rules, so isolation depends on host-only cookies plus explicit
-  `Origin`/CSRF enforcement on every state-changing endpoint.
-- **The server↔auth boundary is sanitized.** Forwarded host/proto headers are
-  stripped or overwritten before any call into the auth worker.
-- **Per-tenant JWTs.** Every token is scoped to one host with an `org.sessionVersion`
-  claim, and verifiers check all five invariants.
-- **Self-serve sign-up is off.** Every tenant is operator-created; every tenant user
-  arrives via an invitation. `disableSignUp: true` globally.
+- **Per-host cookies.** No `Domain` attribute, no `crossSubDomainCookies`. `SameSite` is defense in depth, not the isolation boundary.
+- **CSRF and origin checks are first-class.** Sibling tenant subdomains are same-site by browser rules, so isolation depends on host-only cookies plus explicit `Origin`/CSRF enforcement on every state-changing endpoint.
+- **The server↔auth boundary is sanitized.** Forwarded host/proto headers are stripped or overwritten before any call into the auth worker.
+- **Per-tenant JWTs.** Every token is scoped to one host with an `org.sessionVersion` claim; verifiers check all five invariants.
+- **Self-serve sign-up is off.** Every tenant is operator-created; every tenant user arrives via invitation. `disableSignUp: true` globally.
 - **Operator-on-tenant actions are audited twice** — once globally, once tenant-scoped.
 - **`audit_logs` is append-only** at the database level, enforced by a Postgres trigger.
 
 ## Non-goals (v1)
 
-Deliberately out of scope for the first version: SAML 2.0 (the plugin supports it;
-only the onboarding UI is deferred), cross-tenant SSO or shared cookies, apex tenant
-domains (needs Cloudflare Enterprise), per-tenant DB sharding, per-tenant branded
-transactional email, operator impersonation ("view as tenant admin", deferred to v2),
-and slug renaming (operationally heavy because of IdP-registered SSO callbacks).
+SAML 2.0 (plugin supports it; onboarding UI deferred), cross-tenant SSO or shared cookies, apex tenant domains (needs Cloudflare Enterprise), per-tenant DB sharding, per-tenant branded transactional email, operator impersonation ("view as tenant admin", v2), slug renaming (breaks IdP-registered SSO callbacks).

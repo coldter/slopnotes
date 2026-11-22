@@ -1,6 +1,6 @@
 ---
 title: Anatomy of a Service
-description: How a long-running Go service bootstraps, serves, stays healthy, and shuts down through a small engine of lifecycle hooks.
+description: "Every long-running service runs the same `servenv` lifecycle — `Init` → `OnRun` gRPC registration → `Run` (HTTP first, then gRPC `Serve`, then block) → timeout-bounded shutdown via `OnTerm`/`OnTermSync`/`OnClose`."
 sidebar:
   order: 5
 ---
@@ -8,21 +8,13 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
 
-**What you will learn:** how a long-running Go service is structured, brought to a serving state, kept healthy, and shut down gracefully — by dissecting one small lifecycle engine and the service that drives it end to end.
+Every long-running binary — gateway, pooler, orchestrator, admin, the Postgres controller — shares one bootstrapping engine called **`servenv`** ("serving environment"). Understand `servenv` plus one concrete service and you understand all of them. The **gateway** is the worked example (most complete startup); the **pooler** is the contrast.
 
-**Prerequisites:** [interfaces & composition](/go-guide/language/03-interfaces-composition/), [concurrency](/go-guide/language/07-concurrency/), [context](/go-guide/language/08-context/), [sync & the memory model](/go-guide/language/09-sync-and-memory-model/), and [errors](/go-guide/language/05-errors/). It also helps to have read [cmd & cobra](/go-guide/project/02-cmd-and-cobra/) (process entry) and [config](/go-guide/project/03-config-and-flags/) (where the flag values come from).
+A `*servenv.ServEnv` is the per-process object that owns the HTTP mux, lifecycle hooks, readiness checks, telemetry, the PID file, and the signal channel. A service struct like `Gateway` *holds* a `*ServEnv` and a `*GrpcServer` rather than embedding the machinery — composition over inheritance.
 
----
+## The hook-driven state machine
 
-Every long-running binary in this system — gateway, pooler, orchestrator, admin, the Postgres controller — is a server, and they all share one bootstrapping engine called **`servenv`** (short for *serving environment*). Understand `servenv` plus one concrete service and you understand all of them. We'll use the **gateway** as the worked example because its startup is the most complete and self-contained, and bring in the **pooler** for contrast.
-
-A `*servenv.ServEnv` is the per-process object that owns the HTTP mux, the lifecycle hooks, readiness checks, telemetry, the PID file, and the signal channel. A service struct like `Gateway` *holds* a `*ServEnv` and a `*GrpcServer` rather than embedding the machinery itself — composition over inheritance, the Go way.
-
-## The big picture: a hook-driven state machine
-
-`servenv` is built around six families of **lifecycle hooks**. A hook is just a registered function (`func()` or `func() error`). The service registers callbacks; `servenv` fires them at the right phase. This is the functional-callback idiom — see [concurrency](/go-guide/language/07-concurrency/) for why functions-as-values matter here, since hooks fire on goroutines.
-
-The whole lifecycle is a small state machine. A process starts, the environment comes up (`OnInit`), the service wires its object graph and registers deferred work, then `Run` listens, fires its run hooks, and blocks while serving. A signal kicks it into a bounded, ordered shutdown:
+`servenv` is built around six families of **lifecycle hooks** — registered `func()` / `func() error` callbacks fired at the right phase:
 
 <Mermaid title="Service lifecycle" height={560} code={`
 stateDiagram-v2
@@ -52,7 +44,7 @@ stateDiagram-v2
   Exit --> [*]: telemetry shutdown, exit
 `} />
 
-The six registration methods give you a hook for each interesting moment:
+The six registration methods:
 
 ```go title="internal/servenv/servenv.go"
 func (se *ServEnv) OnInit(f func()) { se.onInitHooks.Add(f) }      // start of lifecycle
@@ -93,15 +85,11 @@ func (h *Hooks) Fire() {
 }
 ```
 
-`wg.Go(f)` is the Go 1.25 convenience form of `wg.Add(1); go func(){ defer wg.Done(); f() }()` — see [sync & the memory model](/go-guide/language/09-sync-and-memory-model/). The error-returning variant is also parallel but **fail-fast**: it returns the first error received on a channel while the rest may still be running.
-
-:::caution[Gotcha — registration order is not execution order]
-Because every hook in a family runs on its own goroutine, the order you register hooks in tells you nothing about the order they run. Hooks must be independent and concurrency-safe. Don't register two `OnClose` hooks where one depends on the other having already run.
-:::
+`wg.Go(f)` is the Go 1.25 convenience form of `wg.Add(1); go func(){ defer wg.Done(); f() }()`. The error-returning variant is also parallel but **fail-fast**: it returns the first error received on a channel while the rest may still be running. Because every hook in a family runs on its own goroutine, registration order tells you nothing about execution order — hooks must be independent and concurrency-safe. Don't register two `OnClose` hooks where one depends on the other having already run.
 
 ## Phase 1 — process start: cobra to `Init`
 
-The entry point is tiny. The `main.go` builds a cobra command whose `RunE` calls a `run` function that is just `Init` then `RunDefault`:
+The entry point is tiny. `main.go` builds a cobra command whose `RunE` calls `run` — just `Init` then `RunDefault`:
 
 ```go title="cmd/gateway/main.go"
 func run(ctx context.Context, g *gateway.Gateway) error {
@@ -112,7 +100,7 @@ func run(ctx context.Context, g *gateway.Gateway) error {
 }
 ```
 
-`PreRunE` is wired to load the config before `RunE` runs (see [config](/go-guide/project/03-config-and-flags/)). `main()` calls `cmd.Execute()` and `os.Exit(1)` on error — and that's the *only* place `os.Exit` is allowed.
+`PreRunE` loads config before `RunE` runs (see [config](/go-guide/project/03-config-and-flags/)). `main()` calls `cmd.Execute()` and `os.Exit(1)` on error — the *only* place `os.Exit` is allowed.
 
 ## Phase 2 — `ServEnv.Init`: the serving environment comes up
 
@@ -134,7 +122,7 @@ if err := g.senv.Init(servenv.ServiceIdentity{
 
 1. Set up logging and OpenTelemetry from the identity (resource attributes like `service.instance.id`, cell, build revision).
 2. Optionally ignore `SIGPIPE`.
-3. **Double-init guard:** under a mutex, if the env is already inited it calls `log.Fatal`. Otherwise it marks itself inited.
+3. **Double-init guard:** under a mutex, if already inited it calls `log.Fatal`; otherwise marks itself inited.
 4. **Refuse to run as root:** `if os.Getuid() == 0` it returns an error.
 5. Set the max stack and resolve the hostname (failing early on a bad one).
 6. Fire the `OnInit` hooks — your early setup callbacks run here.
@@ -146,14 +134,14 @@ if err := g.senv.Init(servenv.ServiceIdentity{
 `ServEnv.Init` will not run as root, and a *second* call to it is fatal. Tests and embedders must construct a fresh `ServEnv` per process and never double-init one.
 :::
 
-After `senv.Init` returns, `Init` builds the **service object graph** — where the request-flow components are wired (see [architecture & request flow](/go-guide/project/01-architecture-request-flow/)). The first thing it does is create a service-lifetime context cancelled on shutdown:
+After `senv.Init` returns, `Init` builds the **service object graph** (where the request-flow components are wired). First it creates a service-lifetime context cancelled on shutdown:
 
 ```go title="services/gateway/init.go"
 // A service-lifetime context, cancelled once at shutdown.
 g.shutdownCtx, g.shutdownCancel = context.WithCancel(ctx)
 ```
 
-`g.shutdownCtx` is then threaded into *every* long-running goroutine — pooler discovery, the load balancer, the failover buffer:
+`g.shutdownCtx` is threaded into *every* long-running goroutine — pooler discovery, the load balancer, the failover buffer:
 
 ```go title="services/gateway/init.go"
 g.poolerDiscovery = NewGlobalPoolerDiscovery(g.shutdownCtx, g.ts, g.cell.Get(), logger)
@@ -161,11 +149,11 @@ loadBalancer := poolergateway.NewLoadBalancer(g.shutdownCtx, g.cell.Get(), logge
 g.buffer = buffer.New(g.shutdownCtx, g.bufferConfig, logger)
 ```
 
-This is the canonical Go pattern for fanning a cancel signal out to many goroutines: derive one cancellable context, store its `CancelFunc`, pass the context down, and cancel once at shutdown. See [context](/go-guide/language/08-context/).
+This is the canonical Go pattern for fanning a cancel signal out to many goroutines: derive one cancellable context, store its `CancelFunc`, pass the context down, cancel once at shutdown.
 
 ## Phase 3 — deferred gRPC registration via `OnRun`
 
-Here is the single most important structural rule in one of these services. The service holds a `*servenv.GrpcServer`, but its embedded `*grpc.Server` field **does not exist yet during `Init`** — it's created later, inside `ServEnv.Run`, by `grpcServer.Create()`. So you can't register gRPC handlers in `Init` (you'd dereference `nil`), and you can't register them after `Serve()` (gRPC panics). The handlers go in an `OnRun` hook, which fires in the narrow window in between:
+The single most important structural rule: the service holds a `*servenv.GrpcServer`, but its embedded `*grpc.Server` field **does not exist yet during `Init`** — it's created later, inside `ServEnv.Run`, by `grpcServer.Create()`. So you can't register gRPC handlers in `Init` (nil dereference), and you can't register after `Serve()` (panic). The handlers go in an `OnRun` hook, which fires in the narrow window in between:
 
 ```go title="services/gateway/init.go"
 // Register gRPC services via OnRun because grpcServer.Server is only
@@ -177,10 +165,8 @@ g.senv.OnRun(func() {
 })
 ```
 
-The constraint is documented right at the gRPC `Serve` site too: all services must register before `Serve()`, which is exactly why the run hooks fire after `Create()` and before `Serve()`. Otherwise the binary crashes with `grpc: Server.RegisterService after Server.Serve`.
-
 :::caution[Gotcha — register gRPC handlers in `OnRun`/`OnRunE`, nowhere else]
-Never in `Init` (the `*grpc.Server` is `nil`), and never after `Serve` (panic). When you add a new gRPC service to a binary, the registration line goes inside an `OnRun` closure.
+Never in `Init` (the `*grpc.Server` is `nil`), and never after `Serve` (panic: `grpc: Server.RegisterService after Server.Serve`). When you add a new gRPC service to a binary, the registration line goes inside an `OnRun` closure.
 :::
 
 ### service-map gating
@@ -201,17 +187,11 @@ func RegisterPoolerServices(senv *servenv.ServEnv, grpc *servenv.GrpcServer) {
 }
 ```
 
-`CheckServiceMap` returns `false` outright if gRPC is disabled (no grpc-port/socket), and otherwise consults `--service-map` (`grpc-pooler`, `grpc-consensus`, and so on; a `-` prefix disables a name). One binary can selectively expose subsets of its services this way.
-
-:::caution[Gotcha — a sub-service can silently not be exposed]
-If a gRPC sub-service's name isn't enabled in `--service-map`, or gRPC itself is off, the service simply isn't registered — no error. If a client gets `unimplemented`, check the service map before suspecting the handler.
-:::
-
-Note that `poolerService` embeds `poolerpb.UnimplementedPoolerServiceServer`. That embedded "Unimplemented" struct is the standard gRPC forward-compatibility idiom: it satisfies the generated server interface so new RPCs in the proto don't break the build. See [interfaces & composition](/go-guide/language/03-interfaces-composition/) and [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/).
+`CheckServiceMap` returns `false` outright if gRPC is disabled (no grpc-port/socket), and otherwise consults `--service-map` (`grpc-pooler`, `grpc-consensus`, …; a `-` prefix disables a name). If a client gets `unimplemented`, check the service map before suspecting the handler.
 
 ## Phase 4 — `Run`: HTTP first, then serve, then block
 
-`RunDefault` simply delegates to `servenv`, which runs the blocking serve-and-shutdown loop. Here is the startup half:
+`RunDefault` delegates to `servenv`, which runs the blocking serve-and-shutdown loop. The startup half:
 
 ```go title="internal/servenv/run.go" {6-9,12-15,18}
 func (sv *ServEnv) Run(bindAddress string, port int, grpcServer *GrpcServer) error {
@@ -236,9 +216,9 @@ func (sv *ServEnv) Run(bindAddress string, port int, grpcServer *GrpcServer) err
 
 The ordering is deliberate:
 
-1. **The HTTP listener starts first,** in its own goroutine. Kubernetes liveness/startup probes must be able to respond *before* the potentially-blocking `OnRun` hooks (which may wait on topology or manager readiness). On K8s 1.33+ native sidecars, a probe deadlock here would stall the whole pod.
+1. **The HTTP listener starts first**, in its own goroutine — Kubernetes liveness/startup probes must respond *before* potentially-blocking `OnRun` hooks (which may wait on topology or manager readiness). On K8s 1.33+ native sidecars, a probe deadlock here would stall the whole pod.
 2. `grpcServer.Create()` — now `grpcServer.Server` exists.
-3. `FireRunHooks()` runs `OnRun` then `OnRunE`. The error result is joined and returned, so a registration error aborts startup with a wrapped error (`%w` — see [errors](/go-guide/language/05-errors/)).
+3. `FireRunHooks()` runs `OnRun` then `OnRunE`; a registration error aborts startup with a wrapped error.
 4. `grpcServer.Serve(sv)` registers reflection, a build-identity service, and the standard gRPC health server, then serves on a goroutine.
 5. `signal.Notify(...)` then **`<-sv.exitChan`** — the exact line where the process blocks while serving.
 
@@ -248,12 +228,7 @@ The HTTP server is up *before* the run hooks precisely so probes pass while a sl
 
 ## Health and readiness
 
-A service exposes two independent health surfaces, and they mean different things.
-
-**HTTP** endpoints are built into every service:
-
-- `/live` always returns ok — pure liveness.
-- `/ready` iterates the registered ready checks and returns **503** if any of them errors:
+Two independent health surfaces. **HTTP** endpoints are built into every service: `/live` always returns ok (pure liveness); `/ready` iterates the registered ready checks and returns **503** if any errors:
 
 ```go title="internal/servenv/pages.go"
 sv.HTTPHandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
@@ -287,13 +262,7 @@ g.senv.RegisterReadyCheck(func() error {
 })
 ```
 
-`serverStatus` is a small struct with a mutex guarding its fields — the state shared between this check and the `/` index page. Guarding shared mutable state with a mutex is the textbook concurrency rule (see [sync & the memory model](/go-guide/language/09-sync-and-memory-model/)).
-
-:::note[A red `/ready` with a green `/live` is the normal pre-traffic state]
-`/live` is always green; `/ready` is the meaningful one, and only matters if you registered a check. A gateway that has started but discovered no poolers yet shows green `/live`, red `/ready` — that's expected, not a bug.
-:::
-
-**gRPC health** is auto-registered when the gRPC server starts. Every registered gRPC service is marked `SERVING`, alongside reflection and a build-identity service:
+A red `/ready` with a green `/live` is the normal pre-traffic state — `/live` is always green; `/ready` is the meaningful one, and only matters if you registered a check. **gRPC health** is auto-registered when the gRPC server starts: every registered gRPC service is marked `SERVING`, alongside reflection and a build-identity service:
 
 ```go title="internal/servenv/grpc_server.go"
 healthServer := health.NewServer()
@@ -305,7 +274,7 @@ for service := range g.Server.GetServiceInfo() {
 
 ## Phase 5 — shutdown: every step is timeout-bounded
 
-Once `<-sv.exitChan` unblocks on `SIGTERM`/`SIGINT`, the shutdown sequence runs in a fixed order, and each waited step is bounded by a timeout:
+Once `<-sv.exitChan` unblocks on `SIGTERM`/`SIGINT`, the shutdown sequence runs in a fixed order, each waited step bounded by a timeout:
 
 ```go title="internal/servenv/run.go"
 startTime := time.Now()
@@ -359,7 +328,7 @@ func (se *ServEnv) fireHooksWithTimeout(timeout time.Duration, name string, hook
 }
 ```
 
-This is the classic `select`-with-timer pattern from [concurrency](/go-guide/language/07-concurrency/): a stuck cleanup hook cannot block shutdown past `--onterm-timeout` (30s, matched to the K8s grace period) or `--onclose-timeout` (10s). The hook goroutine may leak, but the process exits on schedule.
+This is the classic `select`-with-timer pattern: a stuck cleanup hook cannot block shutdown past `--onterm-timeout` (30s, matched to the K8s grace period) or `--onclose-timeout` (10s). The hook goroutine may leak, but the process exits on schedule.
 
 ### The service's `Shutdown`: cancel first, then LIFO teardown
 
@@ -387,7 +356,7 @@ Call `shutdownCancel()` *before* closing gRPC connections. Otherwise health-stre
 
 ## The cross-network contract: `queryservice.QueryService`
 
-The lifecycle exists to serve queries, and the request path is glued together by one interface: `queryservice.QueryService`. Its package doc says it's implemented on the pooler side (the *server* of the gRPC connection), by `PoolerGateway` (which abstracts away managing pooler connections), and by the gateway-side gRPC *client*:
+The lifecycle exists to serve queries, and the request path is glued by one interface:
 
 ```go title="internal/queryservice/queryservice.go"
 // All methods must be safe to be called concurrently.
@@ -398,17 +367,11 @@ type QueryService interface {
 }
 ```
 
-That same interface is satisfied by three implementations:
-
-- the pooler-side executor (real execution against PostgreSQL),
-- the gateway-side gRPC *client* `grpcQueryService` (whose constructor returns a `queryservice.QueryService`),
-- and `PoolerGateway`.
-
-This is **interface-based dependency inversion across a network boundary**: the gateway calls `QueryService` methods; one implementation turns them into gRPC calls; another, on the pooler side, executes them. Every method takes `context.Context` first (so cancellation and deadlines propagate over the wire) and is documented as concurrency-safe. See [interfaces & composition](/go-guide/language/03-interfaces-composition/) and [context](/go-guide/language/08-context/).
+Three implementations satisfy it: the pooler-side executor (real execution against PostgreSQL), the gateway-side gRPC *client* `grpcQueryService` (whose constructor returns a `queryservice.QueryService`), and `PoolerGateway`. This is **interface-based dependency inversion across a network boundary**: the gateway calls `QueryService` methods; one implementation turns them into gRPC calls; another, on the pooler side, executes them. Every method takes `context.Context` first (so cancellation and deadlines propagate over the wire) and is concurrency-safe.
 
 ## Contrast: the manager pattern
 
-The `pooler` has the same skeleton — `Init` / `RunDefault` / `Shutdown`, a `senv` and a `grpcServer` — but organizes differently. It delegates its state and topology to a dedicated `manager.PoolerManager` and registers gRPC through helper functions:
+The `pooler` has the same skeleton — `Init` / `RunDefault` / `Shutdown`, a `senv` and a `grpcServer` — but organizes differently. It delegates state and topology to a dedicated `manager.PoolerManager` and registers gRPC through helper functions:
 
 ```go title="services/pooler/init.go"
 poolerManager.Start(mp.senv)
@@ -436,19 +399,19 @@ mp.senv.OnClose(func() {
 ```
 
 :::note[Why `ctxutil.Detach`?]
-Shutdown must not be short-circuited by an already-cancelled startup context, but it still wants the trace/telemetry values from it. `Detach` keeps the values, drops the cancellation, and then a fresh 10s timeout is layered on top. See [context](/go-guide/language/08-context/) for value vs. cancellation propagation.
+Shutdown must not be short-circuited by an already-cancelled startup context, but still wants the trace/telemetry values from it. `Detach` keeps the values, drops the cancellation, and then a fresh 10s timeout is layered on top. See [context](/go-guide/language/08-context/).
 :::
 
-Where the pooler hides topology behind a manager, the gateway wires it inline through a `toporeg` helper: `Register` retries in a background goroutine with backoff; `RegisterSynchronous` blocks until success (the gateway uses it to claim a unique PID prefix); `Unregister` cancels the retry goroutine, waits, then deregisters with a fresh short-lived context. The two styles do the same job — one factored into a manager, one inline — which is a useful lesson in itself about how a large codebase carries more than one idiom for the same task.
+Where the pooler hides topology behind a manager, the gateway wires it inline through a `toporeg` helper: `Register` retries in a background goroutine with backoff; `RegisterSynchronous` blocks until success (the gateway uses it to claim a unique PID prefix); `Unregister` cancels the retry goroutine, waits, then deregisters with a fresh short-lived context. The two styles do the same job — one factored into a manager, one inline.
 
 ## Putting it together
 
-A single-paragraph trace of the whole machine: `main()` builds the cobra command and calls `Execute`; cobra loads config then runs `run` → `Init`. `Init` calls `senv.Init` (telemetry, hostname, `OnInit` fire, `/live`+`/ready` endpoints, double-init/root guards), creates `shutdownCtx`, builds the object graph passing that context into every goroutine, registers gRPC handlers in an `OnRun` hook (because the `*grpc.Server` is still `nil`), registers a ready check, and wires `Shutdown` as `OnClose`. Then `RunDefault` → `senv.Run`: HTTP listens first, `grpcServer.Create()`, `FireRunHooks()`, `grpcServer.Serve()`, then `signal.Notify` and **block on the exit channel**. On `SIGTERM`: lameduck → async `OnTerm` → waited `OnTermSync` (gRPC `GracefulStop`, ≤30s) → finish lameduck → close HTTP listener → waited `OnClose` (`Shutdown`: cancel ctx, LIFO teardown, topo unregister, ≤10s) → telemetry shutdown → exit.
+`main()` builds the cobra command and calls `Execute`; cobra loads config then runs `run` → `Init`. `Init` calls `senv.Init` (telemetry, hostname, `OnInit` fire, `/live`+`/ready` endpoints, double-init/root guards), creates `shutdownCtx`, builds the object graph passing that context into every goroutine, registers gRPC handlers in an `OnRun` hook (because the `*grpc.Server` is still `nil`), registers a ready check, and wires `Shutdown` as `OnClose`. Then `RunDefault` → `senv.Run`: HTTP listens first, `grpcServer.Create()`, `FireRunHooks()`, `grpcServer.Serve()`, then `signal.Notify` and **block on the exit channel**. On `SIGTERM`: lameduck → async `OnTerm` → waited `OnTermSync` (gRPC `GracefulStop`, ≤30s) → finish lameduck → close HTTP listener → waited `OnClose` (`Shutdown`: cancel ctx, LIFO teardown, topo unregister, ≤10s) → telemetry shutdown → exit.
 
 ## Checkpoints
 
 <details><summary>Why can't a service register its gRPC handlers inside <code>Init</code>, and where must it do it instead?</summary>
-Because <code>grpcServer.Server</code> (the <code>*grpc.Server</code>) is <code>nil</code> until <code>grpcServer.Create()</code> runs inside <code>ServEnv.Run</code>, which executes <em>after</em> <code>Init</code> returns. Registering in <code>Init</code> dereferences nil; registering after <code>Serve</code> panics with "grpc: Server.RegisterService after Server.Serve". The correct place is an <code>OnRun</code> (or <code>OnRunE</code>) hook, which fires between <code>Create</code> and <code>Serve</code>.</details>
+Because <code>grpcServer.Server</code> is <code>nil</code> until <code>grpcServer.Create()</code> runs inside <code>ServEnv.Run</code>, which executes <em>after</em> <code>Init</code> returns. Registering in <code>Init</code> dereferences nil; registering after <code>Serve</code> panics. The correct place is an <code>OnRun</code>/<code>OnRunE</code> hook, which fires between <code>Create</code> and <code>Serve</code>.</details>
 
 <details><summary>A cleanup hook hangs forever. Does the process still exit? Why?</summary>
 Yes. <code>OnTermSync</code> and <code>OnClose</code> fire through <code>fireHooksWithTimeout</code>, which <code>select</code>s the hooks-done channel against a <code>time.Timer</code>. After <code>--onterm-timeout</code> (30s) or <code>--onclose-timeout</code> (10s) the timer fires, the function returns <code>false</code>, and <code>Run</code> proceeds to exit. The stuck goroutine leaks but does not block shutdown.</details>

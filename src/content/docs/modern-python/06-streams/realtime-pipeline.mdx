@@ -1,6 +1,6 @@
 ---
 title: Real-Time Processing Pipeline
-description: Build an in-process async streaming pipeline — a generator event source through parse/filter/enrich stages to a windowed aggregator, with bounded queues and graceful shutdown.
+description: "An in-process async streaming pipeline — an async-generator event source through parse/filter/enrich stages to a 2s windowed aggregator, decoupled by bounded asyncio.Queues with graceful Ctrl-C shutdown."
 sidebar:
   order: 1
 ---
@@ -15,49 +15,21 @@ import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
 
 ## Goal
 
-Build a complete in-process real-time processing pipeline with nothing but
-`asyncio`: a simulated **event source** (an async generator) feeds a chain of
-**transform stages** (parse → filter → enrich), which feed a **windowed
-aggregator** that emits a rolling summary every few seconds. The stages are
-decoupled by **bounded `asyncio.Queue`s** so a slow stage applies backpressure to
-a fast one, and the whole thing shuts down **gracefully** on Ctrl-C — every
-stage drains, every resource closes.
-
-If you've built a Kotlin `Flow` pipeline or chained RxJS operators, this is the
-same shape. The difference: you'll *see* the parts — the generator, the queues,
-the worker tasks — instead of them hiding behind operator names. That's the
-point.
-
-## What you'll practice
-
-- **Async generators** as a stream source (`async def` + `yield`).
-- **Hand-built stream operators** (parse, filter, enrich) as async generators
-  that consume async generators.
-- **`asyncio.Queue(maxsize=...)`** for backpressure between stages.
-- A **windowed aggregator** — time-bucketed `reduce`, the bread-and-butter of
-  real-time analytics.
-- **`asyncio.TaskGroup`** to supervise the stages.
-- **Graceful shutdown**: sentinel propagation, `CancelledError` handling, and
-  `finally`/`aclose()` cleanup.
+Build a real-time pipeline with nothing but `asyncio`: an **event source** (async generator) feeds **transform stages** (parse → filter → enrich), which feed a **windowed aggregator** emitting a rolling summary every 2s. Stages are decoupled by **bounded `asyncio.Queue`s** so a slow stage backpressures a fast one, and Ctrl-C triggers a graceful shutdown — every stage drains, every resource closes.
 
 ## Requirements
 
-1. The **source** emits simulated events forever (until cancelled), at a slightly
-   irregular rate, as raw `str` lines (simulating a socket/log feed).
-2. **parse** turns each raw line into an `Event`, dropping malformed lines.
-3. **filter** drops events below a severity threshold.
-4. **enrich** adds a derived field (a region looked up from an async "service",
-   with a small simulated latency — this is the stage that benefits from buffering).
-5. The **aggregator** keeps a tumbling time window (e.g. 2s) and, when the window
-   closes, emits a summary: count and per-type breakdown for that window.
-6. Stages are connected by **bounded queues**; the pipeline must apply
-   backpressure, not grow memory without bound.
-7. **Ctrl-C** triggers a clean shutdown: the source stops, in-flight items drain,
-   the final partial window flushes, and every task exits.
+1. **Source**: emits simulated events forever as raw `str` lines at an irregular rate.
+2. **parse**: raw line → `Event`, dropping malformed lines.
+3. **filter**: drops events below a severity threshold.
+4. **enrich**: adds a region from an async "service" with simulated latency — the slow stage that benefits from buffering.
+5. **aggregator**: tumbling 2s window emitting count + per-type/per-region breakdown.
+6. Bounded queues between stages — backpressure, not unbounded memory.
+7. Ctrl-C → clean shutdown: source stops, in-flight items drain, final window flushes, every task exits.
 
 ## The pipeline at a glance
 
-<Mermaid title="Real-time pipeline: stages decoupled by bounded queues" code={`
+<Mermaid title="Stages decoupled by bounded queues — the slow enrich stage backpressures all the way to the source" code={`
 flowchart LR
   SRC["event_source()<br/>async generator"] --> Q1["raw Queue<br/>maxsize=50"]
   Q1 --> PRS["parse worker"]
@@ -70,16 +42,11 @@ flowchart LR
   AGG --> OUT["print summary"]
 `} height={300} />
 
-Each stage is a task that reads from its input queue, does its work, and writes
-to its output queue. The bounded queues are the backpressure: if `enrich` (slow,
-it awaits a lookup) falls behind, its input queue fills, which stalls `filter`,
-which stalls `parse`, which stalls the source. The whole chain self-throttles to
-the slowest stage — exactly like a buffered Go channel pipeline.
+Each stage is a task reading its input queue, working, writing its output queue. If `enrich` (30ms lookup per event) falls behind, its input queue fills, which stalls `filter`, which stalls `parse`, which stalls the source — the chain self-throttles to the slowest stage, exactly like a buffered Go channel pipeline.
 
 ## The worked solution
 
-A single-module `uv` project. The whole pipeline lives in `src/pipeline/main.py`;
-the data model is a `dataclass`.
+A single-module `uv` project — the whole pipeline in `src/pipeline/main.py`.
 
 <FileTree>
 - realtime-pipeline/
@@ -89,12 +56,6 @@ the data model is a `dataclass`.
       - __init__.py
       - **main.py** source, stages, aggregator, wiring, shutdown
 </FileTree>
-
-### pyproject.toml
-
-No runtime dependencies — `asyncio` is stdlib. The dev group carries `ruff` and
-`ty`. (If you wanted the operator-library route, this is where `aiostream` would
-go; we're doing it by hand.)
 
 ```toml title="pyproject.toml"
 [project]
@@ -115,24 +76,17 @@ build-backend = "uv_build"
 target-version = "py313"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ASYNC"]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]   # ASYNC = flake8-async: catches blocking calls in coroutines
 
 [tool.ty.rules]
 # ty is young; loosen as needed while it matures.
 ```
 
-:::note[The `ASYNC` ruff rules earn their keep here]
-Enabling Ruff's `ASYNC` (flake8-async) rule set catches the classic asyncio
-mistakes this exercise is full of opportunities for: blocking calls in a
-coroutine, `asyncio.sleep` with the wrong argument, and tasks created without a
-held reference. Turn them on in every async project.
-:::
+The `ASYNC` ruff rules (flake8-async) earn their keep in async projects: blocking calls in a coroutine, wrong `asyncio.sleep` args, tasks created without a held reference. Turn them on everywhere.
 
 ### The data model and the source
 
-The source is an async generator that fabricates raw event lines forever. Real
-feeds are messy, so ~1 in 8 lines is deliberately malformed to exercise the parse
-stage's error handling.
+~1 in 8 lines is deliberately malformed to exercise the parse stage. The `finally` is the source's cleanup hook — on cancellation the generator receives `GeneratorExit` at its `await`, and `finally` runs (a real source would close its socket here).
 
 ```python title="src/pipeline/main.py"
 from __future__ import annotations
@@ -183,16 +137,9 @@ async def event_source() -> AsyncIterator[str]:
         print("[source] stopped")                            # runs on cancel
 ```
 
-The `finally` is the source's cleanup hook — when the pipeline is cancelled, the
-generator receives `GeneratorExit` at its `await asyncio.sleep`, and `finally`
-runs. A real source would close its socket here.
-
 ### The transform stages
 
-Each stage is a coroutine that loops: read input queue → transform → write output
-queue, and propagates a **sentinel** when its input is exhausted so the next
-stage knows to stop. This is the explicit version of an async-generator chain;
-queues sit between stages so they run concurrently with backpressure.
+Each stage loops: read input queue → transform → write output queue, forwarding a **sentinel** when its input is exhausted so the next stage knows to stop.
 
 ```python title="src/pipeline/main.py"
 SENTINEL = object()  # the "no more items" signal (asyncio.Queue has no close())
@@ -249,18 +196,11 @@ async def enrich_stage(src: asyncio.Queue, out: asyncio.Queue) -> None:
         await out.put(event)
 ```
 
-`enrich_stage` is the bottleneck on purpose: every event pays a 30ms lookup. With
-bounded queues, that latency backpressures all the way to the source, so memory
-stays flat. Remove the `maxsize` on the queues and watch the upstream queues grow
-unbounded — the classic incident.
+`enrich_stage` is the bottleneck on purpose: every event pays a 30ms lookup. With bounded queues, that latency backpressures all the way to the source, so memory stays flat. Remove the `maxsize` and the upstream queues grow unbounded — the classic incident.
 
 ### The windowed aggregator
 
-The aggregator is where streaming gets interesting. It keeps a **tumbling
-window**: it accumulates events into the current window and, every `window`
-seconds, emits a summary and starts a fresh window. We drive the window boundary
-with `asyncio.wait_for` on the queue `get()` — if no event arrives before the
-window deadline, the timeout fires and we flush.
+A tumbling window driven by `asyncio.wait_for` on the queue `get()` — if no event arrives before the window deadline, the timeout fires and we flush. On the sentinel, flush the final partial window and return.
 
 ```python title="src/pipeline/main.py"
 @dataclass(slots=True)
@@ -318,17 +258,11 @@ async def windowed_aggregator(src: asyncio.Queue, window: float) -> None:
             flush()                         # window elapsed
 ```
 
-This is a hand-rolled equivalent of a Kotlin `Flow` `chunked`-by-time, or RxJS
-`bufferTime` followed by a `scan`/`reduce`. The `nonlocal` closure keeps the
-window state without a class; the `flush()` is the only place that resets it,
-which keeps the boundary logic in one spot.
+This is the hand-rolled equivalent of Kotlin `Flow` chunked-by-time or RxJS `bufferTime` + `scan`. The `nonlocal` closure keeps window state without a class; `flush()` is the only place that resets it.
 
 ### Wiring it together with `TaskGroup` and graceful shutdown
 
-`main` builds the bounded queues, then a `TaskGroup` supervises every stage. The
-source-pump task is what turns the cold generator into a feed: it pulls from the
-generator and puts into the first queue, and on shutdown it sends the sentinel
-that cascades down the whole chain.
+`pump_source` turns the cold generator into a feed: it pulls from the generator into the first queue, and on shutdown sends the sentinel that cascades down the chain. Ctrl-C sets a `stop` event via a signal handler; the `TaskGroup` block exits only when every task has returned.
 
 ```python title="src/pipeline/main.py"
 async def pump_source(out: asyncio.Queue, stop: asyncio.Event) -> None:
@@ -362,9 +296,8 @@ async def run_pipeline() -> None:
         tg.create_task(filter_stage(q_parsed, q_filtered, min_sev="info"))
         tg.create_task(enrich_stage(q_filtered, q_enriched))
         tg.create_task(windowed_aggregator(q_enriched, window=2.0))
-    # TaskGroup exits only when EVERY task has returned — i.e. the sentinel
-    # has cascaded source -> parse -> filter -> enrich -> aggregator and each
-    # stage returned. Clean, ordered shutdown with no leaked tasks.
+    # TaskGroup exits only when EVERY task has returned — the sentinel has
+    # cascaded source -> parse -> filter -> enrich -> aggregator.
     print("[pipeline] drained and stopped")
 
 
@@ -379,30 +312,17 @@ if __name__ == "__main__":
     main()
 ```
 
-The shutdown story is the part worth studying. Ctrl-C sets `stop`; `pump_source`
-sees it, breaks its `async for`, the `aclosing` context closes the generator (its
-`finally` prints `[source] stopped`), and then it puts a single `SENTINEL`. That
-sentinel flows down the chain — each stage forwards it and returns — until the
-aggregator gets it, flushes its final partial window, and returns. The
-`TaskGroup` block exits only once every task has returned. No `CancelledError`
-fireworks, no leaked tasks, no lost in-flight data. That ordered drain is the
-difference between a toy and a pipeline you'd ship.
+The shutdown story: Ctrl-C sets `stop`; `pump_source` breaks its `async for`, `aclosing` closes the generator (its `finally` prints `[source] stopped`), then puts one `SENTINEL`. That sentinel flows down the chain — each stage forwards it and returns — until the aggregator gets it, flushes its final partial window, and returns. No `CancelledError` fireworks, no leaked tasks, no lost in-flight data.
 
 :::note[Why a sentinel cascade instead of cancelling tasks?]
-We could shut down by cancelling the `TaskGroup`, but cancellation can drop
-in-flight items (an event sitting in a queue when its consumer is cancelled is
-lost). The sentinel cascade guarantees every item already in the pipeline is
-fully processed and the final window is flushed before anything exits — a
-*graceful* drain, not an abort. Cancellation is the right tool for "stop now,
-discard the rest"; sentinels are right for "stop accepting new work, finish what
-you have."
+Cancelling the `TaskGroup` would drop in-flight items — an event sitting in a queue when its consumer is cancelled is lost. The sentinel cascade guarantees every item already in the pipeline is fully processed and the final window flushed: a *graceful drain*, not an abort. Cancellation is for "stop now, discard the rest"; sentinels are for "stop accepting new work, finish what you have."
 :::
 
 ## Run it
 
 <Steps>
 
-1. Scaffold and enter the project (or copy the files above into this layout):
+1. Scaffold and enter the project:
 
    ```bash
    uv init realtime-pipeline --package
@@ -410,14 +330,11 @@ you have."
    uv add --dev ruff ty
    ```
 
-2. Run the pipeline. It prints a window summary every ~2 seconds; let it run a
-   few windows, then hit Ctrl-C and watch the ordered shutdown:
+2. Run the pipeline. It prints a window summary every ~2 seconds; let it run a few windows, then hit Ctrl-C and watch the ordered shutdown:
 
    ```bash
    uv run pipeline
    ```
-
-   You'll see output like:
 
    ```text
    [pipeline] running — Ctrl-C to stop
@@ -435,28 +352,14 @@ you have."
    uv run ty check
    ```
 
-   (`ty` is the fast Astral type checker; swap in `uv run mypy src` if your team
-   standardized on the mature option — the code is annotated for both.)
+   (`ty` is the fast Astral checker; swap in `uv run mypy src` if your team standardized on the mature option — the code is annotated for both.)
 
 </Steps>
 
 :::tip[Stretch goals]
-- **Prove backpressure**: print `q_filtered.qsize()` from the enrich stage. Then
-  set every queue's `maxsize=0` (unbounded) and watch the upstream queues balloon
-  while the slow enrich stage falls behind — the incident you're learning to
-  avoid. Put the bounds back and the sizes stay flat.
-- **Fan-out enrich**: the 30ms lookup is the bottleneck. Run 4 `enrich_stage`
-  workers off the same `q_filtered` (send 4 sentinels so each exits) and watch
-  throughput jump ~4x. You just built a worker pool.
-- **Sliding window**: change the tumbling window to a sliding one — keep a
-  `deque` of `(ts, event)` and evict entries older than the window on each tick,
-  emitting a summary of the rolling last-N-seconds. This is what real dashboards
-  show.
-- **Operator-library version**: rewrite the stage chain with
-  [`aiostream`](https://aiostream.readthedocs.io/) (`uv add aiostream`) using
-  `stream.map`/`.filter`/`.chunks` and compare line count and clarity against the
-  hand-built queues.
-- **Make it a web endpoint**: feed the window summaries to a FastAPI
-  `StreamingResponse` as Server-Sent Events — a live dashboard feed. That's the
-  bridge to [Module 07](/modern-python/07-fastapi/).
+- **Prove backpressure**: print `q_filtered.qsize()` from the enrich stage. Then set every queue's `maxsize=0` (unbounded) and watch the upstream queues balloon while the slow enrich stage falls behind. Put the bounds back and the sizes stay flat.
+- **Fan-out enrich**: run 4 `enrich_stage` workers off the same `q_filtered` (send 4 sentinels so each exits) and watch throughput jump ~4x — a worker pool.
+- **Sliding window**: keep a `deque` of `(ts, event)` and evict entries older than the window on each tick, emitting a rolling last-N-seconds summary — what real dashboards show.
+- **Operator-library version**: rewrite the stage chain with [`aiostream`](https://aiostream.readthedocs.io/) (`uv add aiostream`) using `stream.map`/`.filter`/`.chunks` and compare line count against the hand-built queues.
+- **Make it a web endpoint**: feed the window summaries to a FastAPI `StreamingResponse` as Server-Sent Events — a live dashboard feed. That's the bridge to [Module 07](/modern-python/07-fastapi/).
 :::

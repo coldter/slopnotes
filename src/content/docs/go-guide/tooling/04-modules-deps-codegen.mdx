@@ -1,6 +1,6 @@
 ---
 title: "Modules, Dependencies & Code Generation"
-description: How one Go module pins its dependencies and generates four families of code, with CI guardrails that keep all of it reproducible.
+description: "One `go.mod` pins every dependency in `go.sum` (no `vendor/`); four codegen pipelines (protoc, goyacc ×2, asthelpergen, metricsgen) produce committed `DO NOT EDIT` files, and the `validate-generated-files` CI gate fails if any drifts."
 sidebar:
   order: 4
 ---
@@ -8,15 +8,9 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { FileTree } from "@astrojs/starlight/components";
 
-**What you will learn:** how a large Go project organizes itself as a single module, how it adds and pins dependencies, the four different ways it generates code, and the CI gate that ties dependencies and codegen together so nothing drifts.
-
-If you're new to Go, here's the one-paragraph mental model. A Go *module* is a versioned unit of code identified by an import path, with its dependency graph pinned in two files: `go.mod` declares requirements, `go.sum` records cryptographic hashes of every version. We'll ground all of this in a real production system — the example system — which is **one module** containing many packages and many binaries. For the language-level fundamentals of import paths and `go.mod`/`go.sum` semantics, see [Packages, Modules & Imports](/go-guide/language/01-packages-modules-imports/). This page is about the *operational* side: how a project this size adds dependencies, generates code, and verifies the whole thing in CI.
-
----
-
 ## The single module
 
-Everything begins with one `go.mod` at the repo root, and it's short:
+One `go.mod` at the repo root, and it's short:
 
 ```go title="go.mod"
 module github.com/example/platform
@@ -24,20 +18,14 @@ module github.com/example/platform
 go 1.25
 ```
 
-Every package shares this one import-path prefix — for example `github.com/example/platform/internal/parser/ast`. There is **no nested `go.mod`** for the individual services: `gateway`, `pooler`, `dbctld`, and `orchestrator` are all packages in the same module. The companion `go.sum` is hundreds of `module version hash` triples covering every direct and transitive dependency.
+Every package shares this one import-path prefix — e.g. `github.com/example/platform/internal/parser/ast`. There is **no nested `go.mod`** for the individual services: `gateway`, `pooler`, `dbctld`, and `orchestrator` are all packages in the same module. The companion `go.sum` is hundreds of `module version hash` triples covering every direct and transitive dependency. (Language-level fundamentals of import paths and `go.mod`/`go.sum`: [Packages, Modules & Imports](/go-guide/language/01-packages-modules-imports/).)
 
 ### No vendoring
 
-There is **no `vendor/` directory**. Builds resolve dependencies from the Go module cache — downloaded via the module proxy on first build — rather than from a checked-in copy of third-party source.
-
-One consequence is worth internalizing: you **cannot build a clean checkout fully offline**, because the first build needs network access to populate the module cache. Reproducibility comes from two mechanisms working together:
+There is **no `vendor/` directory**. Builds resolve dependencies from the Go module cache — downloaded via the module proxy on first build — rather than from a checked-in copy of third-party source. Consequence: you **cannot build a clean checkout fully offline**, because the first build needs network access to populate the module cache. Reproducibility comes from two mechanisms working together:
 
 1. `go.sum` hash-pins every Go module version, so a tampered download is rejected.
 2. SHA256-pinned native tool downloads (covered in [Supply chain](#supply-chain-pinning-tools-and-downloads) below).
-
-That's the trade-off versus vendoring: a smaller repo with no committed third-party source, but a dependency on the proxy and cache being reachable.
-
----
 
 ## Dependencies: direct vs indirect
 
@@ -51,7 +39,7 @@ require (
 )
 ```
 
-Note that `yaml.v3` has no `// indirect` marker: it's imported directly somewhere in the tree.
+`yaml.v3` has no `// indirect` marker: it's imported directly somewhere in the tree.
 
 ### The everyday commands
 
@@ -61,11 +49,11 @@ go mod tidy                          # recompute require blocks + // indirect ma
                                      # prune unused deps, sync go.sum
 ```
 
-`go mod tidy` is the one to internalize. It walks every import in the module, adds anything missing, drops anything unused, and re-derives the `// indirect` annotations. After any `go get`, run `go mod tidy` and commit **both** `go.mod` and `go.sum`. The CI gate (below) runs `go mod tidy` for you and fails if it produces a diff — so an un-tidied module is a build-breaker even when no code changed.
+`go mod tidy` is the one to internalize: it walks every import in the module, adds anything missing, drops anything unused, and re-derives the `// indirect` annotations. After any `go get`, run `go mod tidy` and commit **both** `go.mod` and `go.sum`. The CI gate (below) runs `go mod tidy` for you and fails if it produces a diff — so an un-tidied module is a build-breaker even when no code changed.
 
 ### Build/codegen tools pinned as module deps
 
-Here's a modern idiom worth knowing. The `tool (...)` directive (Go 1.24+) pins the binaries a project runs during development and codegen *as module dependencies*, so their versions are locked in `go.sum` like any other dep:
+The `tool (...)` directive (Go 1.24+) pins the binaries a project runs during development and codegen *as module dependencies*, so their versions are locked in `go.sum` like any other dep:
 
 ```go title="go.mod"
 tool (
@@ -80,19 +68,15 @@ tool (
 )
 ```
 
-These are invoked with `go tool <name>` — for example `go tool goimports` and `go tool gofumpt` (you'll see exactly that in the `go:generate` lines below). The version is whatever `go.sum` pins: no separate install step, no `PATH` drift between contributors. The payoff is that a generator and the formatter that cleans up after it are reproducible from the module alone.
+These are invoked with `go tool <name>` — e.g. `go tool goimports` and `go tool gofumpt` (you'll see exactly that in the `go:generate` lines below). The version is whatever `go.sum` pins: no separate install step, no `PATH` drift between contributors.
 
 :::note[Two pinning mechanisms, don't confuse them]
-Go-based tools are pinned via the `tool (...)` block above. *Native* binaries (`protoc`, `etcd`, `sqllogictest`, `pgproto`) are pinned by SHA256 in a separate checksum table — a completely different mechanism, covered in [Supply chain](#supply-chain-pinning-tools-and-downloads). And at least one proto plugin is `go install`ed at a hardcoded version in the setup script, *not* in the `tool` block. When you go looking for "what version of X does this project use," check which mechanism owns X first.
+Go-based tools are pinned via the `tool (...)` block above. *Native* binaries (`protoc`, `etcd`, `sqllogictest`, `pgproto`) are pinned by SHA256 in a separate checksum table — a completely different mechanism (below). And at least one proto plugin is `go install`ed at a hardcoded version in the setup script, *not* in the `tool` block. When you go looking for "what version of X does this project use," check which mechanism owns X first.
 :::
-
----
 
 ## Code generation
 
 This codebase generates code four different ways. All generated files carry a `// Code generated ... DO NOT EDIT.` banner and are committed to the repo. The golden rule: never hand-edit a generated file — trace the bug to its *source* (the `.y` grammar, the AST type, the OTel instrument call) and regenerate.
-
-Before the details, here's the whole picture — each source of truth, the generator that reads it, and the output it produces:
 
 <Mermaid title="The four code-generation pipelines" height={560} code={`
 flowchart LR
@@ -111,9 +95,7 @@ flowchart LR
 
 ### `go generate` and `//go:generate`
 
-`go generate` scans Go files for `//go:generate <command>` comment directives and runs them. It is *not* part of `go build` — it only runs when explicitly invoked, here through Makefile targets.
-
-A small but instructive pattern shows up in every directive: run the generator, then format the output with the pinned `goimports` and `gofumpt`. Generated Go is rarely gofmt-clean on its own, so formatting is part of generation, not an afterthought.
+`go generate` scans Go files for `//go:generate <command>` comment directives and runs them. It is *not* part of `go build` — it only runs when explicitly invoked, here through Makefile targets. A small pattern shows up in every directive: run the generator, then format the output with the pinned `goimports` and `gofumpt`. Generated Go is rarely gofmt-clean on its own, so formatting is part of generation, not an afterthought.
 
 **Parser (goyacc on `postgres.y`):**
 
@@ -133,7 +115,7 @@ The generated `postgres.go` even records the exact invocation in its banner: `//
 //go:generate go tool gofumpt -w grammar.go
 ```
 
-This grammar deliberately omits goyacc's `-f` flag; the file comment explains it caused a hang in `ParseReplicationCommand` under `go test`. A good reminder that generator flags are load-bearing.
+This grammar deliberately omits goyacc's `-f` flag; the file comment explains it caused a hang in `ParseReplicationCommand` under `go test`. Generator flags are load-bearing.
 
 **AST helpers (asthelpergen → clone + rewrite):**
 
@@ -143,8 +125,8 @@ This grammar deliberately omits goyacc's `-f` flag; the file comment explains it
 
 This walks every AST node type implementing the `Node` interface and emits `ast_clone.go` (deep-clone helpers) and `ast_rewrite.go` (a tree-walker). Both carry `// Code generated by asthelpergen. DO NOT EDIT.`
 
-:::caution[Gotcha — the `go:generate` directive on the parser package only runs goyacc]
-A `go:generate` directive sitting on the parser package runs goyacc but does *not* regenerate the AST helpers — those are triggered by a separate directive on the `ast/` package. The full regen story is the Makefile targets below; reach for those, not a single `go generate`, after changing AST types. (There can also be a stale leftover comment in a `generate.go` claiming AST helper generation "will be implemented later" — ignore it. The real wiring lives in `ast/generate.go` above, and the helper files exist and are generated today.)
+:::caution[Gotcha — a `go:generate` directive on the parser package only runs goyacc]
+The AST helpers are triggered by a *separate* directive on the `ast/` package. The full regen story is the Makefile targets below; reach for those, not a single `go generate`, after changing AST types. (There can also be a stale leftover comment in a `generate.go` claiming AST helper generation "will be implemented later" — ignore it; the real wiring lives in `ast/generate.go` and the helper files exist and are generated today.)
 :::
 
 The deep dive on what this generated code actually *does* — grammar productions, AST shape, the rewriter — is in [The SQL Parser: Lexer, goyacc & AST Codegen](/go-guide/project/06-parser-lexer-ast-codegen/).
@@ -161,8 +143,6 @@ go run ./tools/metricsgen/main -verify  # fail if it is stale
 The output is `internal/observability/metriccatalog/catalog_generated.go`, with the banner `// Code generated by go run ./tools/metricsgen/main. DO NOT EDIT.` The `-verify` flag is a drift check (fail-if-stale), distinct from the default write mode. See [errors & observability](/go-guide/project/09-errors-and-observability/) for the instruments it scans.
 
 ### The Makefile targets that drive it all
-
-A project this size wraps every generator behind `make` targets rather than asking you to remember each invocation:
 
 ```bash title="Makefile codegen targets"
 make proto      # protobuf + grpc + grpc-gateway -> pb
@@ -186,11 +166,9 @@ After **adding or removing AST node types** under `internal/parser/ast/`, run `m
 | `ast_clone.go` + `ast_rewrite.go` | asthelpergen | `make parser` / `make build-all` | AST node types in `ast/` |
 | `internal/observability/metriccatalog/catalog_generated.go` | metricsgen | `make metrics` | OTel instrument calls across the tree |
 
----
-
 ## The `validate-generated-files` CI gate
 
-This is the gate that ties dependencies and codegen together. It rebuilds everything from source, re-tidies the module, and fails if the working tree changed — i.e. if anyone forgot to regenerate or commit:
+This gate ties dependencies and codegen together: it rebuilds everything from source, re-tidies the module, and fails if the working tree changed — i.e. if anyone forgot to regenerate or commit:
 
 ```make title="Makefile"
 validate-generated-files: clean build-all ## Validate that generated files match source.
@@ -217,8 +195,6 @@ What can make it fail — effectively your pre-push checklist:
 5. You ran `go get` but forgot to `go mod tidy` and commit `go.mod`/`go.sum`. **This trips the gate even when no generated `.go` changed**, because `go mod tidy` runs as part of the target.
 
 The fix is always the message it prints: `make build-all && go mod tidy`, then commit the diff.
-
----
 
 ## Supply-chain pinning: tools and downloads
 
@@ -297,9 +273,7 @@ Editing one bot's config without the other can cause duplicate or missing depend
   uses: suzuki-shunsuke/pinact-action@cf51507d80d4d6522a07348e3d58790290eaf0b6 # v2.0.0
 ```
 
-Notice the action itself is SHA-pinned, with the human-readable tag in a trailing comment — exactly the pattern it enforces on everyone else.
-
-And govulncheck installs a pinned scanner and runs against the module on any change to its dependency files:
+Notice the action itself is SHA-pinned, with the human-readable tag in a trailing comment — exactly the pattern it enforces on everyone else. And govulncheck installs a pinned scanner and runs against the module on any change to its dependency files:
 
 ```yaml title=".github/workflows/govulncheck.yaml"
 pull_request:
@@ -310,8 +284,6 @@ pull_request:
 - name: Install govulncheck
   run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
 ```
-
----
 
 ## What to run when
 
@@ -325,11 +297,7 @@ pull_request:
 | Before pushing (catch-all sanity) | `make validate-generated-files` | fix anything it flags |
 | First-time setup / new machine | `make tools` | populates SHA-verified native tools |
 
----
-
 ## Where the generated code lands
-
-Putting the layout next to the pipelines makes the source-to-output mapping concrete:
 
 <FileTree>
 - repo-root/
@@ -351,8 +319,6 @@ Putting the layout next to the pipelines makes the source-to-output mapping conc
   - proto/ `.proto` source for the pb layer
 </FileTree>
 
----
-
 ## Checkpoints
 
 - You can explain why there's no `vendor/` directory and what provides reproducibility instead.
@@ -363,25 +329,19 @@ Putting the layout next to the pipelines makes the source-to-output mapping conc
 - You can describe the two *separate* tool-pinning mechanisms (`tool (...)` block vs the native checksum table) and which tool falls into which.
 - You can say which bot owns Go module updates, which owns the `go` directive bump, and which owns Action SHA pinning.
 
-## Checkpoint questions
-
 <details><summary>Why can't you build a clean checkout fully offline, and what gives you reproducibility instead?</summary>
-There's no `vendor/` directory, so the first build must download dependencies from the module proxy to populate the cache. Reproducibility comes from `go.sum` hash-pinning every Go module version plus SHA256-pinned native tool downloads — not from committed third-party source.</details>
+There's no <code>vendor/</code> directory, so the first build must download dependencies from the module proxy to populate the cache. Reproducibility comes from <code>go.sum</code> hash-pinning every Go module version plus SHA256-pinned native tool downloads — not from committed third-party source.</details>
 
 <details><summary>You ran <code>go get</code> to bump a dependency but changed no <code>.go</code> code. Can the <code>validate-generated-files</code> gate still fail?</summary>
-Yes. The gate runs `go mod tidy`, and if you forgot to tidy and commit `go.mod`/`go.sum`, that produces a diff in the working tree and the job fails — even though no generated `.go` file changed.</details>
+Yes. The gate runs <code>go mod tidy</code>, and if you forgot to tidy and commit <code>go.mod</code>/<code>go.sum</code>, that produces a diff in the working tree and the job fails — even though no generated <code>.go</code> file changed.</details>
 
 <details><summary>After adding a new AST node type, why is <code>make parser</code> insufficient, and what do you run instead?</summary>
-`make parser` runs goyacc but doesn't reliably regenerate the asthelpergen output for the new type; you must run `make build-all` and commit the regenerated `ast_clone.go` and `ast_rewrite.go`, or the `validate-generated-files` CI job fails.</details>
+<code>make parser</code> runs goyacc but doesn't reliably regenerate the asthelpergen output for the new type; you must run <code>make build-all</code> and commit the regenerated <code>ast_clone.go</code> and <code>ast_rewrite.go</code>, or the <code>validate-generated-files</code> CI job fails.</details>
 
 <details><summary>A project pins <code>gofumpt</code> in its <code>go.mod</code> <code>tool (...)</code> block but <code>protoc</code> in a separate SHA256 table. Why the two mechanisms?</summary>
-`gofumpt` is a Go module, so the `tool (...)` directive pins it in `go.sum` like any dependency and runs it via `go tool`. `protoc` is a native (non-Go) binary downloaded as a release artifact, so it's pinned by SHA256 in a checksum table and verified on download — Go's module machinery can't pin it.</details>
-
----
+<code>gofumpt</code> is a Go module, so the <code>tool (...)</code> directive pins it in <code>go.sum</code> like any dependency and runs it via <code>go tool</code>. <code>protoc</code> is a native (non-Go) binary downloaded as a release artifact, so it's pinned by SHA256 in a checksum table and verified on download — Go's module machinery can't pin it.</details>
 
 ## Exercises
-
-All grounded in a read-only checkout of the codebase — never modify it.
 
 1. **Map the directives.** Run `grep -rn "go:generate" .` and match each directive to the artifact it produces (`postgres.go`, `grammar.go`, `ast_clone.go`, `ast_rewrite.go`) and the `make` target that triggers it.
 2. **Read the gate.** Walk the `validate-generated-files` target line by line and write the contributor checklist of everything that would make it fail in CI.
@@ -389,13 +349,9 @@ All grounded in a read-only checkout of the codebase — never modify it.
 4. **Trace protoc's supply chain.** Find the protoc version in the `Makefile`, the matching SHA256 in the checksum table, and the safe-download call in the setup script. Describe exactly what happens when the checksum doesn't match.
 5. **Compare the bots.** Read `renovate.json` and `.github/dependabot.yml` and write one paragraph: who owns Go module updates, who owns the `go` directive bump, who owns Action SHA pinning.
 
----
-
 ## Next
 
 [Debugging & Profiling](/go-guide/tooling/05-debugging-profiling/) — when the generated code or a dependency misbehaves at runtime.
-
----
 
 ## See also
 

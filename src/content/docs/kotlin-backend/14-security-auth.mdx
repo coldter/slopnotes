@@ -1,6 +1,6 @@
 ---
 title: Security & Auth
-description: Authentication and authorization on the JVM — Spring Security, JWT, OAuth2 with Keycloak, RBAC, and BCrypt, mapped from Express and Go.
+description: "Spring Security filter chain, JWT with jjwt, OAuth2 resource server with Keycloak, @PreAuthorize RBAC, BCrypt, and Ktor's auth plugin."
 sidebar:
   order: 14
 ---
@@ -8,70 +8,34 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { Tabs, TabItem, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-Every backend you've built has needed auth. In Express, you bolted on Passport.js
-middleware. In Go, you hand-rolled middleware with `golang-jwt`. On the JVM,
-**Spring Security** is the heavyweight champion — a deeply integrated,
-filter-chain-based security framework that handles authentication, authorization,
-CORS, CSRF, session management, and OAuth2 out of the box.
+Spring Security centralizes auth in a declarative **filter chain** — authentication, authorization, CORS, CSRF, sessions, OAuth2. JWT tokens go through `jjwt`; external IdPs through the OAuth2 resource server; RBAC via `@PreAuthorize`.
 
-This module covers Spring Security fundamentals (the `SecurityFilterChain`), JWT
-authentication with `jjwt`, OAuth2 / OpenID Connect as a resource server with
-Keycloak, role-based access control (RBAC) via `@PreAuthorize`, password hashing
-with BCrypt, Ktor's lighter plugin-based security, and rate limiting backed by
-Redis (from [Module 11](/kotlin-backend/11-redis-caching/)).
-
-## Security Mental Model: Express vs Go vs Spring
-
-Each ecosystem wires auth differently. Express and Go lean on per-route middleware
-you assemble by hand; Spring Security centralizes everything in a declarative
-filter chain.
+## Mental model: Express vs Go vs Spring
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
 
 ```typescript
-// Express: middleware-based, manual wiring
 import passport from "passport";
 import { Strategy as JwtStrategy, ExtractJwt } from "passport-jwt";
 
-// 1. Configure strategy
-passport.use(
-  new JwtStrategy(
-    {
-      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      secretOrKey: process.env.JWT_SECRET!,
-    },
-    (payload, done) => {
-      // Find user, call done(null, user) or done(null, false)
-      return done(null, payload);
-    }
-  )
-);
+passport.use(new JwtStrategy({
+  jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+  secretOrKey: process.env.JWT_SECRET!,
+}, (payload, done) => done(null, payload)));
 
-// 2. Apply middleware per-route
-app.get(
-  "/api/tasks",
-  passport.authenticate("jwt", { session: false }),
-  (req, res) => {
-    res.json({ user: req.user, tasks: [] });
-  }
-);
+app.get("/api/tasks", passport.authenticate("jwt", { session: false }), (req, res) => {
+  res.json({ user: req.user, tasks: [] });
+});
 ```
 
   </TabItem>
   <TabItem label="Go">
 
 ```go
-// Go: hand-rolled middleware, explicit control
 func authMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        tokenStr := r.Header.Get("Authorization")
-        if tokenStr == "" {
-            http.Error(w, "Unauthorized", http.StatusUnauthorized)
-            return
-        }
-        tokenStr = strings.TrimPrefix(tokenStr, "Bearer ")
-
+        tokenStr := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
         token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
             return []byte(os.Getenv("JWT_SECRET")), nil
         })
@@ -79,14 +43,10 @@ func authMiddleware(next http.Handler) http.Handler {
             http.Error(w, "Unauthorized", http.StatusUnauthorized)
             return
         }
-
-        claims := token.Claims.(jwt.MapClaims)
-        ctx := context.WithValue(r.Context(), "user", claims)
+        ctx := context.WithValue(r.Context(), "user", token.Claims)
         next.ServeHTTP(w, r.WithContext(ctx))
     })
 }
-
-// Apply
 mux.Handle("/api/tasks", authMiddleware(tasksHandler))
 ```
 
@@ -94,7 +54,6 @@ mux.Handle("/api/tasks", authMiddleware(tasksHandler))
   <TabItem label="Kotlin">
 
 ```kotlin
-// Spring Security: filter-chain-based, declarative configuration
 @Configuration
 @EnableWebSecurity
 class SecurityConfig {
@@ -109,9 +68,7 @@ class SecurityConfig {
                 authorize(anyRequest, denyAll)
             }
             addFilterBefore<UsernamePasswordAuthenticationFilter>(jwtAuthFilter())
-            sessionManagement {
-                sessionCreationPolicy = SessionCreationPolicy.STATELESS
-            }
+            sessionManagement { sessionCreationPolicy = SessionCreationPolicy.STATELESS }
         }
         return http.build()
     }
@@ -120,8 +77,6 @@ class SecurityConfig {
 
   </TabItem>
 </Tabs>
-
-**Key Differences:**
 
 | Aspect | Express | Go | Spring Security |
 |--------|---------|-----|----------------|
@@ -133,16 +88,9 @@ class SecurityConfig {
 | CORS | `cors` npm package | Manual headers | Built-in `cors {}` DSL |
 | Session | `express-session` | `gorilla/sessions` | Built-in session management |
 
-## Spring Security Fundamentals
+## The filter chain
 
-### The Filter Chain
-
-Spring Security works via a chain of **servlet filters** that execute before your
-controllers. Think of it as Express middleware, but deeply integrated into the
-Spring container — each filter has one job, and the request only reaches your
-controller if it survives them all.
-
-<Mermaid title="Spring Security filter chain" code={`
+<Mermaid title="Spring Security filter chain — request passes through each filter before the controller" code={`
 flowchart TB
   REQ["HTTP Request"] --> CORS["CorsFilter — CORS headers"]
   CORS --> CSRF["CsrfFilter — CSRF protection"]
@@ -152,8 +100,6 @@ flowchart TB
   EX --> CTRL["Controller"]
 `} />
 
-### Dependencies
-
 ```kotlin title="build.gradle.kts"
 dependencies {
     implementation("org.springframework.boot:spring-boot-starter-security")
@@ -162,9 +108,7 @@ dependencies {
 }
 ```
 
-Adding `spring-boot-starter-security` immediately secures **every endpoint** with
-HTTP Basic auth and a generated password (printed at startup). You must configure
-it to customize.
+Adding `spring-boot-starter-security` immediately secures every endpoint with HTTP Basic + a generated password. Configure it to customize.
 
 ### Basic SecurityFilterChain
 
@@ -183,7 +127,6 @@ class SecurityConfig {
     @Bean
     fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
         http {
-            // Define URL authorization rules
             authorizeHttpRequests {
                 authorize("/api/public/**", permitAll)
                 authorize("/api/admin/**", hasRole("ADMIN"))
@@ -197,28 +140,22 @@ class SecurityConfig {
 ```
 
 :::note
-The `http { }` block is Spring Security's Kotlin DSL (imported via
-`org.springframework.security.config.annotation.web.invoke`). Without this import,
-you'd use the Java-style `.authorizeHttpRequests().requestMatchers(...)` fluent API.
+The `http { }` block is Spring Security's Kotlin DSL (import `org.springframework.security.config.annotation.web.invoke`). Without it you'd use the Java-style fluent API.
 :::
 
-### Authentication vs Authorization
+### Authentication vs authorization
 
-Authentication answers "Who are you?" and fails with `401 Unauthorized`.
-Authorization answers "Are you allowed?" and fails with `403 Forbidden`. Spring
-Security handles both through the filter chain:
+Authentication = "Who are you?" → fails with `401`. Authorization = "Are you allowed?" → fails with `403`.
 
 ```kotlin
 @Bean
 fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
     http {
-        // Authentication: configure HOW users prove identity
         httpBasic { }    // HTTP Basic auth
         formLogin { }    // Form-based login
         oauth2Login { }  // OAuth2 login
-        // (or custom JWT filter — see the JWT Authentication section)
+        // (or custom JWT filter — see below)
 
-        // Authorization: configure WHO can access WHAT
         authorizeHttpRequests {
             authorize("/login", permitAll)
             authorize("/api/**", authenticated)
@@ -228,24 +165,18 @@ fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
 }
 ```
 
-### UserDetailsService — Loading Users
-
-Spring Security's authentication needs a way to load users. You provide a
-`UserDetailsService`:
+### UserDetailsService
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
 
 ```typescript
-// Express: you do this manually in the route/strategy
-passport.use(
-  new LocalStrategy(async (username, password, done) => {
-    const user = await db.users.findByEmail(username);
-    if (!user) return done(null, false);
-    if (!await bcrypt.compare(password, user.passwordHash)) return done(null, false);
-    return done(null, user);
-  })
-);
+passport.use(new LocalStrategy(async (username, password, done) => {
+  const user = await db.users.findByEmail(username);
+  if (!user) return done(null, false);
+  if (!await bcrypt.compare(password, user.passwordHash)) return done(null, false);
+  return done(null, user);
+}));
 ```
 
   </TabItem>
@@ -266,11 +197,10 @@ class AppUserDetailsService(
     override fun loadUserByUsername(username: String): UserDetails {
         val user = userRepository.findByEmail(username)
             ?: throw UsernameNotFoundException("User not found: $username")
-
         return User.builder()
             .username(user.email)
             .password(user.passwordHash)  // Already BCrypt-hashed
-            .roles(*user.roles.toTypedArray())  // e.g., "USER", "ADMIN"
+            .roles(*user.roles.toTypedArray())
             .build()
     }
 }
@@ -279,26 +209,16 @@ class AppUserDetailsService(
   </TabItem>
 </Tabs>
 
-**Key Differences:** In Express you wire user lookup into the strategy callback
-yourself; in Spring you implement one interface method and the framework calls it
-whenever authentication needs to resolve a username.
+## CORS, CSRF, headers
 
-## HTTP Security: CORS, CSRF, Headers
-
-### CORS Configuration
+### CORS
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
 
 ```typescript
 import cors from "cors";
-app.use(
-  cors({
-    origin: "http://localhost:3000",
-    methods: ["GET", "POST", "PUT", "DELETE"],
-    credentials: true,
-  })
-);
+app.use(cors({ origin: "http://localhost:3000", methods: ["GET","POST","PUT","DELETE"], credentials: true }));
 ```
 
   </TabItem>
@@ -309,11 +229,7 @@ func corsMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
         w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE")
-        w.Header().Set("Access-Control-Allow-Credentials", "true")
-        if r.Method == "OPTIONS" {
-            w.WriteHeader(http.StatusOK)
-            return
-        }
+        if r.Method == "OPTIONS" { w.WriteHeader(http.StatusOK); return }
         next.ServeHTTP(w, r)
     })
 }
@@ -321,33 +237,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 
   </TabItem>
   <TabItem label="Kotlin">
-
-```kotlin
-@Bean
-fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
-    http {
-        cors {
-            configurationSource = UrlBasedCorsConfigurationSource().apply {
-                registerCorsConfiguration("/**", CorsConfiguration().apply {
-                    allowedOrigins = listOf("http://localhost:3000")
-                    allowedMethods = listOf("GET", "POST", "PUT", "DELETE")
-                    allowedHeaders = listOf("*")
-                    allowCredentials = true
-                    maxAge = 3600L
-                })
-            }
-        }
-    }
-    return http.build()
-}
-```
-
-  </TabItem>
-</Tabs>
-
-**Key Differences:** Express and Go set CORS headers per request; Spring registers
-a `CorsConfigurationSource` once and the `CorsFilter` applies it for you. You can
-also extract the config to a dedicated bean:
 
 ```kotlin
 @Bean
@@ -375,64 +264,40 @@ fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
 }
 ```
 
-### CSRF Protection
+  </TabItem>
+</Tabs>
 
-CSRF protection is **enabled by default** in Spring Security. For stateless APIs
-(JWT-based), you typically disable it since there's no session cookie to hijack:
+### CSRF
 
-```kotlin
-http {
-    csrf { disable() }  // Safe for stateless JWT APIs
-}
-```
-
-For traditional server-rendered apps with sessions, keep CSRF enabled:
+Enabled by default. Disable for stateless JWT APIs (no session cookie to hijack):
 
 ```kotlin
-http {
-    csrf {
-        csrfTokenRepository = CookieCsrfTokenRepository.withHttpOnlyFalse()
-    }
-}
+http { csrf { disable() } }  // Safe for stateless JWT APIs
 ```
 
-### Security Headers
+For server-rendered apps with sessions, keep it: `csrf { csrfTokenRepository = CookieCsrfTokenRepository.withHttpOnlyFalse() }`
 
-Spring Security adds security headers by default. You can customize them:
+### Security headers
+
+Spring adds them by default. Customize:
 
 ```kotlin
 http {
     headers {
         frameOptions { deny() }
-        contentSecurityPolicy {
-            policyDirectives = "default-src 'self'; script-src 'self'"
-        }
-        httpStrictTransportSecurity {
-            includeSubDomains = true
-            maxAgeInSeconds = 31536000
-        }
+        contentSecurityPolicy { policyDirectives = "default-src 'self'; script-src 'self'" }
+        httpStrictTransportSecurity { includeSubDomains = true; maxAgeInSeconds = 31536000 }
         xssProtection { }
         contentTypeOptions { }  // X-Content-Type-Options: nosniff
     }
 }
 ```
 
-Default headers Spring Security adds:
+Default headers: `Cache-Control: no-cache...`, `X-Content-Type-Options: nosniff`, `Strict-Transport-Security`, `X-Frame-Options: DENY`, `X-XSS-Protection: 0`.
 
-```text
-Cache-Control: no-cache, no-store, max-age=0, must-revalidate
-X-Content-Type-Options: nosniff
-Strict-Transport-Security: max-age=31536000; includeSubDomains
-X-Frame-Options: DENY
-X-XSS-Protection: 0
-```
+## JWT authentication
 
-## JWT Authentication
-
-This is the most common auth pattern for APIs. Generate a JWT on login, send it as
-a Bearer token, validate it on every request.
-
-<Mermaid title="JWT issue and verify" code={`
+<Mermaid title="JWT issue and verify — login returns a token, every request carries it as Bearer" code={`
 sequenceDiagram
   actor Client
   participant Auth as AuthController
@@ -457,28 +322,23 @@ sequenceDiagram
 dependencies {
     implementation("org.springframework.boot:spring-boot-starter-security")
     implementation("org.springframework.boot:spring-boot-starter-web")
-
-    // JJWT — the most popular Java JWT library
     implementation("io.jsonwebtoken:jjwt-api:0.12.6")
     runtimeOnly("io.jsonwebtoken:jjwt-impl:0.12.6")
     runtimeOnly("io.jsonwebtoken:jjwt-jackson:0.12.6")
 }
 ```
 
-### JWT Service — Generate & Validate Tokens
+### JwtService
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
 
 ```typescript
 import jwt from "jsonwebtoken";
-
 const SECRET = process.env.JWT_SECRET!;
-
 function generateToken(userId: string, roles: string[]): string {
   return jwt.sign({ sub: userId, roles }, SECRET, { expiresIn: "24h" });
 }
-
 function validateToken(token: string): JwtPayload {
   return jwt.verify(token, SECRET) as JwtPayload;
 }
@@ -490,13 +350,11 @@ function validateToken(token: string): JwtPayload {
 ```go
 func generateToken(userID string, roles []string) (string, error) {
     claims := jwt.MapClaims{
-        "sub":   userID,
-        "roles": roles,
-        "exp":   time.Now().Add(24 * time.Hour).Unix(),
-        "iat":   time.Now().Unix(),
+        "sub": userID, "roles": roles,
+        "exp": time.Now().Add(24 * time.Hour).Unix(),
+        "iat": time.Now().Unix(),
     }
-    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-    return token.SignedString([]byte(os.Getenv("JWT_SECRET")))
+    return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(os.Getenv("JWT_SECRET")))
 }
 ```
 
@@ -522,7 +380,6 @@ class JwtService(
     fun generateToken(userId: String, email: String, roles: List<String>): String {
         val now = Date()
         val expiry = Date(now.time + expirationMs)
-
         return Jwts.builder()
             .subject(userId)
             .claim("email", email)
@@ -541,9 +398,7 @@ class JwtService(
             .payload
     }
 
-    fun getUserId(token: String): String {
-        return validateToken(token).subject
-    }
+    fun getUserId(token: String): String = validateToken(token).subject
 
     fun getRoles(token: String): List<String> {
         @Suppress("UNCHECKED_CAST")
@@ -555,14 +410,9 @@ class JwtService(
   </TabItem>
 </Tabs>
 
-**Key Differences:** All three sign HS256 tokens with a shared secret, but JJWT's
-builder is fully typed (`.subject()`, `.claim()`, `.expiration()`) and validation
-goes through a parser that verifies the signature before handing back `Claims`.
+All three sign HS256 tokens with a shared secret. JJWT's builder is fully typed (`.subject()`, `.claim()`, `.expiration()`); validation verifies the signature before returning `Claims`.
 
-### JWT Authentication Filter
-
-This is the equivalent of the Express/Go middleware — a servlet filter that
-extracts and validates the JWT on every request:
+### JWT authentication filter
 
 ```kotlin title="src/main/kotlin/com/example/auth/JwtAuthenticationFilter.kt"
 import jakarta.servlet.FilterChain
@@ -585,43 +435,27 @@ class JwtAuthenticationFilter(
         filterChain: FilterChain,
     ) {
         val token = extractToken(request)
-
         if (token != null) {
             try {
                 val claims = jwtService.validateToken(token)
-                val userId = claims.subject
-                val roles = jwtService.getRoles(token)
-
-                val authorities = roles.map { SimpleGrantedAuthority("ROLE_$it") }
-                val authentication = UsernamePasswordAuthenticationToken(
-                    userId,       // principal
-                    null,         // credentials (not needed after auth)
-                    authorities,  // granted authorities
-                )
-
-                SecurityContextHolder.getContext().authentication = authentication
+                val authorities = jwtService.getRoles(token).map { SimpleGrantedAuthority("ROLE_$it") }
+                SecurityContextHolder.getContext().authentication =
+                    UsernamePasswordAuthenticationToken(claims.subject, null, authorities)
             } catch (e: Exception) {
-                // Invalid token — don't set authentication, let the chain continue
-                // The authorization filter will reject if endpoint requires auth
-                logger.debug("Invalid JWT token: ${e.message}")
+                logger.debug("Invalid JWT token: ${e.message}")  // chain continues; authz will reject
             }
         }
-
         filterChain.doFilter(request, response)
     }
 
     private fun extractToken(request: HttpServletRequest): String? {
         val header = request.getHeader("Authorization") ?: return null
-        return if (header.startsWith("Bearer ")) {
-            header.substring(7)
-        } else {
-            null
-        }
+        return if (header.startsWith("Bearer ")) header.substring(7) else null
     }
 }
 ```
 
-### Wiring It Together — SecurityFilterChain
+### SecurityFilterChain wiring
 
 ```kotlin title="src/main/kotlin/com/example/auth/SecurityConfig.kt"
 import org.springframework.context.annotation.Bean
@@ -652,24 +486,16 @@ class SecurityConfig(
             cors { }
 
             authorizeHttpRequests {
-                // Public endpoints
                 authorize(HttpMethod.POST, "/api/auth/register", permitAll)
                 authorize(HttpMethod.POST, "/api/auth/login", permitAll)
                 authorize("/actuator/health", permitAll)
-
-                // Everything else requires authentication
                 authorize("/api/**", authenticated)
                 authorize(anyRequest, denyAll)
             }
 
-            sessionManagement {
-                sessionCreationPolicy = SessionCreationPolicy.STATELESS
-            }
-
-            // Insert our JWT filter before Spring's default auth filter
+            sessionManagement { sessionCreationPolicy = SessionCreationPolicy.STATELESS }
             addFilterBefore<UsernamePasswordAuthenticationFilter>(jwtAuthFilter)
 
-            // Custom 401/403 responses
             exceptionHandling {
                 authenticationEntryPoint = HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)
             }
@@ -677,17 +503,15 @@ class SecurityConfig(
         return http.build()
     }
 
-    @Bean
-    fun passwordEncoder(): PasswordEncoder = BCryptPasswordEncoder()
+    @Bean fun passwordEncoder(): PasswordEncoder = BCryptPasswordEncoder()
 
     @Bean
-    fun authenticationManager(config: AuthenticationConfiguration): AuthenticationManager {
-        return config.authenticationManager
-    }
+    fun authenticationManager(config: AuthenticationConfiguration): AuthenticationManager =
+        config.authenticationManager
 }
 ```
 
-### Auth Controller — Register & Login
+### Auth controller — register & login
 
 ```kotlin title="src/main/kotlin/com/example/auth/AuthController.kt"
 import org.springframework.http.HttpStatus
@@ -695,22 +519,9 @@ import org.springframework.http.ResponseEntity
 import org.springframework.security.crypto.password.PasswordEncoder
 import org.springframework.web.bind.annotation.*
 
-data class RegisterRequest(
-    val email: String,
-    val password: String,
-    val name: String,
-)
-
-data class LoginRequest(
-    val email: String,
-    val password: String,
-)
-
-data class AuthResponse(
-    val token: String,
-    val userId: String,
-    val email: String,
-)
+data class RegisterRequest(val email: String, val password: String, val name: String)
+data class LoginRequest(val email: String, val password: String)
+data class AuthResponse(val token: String, val userId: String, val email: String)
 
 @RestController
 @RequestMapping("/api/auth")
@@ -721,12 +532,9 @@ class AuthController(
 ) {
     @PostMapping("/register")
     fun register(@RequestBody request: RegisterRequest): ResponseEntity<AuthResponse> {
-        // Check if user exists
         if (userRepository.findByEmail(request.email) != null) {
             return ResponseEntity.status(HttpStatus.CONFLICT).build()
         }
-
-        // Create user
         val user = AppUser(
             email = request.email,
             passwordHash = passwordEncoder.encode(request.password),
@@ -734,67 +542,39 @@ class AuthController(
             roles = listOf("USER"),
         )
         val saved = userRepository.save(user)
-
-        // Generate token
-        val token = jwtService.generateToken(
-            userId = saved.id.toString(),
-            email = saved.email,
-            roles = saved.roles,
-        )
-
-        return ResponseEntity.status(HttpStatus.CREATED).body(
-            AuthResponse(token = token, userId = saved.id.toString(), email = saved.email)
-        )
+        val token = jwtService.generateToken(saved.id.toString(), saved.email, saved.roles)
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(AuthResponse(token = token, userId = saved.id.toString(), email = saved.email))
     }
 
     @PostMapping("/login")
     fun login(@RequestBody request: LoginRequest): ResponseEntity<AuthResponse> {
         val user = userRepository.findByEmail(request.email)
             ?: return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build()
-
         if (!passwordEncoder.matches(request.password, user.passwordHash)) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build()
         }
-
-        val token = jwtService.generateToken(
-            userId = user.id.toString(),
-            email = user.email,
-            roles = user.roles,
-        )
-
-        return ResponseEntity.ok(
-            AuthResponse(token = token, userId = user.id.toString(), email = user.email)
-        )
+        val token = jwtService.generateToken(user.id.toString(), user.email, user.roles)
+        return ResponseEntity.ok(AuthResponse(token = token, userId = user.id.toString(), email = user.email))
     }
 }
 ```
 
-### Protected Controller — Accessing the Current User
-
-Inject `Authentication` into a handler to read the principal the filter set. Here's
-how the same "get the current user" move looks in each ecosystem:
+### Accessing the current user
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
 
 ```typescript
-// Express: req.user is set by Passport
-app.get("/api/tasks", authenticate, (req, res) => {
-  const userId = req.user.sub;
-  // ...
-});
+app.get("/api/tasks", authenticate, (req, res) => { const userId = req.user.sub; });
 ```
 
   </TabItem>
   <TabItem label="Go">
 
 ```go
-// Go: pull from context.Value
-func tasksHandler(w http.ResponseWriter, r *http.Request) {
-    claims := r.Context().Value("user").(jwt.MapClaims)
-    userID := claims["sub"].(string)
-    // ...
-}
+claims := r.Context().Value("user").(jwt.MapClaims)
+userID := claims["sub"].(string)
 ```
 
   </TabItem>
@@ -806,24 +586,12 @@ import org.springframework.web.bind.annotation.*
 
 @RestController
 @RequestMapping("/api/tasks")
-class TaskController(
-    private val taskRepository: TaskRepository,
-) {
+class TaskController(private val taskRepository: TaskRepository) {
+
     @GetMapping
     fun getTasks(authentication: Authentication): List<Task> {
         val userId = authentication.principal as String  // Set in JwtAuthFilter
         return taskRepository.findByUserId(userId)
-    }
-
-    @PostMapping
-    fun createTask(
-        @RequestBody request: CreateTaskRequest,
-        authentication: Authentication,
-    ): Task {
-        val userId = authentication.principal as String
-        return taskRepository.save(
-            Task(title = request.title, userId = userId)
-        )
     }
 }
 ```
@@ -831,11 +599,9 @@ class TaskController(
   </TabItem>
 </Tabs>
 
-**Key Differences:** Express stashes the user on `req.user` and Go on the request
-context; Spring exposes it through the `SecurityContext`, which you reach by simply
-declaring an `Authentication` parameter on the handler.
+Spring exposes the principal by declaring an `Authentication` parameter on the handler.
 
-### Testing JWT Auth
+### Testing JWT auth
 
 ```kotlin title="src/test/kotlin/com/example/auth/AuthIntegrationTest.kt"
 import org.springframework.beans.factory.annotation.Autowired
@@ -856,58 +622,30 @@ class AuthIntegrationTest {
 
     @Test
     fun `unauthenticated request returns 401`() {
-        mockMvc.get("/api/tasks")
-            .andExpect { status { isUnauthorized() } }
+        mockMvc.get("/api/tasks").andExpect { status { isUnauthorized() } }
     }
 
     @Test
     fun `authenticated request returns 200`() {
         val token = jwtService.generateToken("user-1", "test@test.com", listOf("USER"))
-
-        mockMvc.get("/api/tasks") {
-            header("Authorization", "Bearer $token")
-        }.andExpect {
-            status { isOk() }
-        }
+        mockMvc.get("/api/tasks") { header("Authorization", "Bearer $token") }
+            .andExpect { status { isOk() } }
     }
 
     @Test
     fun `register and login flow`() {
-        // Register
         mockMvc.post("/api/auth/register") {
             contentType = MediaType.APPLICATION_JSON
             content = """{"email":"new@test.com","password":"secret123","name":"Test"}"""
         }.andExpect {
             status { isCreated() }
             jsonPath("$.token") { isNotEmpty() }
-            jsonPath("$.email") { value("new@test.com") }
-        }
-
-        // Login
-        mockMvc.post("/api/auth/login") {
-            contentType = MediaType.APPLICATION_JSON
-            content = """{"email":"new@test.com","password":"secret123"}"""
-        }.andExpect {
-            status { isOk() }
-            jsonPath("$.token") { isNotEmpty() }
-        }
-    }
-
-    @Test
-    fun `expired token returns 401`() {
-        // Create a token that's already expired (using a test-only method)
-        val expiredToken = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEiLCJleHAiOjE2MDAwMDAwMDB9.invalid"
-
-        mockMvc.get("/api/tasks") {
-            header("Authorization", "Bearer $expiredToken")
-        }.andExpect {
-            status { isUnauthorized() }
         }
     }
 }
 ```
 
-Spring Security Test also provides `@WithMockUser` for simpler unit tests:
+Spring Security Test also provides `@WithMockUser` for simpler tests:
 
 ```kotlin
 import org.springframework.security.test.context.support.WithMockUser
@@ -915,34 +653,23 @@ import org.springframework.security.test.context.support.WithMockUser
 @Test
 @WithMockUser(username = "user-1", roles = ["USER"])
 fun `mock user can access tasks`() {
-    mockMvc.get("/api/tasks")
-        .andExpect { status { isOk() } }
-}
-
-@Test
-@WithMockUser(username = "admin-1", roles = ["ADMIN"])
-fun `admin can access admin endpoint`() {
-    mockMvc.get("/api/admin/users")
-        .andExpect { status { isOk() } }
+    mockMvc.get("/api/tasks").andExpect { status { isOk() } }
 }
 ```
 
 ## OAuth2 / OpenID Connect
 
-OAuth2 and OpenID Connect (OIDC) let users authenticate via an external identity
-provider (IdP) like Keycloak, Auth0, Okta, or Google. Your API acts as a
-**Resource Server** that validates tokens issued by the IdP.
+Your API acts as a **resource server** validating tokens from an external IdP (Keycloak, Auth0, Okta).
 
-<Mermaid title="OAuth2 authorization-code flow" code={`
+<Mermaid title="OAuth2 authorization-code flow — the API only verifies, never sees credentials" code={`
 sequenceDiagram
   actor User
   participant FE as Frontend
   participant IdP as Identity Provider (Keycloak)
   participant API as Your API (Resource Server)
   User->>FE: click "Log in"
-  FE->>IdP: redirect to /authorize (client_id, redirect_uri)
+  FE->>IdP: redirect to /authorize
   IdP->>User: login + consent prompt
-  User->>IdP: credentials
   IdP-->>FE: redirect back with authorization code
   FE->>IdP: POST /token (code, client_secret)
   IdP-->>FE: access token (JWT)
@@ -952,9 +679,7 @@ sequenceDiagram
   API-->>FE: 200 protected resource
 `} />
 
-### Spring Security OAuth2 Resource Server
-
-**Dependencies:**
+### Resource server config
 
 ```kotlin title="build.gradle.kts"
 dependencies {
@@ -964,19 +689,15 @@ dependencies {
 }
 ```
 
-**Configuration (`application.yml`):**
-
-```yaml title="src/main/resources/application.yml"
+```yaml title="application.yml"
 spring:
   security:
     oauth2:
       resourceserver:
         jwt:
           issuer-uri: http://localhost:8180/realms/my-app
-          # Spring Security auto-discovers JWKS endpoint from issuer
+          # Spring auto-discovers the JWKS endpoint from the issuer
 ```
-
-**SecurityFilterChain for OAuth2:**
 
 ```kotlin
 @Configuration
@@ -987,19 +708,13 @@ class OAuth2SecurityConfig {
     fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
         http {
             csrf { disable() }
-
             authorizeHttpRequests {
                 authorize("/api/public/**", permitAll)
                 authorize("/api/admin/**", hasRole("ADMIN"))
                 authorize("/api/**", authenticated)
             }
-
             oauth2ResourceServer {
-                jwt {
-                    // Spring auto-configures JWT decoder from issuer-uri
-                    // Customize claim-to-authority mapping:
-                    jwtAuthenticationConverter = jwtAuthenticationConverter()
-                }
+                jwt { jwtAuthenticationConverter = jwtAuthenticationConverter() }
             }
         }
         return http.build()
@@ -1007,11 +722,9 @@ class OAuth2SecurityConfig {
 
     private fun jwtAuthenticationConverter(): JwtAuthenticationConverter {
         val grantedAuthoritiesConverter = JwtGrantedAuthoritiesConverter().apply {
-            // Keycloak puts roles in realm_access.roles
-            setAuthoritiesClaimName("realm_access.roles")
+            setAuthoritiesClaimName("realm_access.roles")  // Keycloak puts roles here
             setAuthorityPrefix("ROLE_")
         }
-
         return JwtAuthenticationConverter().apply {
             setJwtGrantedAuthoritiesConverter(grantedAuthoritiesConverter)
         }
@@ -1019,10 +732,9 @@ class OAuth2SecurityConfig {
 }
 ```
 
-### Custom Keycloak Role Extraction
+### Keycloak role converter
 
-Keycloak stores roles in a nested structure (`realm_access.roles`). You need a
-custom converter:
+Keycloak stores roles in a nested `realm_access.roles` claim:
 
 ```kotlin
 import org.springframework.core.convert.converter.Converter
@@ -1034,30 +746,14 @@ class KeycloakRoleConverter : Converter<Jwt, Collection<GrantedAuthority>> {
 
     override fun convert(jwt: Jwt): Collection<GrantedAuthority> {
         val realmAccess = jwt.getClaimAsMap("realm_access") ?: return emptyList()
-
         @Suppress("UNCHECKED_CAST")
         val roles = realmAccess["roles"] as? List<String> ?: return emptyList()
-
-        return roles.map { role ->
-            SimpleGrantedAuthority("ROLE_${role.uppercase()}")
-        }
+        return roles.map { SimpleGrantedAuthority("ROLE_${it.uppercase()}") }
     }
 }
 ```
 
-Use it in the security config:
-
-```kotlin
-private fun jwtAuthenticationConverter(): JwtAuthenticationConverter {
-    return JwtAuthenticationConverter().apply {
-        setJwtGrantedAuthoritiesConverter(KeycloakRoleConverter())
-    }
-}
-```
-
-### Accessing JWT Claims in Controllers
-
-Inject the validated token with `@AuthenticationPrincipal Jwt`:
+### Accessing JWT claims
 
 ```kotlin
 import org.springframework.security.core.annotation.AuthenticationPrincipal
@@ -1068,20 +764,18 @@ import org.springframework.security.oauth2.jwt.Jwt
 class ProfileController {
 
     @GetMapping
-    fun getProfile(@AuthenticationPrincipal jwt: Jwt): Map<String, Any?> {
-        return mapOf(
-            "sub" to jwt.subject,
-            "email" to jwt.getClaimAsString("email"),
-            "name" to jwt.getClaimAsString("preferred_username"),
-            "roles" to jwt.getClaimAsStringList("realm_access.roles"),
-            "issued_at" to jwt.issuedAt,
-            "expires_at" to jwt.expiresAt,
-        )
-    }
+    fun getProfile(@AuthenticationPrincipal jwt: Jwt): Map<String, Any?> = mapOf(
+        "sub" to jwt.subject,
+        "email" to jwt.getClaimAsString("email"),
+        "name" to jwt.getClaimAsString("preferred_username"),
+        "roles" to jwt.getClaimAsStringList("realm_access.roles"),
+        "issued_at" to jwt.issuedAt,
+        "expires_at" to jwt.expiresAt,
+    )
 }
 ```
 
-### Keycloak Setup with Docker
+### Keycloak via Docker
 
 ```yaml title="docker-compose.yml"
 services:
@@ -1100,34 +794,11 @@ volumes:
   keycloak_data:
 ```
 
-After starting Keycloak, go to `http://localhost:8180`, log in as `admin/admin`,
-then create a realm `my-app`, a client `my-api` (Client authentication: ON, Service
-accounts: OFF), roles `USER` and `ADMIN`, and users with those roles assigned.
+At `http://localhost:8180` (admin/admin): create realm `my-app`, client `my-api` (Client authentication: ON), roles `USER`/`ADMIN`, and users with roles assigned.
 
-Compare to the TypeScript equivalent — `express-oauth2-jwt-bearer` validates the
-same issuer-issued JWT:
+## RBAC
 
-```typescript
-// Express with Auth0/Keycloak
-import { auth } from "express-oauth2-jwt-bearer";
-
-app.use(
-  auth({
-    issuerBaseURL: "http://localhost:8180/realms/my-app",
-    audience: "my-api",
-  })
-);
-
-app.get("/api/profile", (req, res) => {
-  res.json(req.auth); // Claims from validated JWT
-});
-```
-
-## Role-Based Access Control (RBAC)
-
-### URL-Based Authorization
-
-Coarse rules live in the `SecurityFilterChain`, matching by path and role:
+### URL-based authorization
 
 ```kotlin
 authorizeHttpRequests {
@@ -1137,7 +808,7 @@ authorizeHttpRequests {
 }
 ```
 
-<Mermaid title="RBAC authorization decision" code={`
+<Mermaid title="RBAC decision — URL rule first, then @PreAuthorize SpEL, else 403" code={`
 sequenceDiagram
   actor Client
   participant Az as AuthorizationFilter
@@ -1158,105 +829,52 @@ sequenceDiagram
   end
 `} />
 
-### Method-Level Security with @PreAuthorize
+### Method-level: @PreAuthorize
 
-Enable with `@EnableMethodSecurity`:
-
-```kotlin
-@Configuration
-@EnableWebSecurity
-@EnableMethodSecurity(prePostEnabled = true)  // Enables @PreAuthorize
-class SecurityConfig { /* ... */ }
-```
-
-Then use it in controllers or services:
+Enable with `@EnableMethodSecurity(prePostEnabled = true)`, then annotate:
 
 ```kotlin
 import org.springframework.security.access.prepost.PreAuthorize
 
 @RestController
 @RequestMapping("/api/tasks")
-class TaskController(
-    private val taskService: TaskService,
-) {
+class TaskController(private val taskService: TaskService) {
+
     @GetMapping
     @PreAuthorize("hasRole('USER')")
-    fun getAllTasks(authentication: Authentication): List<Task> {
-        return taskService.getTasksForUser(authentication.name)
-    }
+    fun getAllTasks(authentication: Authentication): List<Task> =
+        taskService.getTasksForUser(authentication.name)
 
     @DeleteMapping("/{id}")
     @PreAuthorize("hasRole('ADMIN') or @taskService.isOwner(#id, authentication.name)")
     fun deleteTask(@PathVariable id: Long, authentication: Authentication) {
         taskService.deleteTask(id)
     }
-
-    @PutMapping("/{id}/assign")
-    @PreAuthorize("hasRole('ADMIN')")
-    fun assignTask(@PathVariable id: Long, @RequestBody request: AssignRequest) {
-        taskService.assignTask(id, request.userId)
-    }
 }
 ```
 
-### SpEL Expressions in @PreAuthorize
-
-Spring Expression Language (SpEL) gives you powerful authorization logic — it can
-reference method parameters (with `#param`), call beans, and combine conditions:
+### SpEL expressions in @PreAuthorize
 
 ```kotlin
-// Simple role check
-@PreAuthorize("hasRole('ADMIN')")
-
-// Multiple roles
-@PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")
-
-// Access method parameters
-@PreAuthorize("#userId == authentication.name")
-fun getUser(@PathVariable userId: String): User { /* ... */ }
-
-// Call a bean method
-@PreAuthorize("@authorizationService.canAccess(authentication, #taskId)")
-fun getTask(@PathVariable taskId: Long): Task { /* ... */ }
-
-// Combine with AND/OR
-@PreAuthorize("hasRole('ADMIN') or #request.userId == authentication.name")
-fun updateTask(@PathVariable id: Long, @RequestBody request: UpdateRequest) { /* ... */ }
-
-// Check authentication status
+@PreAuthorize("hasRole('ADMIN')")                              // role check
+@PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")                 // multiple roles
+@PreAuthorize("#userId == authentication.name")                  // param check
+@PreAuthorize("@authorizationService.canAccess(authentication, #taskId)")  // bean call
+@PreAuthorize("hasRole('ADMIN') or #request.userId == authentication.name") // combine
 @PreAuthorize("isAuthenticated()")
-@PreAuthorize("isAnonymous()")
 ```
 
-### @PostAuthorize — Check After Method Execution
-
-`@PostAuthorize` runs the check against the **returned** object — useful for
-ownership checks where you need the loaded entity first:
+### @PostAuthorize and @Secured
 
 ```kotlin
 @PostAuthorize("returnObject.userId == authentication.name or hasRole('ADMIN')")
-fun getTask(@PathVariable id: Long): Task {
-    return taskService.findById(id)  // Returns task, then Spring checks authorization
-}
+fun getTask(@PathVariable id: Long): Task = taskService.findById(id)  // check after load
+
+@Secured("ROLE_ADMIN")  // simpler, no SpEL
+fun adminOnly() { }
 ```
 
-### @Secured — Simpler Role Check
-
-```kotlin
-import org.springframework.security.access.annotation.Secured
-
-@Secured("ROLE_ADMIN")
-fun adminOnly() { /* ... */ }
-
-@Secured("ROLE_USER", "ROLE_ADMIN")
-fun userOrAdmin() { /* ... */ }
-```
-
-`@Secured` is simpler but less powerful than `@PreAuthorize` (no SpEL support).
-
-### Custom Permission Evaluator
-
-For complex authorization logic, create a custom evaluator:
+### Custom PermissionEvaluator
 
 ```kotlin
 import org.springframework.security.access.PermissionEvaluator
@@ -1270,9 +888,7 @@ class TaskPermissionEvaluator(
 ) : PermissionEvaluator {
 
     override fun hasPermission(
-        authentication: Authentication,
-        targetDomainObject: Any?,
-        permission: Any,
+        authentication: Authentication, targetDomainObject: Any?, permission: Any,
     ): Boolean {
         if (targetDomainObject is Task) {
             return when (permission.toString()) {
@@ -1287,10 +903,7 @@ class TaskPermissionEvaluator(
     }
 
     override fun hasPermission(
-        authentication: Authentication,
-        targetId: Serializable,
-        targetType: String,
-        permission: Any,
+        authentication: Authentication, targetId: Serializable, targetType: String, permission: Any,
     ): Boolean {
         if (targetType == "Task") {
             val task = taskRepository.findById(targetId as Long).orElse(null) ?: return false
@@ -1301,95 +914,29 @@ class TaskPermissionEvaluator(
 }
 ```
 
-Register and use it:
+Register and use:
 
 ```kotlin
 @Configuration
 class MethodSecurityConfig {
     @Bean
-    fun methodSecurityExpressionHandler(
-        evaluator: TaskPermissionEvaluator,
-    ): DefaultMethodSecurityExpressionHandler {
-        return DefaultMethodSecurityExpressionHandler().apply {
-            setPermissionEvaluator(evaluator)
-        }
-    }
+    fun methodSecurityExpressionHandler(evaluator: TaskPermissionEvaluator): DefaultMethodSecurityExpressionHandler =
+        DefaultMethodSecurityExpressionHandler().apply { setPermissionEvaluator(evaluator) }
 }
 
-// Usage in controller
 @PreAuthorize("hasPermission(#id, 'Task', 'READ')")
-fun getTask(@PathVariable id: Long): Task { /* ... */ }
-
-@PreAuthorize("hasPermission(#id, 'Task', 'DELETE')")
-fun deleteTask(@PathVariable id: Long) { /* ... */ }
+fun getTask(@PathVariable id: Long): Task { }
 ```
 
-Compare to how you'd do role enforcement in Express and Go — manual middleware,
-wired per route:
+Express/Go do RBAC with manual per-route middleware; Spring does it declaratively with annotations + SpEL.
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-
-```typescript
-// Express: manual middleware
-function requireRole(...roles: string[]) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    if (!roles.some((r) => req.user.roles.includes(r))) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-    next();
-  };
-}
-
-app.delete("/api/tasks/:id", authenticate, requireRole("ADMIN"), deleteTask);
-```
-
-  </TabItem>
-  <TabItem label="Go">
-
-```go
-// Go: manual middleware
-func requireRole(roles ...string) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            claims := r.Context().Value("user").(jwt.MapClaims)
-            userRoles := claims["roles"].([]interface{})
-            for _, required := range roles {
-                for _, has := range userRoles {
-                    if has.(string) == required {
-                        next.ServeHTTP(w, r)
-                        return
-                    }
-                }
-            }
-            http.Error(w, "Forbidden", http.StatusForbidden)
-        })
-    }
-}
-```
-
-  </TabItem>
-</Tabs>
-
-**Key Differences:**
-
-- **Express/Go**: RBAC is imperative — you write middleware functions and wire them per-route.
-- **Spring Security**: RBAC is declarative — annotations on methods, SpEL expressions, automatic enforcement.
-- Spring's `@PreAuthorize` can reference method parameters, call beans, and use complex logic.
-- The filter chain handles the 401/403 responses automatically.
-
-## Password Hashing
-
-### BCrypt across ecosystems
-
-The hashing primitive is the same everywhere; only the API wrapping it changes.
+## Password hashing
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
 
 ```typescript
 import bcrypt from "bcrypt";
-
 const hash = await bcrypt.hash("password123", 12);
 const matches = await bcrypt.compare("password123", hash);
 ```
@@ -1399,7 +946,6 @@ const matches = await bcrypt.compare("password123", hash);
 
 ```go
 import "golang.org/x/crypto/bcrypt"
-
 hash, _ := bcrypt.GenerateFromPassword([]byte("password123"), 12)
 err := bcrypt.CompareHashAndPassword(hash, []byte("password123"))
 ```
@@ -1411,70 +957,52 @@ err := bcrypt.CompareHashAndPassword(hash, []byte("password123"))
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder
 
 val encoder = BCryptPasswordEncoder()  // Default strength: 10
-
-// Hash
 val hash: String = encoder.encode("password123")
 // → "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
-
-// Verify
-val matches: Boolean = encoder.matches("password123", hash)
-// → true
+val matches: Boolean = encoder.matches("password123", hash)  // true
 ```
 
   </TabItem>
 </Tabs>
 
-**Key Differences:** Spring wraps BCrypt in a `PasswordEncoder` you register as a
-bean and inject, rather than calling a free function:
+Register as a bean and inject:
 
 ```kotlin
 @Bean
 fun passwordEncoder(): PasswordEncoder = BCryptPasswordEncoder(12)  // strength = 12
 
-// Use in service
 @Service
 class UserService(
     private val passwordEncoder: PasswordEncoder,
     private val userRepository: UserRepository,
 ) {
     fun register(email: String, rawPassword: String): AppUser {
-        val user = AppUser(
-            email = email,
-            passwordHash = passwordEncoder.encode(rawPassword),
-        )
+        val user = AppUser(email = email, passwordHash = passwordEncoder.encode(rawPassword))
         return userRepository.save(user)
     }
 
     fun authenticate(email: String, rawPassword: String): AppUser? {
         val user = userRepository.findByEmail(email) ?: return null
-        if (!passwordEncoder.matches(rawPassword, user.passwordHash)) return null
-        return user
+        return if (passwordEncoder.matches(rawPassword, user.passwordHash)) user else null
     }
 }
 ```
 
-### DelegatingPasswordEncoder — Supporting Multiple Algorithms
-
-Spring Security's `DelegatingPasswordEncoder` supports migrating between hash
-algorithms by storing the algorithm ID in the hash itself:
+### DelegatingPasswordEncoder (algorithm migration)
 
 ```kotlin
 @Bean
 fun passwordEncoder(): PasswordEncoder {
     return PasswordEncoderFactories.createDelegatingPasswordEncoder()
-    // Creates: {bcrypt}$2a$10$...
-    // Also supports: {noop}, {scrypt}, {argon2}, {sha256}
+    // Creates: {bcrypt}$2a$10$... — also supports {noop}, {scrypt}, {argon2}, {sha256}
 }
 ```
 
-Because the prefix like `{bcrypt}` is stored alongside the hash, you can upgrade
-algorithms without breaking existing passwords.
+The `{bcrypt}` prefix is stored with the hash, so you can upgrade algorithms without breaking existing passwords.
 
-## Ktor Security
+## Ktor security
 
-Ktor takes a lighter approach — plugins instead of a filter chain.
-
-### Authentication Plugin
+Ktor uses plugins instead of a filter chain.
 
 ```kotlin title="build.gradle.kts"
 dependencies {
@@ -1483,7 +1011,7 @@ dependencies {
 }
 ```
 
-### JWT Authentication in Ktor
+### JWT in Ktor
 
 ```kotlin
 import io.ktor.server.application.*
@@ -1503,62 +1031,43 @@ fun Application.configureSecurity() {
     install(Authentication) {
         jwt("auth-jwt") {
             realm = "task-api"
-
             verifier(
                 JWT.require(Algorithm.HMAC256(secret))
                     .withAudience(audience)
                     .withIssuer(issuer)
                     .build()
             )
-
             validate { credential ->
-                val userId = credential.payload.subject
-                if (userId != null) {
-                    JWTPrincipal(credential.payload)
-                } else {
-                    null
-                }
+                if (credential.payload.subject != null) JWTPrincipal(credential.payload) else null
             }
-
             challenge { _, _ ->
-                call.respond(
-                    HttpStatusCode.Unauthorized,
-                    mapOf("error" to "Token is invalid or expired")
-                )
+                call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Token is invalid or expired"))
             }
         }
     }
 }
 ```
 
-### Protected Routes
+### Protected routes
 
 ```kotlin
 fun Application.configureRouting() {
     routing {
-        // Public routes
         post("/api/auth/login") {
             val request = call.receive<LoginRequest>()
-            // ... validate credentials, generate token
             val token = generateToken(user)
             call.respond(mapOf("token" to token))
         }
 
-        // Protected routes
         authenticate("auth-jwt") {
             route("/api/tasks") {
                 get {
-                    val principal = call.principal<JWTPrincipal>()!!
-                    val userId = principal.payload.subject
-                    val tasks = taskService.getTasksForUser(userId)
-                    call.respond(tasks)
+                    val userId = call.principal<JWTPrincipal>()!!.payload.subject
+                    call.respond(taskService.getTasksForUser(userId))
                 }
-
                 post {
-                    val principal = call.principal<JWTPrincipal>()!!
-                    val userId = principal.payload.subject
-                    val request = call.receive<CreateTaskRequest>()
-                    val task = taskService.createTask(request, userId)
+                    val userId = call.principal<JWTPrincipal>()!!.payload.subject
+                    val task = taskService.createTask(call.receive(), userId)
                     call.respond(HttpStatusCode.Created, task)
                 }
             }
@@ -1567,21 +1076,14 @@ fun Application.configureRouting() {
 }
 ```
 
-### Token Generation in Ktor
+### Token generation in Ktor
 
 ```kotlin
 import com.auth0.jwt.JWT
 import com.auth0.jwt.algorithms.Algorithm
 import java.util.Date
 
-fun generateToken(
-    userId: String,
-    email: String,
-    roles: List<String>,
-    secret: String,
-    issuer: String,
-    audience: String,
-): String {
+fun generateToken(userId: String, email: String, roles: List<String>, secret: String, issuer: String, audience: String): String {
     return JWT.create()
         .withSubject(userId)
         .withAudience(audience)
@@ -1594,12 +1096,9 @@ fun generateToken(
 }
 ```
 
-### Role-Based Authorization in Ktor
-
-Ktor doesn't have built-in RBAC annotations like Spring. You build it manually:
+### RBAC in Ktor
 
 ```kotlin
-// Custom RBAC helper
 fun ApplicationCall.hasRole(role: String): Boolean {
     val principal = principal<JWTPrincipal>() ?: return false
     val roles = principal.payload.getClaim("roles").asList(String::class.java)
@@ -1618,26 +1117,14 @@ fun Route.requireRole(role: String, build: Route.() -> Unit) {
     }
 }
 
-// Usage
 routing {
     requireRole("ADMIN") {
-        get("/api/admin/users") {
-            call.respond(userService.getAllUsers())
-        }
-    }
-
-    authenticate("auth-jwt") {
-        get("/api/tasks") {
-            val userId = call.principal<JWTPrincipal>()!!.payload.subject
-            call.respond(taskService.getTasksForUser(userId))
-        }
+        get("/api/admin/users") { call.respond(userService.getAllUsers()) }
     }
 }
 ```
 
-### Session Authentication in Ktor
-
-For server-rendered apps, Ktor supports sessions:
+### Sessions in Ktor
 
 ```kotlin
 import io.ktor.server.sessions.*
@@ -1650,25 +1137,20 @@ fun Application.configureSessions() {
             cookie.path = "/"
             cookie.maxAgeInSeconds = 86400
             cookie.httpOnly = true
-            cookie.secure = true  // HTTPS only
+            cookie.secure = true
             cookie.extensions["SameSite"] = "Strict"
         }
     }
-
     install(Authentication) {
         session<UserSession>("auth-session") {
-            validate { session ->
-                session  // Return session as principal if valid
-            }
-            challenge {
-                call.respond(HttpStatusCode.Unauthorized)
-            }
+            validate { it }
+            challenge { call.respond(HttpStatusCode.Unauthorized) }
         }
     }
 }
 ```
 
-### Spring vs Ktor Security Comparison
+### Spring vs Ktor comparison
 
 | Feature | Spring Security | Ktor |
 |---------|----------------|------|
@@ -1681,10 +1163,9 @@ fun Application.configureSessions() {
 | Complexity | High (many concepts) | Low (explicit wiring) |
 | Flexibility | Convention over configuration | Full control |
 
-## Rate Limiting with Redis
+## Rate limiting with Redis
 
-Connect security to [Module 11](/kotlin-backend/11-redis-caching/) (Redis). Rate
-limiting prevents abuse — especially on auth endpoints.
+Connect security to [Module 11](/kotlin-backend/11-redis-caching/). Rate limiting prevents abuse — especially on auth endpoints.
 
 ```kotlin
 import org.springframework.data.redis.core.StringRedisTemplate
@@ -1695,42 +1176,26 @@ import java.time.Duration
 class RateLimiter(
     private val redis: StringRedisTemplate,
 ) {
-    /**
-     * Sliding window rate limiter.
-     * Returns true if the request is allowed, false if rate-limited.
-     */
+    /** Sliding window rate limiter. Returns true if allowed, false if rate-limited. */
     fun isAllowed(key: String, maxRequests: Int, window: Duration): Boolean {
         val redisKey = "rate_limit:$key"
         val now = System.currentTimeMillis()
         val windowStart = now - window.toMillis()
 
-        // Use Redis sorted set with timestamps as scores
-        redis.execute { connection ->
+        return redis.execute { connection ->
             val conn = connection.zSetCommands()
             val keyBytes = redisKey.toByteArray()
-
-            // Remove old entries outside the window
-            conn.zRemRangeByScore(keyBytes, 0.0, windowStart.toDouble())
-
-            // Count current entries
+            conn.zRemRangeByScore(keyBytes, 0.0, windowStart.toDouble())  // drop old
             val count = conn.zCard(keyBytes) ?: 0
-
             if (count < maxRequests) {
-                // Add current request
                 conn.zAdd(keyBytes, now.toDouble(), "$now".toByteArray())
-                // Set TTL on the key
                 connection.keyCommands().expire(keyBytes, window.seconds)
                 true
-            } else {
-                false
-            }
+            } else false
         } as Boolean
     }
 }
 ```
-
-A filter applies the limiter before the request reaches your controllers, keyed by
-authenticated user when available and falling back to client IP:
 
 ```kotlin
 import jakarta.servlet.FilterChain
@@ -1742,43 +1207,30 @@ import org.springframework.web.filter.OncePerRequestFilter
 import java.time.Duration
 
 @Component
-class RateLimitFilter(
-    private val rateLimiter: RateLimiter,
-) : OncePerRequestFilter() {
+class RateLimitFilter(private val rateLimiter: RateLimiter) : OncePerRequestFilter() {
 
     override fun doFilterInternal(
-        request: HttpServletRequest,
-        response: HttpServletResponse,
-        filterChain: FilterChain,
+        request: HttpServletRequest, response: HttpServletResponse, filterChain: FilterChain,
     ) {
         val key = getClientKey(request)
-
         if (!rateLimiter.isAllowed(key, maxRequests = 100, window = Duration.ofMinutes(1))) {
             response.status = HttpStatus.TOO_MANY_REQUESTS.value()
             response.contentType = "application/json"
             response.writer.write("""{"error":"Rate limit exceeded. Try again later."}""")
             return
         }
-
         filterChain.doFilter(request, response)
     }
 
     private fun getClientKey(request: HttpServletRequest): String {
-        // Use authenticated user ID if available, otherwise IP
         val auth = org.springframework.security.core.context.SecurityContextHolder
             .getContext().authentication
-        return if (auth != null && auth.isAuthenticated) {
-            "user:${auth.name}"
-        } else {
-            "ip:${request.remoteAddr}"
-        }
+        return if (auth != null && auth.isAuthenticated) "user:${auth.name}" else "ip:${request.remoteAddr}"
     }
 }
 ```
 
-## Security Checklist
-
-Before deploying your API, verify each of these:
+## Security checklist
 
 ```text
 Authentication:
@@ -1831,18 +1283,12 @@ Dependencies:
 | CSRF | `csurf` | Manual | Built-in, on by default | Not built-in |
 | Rate limiting | `express-rate-limit` | Manual + Redis | Custom filter + Redis | Custom plugin |
 
-**Key takeaways:**
-
 - Spring Security is batteries-included but has a learning curve — learn the filter chain.
-- Ktor gives you more control but less out of the box.
 - `@PreAuthorize` with SpEL is extremely powerful for authorization.
 - Always use BCrypt (or Argon2) for passwords, never SHA/MD5.
 - For microservices, OAuth2 Resource Server with an external IdP is the standard pattern.
 
 ## Practice
-
-Put auth into practice — secure a real API end to end, then validate tokens from an
-external identity provider.
 
 <CardGrid>
   <LinkCard

@@ -1,6 +1,6 @@
 ---
 title: Scopes & Resource Safety
-description: Why try/finally leaks under concurrency, how Scope turns lifetimes into values, acquireRelease's uninterruptible-acquisition guarantee, LIFO finalizer ordering, exit-aware cleanup, and leak-free resource graphs in Layers.
+description: "Why try/finally leaks under concurrency, how Scope turns lifetimes into values, acquireRelease's uninterruptible-acquisition guarantee, LIFO finalizer ordering, exit-aware cleanup, and leak-free resource graphs in Layers."
 sidebar:
   order: 12
 ---
@@ -8,26 +8,13 @@ sidebar:
 import { LinkCard } from "@astrojs/starlight/components";
 import Mermaid from "~/components/Mermaid.astro";
 
-Every long-lived process accumulates things that must be closed: sockets, file
-handles, DB connections, subscriptions, locks, temp directories. In plain
-TypeScript the tools for this are `try/finally` and — since the disposal
-proposals landed — `Symbol.dispose`/`using`. Both work fine for *synchronous,
-lexical* lifetimes: the resource is opened and closed inside one function body.
-
-They fall apart the moment lifetimes become **dynamic**: a connection opened in
-one function but used until an HTTP request finishes, a subscription that lives
-as long as a websocket, a pool shared by N concurrent tasks and torn down when
-the last user leaves. At that point you are manually threading cleanup
-callbacks through your architecture, and every code path you forgot is a leak.
-
-This chapter builds up Effect's answer from first principles: the `Scope`.
+Long-lived processes accumulate things that must be closed: sockets, file handles, DB connections, subscriptions, locks, temp dirs. `try/finally` and `Symbol.dispose`/`using` work for *synchronous, lexical* lifetimes — open and close inside one function body. They fall apart when lifetimes become **dynamic**: a connection opened in one function but used until an HTTP request finishes, a pool shared by N tasks and torn down when the last user leaves. Effect's answer is the `Scope`.
 
 ## The problem with manual cleanup
 
-Consider the canonical TS pattern for "use this thing while this request runs":
+The canonical TS pattern for "use this thing while this request runs":
 
 ```ts
-// The boilerplate everyone writes by hand
 async function handleRequest(req: Request): Promise<Response> {
   const controller = new AbortController()
   req.signal.addEventListener("abort", () => controller.abort())
@@ -40,40 +27,27 @@ async function handleRequest(req: Request): Promise<Response> {
 }
 ```
 
-Three independent failure modes live in those eight lines:
+Three failure modes in eight lines:
 
-1. **Early returns and throws between `acquire` and `try`.** Move one line and
-   the `finally` no longer covers acquisition. Any code that can fail *between*
-   obtaining the resource and entering the guarded block leaks it.
-2. **Cancellation has no story.** If the request is aborted mid-query, does the
-   underlying driver stop? Does `finally` even get a chance to run before the
-   event loop tears down? `AbortController` gives you a *signal*, not a
-   lifecycle — every resource gets its own ad-hoc listener wiring.
-3. **Composition doesn't scale.** A function that needs two resources must
-   nest two try/finally blocks; a resource whose lifetime outlives the function
-   needs a callback parameter or a registry of "things to close later" that
-   someone, someday, must remember to drain.
+1. **Early returns/throws between `acquire` and `try`** — move one line and `finally` no longer covers acquisition.
+2. **Cancellation has no story** — `AbortController` gives a *signal*, not a lifecycle; every resource gets ad-hoc listener wiring.
+3. **Composition doesn't scale** — two resources means two nested try/finally blocks; a resource outliving the function needs a callback parameter or a "things to close later" registry someone must remember to drain.
 
-The root issue: **the lifetime is implicit**. Nothing in the type system says
-"this value requires a surrounding cleanup boundary", so nothing forces you to
-provide one.
+Root issue: **the lifetime is implicit**. Nothing in the type system says "this value requires a surrounding cleanup boundary."
 
 ## `Scope`: a lifetime as a value
 
-A `Scope` is a container of finalizers. You register cleanup effects on it;
-closing it runs them, handing each one the `Exit` value that ended the work:
+A `Scope` is a container of finalizers. Register cleanup effects on it; closing runs them, handing each the `Exit` that ended the work:
 
 ```ts
 import { Effect, Exit, Scope } from "effect"
 
 const program = Effect.gen(function* () {
-  // create a closeable scope (not yet in context — just a value)
-  const scope = yield* Scope.make()
+  const scope = yield* Scope.make() // closeable scope, not yet in context
 
   yield* Scope.addFinalizer(scope, Effect.sync(() => console.log("cleanup")))
   console.log("work")
 
-  // closing runs finalizers with whatever Exit you pass
   yield* Scope.close(scope, Exit.succeed("done"))
 })
 
@@ -82,43 +56,24 @@ Effect.runSync(program)
 // cleanup
 ```
 
-Three properties matter:
+Three properties:
 
-- **Finalizers run in LIFO order** — last registered, first run. This mirrors
-  nested `defer`/destructors and makes dependent resources compose correctly
-  (the thing acquired second, which may depend on the first, is released
-  first).
-- **Finalizers are exit-aware.** `Scope.close(scope, exit)` records the exit
-  value; each finalizer can inspect whether the scope ended in success,
-  failure, or interruption.
-- **Adding to a closed scope is safe.** If the scope is already `Closed`, the
-  finalizer runs immediately with the stored exit. There is no
-  "register-after-close" race where cleanup silently never happens.
+- **LIFO order** — last registered, first run. Mirrors nested destructors; dependent resources compose correctly (acquired second → released first).
+- **Exit-aware** — `Scope.close(scope, exit)` records the exit; each finalizer can inspect success/failure/interruption.
+- **Add-after-close is safe** — a `Closed` scope runs the finalizer immediately with the stored exit. No register-after-close race.
 
-A scope also carries a **finalization strategy**, chosen at construction:
+Finalization strategy is chosen at construction:
 
 ```ts
-const seq = yield* Scope.make()                  // "sequential" (default)
-const par = yield* Scope.make("parallel")        // finalizers run concurrently
+const seq = yield* Scope.make()           // "sequential" (default): one at a time, reverse order
+const par = yield* Scope.make("parallel") // forks concurrently — teardown I/O-bound and independent
 ```
 
-`"sequential"` runs finalizers one at a time in reverse registration order.
-`"parallel"` forks them concurrently — useful when teardown is I/O-bound and
-independent (close 50 connections at once). Failures from finalizers are
-aggregated into the close result either way.
-
-:::note[Scope state is inspectable]
-A scope exposes `scope.state`: `"Empty"` (no finalizers yet), `"Open"`
-(accepting registrations), or `"Closed"` (with its exit value). You rarely need
-this in application code, but it makes debugging lifecycle bugs concrete — log
-it, and you know exactly which phase failed.
-:::
+Failures from finalizers are aggregated into the close result either way. A scope also exposes `scope.state`: `"Empty"` / `"Open"` / `"Closed"` (with its exit) — handy for debugging lifecycle bugs.
 
 ### The `Scope` service
 
-Most code shouldn't construct scopes by hand. Instead, a scope travels in the
-**context** like any other service, and effects that need to register cleanup
-simply require it:
+Most code shouldn't construct scopes by hand. A scope travels in the **context** like any service, and effects that register cleanup simply require it:
 
 ```ts
 import { Effect, Scope } from "effect"
@@ -131,16 +86,11 @@ const useResource = Effect.gen(function* () {
 })
 ```
 
-Requiring `Scope` in `R` is the *type-level declaration of dynamic lifetime*:
-"This effect creates resources that will need cleanup from whoever runs it."
-The caller cannot forget — the program won't type-check until someone provides
-a scope boundary.
+Requiring `Scope` in `R` is the *type-level declaration of dynamic lifetime*: "this effect creates resources that need cleanup from whoever runs it." The program won't type-check until someone provides a scope boundary.
 
 ## Opening boundaries: `Effect.scoped` and friends
 
-`Effect.scoped` is the workhorse: open a fresh scope, run the effect inside it,
-close the scope when the effect exits — with the same `Exit`, so finalizers
-observe success/failure/interruption:
+`Effect.scoped` is the workhorse: open a fresh scope, run the effect inside, close the scope when it exits — with the same `Exit`, so finalizers observe the outcome:
 
 ```ts
 import { Effect } from "effect"
@@ -149,9 +99,7 @@ const result = yield* Effect.scoped(useResource)
 // R no longer contains Scope — the requirement was discharged
 ```
 
-When you need the scope itself (to hand to `forkIn`, register extra finalizers,
-or build child scopes), `scopedWith` passes it as a value without putting it in
-context:
+When you need the scope itself (hand to `forkIn`, register extra finalizers, build child scopes), `scopedWith` passes it as a value without putting it in context:
 
 ```ts
 import { Effect, Scope } from "effect"
@@ -164,8 +112,6 @@ const program = Effect.scopedWith((scope) =>
 )
 ```
 
-Two more primitives complete the picture:
-
 | Function | Behavior |
 |---|---|
 | `Effect.scoped(effect)` | Fresh scope opened + closed around `effect`; removes `Scope` from `R` |
@@ -174,10 +120,7 @@ Two more primitives complete the picture:
 | `Scope.use(closeable)(effect)` | Like `Scope.provide` but closes the scope when `effect` exits |
 | `Scope.fork(scope, strategy?)` | Creates a child scope registered with the parent; closing parent closes child, closing child detaches it |
 
-The distinction between `Effect.scoped` and `Scope.provide` is the ownership
-boundary. `Effect.scoped` says "resources die when this block ends".
-`Scope.provide` says "run inside *my* lifetime" — used to attach resources to a
-long-lived scope you control elsewhere (a request scope, a session scope).
+The `Effect.scoped` vs `Scope.provide` distinction is the ownership boundary: `Effect.scoped` says "resources die when this block ends"; `Scope.provide` says "run inside *my* lifetime" — attaching resources to a long-lived scope you control elsewhere (request scope, session scope):
 
 ```ts
 import { Effect, Exit, Scope } from "effect"
@@ -195,15 +138,12 @@ const attachToRequest = Effect.gen(function* () {
 ```
 
 :::caution[provide ≠ scoped]
-`Scope.provide` deliberately does not close anything. If you use it and never
-close the scope yourself, you have built a leak with excellent types. Reach for
-`Scope.use` when you want the auto-close behavior with a scope you created.
+`Scope.provide` deliberately does not close anything. If you use it and never close the scope yourself, you've built a leak with excellent types. Reach for `Scope.use` when you want auto-close with a scope you created.
 :::
 
 ## `acquireRelease`: the bracket, done right
 
-`Effect.acquireRelease(acquire, release)` pairs acquisition with a release
-function and registers the release on the current scope:
+`Effect.acquireRelease(acquire, release)` pairs acquisition with a release function and registers the release on the current scope:
 
 ```ts
 import { Cause, Effect, Schema } from "effect"
@@ -231,7 +171,7 @@ const conn = Effect.acquireRelease(
 )
 ```
 
-Read the signature carefully — v4 changed it in a way that matters:
+v4 changed the signature in a way that matters:
 
 ```ts
 Effect.acquireRelease<A, E, R, R2>(
@@ -241,31 +181,15 @@ Effect.acquireRelease<A, E, R, R2>(
 ): Effect<A, E, R | R2 | Scope>
 ```
 
-The release function receives **both** the acquired resource *and* the `Exit`
-the scope closed with. That single detail replaces an entire category of
-"was I cancelled?" plumbing: a connection release can send a graceful
-`BYE` frame on success, an `RST` on failure, and nothing on interruption.
+The release function receives **both** the acquired resource *and* the `Exit` the scope closed with — replacing a whole category of "was I cancelled?" plumbing: send a graceful `BYE` on success, an `RST` on failure, nothing on interruption.
 
-Three guarantees make this safe under concurrency, and they are worth internalizing because they're what plain `try/finally` *cannot* give you:
+Three guarantees make this safe under concurrency — what plain `try/finally` *cannot* give you:
 
-1. **Acquisition runs uninterruptibly by default.** Once `acquireRelease`
-   starts executing the acquire effect, it cannot be interrupted halfway. The
-   runtime treats "acquiring" as atomic: the resource is fully obtained, or
-   acquisition never began. Without this, an interrupt landing between "socket
-   opened" and "registered in scope" leaks the socket — precisely the bug class
-   brackets exist to prevent.
+1. **Acquisition runs uninterruptibly by default.** Once `acquireRelease` starts the acquire effect, it can't be interrupted halfway — the resource is fully obtained, or acquisition never began. Without this, an interrupt between "socket opened" and "registered in scope" leaks the socket.
+2. **Release runs only if acquisition succeeded, and then *always*** — success, failure of subsequent code, interruption of the whole fiber all funnel into scope close.
+3. **Release itself runs uninterruptibly.** Cleanup is never abandoned halfway. (If release needs interruptible work — e.g. wait on another service with a timeout — wrap that part explicitly.)
 
-2. **Release runs only if acquisition succeeded**, and then *always*: success,
-   failure of subsequent code, interruption of the whole fiber — all paths
-   funnel into the scope close, which runs the registered finalizer.
-
-3. **Release itself runs uninterruptibly.** Cleanup is never abandoned
-   halfway. (If your release needs to perform interruptible work — e.g. wait on
-   another service with a timeout — wrap the relevant part explicitly.)
-
-If acquisition is genuinely long and you accept partial-state cleanup on
-interrupt (say, acquiring a lease where aborting mid-handshake just means the
-server expires it), opt in:
+If acquisition is genuinely long and you accept partial-state cleanup on interrupt, opt in:
 
 ```ts
 const lease = Effect.acquireRelease(
@@ -276,17 +200,12 @@ const lease = Effect.acquireRelease(
 ```
 
 :::tip[Disposable resources]
-For values already implementing `Symbol.dispose` / `Symbol.asyncDispose`,
-v4 adds `Effect.acquireDisposable(acquire)` — same scoping behavior, disposal
-protocol instead of an explicit release function. Handy when bridging to
-libraries built around `using`.
+For values already implementing `Symbol.dispose` / `Symbol.asyncDispose`, v4 adds `Effect.acquireDisposable(acquire)` — same scoping behavior, disposal protocol instead of an explicit release function. Handy when bridging to libraries built around `using`.
 :::
 
 ## Custom resources with `addFinalizer`
 
-`acquireRelease` covers the common shape. When the "resource" is really a set
-of cleanups, or acquisition interleaves with usage, drop to `addFinalizer`,
-which registers directly on the ambient scope:
+`acquireRelease` covers the common shape. When the "resource" is really a set of cleanups, or acquisition interleaves with usage, drop to `addFinalizer`, which registers directly on the ambient scope:
 
 ```ts
 import { Cause, Effect, Exit, Schema } from "effect"
@@ -318,31 +237,13 @@ const withTempDir = Effect.gen(function* () {
 })
 ```
 
-`Effect.addFinalizer` requires `Scope` — the type system now insists that
-whoever runs `withTempDir` provides a cleanup boundary. Wrap it:
-`yield* Effect.scoped(withTempDir)`.
+`Effect.addFinalizer` requires `Scope` — the type system now insists whoever runs `withTempDir` provides a cleanup boundary. Wrap it: `yield* Effect.scoped(withTempDir)`.
 
-The `(exit) => ...` shape unlocks behavior impossible with `finally`:
-
-- **Distinguish interruption** (`Exit.isInterrupted`) — preserve debug state on
-  cancel, clean up on normal paths.
-- **Inspect failures** — a finalizer can log the cause that killed the scope.
-- **Compensate differently per outcome** — commit a marker row on success,
-  roll back on failure.
-
-Sibling combinators for attaching behavior to a specific effect rather than the
-surrounding scope: `Effect.onExit` (runs with the `Exit`),
-`Effect.onError` (failures only, gets the `Cause`),
-`Effect.onInterrupt` (interruption only), and `Effect.ensuring`
-(unconditional). Use `addFinalizer`/`acquireRelease` for resources; use these
-for logging and metrics hooks.
+The `(exit) => ...` shape unlocks behavior impossible with `finally`: distinguish interruption (`Exit.isInterrupted`) to preserve debug state on cancel; inspect failures to log the cause; compensate differently per outcome (commit a marker row on success, roll back on failure). Sibling combinators for attaching behavior to a specific effect rather than the surrounding scope: `Effect.onExit` (runs with the `Exit`), `Effect.onError` (failures only, gets the `Cause`), `Effect.onInterrupt` (interruption only), `Effect.ensuring` (unconditional). Use `addFinalizer`/`acquireRelease` for resources; these for logging and metrics hooks.
 
 ## Ordering: why LIFO is load-bearing
 
-Real systems acquire *graphs* of resources, not singletons: a pool depends on a
-config service; a consumer depends on the pool; a health-checker depends on all
-of it. LIFO finalization means dependencies tear down in exact reverse order of
-construction — the consumer's finalizer still has a working pool to flush into.
+Real systems acquire *graphs* of resources: a pool depends on a config service; a consumer depends on the pool. LIFO finalization tears down in exact reverse order of construction — the consumer's finalizer still has a working pool to flush into:
 
 ```ts
 import { Effect } from "effect"
@@ -370,10 +271,7 @@ Effect.runSync(program)
 // release consumer -> release pool -> release config
 ```
 
-Manual cleanup makes you maintain that ordering by hand across every call site.
-Scopes make it structural. And because each layer's resources were registered
-on the same scope, an interruption at any point unwinds exactly what was
-acquired so far — nothing more, nothing less.
+Manual cleanup makes you maintain that ordering by hand across every call site. Scopes make it structural — and because each layer's resources registered on the same scope, an interruption at any point unwinds exactly what was acquired so far.
 
 <Mermaid title="Scope lifetime: acquire, work, unwind" height={340} code={`
 sequenceDiagram
@@ -396,21 +294,17 @@ sequenceDiagram
   end
 `} />
 
+Notice: acquisition is uninterruptible and registration is atomic with it; business logic is interruptible; every exit path closes the scope LIFO with the finalizers uninterruptible.
+
 ## Scopes inside Layers
 
-Layers (chapter 10) are scopes wearing a dependency-injection hat. A
-`Layer.effect(Service, buildEffect)` runs `buildEffect` inside the layer's own
-scope — and the signature shows it:
+Layers (chapter 10) are scopes wearing a dependency-injection hat. `Layer.effect(Service, buildEffect)` runs `buildEffect` inside the layer's own scope — the signature shows it:
 
 ```ts
 Layer.effect<Service, E, R>(service, effect): Layer<Service, E, Exclude<R, Scope>>
 ```
 
-That `Exclude<R, Scope>` is the tell: any `Scope` requirement the build effect
-had is satisfied by the layer and removed from what users of the layer need.
-Resources acquired during construction are finalized automatically when the
-layer's memoized lifetime ends (usually via `Layer.launch`, `MemoMap` teardown
-at shutdown, or `Effect.scoped(Layer.build(layer))`).
+That `Exclude<R, Scope>` is the tell: any `Scope` requirement the build effect had is satisfied by the layer and removed from what users need. Resources acquired during construction finalize automatically when the layer's memoized lifetime ends (`Layer.launch`, MemoMap teardown at shutdown, or `Effect.scoped(Layer.build(layer))`):
 
 ```ts
 import { Context, Effect, Layer } from "effect"
@@ -435,15 +329,9 @@ export const PoolLive = Layer.effect(
 // PoolLive: Layer<Pool, never> — no Scope leaked to consumers
 ```
 
-The composition rule falls straight out of scope semantics: layers built from
-other layers acquire their dependencies' resources first, and everything tears
-down in reverse construction order when the memo map closes. You get
-dependency-ordered startup and shutdown for free because underneath, it's one
-big LIFO scope.
+Layers built from other layers acquire dependencies' resources first, and everything tears down in reverse construction order when the memo map closes — dependency-ordered startup and shutdown for free, because underneath it's one big LIFO scope.
 
 ## Leak-freedom: comparing the models
-
-The guarantees, side by side:
 
 | Concern | `try/finally` | `AsyncDisposable` / `using` | `AbortController` | Effect `Scope` |
 |---|---|---|---|---|
@@ -455,21 +343,15 @@ The guarantees, side by side:
 | Ordering across dependencies | Hand-maintained nesting | Hand-maintained | None | LIFO, automatic |
 | Type-level proof a boundary exists | No | No | No | Yes — `R` contains `Scope` until discharged |
 
-The last row is the quiet revolution. In vanilla TS, "does this function leak
-if misused?" is a code-review question. With scopes, it's a compile error:
-an effect with `Scope` in `R` simply cannot run without a boundary.
+The last row is the quiet revolution: in vanilla TS, "does this leak if misused?" is a code-review question. With scopes it's a compile error — an effect with `Scope` in `R` cannot run without a boundary.
 
 :::caution[Scopes don't fix blocking]
-All of this machinery coordinates *when* cleanup effects run. It cannot make a
-synchronous blocking call cancellable, nor conjure a release for a native
-handle that lacks one. Wrap blocking work with `Effect.try` and give the
-underlying library its own shutdown hook if it has one.
+This machinery coordinates *when* cleanup effects run. It cannot make a synchronous blocking call cancellable, nor conjure a release for a native handle that lacks one. Wrap blocking work with `Effect.try` and give the underlying library its own shutdown hook if it has one.
 :::
 
 ## A complete resource graph
 
-Tying it together — three dependent resources, exit-aware releases, composed
-into a layer, consumed in a scoped block:
+Three dependent resources, exit-aware releases, composed into a layer, consumed in a scoped block:
 
 ```ts
 import { Context, Effect, Layer, Schema } from "effect"
@@ -533,19 +415,7 @@ await Effect.runPromise(program.pipe(Effect.scoped))
 // bus: closed (Success)
 ```
 
-Note what did *not* appear anywhere: try/finally blocks, cleanup registries,
-abort listeners, shutdown flags. The lifetimes are declared once, in the right
-order, and the runtime enforces them on every exit path — including the ones
-nobody tested.
-
-:::tip[Debugging tip]
-When tracking down a suspected leak, remember the invariant: **every
-registration happens on some scope, and every scope closes exactly once**. Log
-`scope.state._tag` transitions, or place a development-only finalizer that logs
-at scope close — leaks almost always turn out to be a scope that nobody closes
-(a `Scope.provide` without `close`, or fibers detached via `forkDetach`, see
-the next chapter).
-:::
+Note what did *not* appear anywhere: try/finally blocks, cleanup registries, abort listeners, shutdown flags. The lifetimes are declared once, in the right order, and the runtime enforces them on every exit path — including the ones nobody tested. When hunting a suspected leak, remember the invariant: **every registration happens on some scope, and every scope closes exactly once** — leaks almost always turn out to be a scope nobody closes (a `Scope.provide` without `close`, or fibers detached via `forkDetach`, next chapter).
 
 ## Next
 

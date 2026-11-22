@@ -1,74 +1,37 @@
 ---
 title: Schema & Migrations
-description: The four new tables, the column additions, the append-only audit trigger, and the phased migration order that turns a single-tenant schema multi-tenant.
+description: "The four new tables, column additions, the append-only audit trigger, and the phased migration order that turns a single-tenant schema multi-tenant."
 sidebar:
   order: 8
 ---
 
 import { Steps } from "@astrojs/starlight/components";
 
-Going multi-tenant is, at the database level, a small set of additive changes plus
-exactly one breaking one. This chapter collects every schema change the
-multi-tenancy work needs — four new tables, a handful of columns on existing
-tables, an append-only audit trigger, and an encrypted-secrets view — and then
-sequences them into a migration order that stays compatible with the running
-single-tenant code at every step.
+Going multi-tenant is, at the database level, additive changes plus exactly one breaking one: four new tables, a handful of columns on existing tables, an append-only audit trigger, an encrypted-secrets view. The guiding rule: **every change is forward-compatible** — new tables are purely additive, new columns nullable or defaulted, so old code keeps working without a backfill. The one breaking change — dropping the `audit_logs.actor_id` FK — gets its own coordinated rollout below.
 
-The guiding rule is **every change is forward-compatible**: new tables are purely
-additive, and new columns are nullable or defaulted, so old code keeps working
-without a backfill. That's what lets the phases deploy independently — a migration
-can land ahead of the worker that uses it without breaking anything. There is
-exactly **one** breaking change in the whole set — dropping the `audit_logs.actor_id`
-foreign key — and it gets its own coordinated rollout, called out below.
-
-Everything follows the project's existing conventions, so new tables look like the
-old ones: Drizzle ORM, `varchar(255)` primary keys, `text` foreign keys for
-compatibility with Better Auth-managed tables, the `createdAt()` / `updatedAt()`
-helpers from `@repo/db`, and prefixed cuids generated with
-`generatePrefixedCuid(ID_PREFIXES.X)`.
+Conventions: Drizzle ORM, `varchar(255)` primary keys, `text` FKs to Better Auth tables, `createdAt()`/`updatedAt()` helpers from `@repo/db`, and prefixed cuids via `generatePrefixedCuid(ID_PREFIXES.X)`.
 
 ## Conventions these tables follow
 
-Before reading the DDL, it helps to know the rules every table obeys. They aren't
-arbitrary — each one keeps the new schema consistent with the Better Auth-managed
-tables it lives alongside.
-
 | Concern | Convention |
 | --- | --- |
-| Primary keys | `varchar("id", { length: 255 })` for non-Better-Auth tables. |
-| FKs to Better Auth tables | `text(...)`, to match Better Auth's `text("id")` PK. |
-| Timestamps on new tables | `createdAt()` / `updatedAt()` from `@repo/db/helpers` (these include `withTimezone: true` and `$onUpdate`). |
-| Timestamps on Better Auth tables | Match the table's existing style: `timestamp("...").defaultNow().notNull()` **without** `withTimezone`. |
-| Enums | `text("col", { enum: [...] })` inline — the project does not use `pgEnum`. |
-| Indexes | Declared in the second `pgTable` argument; named `<table_short>_<columns>_idx`. |
-| ID prefixes | Three chars, registered in `packages/db/src/ids.ts`. Call `generatePrefixedCuid(ID_PREFIXES.X)` directly. |
+| Primary keys | `varchar("id", { length: 255 })` for non-Better-Auth tables |
+| FKs to Better Auth tables | `text(...)`, to match Better Auth's `text("id")` PK |
+| Timestamps on new tables | `createdAt()` / `updatedAt()` from `@repo/db/helpers` (withTimezone + `$onUpdate`) |
+| Timestamps on Better Auth tables | match existing style: `timestamp("...").defaultNow().notNull()` **without** `withTimezone` |
+| Enums | `text("col", { enum: [...] })` inline — no `pgEnum` |
+| Indexes | declared in the second `pgTable` argument; named `<table_short>_<columns>_idx` |
+| ID prefixes | three chars in `packages/db/src/ids.ts`; call `generatePrefixedCuid(ID_PREFIXES.X)` directly |
 
 :::caution[Always generate IDs the explicit way]
-`generateIdForModel` is a closed switch that falls through to `"ent"` for unknown
-models — so `generateIdForModel("tenantHostname")` would silently mint an `ent_*`
-prefix. Always call `generatePrefixedCuid(ID_PREFIXES.tenantHostname)` directly for
-the new tables.
+`generateIdForModel` is a closed switch that falls through to `"ent"` for unknown models — `generateIdForModel("tenantHostname")` would silently mint an `ent_*` prefix. Always call `generatePrefixedCuid(ID_PREFIXES.tenantHostname)` directly for the new tables.
 :::
 
 ## New tables
 
-Four tables carry the multi-tenant state that doesn't fit into Better Auth's own
-schema:
-
-- **`tenant_custom_hostnames`** — each tenant's custom domain and where it sits in the
-  Cloudflare for SaaS lifecycle.
-- **`sso_providers`** — Better Auth's SSO config per tenant, including the (encrypted)
-  client secret.
-- **`reserved_slugs`** — a tombstone registry so a deleted org's slug can't be
-  immediately reused.
-- **`global_admins`** — the operator roster the admin worker authorizes against.
+Four tables carry the multi-tenant state that doesn't fit Better Auth's schema: `tenant_custom_hostnames` (each tenant's custom domain + Cloudflare for SaaS lifecycle), `sso_providers` (per-tenant OIDC config incl. encrypted client secret), `reserved_slugs` (tombstone registry), `global_admins` (operator roster).
 
 ### `tenant_custom_hostnames`
-
-This table tracks each tenant's custom domain and where it sits in the Cloudflare
-for SaaS lifecycle. The reconciler cron and the HTTP routes both read and write it,
-so the `lifecycle_status` enum and the reconciliation timestamps are first-class
-columns rather than derived state.
 
 ```ts title="packages/db/src/schema/tenant-custom-hostnames.ts"
 import { index, jsonb, pgTable, text, timestamp, varchar } from "drizzle-orm/pg-core";
@@ -100,22 +63,14 @@ export const tenantCustomHostnames = pgTable("tenant_custom_hostnames", {
 ]);
 ```
 
-The `tch_status_reconciled_idx` index exists so the 60-second reconciler can cheaply
-find non-terminal rows ordered by how long ago they were last checked. The full
-state machine these statuses drive is covered in
-[Custom Hostnames](/multi-tenant/custom-hostnames/).
+The `tch_status_reconciled_idx` index lets the 60-second reconciler cheaply find non-terminal rows oldest-first. The state machine these statuses drive is in [Custom Hostnames](/multi-tenant/custom-hostnames/).
 
 ### `sso_providers`
 
-This is the table Better Auth's SSO plugin reads from, holding each tenant's OIDC
-provider config and (encrypted) client secret. Because the plugin owns the canonical
-shape, you should not hand-write this from memory.
+The table Better Auth's SSO plugin reads from. The plugin owns the canonical shape — don't hand-write from memory.
 
 :::caution[Generate this schema; don't transcribe it]
-Phase 0 runs `npx auth generate` with `sso()` enabled, then again with
-`domainVerification: { enabled: true }`, and mirrors the generated schema in Drizzle.
-The sketch below is the intended shape, but the generated output is the source of
-truth.
+Phase 0 runs `npx auth generate` with `sso()` enabled, then again with `domainVerification: { enabled: true }`, and mirrors the generated schema in Drizzle. The sketch below is the intended shape; the generated output is the source of truth.
 :::
 
 ```ts title="packages/db/src/schema/sso-providers.ts"
@@ -141,17 +96,11 @@ export const ssoProviders = pgTable("sso_providers", {
 ]);
 ```
 
-The client secret is never stored in plaintext here — see the
-[`pgcrypto` view](#the-pgcrypto-view-for-encrypted-secrets) below for how the
-encrypted column and the decrypting view fit together, and
-[Deep Modules](/multi-tenant/deep-modules/) for the repository that wraps it.
+The client secret is never stored in plaintext — see [the pgcrypto view](#the-pgcrypto-view-for-encrypted-secrets) below.
 
 ### `reserved_slugs`
 
-This is a tombstone registry. When an org is deleted, its slug (and any custom
-hostnames) land here so the same name can't immediately be reused by a new tenant —
-which would otherwise let a deleted org's cached sessions or external SSO callbacks
-resolve to someone else's data.
+Tombstone registry: when an org is deleted, its slug (and custom hostnames) land here so the name can't be immediately reused — otherwise a deleted org's cached sessions or external SSO callbacks could resolve to someone else's data.
 
 ```ts title="packages/db/src/schema/reserved-slugs.ts"
 export const reservedSlugs = pgTable("reserved_slugs", {
@@ -166,10 +115,7 @@ export const reservedSlugs = pgTable("reserved_slugs", {
 
 ### `global_admins`
 
-This is the operator roster the admin worker gates against. Cloudflare Access
-verifies an operator's identity at the perimeter, but the database lookup against
-this table is what actually authorizes them — and the `role` column is the input to
-the operator permission matrix.
+The operator roster the admin worker gates against. CF Access verifies identity at the perimeter; this lookup authorizes. The `role` column feeds the operator permission matrix.
 
 ```ts title="packages/db/src/schema/global-admins.ts"
 import { type AnyPgColumn, sql } from "drizzle-orm";
@@ -199,25 +145,13 @@ export const globalAdmins = pgTable("global_admins", {
 ]);
 ```
 
-`created_by` and `deactivated_by` are self-referential foreign keys: a global admin
-is created and deactivated by another global admin. Drizzle needs the explicit
-`(): AnyPgColumn` return-type annotation on the `references()` callback to break the
-circular type inference that a self-reference would otherwise cause. The partial
-index on `email` covers only rows where `deactivated_at IS NULL`, keeping it small
-and well-suited to "list active operators" queries.
+`created_by` / `deactivated_by` are self-referential FKs; Drizzle needs the explicit `(): AnyPgColumn` return-type annotation on the `references()` callback to break the circular type inference.
 
 ## Additions to existing tables
 
-The Better Auth-managed `organization`, `audit_logs`, and `invitations` tables each
-grow a few columns. The rule throughout is to match the host table's existing style
-rather than the new-table style.
+The Better Auth-managed `organization`, `audit_logs`, and `invitations` tables each grow a few columns, matching the host table's existing style.
 
 ### `organization`
-
-The organization gains its tenant lifecycle and branding state. New columns are all
-nullable or defaulted, so existing rows remain valid without a backfill. Note these
-use Better Auth-style timestamps (no `withTimezone`) to stay consistent within the
-table.
 
 ```ts title="packages/db/src/schema/organizations.ts (added columns)"
 // Match Better Auth-style timestamps (no withTimezone) for consistency within the table.
@@ -233,39 +167,23 @@ brandingPrimaryColor: text("branding_primary_color"),
 brandingAppName: text("branding_app_name"),
 ```
 
-`session_version` is the linchpin of tenant invalidation:
-`tenantOperations.suspend / restore / delete` bumps it, and JWT verifiers reject any
-claim carrying a stale version. There's a deliberate detail worth knowing here: the
-existing Better Auth schema stores `organization.metadata` as `text`, not `jsonb`,
-so you can't query `metadata->>'enforce_sso'`. That's precisely why `enforce_sso` is
-a dedicated boolean column.
+`session_version` is the linchpin of tenant invalidation: `tenantOperations.suspend / restore / delete` bumps it, and JWT verifiers reject stale claims. Note: Better Auth stores `organization.metadata` as `text`, not `jsonb`, so `metadata->>'enforce_sso'` can't be queried — hence the dedicated boolean column.
 
 ### `audit_logs`
 
-The audit log needs three changes. The first is the one breaking change in the whole
-migration set.
+Three changes. The first is the one breaking change in the whole set.
 
 :::caution[Breaking change — dropping the `audit_logs.actor_id` FK]
-The actor becomes polymorphic: `actor_id` may now reference `users.id`,
-`global_admins.id`, or be NULL. A single foreign key can't express that, so the FK
-constraint is dropped. This must be coordinated with the deploy of the
-polymorphic-actor code that writes `gad_*` actor IDs — see
-[Migration ordering](#migration-ordering-and-safety) for the exact sequence.
+The actor becomes polymorphic: `actor_id` may reference `users.id`, `global_admins.id`, or be NULL. A single FK can't express that, so the constraint is dropped. Coordinate with the deploy of the polymorphic-actor code that writes `gad_*` actor IDs — see [Migration ordering](#migration-ordering-and-safety).
 :::
 
 <Steps>
 
-1. **Drop the foreign key** on `actor_id` (polymorphic actor — may reference
-   `users.id`, `global_admins.id`, or be NULL).
-2. **Add an `organization_id varchar(255)` column** (nullable; enables
-   tenant-scoped filtering of audit rows).
-3. **Add an append-only Postgres trigger** — a `BEFORE UPDATE OR DELETE` trigger that
-   raises an exception, so rows can be inserted but never changed or removed.
+1. **Drop the foreign key** on `actor_id` (polymorphic actor — may reference `users.id`, `global_admins.id`, or be NULL).
+2. **Add an `organization_id varchar(255)` column** (nullable; enables tenant-scoped filtering).
+3. **Add an append-only Postgres trigger** — a `BEFORE UPDATE OR DELETE` trigger that raises an exception, so rows can be inserted but never changed or removed.
 
 </Steps>
-
-The trigger is what enforces immutability at the database level — not application
-discipline. Any `UPDATE` or `DELETE`, from any code path, raises an exception:
 
 ```sql
 CREATE OR REPLACE FUNCTION audit_logs_immutable() RETURNS trigger AS $$
@@ -277,24 +195,16 @@ CREATE TRIGGER audit_logs_block_update_delete
   FOR EACH ROW EXECUTE FUNCTION audit_logs_immutable();
 ```
 
-Two indexes support the common query shapes — operator-scoped reads by actor type,
-and tenant-scoped reads by organization — both ordered newest-first:
+The trigger enforces immutability at the database level, not by convention — any `UPDATE`/`DELETE` from any code path raises. Two indexes support the common query shapes, newest-first:
 
 ```sql
 CREATE INDEX audit_logs_actor_type_created_at_idx ON audit_logs (actor_type, created_at DESC);
 CREATE INDEX audit_logs_org_id_created_at_idx     ON audit_logs (organization_id, created_at DESC);
 ```
 
-:::note[The trigger is the invariant]
-Application code never updates or deletes audit rows, so in practice the trigger
-never fires. It exists so that immutability holds even if some future code path gets
-it wrong — the database, not a convention, guarantees it.
-:::
-
 ### `invitations`
 
-Operator-issued invitations have no Better Auth user as the inviter, so `inviter_id`
-has to become nullable:
+Operator-issued invitations have no Better Auth user as inviter, so `inviter_id` becomes nullable:
 
 ```sql
 ALTER TABLE invitations ALTER COLUMN inviter_id DROP NOT NULL;
@@ -302,12 +212,7 @@ ALTER TABLE invitations ALTER COLUMN inviter_id DROP NOT NULL;
 
 ## The `pgcrypto` view for encrypted secrets
 
-SSO client secrets are encrypted at rest using `pgcrypto` — Postgres's built-in
-cryptography extension, which provides symmetric encrypt/decrypt functions inside the
-database. Better Auth's SSO plugin reads provider rows directly from `node_modules`
-and can't be intercepted, so we can't decrypt in application code on its behalf. The
-solution is to store ciphertext in the table and expose a decrypting view that Better
-Auth alone reads from:
+SSO client secrets are encrypted at rest with `pgcrypto` (Postgres's built-in crypto extension). Better Auth's SSO plugin reads provider rows directly from `node_modules` and can't be intercepted, so store ciphertext in the table and expose a decrypting view that Better Auth alone reads from:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -321,18 +226,13 @@ CREATE VIEW sso_providers_decrypted AS
   FROM sso_providers;
 ```
 
-The decryption key is supplied per session with `SET LOCAL app.sso_key = '...'`, so
-it never persists in connection state across requests. Better Auth's adapter is
-pointed at `sso_providers_decrypted`; the application's own code reads the raw,
-encrypted `sso_providers` table. The repository that mediates all of this lives in
-[Deep Modules](/multi-tenant/deep-modules/).
+The decryption key is supplied per session with `SET LOCAL app.sso_key = '...'`, so it never persists in connection state. Better Auth's adapter points at `sso_providers_decrypted`; application code reads the raw encrypted `sso_providers` table. The repository mediating this lives in [Deep Modules](/multi-tenant/deep-modules/).
 
 ## Supporting code changes
 
-Three small files need updating alongside the schema.
+Three small files update alongside the schema.
 
-The Drizzle relations file gains the new tables' relations, including the
-self-referential global-admin relations keyed by alias:
+The Drizzle relations file gains the new tables' relations, including the self-referential global-admin relations keyed by alias:
 
 ```ts title="packages/db/src/relations.ts (Drizzle Relations v2)"
 organizations: {
@@ -361,9 +261,7 @@ export const ID_PREFIXES = {
 } as const;
 ```
 
-And the audit definitions gain the new actor and target types, the new event
-groups, and their classification. Every event must be classified as critical or
-bufferable — a compile-time exhaustiveness check enforces it:
+The audit definitions gain the new actor/target types and event groups. Every event must be classified critical or bufferable — a compile-time exhaustiveness check enforces it:
 
 ```ts title="packages/shared/src/audit.ts"
 export const ACTOR_TYPES = {
@@ -432,9 +330,7 @@ export const BUFFERABLE_EVENTS = [
 
 ### The dual-scope audit helper
 
-Operator-on-tenant events need to appear in two places at once: the global operator
-audit view and the tenant's own audit log. `auditLogService.createDualScope` writes
-both rows in a single statement so they commit atomically:
+Operator-on-tenant events must appear in two places at once: the global operator audit view and the tenant's own log. `auditLogService.createDualScope` writes both rows in a single statement so they commit atomically:
 
 ```ts title="packages/shared/src/audit.ts (createDualScope)"
 async createDualScope(
@@ -449,20 +345,13 @@ async createDualScope(
 }
 ```
 
-This helper is called inside the same transaction as the mutation it records, which
-is how `tenantOperations` keeps the audit row and the DB write atomic — see
-[Deep Modules](/multi-tenant/deep-modules/).
+Called inside the same transaction as the mutation it records — that's how `tenantOperations` keeps audit row and DB write atomic. See [Deep Modules](/multi-tenant/deep-modules/).
 
 ## Phased migration plan
 
-The schema changes don't all land at once. They're split across the implementation
-phases so that each migration deploys with the workers that need it, and the running
-single-tenant code stays valid throughout.
-
 ### Phase 0 — Schema validation spike
 
-No production migration runs yet. The goal is to confirm the Better Auth-generated
-SSO schema before committing to it.
+No production migration. Confirm the Better Auth-generated SSO schema before committing:
 
 <Steps>
 
@@ -476,19 +365,14 @@ SSO schema before committing to it.
 
 ### Phase A — Core multi-tenancy schema
 
-Deployed with the Phase A workers. This is where the bulk of the DDL lands.
-
 <Steps>
 
 1. **A1a** — Create `tenant_custom_hostnames`, `sso_providers`, `reserved_slugs`.
-2. **A1b** — Add columns to `organization`: `enforce_sso`, `suspended_*`,
-   `deleted_*`, `session_version`, `branding_*`.
-3. **A1c** — Modify `audit_logs`: drop the FK on `actor_id`; add `organization_id`;
-   add the two indexes; create the append-only trigger.
+2. **A1b** — Add columns to `organization`: `enforce_sso`, `suspended_*`, `deleted_*`, `session_version`, `branding_*`.
+3. **A1c** — Modify `audit_logs`: drop the FK on `actor_id`; add `organization_id`; add the two indexes; create the append-only trigger.
 4. **A1d** — Modify `invitations`: make `inviter_id` nullable.
 5. **A1e** — Add the `pgcrypto` extension.
-6. **A1f** — Set up the `sso_providers_decrypted` view. It's used in Phase C but
-   created early for forward compatibility:
+6. **A1f** — Set up the `sso_providers_decrypted` view (used in Phase C but created early for forward compatibility):
 
    ```sql
    CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -500,71 +384,44 @@ Deployed with the Phase A workers. This is where the bulk of the DDL lands.
 
 7. **A2** — Update `relations.ts` (v2 syntax) for the new tables.
 8. **A3** — Update `ids.ts` with the new prefixes.
-9. **A4** — Update `audit.ts` with the new events, target types, and actor type;
-   confirm the compile-time exhaustiveness check passes.
-10. **A5** — Generate the Drizzle migration with `bun run db:generate`, hand-review
-    the SQL, and commit.
-11. **A6** — Apply it with `bun run db:migrate` and verify in dev/staging.
+9. **A4** — Update `audit.ts` with the new events, target types, and actor type; confirm the compile-time exhaustiveness check passes.
+10. **A5** — Generate the Drizzle migration with `bun run db:generate`, hand-review the SQL, commit.
+11. **A6** — Apply with `bun run db:migrate` and verify in dev/staging.
 
 </Steps>
 
 ### Phase B — Admin layer schema
 
-Deployed with the Phase B workers. This adds the operator roster.
-
 <Steps>
 
 1. **B1a** — Create the `global_admins` table.
-2. **B1b** — Add the Drizzle relations for `globalAdmins.createdByAdmin` /
-   `deactivatedByAdmin` (the self-FKs).
+2. **B1b** — Add the Drizzle relations for `globalAdmins.createdByAdmin` / `deactivatedByAdmin` (self-FKs).
 3. **B2** — Generate and apply the migration.
-4. **B3** — Run `scripts/seed-global-admins.ts` to bootstrap the initial
-   `super_admin` rows from the `INITIAL_GLOBAL_ADMIN_EMAILS` env var.
+4. **B3** — Run `scripts/seed-global-admins.ts` to bootstrap initial `super_admin` rows from `INITIAL_GLOBAL_ADMIN_EMAILS`.
 
 </Steps>
 
 ### Phase C — Architectural deepening
 
-Phase C is module-only refactoring with no schema changes; the schema is stable from
-Phase B onward. The consolidations it covers are in
-[Deep Modules](/multi-tenant/deep-modules/).
+Module-only refactoring, no schema changes — the schema is stable from Phase B onward. See [Deep Modules](/multi-tenant/deep-modules/).
 
 ## Migration ordering and safety
 
-The schema is forward-compatible with the existing single-tenant code, which is what
-makes a staged rollout safe. This is the **expand-contract** pattern (also called
-*nullable-first*): you add the new shape in a way that doesn't break the old code
-("expand"), deploy code that uses it, and only later remove anything no longer needed
-("contract"). Here almost everything is expand-only:
+The expand-contract pattern (nullable-first): add the new shape without breaking old code ("expand"), deploy code that uses it, only later remove anything unneeded ("contract"). Here almost everything is expand-only:
 
-- New columns are nullable or defaulted (`enforce_sso` defaults to `false`,
-  `session_version` to `0`; `suspended_*` / `deleted_*` / `branding_*` are nullable),
-  so a row written by old code is still valid.
+- New columns are nullable or defaulted (`enforce_sso` → `false`, `session_version` → `0`; `suspended_*` / `deleted_*` / `branding_*` nullable), so rows written by old code stay valid.
 - New tables are purely additive.
-- The `audit_logs.actor_id` FK drop is the **one** breaking change, and it must be
-  coordinated with the deploy of the polymorphic-actor code that writes `gad_*` IDs.
+- The `audit_logs.actor_id` FK drop is the **one** breaking change, coordinated with the polymorphic-actor code that writes `gad_*` IDs.
 
-That ordering constraint resolves cleanly: deploy the migration first, then deploy
-`apps/server` and `apps/auth` (which still write `usr_*` actor IDs, so the dropped FK
-doesn't matter to them yet), and only then deploy `apps/admin` — the first writer of
-`gad_*` actor IDs. In general the migration must run **before** any worker that
-queries the new columns or tables: Phase A workers query the new columns, Phase B
-workers query the new tables.
+Ordering: deploy the migration first, then `apps/server` and `apps/auth` (they still write `usr_*` actor IDs, so the dropped FK doesn't matter yet), and only then `apps/admin` — the first writer of `gad_*` actor IDs. In general, the migration must run **before** any worker that queries the new columns or tables.
 
 :::note[Backfill plan]
-No production org rows exist yet — new tenants arrive only via operator creation, so
-there's nothing to backfill. Existing test fixtures may have orgless users; they hit
-the `session.create.before` membership guard and need an onboarding gate, or can
-simply be deleted in the migration.
+No production org rows exist yet — new tenants arrive only via operator creation, so there's nothing to backfill. Existing test fixtures may have orgless users; they hit the `session.create.before` membership guard and need an onboarding gate, or can simply be deleted in the migration.
 :::
 
 ## Bootstrap and dev seed scripts
 
-Two scripts seed operator rows: one for production bootstrapping, one for local dev.
-
-The production bootstrap reads a comma-separated env var and upserts `super_admin`
-rows. It's idempotent, and deliberately does **not** deactivate admins missing from
-the env var — otherwise removing one address would silently lock everyone out:
+The production bootstrap reads a comma-separated env var and upserts `super_admin` rows. Idempotent, and deliberately does **not** deactivate admins missing from the env var (removing one address would silently lock everyone out):
 
 ```ts title="scripts/seed-global-admins.ts"
 #!/usr/bin/env bun
@@ -592,39 +449,17 @@ for (const email of emails) {
 console.log(`Seeded ${created} new global_admins; ${skipped} already existed.`);
 ```
 
-Run it at deploy time with `bun scripts/seed-global-admins.ts`. Re-running is safe.
+Run at deploy time with `bun scripts/seed-global-admins.ts`. Re-running is safe.
 
-The local dev seed (`scripts/seed-dev.ts`, invoked by `bun run seed:dev`) is also
-idempotent and sets up just enough to develop against:
-
-- Creates one org with slug `acme` if it doesn't already exist.
-- Creates one global admin with `email: process.env.LOCAL_DEV_ADMIN_EMAIL`, role
-  `super_admin`, and `cfAccessSub: "local-dev-..."` so the dev fallback in
-  `cfAccessMiddleware` matches.
+The local dev seed (`scripts/seed-dev.ts`, via `bun run seed:dev`) is also idempotent: creates one org with slug `acme` and one global admin with `email: process.env.LOCAL_DEV_ADMIN_EMAIL`, role `super_admin`, and `cfAccessSub: "local-dev-..."` so the dev fallback in `cfAccessMiddleware` matches.
 
 ## Package scaffolding and conventions
 
-The Phase B/C work introduces new packages (`packages/ui`, `packages/tenancy`,
-`packages/auth-tokens`). Each one follows the same skeleton:
+Phase B/C introduces new packages (`packages/ui`, `packages/tenancy`, `packages/auth-tokens`). Each follows the same skeleton: `package.json` with `"name": "@repo/X"`, `"private": true`; `tsconfig.json` extending `tsconfig.base.json`; an `AGENTS.md` scoped to the package; `src/index.ts` as the public entry; a `__tests__/` directory with a Vitest config inheriting from root. The root workspace's `package.json` already glob-includes `packages/*`.
 
-- `package.json` with `"name": "@repo/X"`, `"private": true`, and the workspace dep.
-- `tsconfig.json` extending `tsconfig.base.json`.
-- An `AGENTS.md` scoped to the package's role.
-- `src/index.ts` as the public entry.
-- A `__tests__/` directory with a Vitest config inheriting from root.
-
-The root workspace's `package.json` already glob-includes `packages/*`, so adding the
-packages there is automatic.
-
-Finally, a few invariants are worth recording in the project's `CLAUDE.md` so they
-survive beyond this chapter:
+Invariants recorded in the project's `CLAUDE.md`:
 
 - Every `db.query.organizations` call site must filter `WHERE deleted_at IS NULL`.
-- Operator-on-tenant audit events use `auditLogService.createDualScope(input, tx)`
-  inside the same transaction as the mutation.
-- New audit events must be added to `AUDIT_EVENTS` **and** classified in
-  `CRITICAL_EVENTS` or `BUFFERABLE_EVENTS` (the compile-time exhaustiveness check
-  enforces this).
-- Tenant resolution trusts the public `Host` header only. Better Auth-bound requests
-  must strip or overwrite forwarded host/proto headers before crossing the
-  server/auth boundary.
+- Operator-on-tenant audit events use `auditLogService.createDualScope(input, tx)` inside the same transaction as the mutation.
+- New audit events go into `AUDIT_EVENTS` **and** are classified in `CRITICAL_EVENTS` or `BUFFERABLE_EVENTS` (compile-time exhaustiveness check enforces this).
+- Tenant resolution trusts the public `Host` header only. Better Auth-bound requests must strip or overwrite forwarded host/proto headers before crossing the server/auth boundary.

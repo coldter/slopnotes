@@ -1,6 +1,6 @@
 ---
 title: Redis Caching Strategies
-description: Six Redis caching patterns for a Frappe dashboard — key-value, hash maps, TTL, invalidation, memoization, and warming — with safe invalidation.
+description: "Six Redis caching patterns for a Frappe dashboard — key-value, hash maps, TTL, invalidation, memoization, warming — with safe invalidation."
 sidebar:
   order: 4
 ---
@@ -9,17 +9,9 @@ import { LinkCard } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** The ScoopJoy franchise dashboard runs expensive database queries on
-every page load. You need intelligent caching with proper invalidation so a fresh
-sale doesn't keep serving stale totals.
+**Problem:** The ScoopJoy dashboard runs expensive queries on every page load. You need caching with proper invalidation so a fresh sale doesn't serve stale totals.
 
-**Solution:** A single `FranchiseCacheManager` class that implements six caching
-patterns over `frappe.cache` — Frappe's thin wrapper around Redis. Each pattern is
-shown as its own section below, then wired up through `hooks.py` and a small
-monitoring endpoint.
-
-All keys share the `scoopjoy:` prefix so they never collide with other apps on the
-same Redis instance.
+**Solution:** One `FranchiseCacheManager` class implementing six patterns over `frappe.cache` (Frappe's Redis wrapper), wired through `hooks.py` and a monitoring endpoint. All keys share the `scoopjoy:` prefix so they never collide with other apps on the same Redis instance:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_manager.py"
 import frappe
@@ -39,9 +31,7 @@ class FranchiseCacheManager:
 
 ### Pattern A — Simple key-value
 
-The cheapest pattern: `set_value` / `get_value`. The dashboard summary is computed
-once and stored under `scoopjoy:dashboard_summary`; it persists until something
-explicitly clears it.
+Cheapest pattern: `set_value` / `get_value`. The dashboard summary is computed once and persists until explicitly cleared:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_manager.py"
     @staticmethod
@@ -49,15 +39,11 @@ explicitly clears it.
         """Cache the expensive dashboard summary computation."""
         cache_key = f"{FranchiseCacheManager.PREFIX}:dashboard_summary"
 
-        # Try cache first
         cached = frappe.cache.get_value(cache_key)
         if cached:
             return cached
 
-        # Expensive computation
         summary = _compute_dashboard_summary()
-
-        # Store in cache (persists until explicitly cleared)
         frappe.cache.set_value(cache_key, summary)
 
         return summary
@@ -69,10 +55,7 @@ explicitly clears it.
 
 ### Pattern B — Hash maps for structured data
 
-When you have many related sub-values — one entry per outlet — a Redis hash beats a
-key per outlet. `hset` / `hget` / `hdel` address individual fields inside the single
-`scoopjoy:outlet_metrics` hash, and `hgetall` pulls the whole map at once for
-rendering.
+Many related sub-values (one per outlet)? A Redis hash beats a key per outlet — `hset`/`hget`/`hdel` address individual fields inside the single `scoopjoy:outlet_metrics` hash, and `hgetall` pulls the whole map for rendering:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_manager.py"
     @staticmethod
@@ -80,15 +63,11 @@ rendering.
         """Store per-outlet metrics in a Redis hash map."""
         hash_key = f"{FranchiseCacheManager.PREFIX}:outlet_metrics"
 
-        # Try hash field
         cached = frappe.cache.hget(hash_key, outlet_name)
         if cached:
             return cached
 
-        # Compute for this outlet
         metrics = _compute_outlet_metrics(outlet_name)
-
-        # Store as a field in the hash
         frappe.cache.hset(hash_key, outlet_name, metrics)
 
         return metrics
@@ -97,32 +76,24 @@ rendering.
     def clear_outlet_metrics(outlet_name=None):
         hash_key = f"{FranchiseCacheManager.PREFIX}:outlet_metrics"
         if outlet_name:
-            # Clear single outlet
-            frappe.cache.hdel(hash_key, outlet_name)
+            frappe.cache.hdel(hash_key, outlet_name)  # clear one outlet
         else:
-            # Clear all outlet metrics
-            frappe.cache.delete_value(hash_key)
+            frappe.cache.delete_value(hash_key)  # clear all
 
     @staticmethod
     def get_all_outlet_metrics():
-        """Retrieve the entire hash -- useful for dashboard rendering."""
-        hash_key = f"{FranchiseCacheManager.PREFIX}:outlet_metrics"
-        return frappe.cache.hgetall(hash_key)
+        """Retrieve the entire hash — useful for dashboard rendering."""
+        return frappe.cache.hgetall(f"{FranchiseCacheManager.PREFIX}:outlet_metrics")
 ```
 
 ### Pattern C — Cache with TTL (auto-expiry)
 
-For data that's "fresh enough" within a window, let Redis expire it for you with
-`expires_in_sec`. Trending items refresh every 5 minutes; the live order count uses
-a 30-second TTL for near-real-time numbers — no invalidation hook needed.
+For data that's "fresh enough" within a window, let Redis expire it via `expires_in_sec` — trending items at 5 minutes, live order count at 30 seconds, no invalidation hook needed:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_manager.py" {12,28-29}
     @staticmethod
     def get_trending_items(ttl_seconds=300):
-        """
-        Cache trending items for 5 minutes.
-        TTL ensures data refreshes automatically without explicit invalidation.
-        """
+        """Cache trending items for 5 minutes — TTL refreshes automatically."""
         cache_key = f"{FranchiseCacheManager.PREFIX}:trending_items"
 
         cached = frappe.cache.get_value(cache_key)
@@ -130,8 +101,6 @@ a 30-second TTL for near-real-time numbers — no invalidation hook needed.
             return cached
 
         items = _compute_trending_items()
-
-        # set_value with expires_in_sec for TTL
         frappe.cache.set_value(cache_key, items, expires_in_sec=ttl_seconds)
 
         return items
@@ -154,17 +123,13 @@ a 30-second TTL for near-real-time numbers — no invalidation hook needed.
         return count
 ```
 
-:::note
-`get_live_order_count` checks `if cached is not None` rather than `if cached`,
-because a legitimate cached value of `0` is falsy — see the common mistake below.
+:::note[None vs falsy]
+`get_live_order_count` checks `if cached is not None`, not `if cached` — a legitimate cached `0` is falsy and would look like a miss, re-running the query every time.
 :::
 
 ### Pattern D — Invalidation on document change
 
-TTL alone serves stale data within its window. For totals that must update the
-instant a sale lands, hook the invalidation into `doc_events`. When a Sales Invoice
-is submitted or cancelled, clear exactly the affected caches — and only the affected
-outlet's metrics, not the whole hash.
+TTL alone serves stale data within its window. For totals that must update the instant a sale lands, hook invalidation into `doc_events` — clearing only the affected outlet's hash field, not the whole hash:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_manager.py"
     @staticmethod
@@ -172,29 +137,20 @@ outlet's metrics, not the whole hash.
         """Called automatically when a Sales Invoice is submitted or cancelled."""
         manager = FranchiseCacheManager
 
-        # Clear dashboard summary (total sales changed)
-        manager.clear_dashboard_summary()
+        manager.clear_dashboard_summary()  # total sales changed
 
-        # Clear only the affected outlet's metrics
         if doc.franchise_outlet:
-            manager.clear_outlet_metrics(doc.franchise_outlet)
+            manager.clear_outlet_metrics(doc.franchise_outlet)  # only this outlet
 
-        # Clear trending items (sales volume changed)
         frappe.cache.delete_value(f"{manager.PREFIX}:trending_items")
-
-        # Clear live order count
         frappe.cache.delete_value(f"{manager.PREFIX}:live_order_count")
 ```
 
-This is registered against the `Sales Invoice` `on_submit` and `on_cancel` events in
-`hooks.py` — see the configuration block below.
+Registered against `on_submit`/`on_cancel` in `hooks.py` — see the configuration block below.
 
 ### Pattern E — Memoization decorator
 
-Frappe ships an `@redis_cache` decorator that auto-generates a cache key from the
-function name plus its arguments. Calling `get_franchise_leaderboard(region="Mumbai")`
-and `get_franchise_leaderboard(region="Delhi")` produce separate cache entries
-automatically — no key string to manage.
+Frappe ships `@redis_cache`, which auto-generates a cache key from the function name plus its arguments — `get_franchise_leaderboard(region="Mumbai")` and `(region="Delhi")` get separate entries automatically:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_manager.py" {2}
     @staticmethod
@@ -237,9 +193,7 @@ automatically — no key string to manage.
 
 ### Pattern F — Cache warming on startup
 
-Don't make the first user of the day pay for every cold computation. Warm the
-critical caches after migration and on a daily schedule so the dashboard is always
-hot.
+Don't make the first user of the day pay for every cold computation. Warm the critical caches after migration and on a daily schedule:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_manager.py"
     @staticmethod
@@ -247,21 +201,17 @@ hot.
         """Pre-populate critical caches so the first user doesn't wait."""
         manager = FranchiseCacheManager
 
-        # Warm dashboard summary
         manager.clear_dashboard_summary()
         manager.get_dashboard_summary()
 
-        # Warm all outlet metrics
         outlets = frappe.get_all("Franchise Outlet", filters={"is_active": 1}, pluck="name")
         for outlet in outlets:
             manager.clear_outlet_metrics(outlet)
             manager.get_outlet_metrics(outlet)
 
-        # Warm trending items
         frappe.cache.delete_value(f"{manager.PREFIX}:trending_items")
         manager.get_trending_items()
 
-        # Warm leaderboard for all regions
         manager.clear_leaderboard_cache()
         regions = frappe.get_all("Territory", filters={"is_group": 0}, pluck="name")
         for region in regions:
@@ -270,7 +220,7 @@ hot.
         frappe.logger().info("ScoopJoy: Cache warming complete")
 ```
 
-The private helpers run the actual expensive queries that every pattern above caches.
+The private helpers run the actual expensive queries every pattern caches:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_manager.py"
 # ---------------------------------------------------------------------------
@@ -348,9 +298,7 @@ def invalidate_sales_cache(doc, method):
 
 ## hooks.py configuration
 
-The invalidation (Pattern D) and warming (Pattern F) only fire once they're wired
-into the app's hooks: `doc_events` routes Sales Invoice events to the invalidator,
-`after_migrate` warms on deploy, and `scheduler_events` warms daily.
+Invalidation (Pattern D) and warming (Pattern F) fire once wired into the hooks — `doc_events` routes Sales Invoice events to the invalidator, `after_migrate` warms on deploy, `scheduler_events` warms daily:
 
 ```python title="scoopjoy/hooks.py"
 doc_events = {
@@ -373,8 +321,7 @@ scheduler_events = {
 
 ## Cache monitoring
 
-A small admin-only endpoint reports Redis memory usage and how many `scoopjoy:` keys
-are live — handy when you suspect a runaway cache.
+An admin-only endpoint reports Redis memory usage and how many `scoopjoy:` keys are live:
 
 ```python title="scoopjoy/scoopjoy/utils/cache_monitor.py"
 import frappe
@@ -387,10 +334,7 @@ def get_cache_stats():
 
     prefix = "scoopjoy"
 
-    # Get Redis info
     info = frappe.cache.get_connection().info("memory")
-
-    # Count our keys
     all_keys = frappe.cache.get_connection().keys(f"*{prefix}*")
 
     return {
@@ -403,64 +347,17 @@ def get_cache_stats():
 
 ## When NOT to cache (anti-patterns)
 
-Caching is not free, and the wrong cache is worse than no cache. These four are
-shown as negative examples — do not ship them.
-
-```python title="scoopjoy/scoopjoy/utils/cache_antipatterns.py"
-# DO NOT DO THESE -- included as negative examples
-
-# ANTI-PATTERN 1: Caching user-specific data with a generic key
-# This serves User A's data to User B
-def bad_cache_user_data():
-    cached = frappe.cache.get_value("user_dashboard")  # no user in key!
-    if cached:
-        return cached
-    data = get_user_specific_data(frappe.session.user)
-    frappe.cache.set_value("user_dashboard", data)
-    return data
-
-# FIX: Include the user in the cache key
-def good_cache_user_data():
-    key = f"scoopjoy:user_dashboard:{frappe.session.user}"
-    cached = frappe.cache.get_value(key)
-    if cached:
-        return cached
-    data = get_user_specific_data(frappe.session.user)
-    frappe.cache.set_value(key, data, expires_in_sec=300)
-    return data
-
-
-# ANTI-PATTERN 2: Caching data that changes every request
-# Pointless -- you compute it every time anyway
-def bad_cache_realtime():
-    frappe.cache.set_value("current_time", frappe.utils.now())
-    return frappe.cache.get_value("current_time")
-
-
-# ANTI-PATTERN 3: Caching without TTL on volatile data
-# This serves stale data forever if the invalidation hook misses a path
-def bad_cache_no_ttl():
-    frappe.cache.set_value("stock_levels", get_stock_levels())  # never expires!
-
-
-# ANTI-PATTERN 4: Caching very large objects (>1MB)
-# Redis is memory-bound; large values cause eviction of many small values
-def bad_cache_large_data():
-    all_invoices = frappe.get_all("Sales Invoice", fields=["*"], limit=0)
-    frappe.cache.set_value("all_invoices", all_invoices)  # could be 50MB+
-```
+| Anti-pattern | Why it's wrong | Fix |
+|---|---|---|
+| Caching user-specific data with a generic key (`"user_dashboard"`) | Serves User A's data to User B | Include the user in the key: `scoopjoy:user_dashboard:{user}` |
+| Caching data that changes every request | Pointless — you compute it every time anyway | Don't cache |
+| Caching volatile data with no TTL | Stale forever if an invalidation path is missed | Always set `expires_in_sec` |
+| Caching objects > 1MB | Redis is memory-bound; one large value evicts many small ones | Cache aggregates, not whole tables |
 
 :::note[Why this works]
-Frappe's `frappe.cache` is a thin wrapper around Redis. `set_value` / `get_value`
-handle serialization automatically (pickling Python objects). The `@redis_cache`
-decorator auto-generates cache keys from the function name plus its arguments, so
-`get_franchise_leaderboard(region="Mumbai")` and
-`get_franchise_leaderboard(region="Delhi")` get separate cache entries.
+`frappe.cache` is a thin wrapper around Redis — `set_value`/`get_value` handle serialization (pickling Python objects) automatically. `@redis_cache` auto-generates keys from function name + arguments, so per-argument results cache separately with zero key management.
 :::
 
 :::caution[Common mistake]
-Not distinguishing `None` from falsy values. `frappe.cache.get_value()` returns
-`None` on a cache miss, but your cached value might legitimately be `0`, `[]`, or
-`False`. Always compare with `is not None` (as `get_live_order_count` does), or a
-cached `0` count will look like a miss and trigger the expensive query every time.
+Not distinguishing `None` from falsy values. `frappe.cache.get_value()` returns `None` on a miss, but a cached value may legitimately be `0`, `[]`, or `False`. Always compare with `is not None`, or a cached `0` looks like a miss and triggers the expensive query every time.
 :::

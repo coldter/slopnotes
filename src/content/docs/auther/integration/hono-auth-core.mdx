@@ -1,71 +1,44 @@
 ---
 title: Hono Walkthrough — Auth Core
-description: Deleting the local better-auth instance and rebuilding the auth layer around Auther — JWT verification, the webhook receiver, and a server-to-server admin client.
+description: "Replacing the local better-auth instance with Auther — JWT verification, the webhook receiver, and a server-to-server admin client."
 sidebar:
   order: 14
 ---
 
-import { FileTree, Steps } from "@astrojs/starlight/components";
+import { FileTree, Steps, LinkCard } from "@astrojs/starlight/components";
 
-The [schema changes](/auther/integration/hono-schema/) from the previous page surface
-a lot of dead code in `apps/server`. Once Auther owns identity, every file that used
-to run authentication locally — the better-auth instance, the password helpers, the
-rate-limit constants — has nothing left to do. This page walks the auth module
-file-by-file: what to delete, and what to write in its place. The end state is a
-server that trusts a verified Auther JWT, keeps a thin shadow user in sync over
-webhooks, and reaches back to Auther only for privileged admin actions.
+The [schema changes](/auther/integration/hono-schema/) surface dead code in `apps/server`. Once Auther owns identity, every file that ran auth locally — the better-auth instance, password helpers, rate-limit constants — has nothing left to do. End state: a server that trusts a verified Auther JWT, keeps a thin shadow user in sync over webhooks, and reaches Auther only for privileged admin actions.
 
 ## Delete the local better-auth instance
 
-The current `apps/server/src/modules/auth/instance.ts` (roughly 15 kB) instantiates
-`betterAuth()` with a Drizzle adapter and wires up plugins, `databaseHooks`,
-`rateLimit`, `emailAndPassword`, the session config, and the `create session before`
-hook that deletes existing sessions, detects new-device logins, and resolves the
-active-org membership.
+`apps/server/src/modules/auth/instance.ts` (~15 kB) instantiates `betterAuth()` with a Drizzle adapter, plugins, `databaseHooks`, `rateLimit`, `emailAndPassword`, session config, and a `create session before` hook. All of it goes — Auther runs these flows remotely. Three pieces need a new home:
 
-All of it goes away. Auther runs these flows remotely now, so the whole file can be
-deleted. A few pieces inside it are still useful and just need a new home:
-
-- **`detectPlatform(userAgent)`** moves to `apps/server/src/utils/platform.ts`. It is
-  still handy for things like rendering mobile-friendly push-notification content.
-- **The new-device login notification** (logic that lived in the existing
-  `instance.ts`) needs somewhere to go. Either let Auther own it — write an
-  `after_signin` pipeline hook in Auther's admin UI that detects a new device and
-  emits a `security.new_device_login` webhook event, which your Hono server's webhook
-  receiver (below) turns into a `notificationService.send(...)` call — or, if Auther's
-  built-in login-security plugin is good enough, drop the feature entirely.
-- **Active-org resolution on session create** moves into the auth-context middleware
-  (below): on any incoming JWT, look up the user's most recent `members` row and
-  attach it to the request context. Alternatively, switch to URL-path tenancy and
-  delete the lookup altogether.
+- **`detectPlatform(userAgent)`** → `apps/server/src/utils/platform.ts` (still useful for push-notification content).
+- **New-device login notification** → either an Auther `after_signin` pipeline hook that emits a `security.new_device_login` webhook your receiver turns into a `notificationService.send(...)` call, or drop it if Auther's login-security plugin suffices.
+- **Active-org resolution on session create** → the auth-context middleware: on any incoming JWT, look up the user's most recent `members` row and attach it. Or switch to URL-path tenancy and delete the lookup.
 
 ## What else to delete
-
-The rest of the auth module follows. Most of it is identity logic that Auther now
-owns; what survives is whatever is genuinely app-specific.
 
 | File | Fate |
 | --- | --- |
 | `instance.ts` | Delete |
 | `handler.ts` | Delete — no `/api/auth/*` routes mounted locally |
 | `constants.ts` (RATE_LIMIT, 2FA) | Delete — Auther owns both |
-| `auth-notifications.ts` | Delete — auth emails come from Auther; new-device webhook from Auther |
+| `auth-notifications.ts` | Delete — auth emails and new-device webhook come from Auther |
 | `helpers/argon2id.ts` | Delete — no passwords stored locally |
 | `plugins/admin.ts` | Delete — use Auther's admin UI, or proxy through the admin API |
 | `plugins/login-security.ts` | Delete — replaced by Auther's login-security plugin |
 | `plugins/user-status.ts` | Delete — covered by Auther admin plugin's `banned` + `banReason` |
-| `roles/*` | Move if app-specific; delete if it's an identity role |
+| `roles/*` | Move if app-specific; delete if identity role |
 
-In their place, four new files carry the integration. Together they cover the three
-directions an integrated server talks to Auther: **inbound tokens** it must verify,
-**inbound events** it must apply, and **outbound admin calls** it must make.
+Four new files carry the integration — covering the three directions an integrated server talks to Auther (inbound tokens, inbound events, outbound admin calls):
 
 | File | What it does |
 | --- | --- |
-| `apps/server/src/modules/auth/verify.ts` | The shared JWKS set + `verifyAutherToken` (jose) — one place that knows how to trust an Auther token, so the middleware and webhook handler can't drift apart. |
-| `apps/server/src/modules/auth/shadow.ts` | `ensureShadowUser` — just-in-time provisioning: turns verified token claims into a local `users` row the first time it's seen. |
-| `apps/server/src/modules/auth/webhook.ts` | The inbound receiver: applies Auther's lifecycle events (user created/updated/deleted, new-device login) to the local database. |
-| `apps/server/src/modules/auth/admin-client.ts` | Outbound server-to-server calls — bans, profile edits, impersonation tokens — to Auther's privileged admin endpoints. |
+| `apps/server/src/modules/auth/verify.ts` | Shared JWKS set + `verifyAutherToken` (jose) — one place that knows how to trust an Auther token. |
+| `apps/server/src/modules/auth/shadow.ts` | `ensureShadowUser` — JIT provisioning from verified token claims. |
+| `apps/server/src/modules/auth/webhook.ts` | Inbound receiver: applies lifecycle events to the local database. |
+| `apps/server/src/modules/auth/admin-client.ts` | Outbound server-to-server calls — bans, profile edits, impersonation. |
 
 <FileTree>
 - apps/server/src/modules/auth/
@@ -75,33 +48,17 @@ directions an integrated server talks to Auther: **inbound tokens** it must veri
   - admin-client.ts server-to-server admin calls
 </FileTree>
 
-:::note[Where each file shows up below]
-This page walks them in the order they matter at runtime: the **middleware** (which
-calls `verify` + `shadow` on every request) first, then the **webhook receiver**, then
-the **shared `verify.ts`** they both lean on, and finally the **admin client** for the
-outbound direction. `shadow.ts` itself was built on the [schema
-page](/auther/integration/hono-schema/).
-:::
-
 ## Rewrite the auth-context middleware
 
-This middleware runs on every request and decides who the caller is. It is the single
-most important rewrite in the module, and the shift is the whole point of the
-integration in one diff:
+This middleware runs on every request and decides who the caller is — the whole integration in one diff:
 
 | | Before (cookie session) | After (verify JWT) |
 | --- | --- | --- |
 | Source of truth | A row in the **local** session store | A signed token the caller carries |
-| The work | Look up the cookie → DB read | Verify the signature against Auther's JWKS — **offline, no DB, no network on the hot path** |
-| Failure mode | DB down → no auth | Cached keys mean verification keeps working through an Auther blip |
+| The work | Cookie → DB read | Verify signature against Auther's JWKS — **offline, no DB, no network on the hot path** |
+| Failure mode | DB down → no auth | Cached keys keep verifying through an Auther blip |
 
-The mental model: a JWKS endpoint is like a public phone book of signing keys. The
-middleware looks the keys up once, caches them, and from then on verifies every token
-locally — it never has to ask Auther "is this session still valid?" the way a cookie
-lookup asks the session store. Seeing both versions side by side makes the change concrete.
-
-The old middleware delegated entirely to the local instance's `getSession` — every
-request was a database read behind `auth.api.getSession`:
+Before — every request was a DB read behind `auth.api.getSession`:
 
 ```ts title="apps/server/src/middlewares/auth-context.ts (before — getSession)"
 import { createMiddleware } from "hono/factory";
@@ -124,9 +81,7 @@ export const authContextMiddleware = createMiddleware<Env>(async (c, next) => {
 });
 ```
 
-The new middleware does the opposite: it verifies a `Bearer` token against a cached
-remote JWKS, then provisions a shadow user just-in-time from the verified claims. No
-local session store is consulted at all.
+After — verify a `Bearer` token against a cached remote JWKS, then JIT-provision a shadow user from the verified claims. No local session store consulted:
 
 ```ts title="apps/server/src/middlewares/auth-context.ts (after — jose verify + JIT)" {7-10,17,21-26,40}
 import { createMiddleware } from "hono/factory";
@@ -175,30 +130,14 @@ export const authContextMiddleware = createMiddleware<Env>(async (c, next) => {
 });
 ```
 
-Four highlighted spots earn their place:
+The highlighted spots:
 
-- **Lines 7–10 — the cached key set.** `createRemoteJWKSet` runs once at module load,
-  not per request. `cacheMaxAge` (12 h) sits well below Auther's 30-day key-rotation
-  window, so a rotated key is picked up promptly; `cooldownDuration` throttles
-  re-fetches when a request arrives with an unknown `kid` (the key id in a token's
-  header), so a flood of bad tokens can't hammer the JWKS endpoint.
-- **Line 17 — no header, no identity.** A request without `Bearer ...` isn't an error
-  here; it's just anonymous. Clear the context and move on.
-- **Lines 21–26 — verify offline.** `jwtVerify` checks the signature against the cached
-  keys and the `issuer` / `audience` / `clockTolerance` constraints. No call to Auther.
-- **Line 40 — fail soft.** On a bad token the middleware does **not** throw; it clears
-  the context and continues, leaving the route handler to decide whether a missing
-  identity means `401` or "carry on as anonymous."
+- **Lines 7–10 — cached key set.** `createRemoteJWKSet` runs once at module load. `cacheMaxAge` (12h) sits below Auther's 30-day rotation so a rotated key is picked up promptly; `cooldownDuration` throttles re-fetches on an unknown `kid` so bad tokens can't hammer the JWKS endpoint.
+- **Line 17 — no header, no identity.** A request without `Bearer ...` is anonymous, not an error.
+- **Lines 21–26 — verify offline.** `jwtVerify` checks signature, `issuer`, `audience`, `clockTolerance` against cached keys. No call to Auther.
+- **Line 40 — fail soft.** A bad token doesn't throw; context is cleared and the route handler decides 401 vs. anonymous.
 
-The synthesized session is no longer a better-auth row — it's built straight from the
-claims, with `claims.sid ?? claims.sub` standing in for a session id and the two
-permission maps (`permissions` and `abac_required`) carried through verbatim.
-
-Because the session shape changed, the `Env` type in
-`apps/server/src/lib/context.ts` has to change with it — Hono type-checks `c.get("user")`
-against this, so the rest of the server won't compile until it matches what the
-middleware now sets. The user is now a plain Drizzle row rather than better-auth's
-inferred session user, and the session becomes the small hand-built object above:
+The synthesized session is built from the claims: `claims.sid ?? claims.sub` as the session id, and the `permissions` / `abac_required` maps carried through verbatim. The `Env` type in `apps/server/src/lib/context.ts` must match:
 
 ```ts title="apps/server/src/lib/context.ts (before)"
 import type { auth } from "@/modules/auth/instance";
@@ -226,31 +165,17 @@ export type Env = {
 };
 ```
 
-Both permission maps are typed `Record<string, string[]>` — the same `entity → list
-of permissions` shape Auther packs into every token.
-
 ## The webhook receiver
 
-Verifying a JWT tells you who the caller is right now, but it does not keep your
-shadow `users` table fresh when a profile changes at Auther, when an account is
-deleted, or when Auther's login-security plugin spots a new device. That is what the
-inbound webhook receiver is for: Auther pushes lifecycle events, and this handler
-applies them to the local database.
-
-Because anyone on the internet can POST to a webhook URL, the handler runs three gates
-before it touches any data:
+Verifying a JWT tells you who the caller is *now*; it doesn't keep the shadow row fresh when a profile changes, an account is deleted, or a new device signs in. The inbound receiver applies Auther's lifecycle events to the local database. It's internet-exposed, so three gates run before touching data:
 
 <Steps>
-1. **Verify the signature** — a constant-time HMAC compare proves the body really came
-   from Auther and wasn't tampered with.
-2. **Reject stale deliveries** — a 5-minute timestamp window stops an attacker from
-   capturing one valid delivery and replaying it later.
-3. **Dedupe retries** — idempotency (running the same delivery twice has the same
-   effect as running it once) via a Redis `SETNX` on the delivery id, so a network
-   retry of an already-applied event is a no-op.
-</Steps>
 
-Only after all three pass does it dispatch the event to the local database.
+1. **Verify the signature** — constant-time HMAC compare.
+2. **Reject stale deliveries** — a 5-minute timestamp window blocks replays.
+3. **Dedupe retries** — Redis `SETNX` on the delivery id, so a retried event is a no-op.
+
+</Steps>
 
 ```ts title="apps/server/src/modules/auth/webhook.ts" {21-25,30-31,38-43,55}
 import { createHmac, timingSafeEqual } from "node:crypto";
@@ -302,7 +227,7 @@ app.post("/webhooks/auther", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     logger.error({ err, evt, id }, "auther webhook dispatch failed");
-    // Return 5xx so QStash retries; the idempotency key is deleted below so the retry can run.
+    // Return 5xx so QStash retries; delete the idempotency key so the retry can run.
     await redis.del(`webhook:auther:${id}`);
     return c.text("dispatch failed", 500);
   }
@@ -364,15 +289,9 @@ async function dispatch(evt: AutherEvent) {
 export default app;
 ```
 
-The highlighted lines are the three gates in order — HMAC compare (21–25), the replay
-window (30–31), the `SETNX` dedupe (38–43) — and the failure path (55). `dispatch`
-below is the easy part: `user.created` inserts with `onConflictDoNothing` (so a
-webhook racing the JIT middleware can't double-insert), the shared `user.updated` /
-`user.verified` case patches only the fields actually present, and `user.deleted`
-removes the row and lets foreign-key cascades clean up the rest.
+The highlighted lines are the three gates in order — HMAC compare (21–25), replay window (30–31), `SETNX` dedupe (38–43) — and the failure path (55). `user.created` inserts with `onConflictDoNothing` (so a webhook racing the JIT middleware can't double-insert), `user.updated`/`user.verified` patch only present fields, and `user.deleted` removes the row and lets FK cascades clean up.
 
-The receiver is mounted under the `/api/auth` prefix in `server.ts`, which lands the
-route at `POST /api/auth/webhooks/auther`:
+Mount it under `/api/auth` in `server.ts` → reachable at `POST /api/auth/webhooks/auther`:
 
 ```ts title="apps/server/src/server.ts (fragment)"
 import autherWebhook from "@/modules/auth/webhook";
@@ -382,21 +301,12 @@ app.route("/api/auth", autherWebhook);
 ```
 
 :::caution[The idempotency-key-on-failure subtlety]
-On a dispatch failure the handler deletes the idempotency key before returning `5xx`.
-Without that delete, QStash retries the same `x-webhook-id` but the handler would
-immediately dedup-reply `{ deduped: true }` with a `200` — masking the failure
-forever. Deleting the key on failure lets the retry actually re-run. If that makes
-you nervous, use a two-phase key instead: write `webhook:auther:<id>:claimed` on
-entry and `webhook:auther:<id>:done` on success, and reject only on the latter.
+On dispatch failure the handler deletes the idempotency key before returning `5xx` — otherwise QStash retries the same `x-webhook-id` but the handler would dedup-reply `200` forever, masking the failure. Delete the key on failure so the retry actually re-runs.
 :::
 
 ## A shared JWKS for both consumers
 
-The middleware and the webhook handler both need to verify Auther tokens, and you do
-not want two independently configured `createRemoteJWKSet` calls drifting apart.
-Centralizing the JWKS setup and the `verifyAutherToken` helper in one file keeps the
-verification parameters — issuer, audience, clock tolerance, cache windows —
-identical everywhere:
+The middleware and webhook handler both verify Auther tokens — centralize the JWKS setup and `verifyAutherToken` in one file so verification parameters (issuer, audience, clock tolerance, cache windows) can't drift apart:
 
 ```ts title="apps/server/src/modules/auth/verify.ts"
 import { createRemoteJWKSet, jwtVerify } from "jose";
@@ -418,20 +328,11 @@ export async function verifyAutherToken(token: string): Promise<AutherClaims> {
 }
 ```
 
-:::tip[Prefer the shared helper]
-Once `verify.ts` exists, the middleware's inline `createRemoteJWKSet` can import
-`JWKS` (or call `verifyAutherToken`) from here rather than redeclaring it. One source
-of truth for the verification parameters means a single place to change when Auther's
-issuer or rotation policy moves.
-:::
+Once `verify.ts` exists, the middleware imports `JWKS` / `verifyAutherToken` from here instead of redeclaring — one source of truth for verification parameters.
 
 ## The server-to-server admin client
 
-Some actions can't be expressed as a token verification — when your own admin UI
-bans a user, it has to *tell Auther* to ban them, since Auther owns the identity. The
-admin client is the outbound counterpart to everything above: it exchanges a stored
-API key for a short-lived admin token (caching it until shortly before expiry) and
-uses that token to call Auther's privileged endpoints.
+Some actions can't be a token verification — when your admin UI bans a user, it must *tell Auther*, since Auther owns identity. The admin client exchanges a stored API key for a short-lived admin token (cached until shortly before expiry) and uses it for Auther's privileged endpoints:
 
 ```ts title="apps/server/src/modules/auth/admin-client.ts" {5-17}
 import { env } from "@/env";
@@ -486,17 +387,6 @@ export const autherAdmin = {
 };
 ```
 
-The highlighted `getAdminToken` (lines 5–17) is the part worth understanding: it
-exchanges the long-lived `AUTHER_ADMIN_API_KEY` for a short-lived admin token and
-caches it in memory, refreshing 60 seconds before expiry (`cache.exp - 60_000`) so a
-long-running server never makes a call with a token about to lapse mid-flight. Every
-method below just borrows that token.
+`getAdminToken` (lines 5–17) exchanges the long-lived `AUTHER_ADMIN_API_KEY` for a short-lived admin token, cached in memory and refreshed 60s before expiry (`cache.exp - 60_000`). Note the one-way flow: `banUser` does **not** also patch the local row — the resulting `user.updated` webhook does that, so the shadow table syncs through exactly one path.
 
-Note also the deliberate one-way flow: when `banUser` calls Auther, it does **not**
-also patch the local row. The resulting `user.updated` webhook does that, so the shadow
-table stays in sync through exactly one path rather than two that could disagree.
-
-With the auth core in place, the remaining work is wiring this context into the rest
-of the server — the principal derivation, the authorization middleware, and the route
-handlers. That's covered next in
-[Hono Walkthrough — Server Internals](/auther/integration/hono-server-internals/).
+<LinkCard title="Next: Hono Walkthrough — Server Internals" href="/auther/integration/hono-server-internals/" description="Principals, keeping your authz package, and a safe cutover." />

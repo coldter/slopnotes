@@ -1,41 +1,21 @@
 ---
 title: Auth & SSO
-description: One Better Auth instance serving every tenant — per-host config, an org-scoped SSO plugin, account-takeover guards, and JWTs pinned to a single tenant.
+description: "One Better Auth instance serving every tenant — per-host config via `allowedHosts`, an org-scoped SSO plugin with pre-exchange guards, and JWTs pinned to a single tenant."
 sidebar:
   order: 3
 ---
 
 import Mermaid from "~/components/Mermaid.astro";
 
-Identity is where multi-tenancy is easiest to get subtly wrong. Misconfigure one
-thing and a user in tenant A can act as a user in tenant B:
+Identity is where multi-tenancy breaks subtly: a cookie scoped to the wrong domain, a forwarded header trusted blindly, or a default account-linking rule merging accounts across orgs — and a user in tenant A can act as a user in tenant B. All auth lives in one worker, `apps/auth`, running the **only** Better Auth instance in the system. One instance = exactly one place to get cookies, sessions, and JWT scoping right.
 
-- a cookie scoped to the wrong domain,
-- a forwarded header you trusted blindly,
-- a default account-linking rule that merges accounts across orgs.
-
-The whole auth surface lives in a single worker, `apps/auth`, which runs the **only**
-Better Auth instance in the system and serves every tenant from it. That one-instance
-design is what makes the rules below tractable: there is exactly one place to get
-cookies, sessions, and JWT scoping right.
-
-:::tip[Mental model: why one instance can serve every tenant]
-Better Auth normally pins itself to a single base URL. Here it is configured with an
-**allowlist of app hosts** instead — so the same worker answers for
-`acme.app.example.com`, sibling tenant subdomains, and tenant-owned custom domains
-like `app.acme.com`. Each request tells the instance which host it's serving; the
-allowlist just says "yes, that host is one of ours." No per-tenant deployment, no
-reconfiguration.
+:::tip[Why one instance can serve every tenant]
+Better Auth normally pins itself to a single base URL. Here it's configured with an **allowlist of app hosts** — so the same worker answers for `acme.app.example.com`, sibling subdomains, and custom domains like `app.acme.com`. Each request says which host it's serving; the allowlist just says "yes, that host is one of ours."
 :::
 
 ## Part 1 — Better Auth config
 
-The auth worker builds a fresh Better Auth instance per request through a factory,
-`createAuth(db, env, ctx, options)`. It receives the already-resolved tenant context
-plus any extra IdP origins a registration attempt needs.
-
-The load-bearing detail: the tenant arrives as a **typed parameter**, not as a header
-the caller could spoof. Nothing in this config trusts an unsanitized forwarded header.
+The auth worker builds a fresh instance per request via `createAuth(db, env, ctx, options)`. The tenant arrives as a **typed parameter**, never as a spoofable header.
 
 ```ts title="apps/auth/src/lib/auth.ts"
 betterAuth({
@@ -81,59 +61,26 @@ betterAuth({
 
 ### Why `baseURL` is an object, not a string
 
-The object form with `allowedHosts` is what lets one instance serve every tenant. The
-key behavior is **OIDC callback URL derivation**: the address the identity provider
-sends the user back to after login. Better Auth builds it from the inbound request's
-host at runtime rather than from a fixed config value. So a per-tenant absolute
-callback like `https://acme.app.example.com/api/auth/sso/callback/{providerId}`
-resolves correctly even though there is only one auth worker behind all of them.
+The object form with `allowedHosts` is what lets one instance serve every tenant. The key behavior is **OIDC callback URL derivation**: Better Auth builds the IdP callback address from the inbound request's host at runtime, so `https://acme.app.example.com/api/auth/sso/callback/{providerId}` resolves correctly even with one auth worker behind all hosts.
 
-That runtime host resolution is also the system's sharpest edge. In Better Auth v1.6,
-the dynamic host is read in this order:
-
-1. `x-forwarded-host`
-2. `host`
-3. the request URL
-
-That ordering makes the proxy boundary load-bearing. Before `apps/server` calls
-`AUTH.fetch(...)`, `AUTH.getSession(...)`, or `AUTH.getToken(...)`, it must:
-
-- reconstruct the auth-bound request,
-- pin `host` to the already-validated public host, and
-- strip or overwrite `x-forwarded-host` and `x-forwarded-proto`.
+That runtime host resolution is the system's sharpest edge. In Better Auth v1.6, the dynamic host is read in this order: `x-forwarded-host`, then `host`, then the request URL. So before `apps/server` calls `AUTH.fetch(...)`, `AUTH.getSession(...)`, or `AUTH.getToken(...)`, it must reconstruct the request, pin `host` to the already-validated public host, and strip or overwrite `x-forwarded-host` / `x-forwarded-proto`.
 
 :::caution[Dynamic `baseURL` trusts proxy headers unless you sanitize them]
-A dynamic `baseURL` will happily believe a forwarded host header. The auth proxy must
-rebuild the request and its headers rather than forwarding the raw incoming object,
-or an attacker who can influence `x-forwarded-host` can steer callback URLs.
+The auth proxy must rebuild the request and its headers rather than forwarding the raw incoming object, or an attacker who can influence `x-forwarded-host` can steer callback URLs.
 :::
 
-Two more deliberate choices in this block:
+Two more deliberate choices:
 
-- **No `fallback`.** In production, an unknown host should fail closed, not silently
-  resolve to some first-party origin. Omitting `fallback` makes unrecognized hosts an
-  error.
-- **`allowedHosts` is a live snapshot, not a timer.** Custom-hostname support needs
-  the set of active custom hosts to be current. The `@repo/tenancy` package owns that
-  snapshot and its invalidation; a blind "refresh every five minutes" loop is too
-  coarse for tenant suspension, hostname deletion, or a freshly added domain.
+- **No `fallback`.** An unknown host should fail closed, not silently resolve to a first-party origin. Omitting `fallback` makes unrecognized hosts an error.
+- **`allowedHosts` is a live snapshot, not a timer.** `@repo/tenancy` owns the active custom-hosts snapshot and its invalidation; a blind "refresh every five minutes" loop is too coarse for suspension, hostname deletion, or a freshly added domain.
 
 ### Why self-serve sign-up is off
 
-Every tenant user arrives through invitation acceptance, never through a public
-sign-up form — see [operator-led onboarding](/multi-tenant/admin-panel/#operator-led-onboarding).
-Self-serve sign-up would bypass the invitation gate entirely, which is incompatible
-with operator-led onboarding, so `disableSignUp: true` is set globally. Invitation
-acceptance still creates users: the `/api/invitations/accept/:invitationId` endpoint
-goes through the server-side `auth.api.createUser` admin path, which is allowed to
-bypass `disableSignUp`.
+Every tenant user arrives through invitation acceptance — see [operator-led onboarding](/multi-tenant/admin-panel/#operator-led-onboarding). `disableSignUp: true` is set globally. Invitation acceptance still creates users via the server-side `auth.api.createUser` admin path, which bypasses `disableSignUp`.
 
 ### Pinning the active org in `session.create.before`
 
-The session-creation hook is where the host's tenant becomes the session's active
-org. It reads the typed RPC tenant parameter — not a header — enforces membership,
-sets `activeOrganizationId`, and rejects any user who has no membership in this
-tenant.
+The session-creation hook reads the typed RPC tenant parameter (not a header), enforces membership, sets `activeOrganizationId`, and rejects users with no membership in this tenant:
 
 ```ts title="apps/auth/src/lib/auth.ts" {6-13}
 session: {
@@ -172,44 +119,23 @@ session: {
 },
 ```
 
-The `update.before` half closes a related hole: `setActive` can normally move a
-session to a different organization, but here the host pins org context, so any
-attempt to switch to a foreign tenant via `setActive` is rejected.
+The `update.before` half closes a related hole: `setActive` can normally move a session to a different org, but the host pins org context, so any attempt to switch to a foreign tenant is rejected.
 
 ### Cookie isolation
 
-Cookies are the actual isolation boundary between tenants, and the configuration
-above leans on a few precise facts:
+Cookies are the actual isolation boundary:
 
-- **No `Domain` attribute** means cookies are host-only by default. The design relies
-  on exactly this, which is why `crossSubDomainCookies` stays disabled.
-- **`SameSite` is not the isolation mechanism.** (`SameSite` is the cookie attribute
-  that controls whether a cookie rides along on cross-site requests.) Sibling tenant
-  subdomains under the same registrable domain — its **eTLD+1**, the registrable
-  domain like `acme.com` — are same-site to the browser, so `SameSite=Strict` does not
-  block tenant-to-tenant CSRF on its own.
-- Auth and session cookies stay `SameSite=lax` to preserve OAuth/OIDC round-trips and
-  Better Auth's state-cookie expectations. Tenant and admin mutations are protected
-  instead by explicit `Origin` checks, Better Auth's built-in CSRF protection on auth
-  routes, and custom non-simple-request guards on the system's own mutation routes.
-- Per-subdomain cookie isolation is automatic, and custom-hostname isolation is too —
-  a custom domain is a different `eTLD+1` entirely from the SaaS zone.
+- **No `Domain` attribute** means host-only by default. `crossSubDomainCookies` stays disabled.
+- **`SameSite` is not the isolation mechanism.** Sibling tenant subdomains under the same registrable domain (eTLD+1) are same-site to the browser, so `SameSite=Strict` does not block tenant-to-tenant CSRF on its own.
+- Auth/session cookies stay `SameSite=lax` to preserve OAuth/OIDC round-trips. Tenant and admin mutations are protected by explicit `Origin` checks, Better Auth's built-in CSRF protection on auth routes, and custom non-simple-request guards on the system's own mutation routes.
+- Per-subdomain cookie isolation is automatic; custom-hostname isolation too — a custom domain is a different eTLD+1 entirely.
 
 ## Part 2 — SSO plugin
 
-Per-tenant SSO is what lets each organization bring its own identity provider. It is
-delivered by `@better-auth/sso`, a separate npm package that supports OIDC, OAuth2,
-and SAML 2.0 in one plugin. OIDC ships on day one; SAML is deferred to v2 (the plugin
-supports it — only the onboarding UI is deferred).
-
-One scope note worth internalizing: Better Auth's hosted self-service SSO dashboard
-is an enterprise / Better Auth Infrastructure feature. This template instead builds
-its own org-admin control plane on top of the OSS plugin endpoints.
+Per-tenant SSO comes from `@better-auth/sso` (OIDC, OAuth2, and SAML 2.0 in one plugin). OIDC ships day one; SAML is deferred to v2 (only the onboarding UI is deferred). Note: Better Auth's hosted self-service SSO dashboard is an enterprise feature — this template builds its own org-admin control plane on the OSS plugin endpoints.
 
 :::tip[Generate the schema before you build]
-Before any Phase A code lands, run `npx auth generate` with `sso()` enabled, then
-again with `domainVerification: { enabled: true }`. The generated schema diff is the
-source of truth for the table shapes mirrored in Drizzle — don't hand-write them.
+Before any Phase A code, run `npx auth generate` with `sso()` enabled, then again with `domainVerification: { enabled: true }`. The generated schema diff is the source of truth for the Drizzle tables — don't hand-write them.
 :::
 
 ### Plugin config
@@ -246,17 +172,11 @@ sso({
 })
 ```
 
-The `provisionUser` triple-gate is the most security-critical code on this page; the
-attack it defends against is covered in detail in [Account linking and cross-tenant takeover](#account-linking-and-cross-tenant-takeover)
-below.
+The `provisionUser` triple-gate is the most security-critical code on this page — the attack it stops is in [Account linking and cross-tenant takeover](#account-linking-and-cross-tenant-takeover) below.
 
 ### `ssoCallbackGuardPlugin` — runs *before* token exchange
 
-Rejecting inside `provisionUser` is too late. By then the **authorization code
-exchange** has already happened — that's the OIDC step where the auth worker trades
-the one-time code from the IdP for tokens, and the code can only be spent once. To
-bind a callback to its tenant *before* the code is consumed, a custom `before` hook
-guards the callback path.
+Rejecting inside `provisionUser` is too late: by then the **authorization code exchange** has already happened (the code can only be spent once). A custom `before` hook guards the callback path first:
 
 ```ts title="apps/auth/src/plugins/sso-callback-guard.ts"
 export const ssoCallbackGuardPlugin = (db, tenant: TenantContext) => ({
@@ -280,9 +200,7 @@ export const ssoCallbackGuardPlugin = (db, tenant: TenantContext) => ({
 
 ### `ssoEnforcementPlugin` — blocks password sign-in when SSO is enforced
 
-When an org turns on SSO enforcement, password sign-in must be refused at the API, not
-just hidden in the UI. This plugin rejects `/sign-in/email` whenever the resolved
-org has `enforceSSO` set.
+When an org turns on SSO enforcement, password sign-in must be refused at the API, not just hidden in the UI:
 
 ```ts title="apps/auth/src/plugins/sso-enforcement.ts"
 export const ssoEnforcementPlugin = (db, tenant: TenantContext) => ({
@@ -303,24 +221,18 @@ export const ssoEnforcementPlugin = (db, tenant: TenantContext) => ({
 });
 ```
 
-Two API details that the 2026 hooks surface enforces:
+Two API details the 2026 hooks surface enforces:
 
-- The hooks API takes a single middleware function, not the older
-  `{ matcher, handler }` array shape.
-- `createAuthMiddleware` and `APIError` import from `better-auth/api`:
-  `import { createAuthMiddleware, APIError } from "better-auth/api"`.
+- The hooks API takes a single middleware function, not the older `{ matcher, handler }` array shape.
+- `createAuthMiddleware` and `APIError` import from `better-auth/api`.
 
 :::note[Match the path exactly]
-Note the enforcement plugin uses `ctx.path === "/sign-in/email"` rather than
-`startsWith`. An exact match avoids accidentally catching future endpoints that share
-the prefix.
+The enforcement plugin uses `ctx.path === "/sign-in/email"`, not `startsWith` — an exact match avoids catching future endpoints sharing the prefix.
 :::
 
 ### The SSO sign-in flow
 
-With enforcement on, the sequence below is what a sign-in looks like. The two guards
-fire at different points: `ssoCallbackGuardPlugin` runs *before* the code exchange,
-and `provisionUser` plus `session.create.before` run *after* it.
+With enforcement on, the two guards fire at different points: `ssoCallbackGuardPlugin` runs *before* the code exchange; `provisionUser` and `session.create.before` run *after*.
 
 <Mermaid title="SSO sign-in when enforceSSO = true" height={520} code={`
 sequenceDiagram
@@ -343,64 +255,25 @@ sequenceDiagram
   A-->>U: Set-Cookie (host-only to acme.app.example.com)
 `} />
 
-When `enforceSSO` is false, the flow is the ordinary one:
-
-1. `/api/tenancy/current` returns `{ enforceSSO: false, ... }`.
-2. The UI shows the password form.
-3. The client calls `authClient.signIn.email({ email, password })`.
-4. The enforcement plugin's `before` hook is a no-op.
-5. The standard Better Auth email/password path runs — still finishing in
-   `session.create.before`, which enforces membership and sets
-   `activeOrganizationId`.
-
-The enforcement plugin is defense in depth. Hiding the password form is a convenience;
-the API is the source of truth, and it refuses password sign-in regardless of what the
-UI renders.
+When `enforceSSO` is false, the flow is ordinary: `/api/tenancy/current` returns `{ enforceSSO: false }`, the UI shows the password form, the client calls `authClient.signIn.email(...)`, the enforcement hook is a no-op, and the standard email/password path still finishes in `session.create.before`. The enforcement plugin is defense in depth — the API refuses password sign-in regardless of what the UI renders.
 
 ### Registering an SSO provider
 
-Org admins holding the `manage_sso_config` permission register a provider with
-`POST /api/sso-config/providers` carrying
-`{ providerId, issuer, clientId, clientSecret, domain }`.
+Org admins with the `manage_sso_config` permission register via `POST /api/sso-config/providers` with `{ providerId, issuer, clientId, clientSecret, domain }`. The server handler **overrides `organizationId` from `c.var.tenant.organizationId`** and never trusts the body, then normalizes the issuer, computes the discovery origins Better Auth must trust, encrypts `clientSecret` at rest (see [SSO client secrets](/multi-tenant/security/#sso-client-secret-encryption)), and calls a dedicated auth-worker registration path.
 
-The server handler **overrides `organizationId` from `c.var.tenant.organizationId`**
-and never trusts the body. It then:
+This is deliberately *not* a naive proxy to `/api/auth/sso/register`. Better Auth performs OIDC discovery during registration and checks those URLs against `trustedOrigins`; since `request` is `undefined` during direct `auth.api.*` calls, registration needs a request-scoped `createAuth(..., { extraTrustedOrigins })` path that injects the validated IdP origins for that one attempt.
 
-- normalizes and validates the issuer URL,
-- computes the discovery origins Better Auth will need to trust,
-- encrypts `clientSecret` at rest (see [SSO client secrets](/multi-tenant/security/#sso-client-secrets)), and
-- calls a dedicated auth-worker registration path.
+Domain verification uses Better Auth's built-in token flow: registration returns a verification token, the tenant publishes a `_better-auth-token-{providerId}` DNS record, the token expires after one week. Even so, `provider.organizationId === tenant.organizationId` plus the membership checks remain the real admission gate; `domainVerified` is hardening, not the sole authorization primitive.
 
-This deliberately is *not* a naive proxy to `/api/auth/sso/register`. Better Auth
-performs OIDC discovery during registration and checks those discovery URLs against
-`trustedOrigins` — the allowlist of origins Better Auth will accept redirects from and
-make requests to. The docs also note that `request` is `undefined` during direct
-`auth.api.*` calls, so registration needs a request-scoped
-`createAuth(..., { extraTrustedOrigins })` path — or an equivalent typed RPC — that
-can inject the validated IdP origins for just that one registration attempt.
-
-Domain verification uses Better Auth's built-in token flow: registration returns a
-verification token, the tenant publishes a `_better-auth-token-{providerId}` DNS
-record (or the configured prefix), the token expires after one week, and the UI can
-request a fresh one. Even so, `provider.organizationId === tenant.organizationId` plus
-the membership checks remain the real admission gate; `domainVerified` is a hardening
-signal, not the sole authorization primitive.
-
-Enforcement is toggled separately with `PATCH /api/sso-config/enforcement`
-carrying `{ enabled: true }`, and the system requires at least one verified SSO
-provider before enforcement can be turned on.
+Enforcement toggles separately via `PATCH /api/sso-config/enforcement` with `{ enabled: true }`; the system requires at least one verified SSO provider before enforcement can be turned on.
 
 ## Part 3 — JWT and sessions
 
-Downstream services authenticate with short-lived JWTs rather than session cookies,
-which raises a multi-tenant question the single-tenant template never had to answer:
-a token minted on tenant A must never be accepted by tenant B. The answer is to scope
-every claim to one host.
+Downstream services authenticate with short-lived JWTs, which raises the question a single-tenant template never had: a token minted on tenant A must never be accepted by tenant B. Scope every claim to one host.
 
 ### Per-tenant JWT scoping
 
-Better Auth's `jwt` plugin issues 15-minute JWTs for downstream services. Here the
-issuer, audience, and an `org` claim are all pinned to the current tenant's host.
+Better Auth's `jwt` plugin issues 15-minute JWTs. Here issuer, audience, and an `org` claim are all pinned to the current tenant's host:
 
 ```ts title="apps/auth/src/lib/auth.ts"
 jwt({
@@ -426,9 +299,7 @@ jwt({
 
 ### The five verifier invariants
 
-Scoping the token at mint time only helps if every consumer checks the scope. A
-verifier of a tenant JWT must confirm all five of these — the claim shapes referenced
-are `{ aud, iss, org }` and `{ id, host, sessionVersion }`:
+A verifier of a tenant JWT must confirm all five — the claim shapes are `{ aud, iss, org }` and `{ id, host, sessionVersion }`:
 
 :::caution[Every consumer must check all five]
 1. `aud === "https://${expectedHost}"` — tenant-host scoping.
@@ -438,85 +309,51 @@ are `{ aud, iss, org }` and `{ id, host, sessionVersion }`:
 5. `org.sessionVersion >= db.organization.session_version` — revocation check.
 :::
 
-Note that invariant 5 is `>=`, not `===`. Several version bumps may be in flight at
-once, and a fresh JWT minted just after a bump should not be rejected for trailing the
-database by a step.
+Invariant 5 is `>=`, not `===`: several version bumps may be in flight, and a fresh JWT minted just after a bump shouldn't be rejected for trailing the database by a step.
 
-Re-implementing these checks in every service is how they drift. Phase C consolidates
-them into `@repo/auth-tokens.verifyTenantJwt(token, opts)` so consumers call one
-function — see the [auth-tokens package](/multi-tenant/deep-modules/#auth-tokens-package).
+Re-implementing these checks in every service is how they drift. Phase C consolidates them into `@repo/auth-tokens.verifyTenantJwt(token, opts)` — see the [auth-tokens package](/multi-tenant/deep-modules/#auth-tokens-package).
 
 ### Session model
 
-The existing per-platform session expiry is preserved: web sessions last one hour,
-mobile sessions seven days.
-
-The revocation lever is a new `organization.session_version` column (integer, default
-`0`), bumped on suspension and restore. A JWT verifier rejects any token whose claimed
-version is stale, which forces a re-authentication.
+Existing per-platform expiry is preserved: web sessions last one hour, mobile seven days. The revocation lever is a new `organization.session_version` column (integer, default `0`), bumped on suspension and restore. A JWT verifier rejects any token whose claimed version is stale, forcing re-authentication.
 
 ### Tenant suspension revokes sessions immediately
 
-Suspending a tenant has to cut live sessions at once, not wait for cookie expiry —
-otherwise a tenant suspended for a ToS violation keeps one hour to seven days of
-access. In the same transaction that sets `suspended_at`, two statements run:
+Suspending a tenant must cut live sessions at once, not wait for cookie expiry (1h–7d). In the same transaction that sets `suspended_at`, two statements run:
 
 ```sql
 DELETE FROM session WHERE active_organization_id = orgId;
 UPDATE organization SET session_version = session_version + 1 WHERE id = orgId;
 ```
 
-This is implemented by the `tenantOperations.suspend` service (see
-[tenant operations](/multi-tenant/deep-modules/#tenant-operations)). It is the only
-correct call path, because the same service also handles the dual-scope audit and
-cache invalidation that suspension requires.
+Implemented by `tenantOperations.suspend` — see [tenant operations](/multi-tenant/deep-modules/#tenant-operations). It's the only correct call path: the same service handles the dual-scope audit and cache invalidation suspension requires.
 
 ## Account linking and cross-tenant takeover
 
-This is the attack the `provisionUser` gate above exists to stop, and it is worth
-understanding concretely. Better Auth's default account linking merges users by email
-address. Without a membership gate, a malicious org admin could take over a victim's
-account in *other* organizations:
+Better Auth's default account linking merges users by email. Without a membership gate, a malicious org admin can take over a victim's account in *other* orgs:
 
 :::danger[Account-takeover path without the gate]
-1. The attacker configures an OIDC provider whose `id_token` returns
-   `email = victim@bigcorp.com` — the IdP is fully attacker-controlled.
+1. The attacker configures an OIDC provider whose `id_token` returns `email = victim@bigcorp.com` — the IdP is fully attacker-controlled.
 2. The attacker signs in via "their" SSO using the victim's email.
-3. Default linking attaches the login to the existing `victim@bigcorp.com` user — the
-   attacker now controls that account, including its memberships in other orgs.
+3. Default linking attaches the login to the existing `victim@bigcorp.com` user — the attacker now controls that account, including memberships in other orgs.
 :::
 
-The `provisionUser` hook blocks this by requiring three conditions before any link:
+The `provisionUser` hook blocks this with three conditions before any link:
 
 - The IdP asserts `email_verified: true`.
-- The existing user is **already** a member of this org.
+- The existing user is **already a member of this org**.
 - The SSO provider's domain is verified.
 
-That triple-gate is reinforced by `account.accountLinking.trustedProviders: []` being
-empty, so default linking only ever proceeds when `provisionUser` explicitly passes.
+`account.accountLinking.trustedProviders: []` stays empty, so default linking only proceeds when `provisionUser` explicitly passes.
 
 :::caution[`allowDifferentEmails: false` is load-bearing]
-Keep `account.accountLinking.allowDifferentEmails` at `false`. The default is `true`
-in some Better Auth versions, which would let an SSO IdP attach a *different* email to
-an existing user — reopening the takeover path from the other side.
+Keep `account.accountLinking.allowDifferentEmails` at `false`. The default is `true` in some Better Auth versions, which would let an SSO IdP attach a *different* email to an existing user — reopening the takeover path.
 :::
 
 ## Things that bite
 
-A few sharp edges in this design that are easy to trip over later:
-
-- **OIDC vs SAML callback handling.** With the object-form `baseURL`, the OIDC
-  callback is derived from the inbound request. SAML, by contrast, stores absolute
-  callbacks per provider — which is precisely why SAML is deferred to v2.
-- **`provisionUser` runs after the token exchange.** Any check that must happen
-  before the IdP code is consumed belongs in `ssoCallbackGuardPlugin`, not
-  `provisionUser`.
-- **Keep `trustedOrigins` small.** Since `allowedHosts` is added to `trustedOrigins`
-  automatically, the extra `trustedOrigins` list should stay purpose-specific (local
-  dev and validated IdP discovery) rather than echoing the inbound host.
-- **Per-request, not a module-level singleton.** The instance is built per request via
-  `createAuth(db, env, ctx, options)`. A module-level singleton would force
-  AsyncLocalStorage and complicate testing for no measurable performance gain.
-- **MFA placement.** For SSO logins, MFA can only be enforced at the IdP layer —
-  Better Auth does not layer MFA on top of SSO. For email/password sign-ins, Better
-  Auth's existing `twoFactor` plugin handles it.
+- **OIDC vs SAML callback handling.** With the object-form `baseURL`, the OIDC callback is derived from the inbound request. SAML stores absolute callbacks per provider — which is why SAML is deferred to v2.
+- **`provisionUser` runs after the token exchange.** Any check that must happen before the IdP code is consumed belongs in `ssoCallbackGuardPlugin`.
+- **Keep `trustedOrigins` small.** `allowedHosts` is added automatically; the extra list should stay purpose-specific (local dev, validated IdP discovery), not echo the inbound host.
+- **Per-request, not a module-level singleton.** `createAuth(db, env, ctx, options)` per request; a singleton would force AsyncLocalStorage for no measurable gain.
+- **MFA placement.** For SSO logins, MFA can only be enforced at the IdP layer — Better Auth doesn't layer MFA on SSO. For email/password, the existing `twoFactor` plugin handles it.

@@ -1,6 +1,6 @@
 ---
 title: "Context: Cancellation & Deadlines"
-description: How context.Context carries cancellation, deadlines, and request-scoped data through every call and across gRPC boundaries in Go.
+description: "Pass a `context.Context` as the first arg to every blocking call; `defer cancel()` always; `select` on `ctx.Done()` to make any wait cancellable; deadlines travel over gRPC automatically."
 sidebar:
   order: 8
 ---
@@ -8,9 +8,7 @@ sidebar:
 import Mermaid from "~/components/Mermaid.astro";
 import { LinkCard, CardGrid } from "@astrojs/starlight/components";
 
-`context.Context` is one of the most pervasive types in real Go code, and the example system — a distributed SQL proxy in front of PostgreSQL — is no exception: a grep across its source touches several hundred files, with thousands of individual call sites. It is the spine of the latency-sensitive query path and of every RPC the system makes. If you internalize one cross-cutting Go concept, make it this one.
-
-We'll learn it the same way: by reading how a real distributed system threads a context through every hop, from the gateway down to a goroutine waiting on a ticker.
+`context.Context` is the spine of the request path: a `statement_timeout` set at the gateway becomes a deadline on the context, and that one context flows all the way down — a cancellation at the top stops work at the bottom without any layer knowing about the others.
 
 <Mermaid title="A context threaded through the request path" code={`
 flowchart LR
@@ -21,15 +19,9 @@ flowchart LR
   PL -. "same ctx" .-> PG
 `} />
 
-A `statement_timeout` set at the gateway becomes a deadline on the context, and that one context flows all the way down — so a cancellation at the top stops work running at the bottom, without any layer in between knowing about the others.
+## The interface
 
-## Why context exists
-
-Go has no thread-local storage and no exceptions, so there's no ambient place to stash "this request must finish by 10:42:03" or "the caller hung up, stop working." Go's answer is to make that state an explicit, ordinary value — a `context.Context` — that you pass as the first argument to every function that might block, do I/O, or spawn work.
-
-A context is an immutable node in a tree: you derive children from a parent, and cancelling (or timing out) a parent cancels every descendant. That tree is how a cancellation at the gateway propagates down through the pooler and out to a goroutine waiting on a ticker, all without those layers knowing about each other.
-
-`Context` is a tiny interface — four methods:
+An immutable node in a tree: derive children from a parent; cancelling/timing out a parent cancels every descendant. Four methods:
 
 ```go title="context.Context (standard library)"
 type Context interface {
@@ -40,11 +32,11 @@ type Context interface {
 }
 ```
 
-You almost never implement this interface yourself. You get a root from the standard library and derive children with `context.WithCancel`, `WithTimeout`, `WithDeadline`, and `WithValue`.
+You almost never implement it yourself — derive children with `WithCancel`, `WithTimeout`, `WithDeadline`, `WithValue`.
 
 ## Roots: `Background()` vs `TODO()`
 
-`context.Background()` is the empty, never-cancelled root. Use it at the true top of a goroutine tree — process startup, a server's main loop, a CLI command, a test.
+`context.Background()` is the empty, never-cancelled root — use it at the true top of a goroutine tree (process startup, a server's main loop, a CLI command, a test):
 
 ```go
 func main() {
@@ -59,7 +51,7 @@ A service entry point that owns a long-lived lifecycle creates its root from `Ba
 ctx, cancel := context.WithCancel(context.Background())
 ```
 
-`context.TODO()` is byte-for-byte identical to `Background()` at runtime, but it means something different to a reader: *"a real context should be threaded in here, but it isn't yet."* It is a marker for incomplete plumbing, not a polite alias.
+`context.TODO()` is byte-for-byte identical to `Background()` at runtime, but means *"a real context should be threaded in here, but it isn't yet"* — a marker for incomplete plumbing. Example: `GetLeadershipView` takes no `ctx`, so it manufactures one from `TODO()`:
 
 ```go title="internal/pooler/heartbeat/reader.go"
 func (r *Reader) GetLeadershipView() (*LeadershipView, error) {
@@ -69,15 +61,11 @@ func (r *Reader) GetLeadershipView() (*LeadershipView, error) {
 }
 ```
 
-Here `GetLeadershipView` takes no `ctx` parameter, so it manufactures one from `TODO()`. The cost is real: because the parent is `TODO()`/`Background()`, the *caller's* cancellation never reaches this query — if the heartbeat reader's owner shuts down, this in-flight read only stops when `r.interval` elapses.
+The cost: the *caller's* cancellation never reaches this query — if the owner shuts down, this in-flight read only stops when `r.interval` elapses. Treat every `context.TODO()` at a deadline/RPC boundary as debt to repay by adding a `ctx` parameter.
 
-:::caution[Gotcha]
-A `TODO()` at a deadline or RPC boundary is silently dropping the caller's cancellation on the floor. Treat every `context.TODO()` as a debt to repay by adding a `ctx context.Context` parameter and threading the real one through. `Background()` says "I am the root"; `TODO()` says "I haven't wired the root in yet."
-:::
+## Deriving cancellable children — always `defer cancel()`
 
-## Deriving cancellable children, and the cancel func
-
-`WithCancel`, `WithTimeout`, and `WithDeadline` each return two things: a derived context and a `context.CancelFunc`. Calling the cancel func releases the resources the context holds — most importantly, for `WithTimeout`/`WithDeadline`, the internal timer goroutine. **You must always call it**, even on the happy path, even after the timeout already fired. Calling it more than once is safe (subsequent calls are no-ops). The idiom is `defer cancel()` on the very next line.
+`WithCancel`/`WithTimeout`/`WithDeadline` each return a derived context and a `context.CancelFunc`. Calling the cancel func releases the resources the context holds (for timeouts, the internal timer goroutine). **Always call it**, even on the happy path, even after the timeout already fired — extra calls are no-ops. Idiom: `defer cancel()` on the very next line:
 
 ```go
 ctx, cancel := context.WithTimeout(parent, 5*time.Second)
@@ -85,7 +73,7 @@ defer cancel() // releases the timer when this function returns, regardless of w
 result, err := doRPC(ctx)
 ```
 
-The codebase does exactly this before every consensus RPC, using a named timeout constant (more on those below):
+The repo does exactly this before every consensus RPC, using a named timeout constant:
 
 ```go title="internal/orchestrator/consensus/rule_change.go" {1-2}
 rpcCtx, cancel := context.WithTimeout(ctx, timeouts.RuleWriteTimeout)
@@ -95,15 +83,15 @@ resp, err := r.coordinator.rpcClient.Recruit(rpcCtx, p.Pooler, &consensusdatapb.
 })
 ```
 
-Note the deliberate naming: the derived context is `rpcCtx`, distinct from the incoming `ctx`. The function logs against `ctx` (the broader request) but passes `rpcCtx` (the narrower deadline) to the RPC, so a slow `Recruit` cannot exceed `RuleWriteTimeout` even if the surrounding `ctx` would allow more.
+Note the naming: the derived context is `rpcCtx`, distinct from the incoming `ctx` — the function logs against `ctx` (the broader request) but passes `rpcCtx` (the narrower deadline) to the RPC.
 
 :::caution[Gotcha]
-Forgetting `defer cancel()` is the single most common context bug. With `WithTimeout` it leaks a timer until the *parent* is cancelled — which for a long-lived parent could be the lifetime of the process. The `go vet` `lostcancel` check (run in CI) catches the obvious "cancel is never used" cases, but not all of them. Make `defer cancel()` muscle memory: write it on the line immediately after the `With...` call, before you write the code that uses the context.
+Forgetting `defer cancel()` is the single most common context bug: with `WithTimeout` it leaks a timer until the *parent* is cancelled — which for a long-lived parent can be the process lifetime. `go vet`'s `lostcancel` check catches some cases but not all. Make `defer cancel()` muscle memory, on the line immediately after the `With...` call.
 :::
 
 ### The no-op cancel trick
 
-Sometimes you want to *conditionally* apply a deadline but still let the caller `defer cancel()` unconditionally. Return a do-nothing cancel func in the "no deadline" branch:
+To conditionally apply a deadline while still letting the caller `defer cancel()` unconditionally, return a do-nothing cancel func in the "no deadline" branch:
 
 ```go title="internal/gateway/handler/handler.go" {6-9}
 func (h *GatewayHandler) statementTimeoutCtx(ctx context.Context, state *GatewayConnectionState, query ast.Stmt) (context.Context, context.CancelFunc) {
@@ -118,13 +106,13 @@ func (h *GatewayHandler) statementTimeoutCtx(ctx context.Context, state *Gateway
 }
 ```
 
-This is the query path's statement-timeout enforcement. When a `statement_timeout` is in effect, callers get a context that will expire; when none is set, they get the original context back plus a `func(){}`. Either way the caller writes the same two lines — `ctx, cancel := h.statementTimeoutCtx(...); defer cancel()` — with no special-casing.
+Either way the caller writes the same two lines — `ctx, cancel := h.statementTimeoutCtx(...); defer cancel()` — with no special-casing.
 
 ## Reacting to cancellation: `Done()`, `Err()`, and `select`
 
-`ctx.Done()` returns a channel that is *closed* when the context is cancelled or its deadline passes. A receive from a closed channel returns immediately, so `<-ctx.Done()` is the "wake me when it's time to stop" primitive. After `Done()` closes, `ctx.Err()` tells you *why*: `context.Canceled` (someone called the cancel func) or `context.DeadlineExceeded` (the timeout fired).
+`ctx.Done()` returns a channel *closed* when the context is cancelled or its deadline passes. `<-ctx.Done()` is the "wake me when it's time to stop" primitive. After it closes, `ctx.Err()` says why: `context.Canceled` (someone called cancel) or `context.DeadlineExceeded` (timeout fired).
 
-The canonical pattern is a `select` that races your real work against `ctx.Done()`. This is how you make *any* blocking wait cancellable:
+The canonical pattern is a `select` racing your real work against `ctx.Done()` — this makes *any* blocking wait cancellable:
 
 ```go
 ticker := time.NewTicker(100 * time.Millisecond)
@@ -141,7 +129,7 @@ for {
 }
 ```
 
-The `WaitForLSN` routine is exactly this — poll PostgreSQL every 100ms until a standby has replayed WAL up to a target position, but bail the instant the caller's context expires:
+`WaitForLSN` is exactly this — poll PostgreSQL every 100ms until a standby has replayed WAL to a target position, but bail the instant the caller's context expires:
 
 ```go title="internal/pooler/manager/rpc_manager.go" {3-7}
 for {
@@ -163,9 +151,9 @@ for {
 }
 ```
 
-Two things to notice. First, `ctx.Err()` is wrapped with `errx.Wrap` so the error chain still satisfies `errors.Is(err, context.DeadlineExceeded)` while carrying extra context — see [Errors](/go-guide/language/05-errors/) for why wrapping preserves the sentinel. Second, `ctx` is *also* passed into `checkLSNReached`, so the inner query inherits the same deadline; cancellation propagates all the way down, not just to the `select` you can see here.
+Two things to notice: `ctx.Err()` is wrapped with `errx.Wrap` so the chain still satisfies `errors.Is(err, context.DeadlineExceeded)` while carrying extra context; and `ctx` is *also* passed into `checkLSNReached`, so the inner query inherits the same deadline — cancellation propagates all the way down.
 
-A subtler variant: select over *two* done-like channels when there are two independent reasons to stop. A connection-pool waitlist races the pool being closed against the caller's deadline:
+A subtler variant selects over *two* done-like channels when there are two independent reasons to stop — a connection-pool waitlist races the pool closing against the caller's deadline:
 
 ```go title="internal/pooler/pools/connpool/waitlist.go"
 select {
@@ -181,16 +169,16 @@ case <-ctx.Done():
 ```
 
 :::caution[Gotcha]
-Cancellation does not undo side effects — it just unblocks you. This waitlist goroutine had registered itself in a shared list; when its `ctx.Done()` fires it must *remove itself* under the mutex, or a peer will later try to hand a connection to a goroutine that has already given up. A naive `case <-ctx.Done(): return ctx.Err()` here would leak a stranded waiter. Whenever you `select` on `ctx.Done()`, ask "what shared state did I register that I now have to unregister?"
+Cancellation does not undo side effects — it just unblocks you. This waitlist goroutine had registered itself in a shared list; when its `ctx.Done()` fires it must *remove itself* under the mutex, or a peer will later hand a connection to a goroutine that already gave up. A naive `case <-ctx.Done(): return ctx.Err()` here leaks a stranded waiter. Whenever you `select` on `ctx.Done()`, ask "what shared state did I register that I now have to unregister?"
 :::
 
 :::note
-That branch returns `context.Cause(ctx)` rather than `ctx.Err()`. `context.Cause` (Go 1.20+) returns the specific cause if the context was cancelled via `context.WithCancelCause`, otherwise it falls back to the same value `ctx.Err()` would give. Reaching for `Cause` keeps the more informative error when one exists.
+That branch returns `context.Cause(ctx)` rather than `ctx.Err()`. `context.Cause` (Go 1.20+) returns the specific cause if the context was cancelled via `WithCancelCause`, otherwise falls back to what `ctx.Err()` would give.
 :::
 
-## The "ctx is the first parameter" convention
+## "ctx is the first parameter" convention
 
-Any method that does I/O, blocks, or makes an RPC takes `ctx context.Context` as its **first** parameter, conventionally named `ctx`. This is not enforced by the compiler; it is a universal Go convention that tooling and reviewers rely on. An entire client interface follows it:
+Any method that does I/O, blocks, or makes an RPC takes `ctx context.Context` as its **first** parameter, named `ctx`. An entire client interface follows it:
 
 ```go title="internal/rpcclient/client.go"
 type PoolerClient interface {
@@ -201,11 +189,11 @@ type PoolerClient interface {
 }
 ```
 
-The corollary: **do not store a `Context` in a struct field** as a general habit. The Go docs say so explicitly. A context models a single call tree's lifetime; stashing one in a struct means later method calls silently reuse a possibly-stale deadline instead of receiving a fresh `ctx` per call. Pass it, don't park it.
+Corollary: **do not store a `Context` in a struct field** as a general habit. A context models a single call tree's lifetime; stashing one means later method calls silently reuse a possibly-stale deadline. Pass it, don't park it.
 
 ### The deliberate exception: self-owned background watchers
 
-There is one legitimate reason to store a context in a struct: an object that owns a long-lived background goroutine and exposes a `Start()`/`Stop()` lifecycle. It derives a cancellable context once at construction, keeps it *and its cancel func*, loops on it in the goroutine, and calls the cancel func from `Stop()`.
+One legitimate reason to store a context in a struct: an object that owns a long-lived background goroutine with a `Start()`/`Stop()` lifecycle. It derives a cancellable context once at construction, keeps it *and its cancel func*, loops on it, and calls cancel from `Stop()`:
 
 ```go title="internal/gateway/discovery.go" {12,21-24}
 type CellPoolerDiscovery struct {
@@ -239,17 +227,13 @@ func (pd *CellPoolerDiscovery) Stop() {
 }
 ```
 
-The stored context belongs to the *watcher itself*, not to any inbound request. `Stop()` calls `cancelFunc()` (closing `pd.ctx.Done()`, which unblocks the loop) and then `wg.Wait()`s for the goroutine to actually exit. This is the idiomatic shape for a service-owned background worker. See [Concurrency](/go-guide/language/07-concurrency/) for the `WaitGroup` + cancel-func goroutine-shutdown pattern in depth.
-
-:::tip[Idiom]
-Store a context in a struct only when the struct owns the goroutine that uses it. A request handler does *not* own its request — the caller does — so a handler must take `ctx` per call and never cache it. The `Start`/`Stop` watcher *is* its own root for that subtree, so caching is correct there.
-:::
+The stored context belongs to the *watcher itself*, not to any inbound request. Rule: store a context in a struct only when the struct owns the goroutine that uses it.
 
 ## Cancellation across gRPC boundaries
 
-A context's cancellation and deadline travel over the wire automatically. When you pass a `ctx` to a generated gRPC client stub, gRPC encodes its deadline as request metadata; the server materializes a context with that same deadline, and if the client cancels, the server's `ctx.Done()` fires. This is what lets a `statement_timeout` set at the gateway actually stop work running inside the pooler.
+A context's cancellation and deadline travel over the wire automatically: pass a `ctx` to a generated gRPC client stub and gRPC encodes its deadline as request metadata; the server materializes a context with the same deadline, and if the client cancels, the server's `ctx.Done()` fires. That's how a gateway `statement_timeout` actually stops work inside the pooler.
 
-The `rpcclient` here is a deliberately thin pass-through. It adds *no timeout of its own* — it forwards the caller's `ctx` straight to the stub. Bounding the call is the caller's job (which is exactly why `rule_change.go` wraps with `WithTimeout(ctx, timeouts.RuleWriteTimeout)` before calling).
+The `rpcclient` here is a deliberately thin pass-through — it adds *no timeout of its own*, just forwards the caller's `ctx` to the stub. Bounding the call is the caller's job (which is why `rule_change.go` wraps with `WithTimeout(ctx, timeouts.RuleWriteTimeout)` first):
 
 ```go title="internal/rpcclient/grpc_client.go" {2,6}
 func (c *Client) Recruit(ctx context.Context, pooler *clustermetadatapb.Pooler, request *consensusdatapb.RecruitRequest) (*consensusdatapb.RecruitResponse, error) {
@@ -262,7 +246,7 @@ func (c *Client) Recruit(ctx context.Context, pooler *clustermetadatapb.Pooler, 
 }
 ```
 
-Notice `ctx` does double duty: it bounds *acquiring* the connection and then propagates as the *call's* deadline. Connection acquisition itself respects the context — when the pool is at capacity and must wait for an evictable connection, it polls in a loop that bails on `ctx.Done()`:
+`ctx` does double duty: it bounds *acquiring* the connection and then propagates as the *call's* deadline. Connection acquisition itself respects the context — when the pool is at capacity and must wait, it polls in a loop that bails on `ctx.Done()`:
 
 ```go title="internal/rpcclient/conn_cache.go"
 for {
@@ -278,11 +262,11 @@ for {
 }
 ```
 
-Long-lived streams use the context as the stream's lifetime: such a stream stays open until the context passed to it is cancelled — cancelling the context is *how* you close the stream. See [gRPC & Protobuf](/go-guide/project/04-grpc-and-protobuf/) for the full picture of how generated stubs and deadlines interact.
+Long-lived streams use the context as the stream's lifetime: a stream stays open until its context is cancelled — cancelling the context is *how* you close the stream.
 
-### Reading and shaving the inbound deadline at the server
+### Shaving the inbound deadline at the server
 
-On the server side, a handler can ask whether the caller imposed a deadline via `ctx.Deadline()`. The `TriggerRecoveryNow` handler does this and, when a deadline exists, derives a *slightly shorter* child deadline so it leaves headroom to actually serialize and send the response:
+A handler can ask whether the caller imposed a deadline via `ctx.Deadline()`. `TriggerRecoveryNow` does this and, when a deadline exists, derives a *slightly shorter* child deadline so it leaves headroom to serialize and send the response:
 
 ```go title="internal/orchestrator/grpcserver/server.go" {6}
 deadline, hasDeadline := ctx.Deadline()
@@ -302,12 +286,12 @@ if !hasDeadline {
 ```
 
 :::caution[Gotcha]
-If a server forwards work using the *exact* inbound deadline, the inner operation can run right up to the moment the client gives up, so the client times out before it can read the server's reply — you lose the answer and the error looks like a network failure. Shaving a little budget (here 200ms) means the server finishes early enough to respond *before* the client's clock runs out. This is non-obvious until you've debugged a flaky timeout; budget headroom is a real design concern on the latency path.
+If a server forwards work using the *exact* inbound deadline, the inner operation can run right up to the moment the client gives up, so the client times out before it can read the reply — you lose the answer and the error looks like a network failure. Shaving a little budget (200ms here) means the server finishes early enough to respond *before* the client's clock runs out.
 :::
 
 ### Distinguishing "deadline hit" from "real failure"
 
-When an RPC's deadline fires, gRPC surfaces it on the *client* as a `status` error (code `DeadlineExceeded`), not as a bare `context.DeadlineExceeded`. But within a server, an operation that watched its own `ctx` will return the Go sentinel. A recovery handler treats a deadline or cancellation as an *expected* outcome (recovery ran out of time — that's information, not a crash) and only maps genuine errors to `Internal`:
+When an RPC's deadline fires, gRPC surfaces it on the *client* as a status error (`DeadlineExceeded`), not a bare `context.DeadlineExceeded`. Within a server, an operation that watched its own `ctx` returns the Go sentinel. A recovery handler treats deadline/cancellation as an *expected* outcome and only maps genuine errors to `Internal`:
 
 ```go title="internal/orchestrator/grpcserver/server.go"
 remainingProblems, err := s.engine.TriggerRecoveryNow(ctx, req.MaxCycles)
@@ -316,13 +300,13 @@ if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, co
 }
 ```
 
-Use `errors.Is` against the sentinels — never string-match `"context deadline exceeded"`. Wrapping with `errx.Wrap(ctx.Err(), ...)` preserves `errors.Is` reachability, which is precisely why the check above keeps working even through several wrap layers. Cross-reference [Errors](/go-guide/language/05-errors/).
+Use `errors.Is` against the sentinels — never string-match `"context deadline exceeded"`. Wrapping with `errx.Wrap(ctx.Err(), ...)` preserves `errors.Is` reachability through several wrap layers.
 
 ## `context.WithValue` — request-scoped data, used sparingly
 
-`WithValue` attaches a key/value pair to a derived context. It is the right tool for a narrow purpose: data that is genuinely *request-scoped* and must cross API boundaries where adding a parameter is impractical — a trace span, an auth principal, a proof-of-something token. It is the *wrong* tool for passing optional arguments or smuggling dependencies into a function.
+`WithValue` attaches a key/value to a derived context. Right tool for narrow, request-scoped data crossing API boundaries where adding a parameter is impractical (a trace span, an auth principal, a proof-of-something). Wrong tool for optional arguments or smuggling dependencies.
 
-The keys must be an **unexported, custom type** — typically a zero-size `struct{}` — never a bare `string` or `int`. String keys from different packages can silently collide; an unexported struct type is unforgeable from outside the package and costs zero bytes.
+Keys must be an **unexported custom type** (typically zero-size `struct{}`) — never a bare `string`/`int`. String keys from different packages can silently collide; an unexported struct type is unforgeable and costs zero bytes:
 
 ```go
 type ctxKey struct{}                       // unexported, zero-size, collision-proof
@@ -330,7 +314,7 @@ ctx = context.WithValue(ctx, ctxKey{}, v)  // store
 v, ok := ctx.Value(ctxKey{}).(*MyType)     // retrieve + type-assert
 ```
 
-An "action lock" is the textbook good use. It threads *proof that the caller holds the lock* through a call chain, so deep functions can assert the lock is held without the lock object being passed down explicitly:
+An "action lock" is the textbook good use — it threads *proof that the caller holds the lock* through a call chain:
 
 ```go title="internal/pooler/manager/actionlock/action_lock.go"
 type actionLockKey struct{}
@@ -357,21 +341,11 @@ func AssertActionLockHeld(ctx context.Context) error {
 }
 ```
 
-`Acquire` returns a *derived* context; callers thread that context downstream, and any function that needs to be sure the lock is held calls `AssertActionLockHeld(ctx)`. The stored value is a pointer to a struct with an `atomic.Bool` released-flag, so `Release` can flip the flag and every context that captured that pointer immediately sees the lock as released — a neat interaction between `WithValue` and the `sync`/`atomic` primitives covered in [Sync & the Memory Model](/go-guide/language/09-sync-and-memory-model/).
-
-:::caution[Gotcha]
-`ctx.Value` does a type assertion against the comma-ok form: a missing key or a wrong-typed value comes back as the zero value with `ok == false`. `AssertActionLockHeld` *relies* on this — `val, ok := ...(*actionLockValue)` cleanly distinguishes "no lock in this context" from "lock present." Never use the single-return assertion `ctx.Value(k).(*T)` on a context value you're not certain holds it; that panics on a miss.
-:::
-
-:::caution[Gotcha]
-Do not put function dependencies in a context. If a value could be a parameter, make it a parameter. The action lock qualifies precisely because the lock-ownership proof must flow transparently through many intermediate functions that have no business taking a lock argument — a request-scoped invariant, not a dependency. Overusing `WithValue` produces "stringly-typed" APIs where you can't tell from a signature what a function actually needs.
-:::
+The stored value is a pointer to a struct with an `atomic.Bool` released-flag, so `Release` can flip the flag and every context that captured that pointer immediately sees the lock as released. If a value could be a parameter, make it a parameter — the action lock qualifies precisely because the lock-ownership proof must flow transparently through intermediate functions that have no business taking a lock argument. Retrieval uses the comma-ok assertion, so a missing/wrong-typed value returns `ok == false` cleanly rather than panicking.
 
 ## Detached contexts: work that must outlive the request
 
-Sometimes a background task is *triggered by* a request but must *outlive* it — graceful shutdown, a post-response health check. If you reuse the request's context, its cancellation (or deadline) will abort the very cleanup you need to run. The fix is to *detach*: build a fresh context that keeps the telemetry baggage but drops the cancellation linkage.
-
-A `ctxutil.Detach` helper starts from `Background()` and copies over OpenTelemetry baggage and the parent span (stored separately so background work can *link to* rather than *nest under* the originating trace):
+Sometimes a background task is *triggered by* a request but must *outlive* it (graceful shutdown, a post-response health check). Reusing the request's context means its cancellation aborts the very cleanup you need. Fix: **detach** — build a fresh context that keeps the telemetry baggage but drops the cancellation linkage. `ctxutil.Detach` starts from `Background()` and copies over OTel baggage and the parent span (stored separately, so background work *links to* rather than *nests under* the originating trace):
 
 ```go title="internal/ctxutil/ctxutil.go"
 func Detach(parent context.Context) context.Context {
@@ -386,7 +360,7 @@ func Detach(parent context.Context) context.Context {
 }
 ```
 
-This contrasts with the standard library's `context.WithoutCancel` (Go 1.21+): `WithoutCancel` keeps the parent span so the background work appears as a *child* of the request; `Detach` deliberately demotes it to a *linked* span so it gets its own trace. The graceful-shutdown hook uses it, then re-imposes a bound:
+Contrast with stdlib `context.WithoutCancel` (Go 1.21+): it keeps the parent span so background work appears as a *child*; `Detach` demotes it to a *linked* span for its own trace. The graceful-shutdown hook uses `Detach`, then re-imposes a bound:
 
 ```go title="internal/pooler/init.go"
 mp.senv.OnClose(func() {
@@ -399,12 +373,12 @@ mp.senv.OnClose(func() {
 ```
 
 :::caution[Gotcha]
-Detaching breaks cancellation *on purpose* — the detached context will not be cancelled when its origin is. That means you have re-introduced the risk of an unbounded operation, so you must add your own bound. The `OnClose` hook wraps `Detach(startCtx)` in `WithTimeout(..., 10*time.Second)`. Forget that wrap and your "graceful shutdown" becomes a "hang forever during shutdown." Detach + bound always travel together.
+Detaching breaks cancellation *on purpose* — the detached context won't be cancelled when its origin is — so you must add your own bound. `Detach` + bound always travel together; forget the `WithTimeout` wrap and your "graceful shutdown" becomes a "hang forever during shutdown".
 :::
 
 ## Centralized timeout constants
 
-Notice that the consensus RPC sites do not hardcode a magic `30 * time.Second`. Deadline durations are collected into a `timeouts` package, each constant carrying a comment that *justifies its specific value* from operational experience:
+Don't hardcode magic `30 * time.Second` at RPC sites. Durations live in a `timeouts` package, each constant carrying a comment justifying its value from operational experience:
 
 ```go title="internal/timeouts/rpc.go"
 // RemoteOperationTimeout is the default timeout for remote operations such as
@@ -419,39 +393,35 @@ const RuleWriteTimeout = 30 * time.Second
 const ReadyTopoCheckTimeout = 4 * time.Second
 ```
 
-Callers reference the named constant: `context.WithTimeout(ctx, timeouts.RuleWriteTimeout)`. This keeps every election RPC on the same budget and turns "why is this 30s?" into a documented decision rather than a guess scattered across the codebase. When you need a deadline on the latency path, look here first before inventing a number.
-
-:::note
-Watch for stale comments: a duration described in prose can drift from the constant it documents. The *constant* is the source of truth, not the comment around it. When you cite a duration, trust the code.
-:::
+Callers reference the named constant: `context.WithTimeout(ctx, timeouts.RuleWriteTimeout)`. When you need a deadline on the latency path, look here first before inventing a number.
 
 ## ctx-aware logging
 
-A small but pervasive idiom: the codebase logs with slog's `*Context` methods — `logger.ErrorContext(ctx, ...)`, `InfoContext`, `DebugContext` — rather than the context-free `Error`/`Info`. Passing `ctx` lets the logging backend extract trace/baggage data carried in the context, so a log line can be correlated with the request that produced it. You saw it in `WaitForLSN` above (`ErrorContext(ctx, "WaitForLSN context cancelled or timed out", ...)`). When you add logging on a code path that has a `ctx`, prefer the `*Context` variant. See [errx & Observability](/go-guide/project/09-errors-and-observability/).
+Log with slog's `*Context` methods — `logger.ErrorContext(ctx, ...)`, `InfoContext`, `DebugContext` — rather than the context-free variants. Passing `ctx` lets the logging backend extract trace/baggage data from the context so a log line correlates with the request that produced it. When you add logging on a path that has a `ctx`, prefer the `*Context` variant.
 
 ## Checkpoints
 
 <details><summary>Why must you call the <code>CancelFunc</code> returned by <code>context.WithTimeout</code> even if the timeout has already fired or the operation succeeded?</summary>
-The cancel func releases the context's internal resources — for `WithTimeout`/`WithDeadline` that includes a timer goroutine. If you never call it, those resources live until the *parent* context is cancelled, which for a long-lived parent can be the entire process lifetime: a slow leak. Calling it is idempotent (extra calls are no-ops), so the safe, universal habit is `defer cancel()` on the line right after creation. `go vet`'s `lostcancel` catches some omissions but not all.</details>
+The cancel func releases the context's internal resources — for <code>WithTimeout</code>/<code>WithDeadline</code> that includes a timer goroutine. If you never call it, those resources live until the *parent* context is cancelled, which for a long-lived parent can be the entire process lifetime: a slow leak. Calling it is idempotent, so the safe universal habit is <code>defer cancel()</code> on the line right after creation. <code>go vet</code>'s <code>lostcancel</code> catches some omissions but not all.</details>
 
-<details><summary>The rule says "never store a <code>Context</code> in a struct," yet <code>CellPoolerDiscovery</code> has a <code>ctx</code> field. Why is that not a contradiction?</summary>
-The rule targets objects that act on *behalf of a caller* per method call — a request handler must receive a fresh `ctx` each call because the caller owns the request's lifetime. `CellPoolerDiscovery` is the opposite: it *owns* a long-lived background goroutine with a `Start()`/`Stop()` lifecycle. It derives one cancellable context at construction (`WithCancel(ctx)`), the goroutine loops on it, and `Stop()` calls the stored `cancelFunc`. The stored context belongs to the watcher's own subtree, so caching it is correct. The distinction is ownership: store a context only when the struct owns the goroutine that consumes it.</details>
+<details><summary>The rule says "never store a <code>Context</code> in a struct", yet <code>CellPoolerDiscovery</code> has a <code>ctx</code> field. Why is that not a contradiction?</summary>
+The rule targets objects that act on *behalf of a caller* per method call — a request handler must receive a fresh <code>ctx</code> each call because the caller owns the request's lifetime. <code>CellPoolerDiscovery</code> is the opposite: it *owns* a long-lived background goroutine with a <code>Start()</code>/<code>Stop()</code> lifecycle. It derives one cancellable context at construction, the goroutine loops on it, and <code>Stop()</code> calls the stored <code>cancelFunc</code>. The stored context belongs to the watcher's own subtree, so caching it is correct. The distinction is ownership: store a context only when the struct owns the goroutine that consumes it.</details>
 
 <details><summary>Why must a <code>WithValue</code> key be an unexported custom type like <code>type actionLockKey struct&#123;&#125;</code> rather than a string constant?</summary>
-Context keys are compared by equality across the whole program. Two packages that both use the string `"lock"` as a key would silently collide and overwrite each other's values. An unexported, zero-size struct type is unique to its package (nothing outside can name it), costs zero bytes, and is collision-proof. Retrieval uses the comma-ok type assertion (`val, ok := ctx.Value(actionLockKey{}).(*actionLockValue)`), so a missing or wrong-typed value returns cleanly as `ok == false` rather than panicking — which is exactly how `AssertActionLockHeld` distinguishes "no lock" from "lock present."</details>
+Context keys are compared by equality across the whole program. Two packages that both use the string <code>"lock"</code> would silently collide and overwrite each other's values. An unexported, zero-size struct type is unique to its package (nothing outside can name it), costs zero bytes, and is collision-proof. Retrieval uses the comma-ok assertion (`val, ok := ctx.Value(actionLockKey{}).(*actionLockValue)`), so a missing or wrong-typed value returns cleanly as <code>ok == false</code> rather than panicking — which is how <code>AssertActionLockHeld</code> distinguishes "no lock" from "lock present".</details>
 
 <details><summary><code>TriggerRecoveryNow</code> subtracts 200ms from the inbound deadline before forwarding work. What goes wrong without that shave?</summary>
-If the server runs the inner operation up to the *exact* inbound deadline, it finishes at the same instant the client gives up. The client's RPC then times out before it can receive the server's response, so the (possibly successful) answer is lost and the caller sees a deadline/network error instead. Reserving a small budget (200ms here) ensures the server completes early enough to serialize and send the reply before the client's clock expires. Budget headroom matters whenever a deadline is forwarded down a call chain.</details>
+If the server runs the inner operation up to the *exact* inbound deadline, it finishes at the same instant the client gives up. The client's RPC then times out before it can receive the server's response, so the (possibly successful) answer is lost and the caller sees a deadline/network error instead. Reserving a small budget (200ms here) ensures the server completes early enough to serialize and send the reply before the client's clock expires.</details>
 
 ## Exercises
 
-1. **Trace the timeout constants.** Open `internal/timeouts/rpc.go` and pick three constants (e.g. `RuleWriteTimeout`, `ReadyTopoCheckTimeout`, `RemoteOperationTimeout`). Grep the repo for each constant name and find a call site that passes it to `context.WithTimeout`. For each, identify the *blocking operation* the deadline bounds (an RPC? an etcd probe?) and read the constant's comment to explain why that specific duration was chosen.
+1. **Trace the timeout constants.** Open `internal/timeouts/rpc.go`, pick three constants (`RuleWriteTimeout`, `ReadyTopoCheckTimeout`, `RemoteOperationTimeout`), grep each for a `context.WithTimeout` call site, and identify the blocking operation each bounds plus why that duration was chosen.
 
-2. **Follow a `WithValue` end to end.** In `internal/pooler/manager/actionlock/action_lock.go`, trace the `*actionLockValue` pointer from `Acquire` (where it's stored) to `Release` and to the package-level `AssertActionLockHeld`. Then find a caller in `rpc_manager.go` that asserts the lock is held via the context. Explain why the `released *atomic.Bool` is a *pointer* shared across the contexts rather than a plain `bool` copied into each.
+2. **Follow a `WithValue` end to end.** In `internal/pooler/manager/actionlock/action_lock.go`, trace the `*actionLockValue` pointer from `Acquire` to `Release` to `AssertActionLockHeld`. Then find a caller in `rpc_manager.go` that asserts the lock via the context. Explain why the `released *atomic.Bool` is a pointer shared across contexts rather than a bool copied into each.
 
-3. **Compare two `select`-on-`Done` loops.** Read `WaitForLSN` (`rpc_manager.go`) and `getOrDial` (`conn_cache.go`). For each, name the *other* `select` case (a ticker channel vs. a `default` poll) and explain the difference between a blocking `select` and a busy `default` loop. Then explain why `WaitForLSN` wraps `ctx.Err()` with `errx.Wrap` while `getOrDial` returns `ctx.Err()` directly.
+3. **Compare two `select`-on-`Done` loops.** Read `WaitForLSN` (`rpc_manager.go`) and `getOrDial` (`conn_cache.go`). For each, name the *other* `select` case (a ticker vs. a `default` poll) and explain blocking-`select` vs busy-`default` loop. Then explain why `WaitForLSN` wraps `ctx.Err()` with `errx.Wrap` while `getOrDial` returns `ctx.Err()` directly.
 
-4. **Detach vs. direct context.** Read `ctxutil.Detach` and the `OnClose` hook in `internal/pooler/init.go`. Explain precisely what would break if the hook used `startCtx` directly instead of `Detach(startCtx)`, and what would break if it used `Detach(startCtx)` *without* wrapping it in `WithTimeout`.
+4. **Detach vs. direct context.** Read `ctxutil.Detach` and the `OnClose` hook in `internal/pooler/init.go`. Explain what breaks if the hook used `startCtx` directly instead of `Detach(startCtx)`, and what breaks if it used `Detach(startCtx)` *without* wrapping it in `WithTimeout`.
 
 ## Next
 
@@ -464,39 +434,11 @@ If the server runs the inner operation up to the *exact* inbound deadline, it fi
 ## See also
 
 <CardGrid>
-  <LinkCard
-    title="Concurrency"
-    description="Goroutines, channels, and select; ctx.Done() is just a channel, and the Start/Stop watcher pattern lives here."
-    href="/go-guide/language/07-concurrency/"
-  />
-  <LinkCard
-    title="Sync & the Memory Model"
-    description="The semaphore + atomic.Bool primitives the action lock combines with WithValue."
-    href="/go-guide/language/09-sync-and-memory-model/"
-  />
-  <LinkCard
-    title="Errors"
-    description="context.Canceled / context.DeadlineExceeded as sentinels checked with errors.Is."
-    href="/go-guide/language/05-errors/"
-  />
-  <LinkCard
-    title="gRPC & Protobuf"
-    description="How a context's deadline crosses the wire as gRPC metadata."
-    href="/go-guide/project/04-grpc-and-protobuf/"
-  />
-  <LinkCard
-    title="Architecture & Request Flow"
-    description="The latency-sensitive query path where statement-timeout deadlines live."
-    href="/go-guide/project/01-architecture-request-flow/"
-  />
-  <LinkCard
-    title="errx & Observability"
-    description="The ErrorContext / InfoContext slog idiom and OTel baggage carried in ctx."
-    href="/go-guide/project/09-errors-and-observability/"
-  />
-  <LinkCard
-    title="Idioms & Gotchas"
-    description="defer cancel(), no Context in structs, unexported WithValue keys."
-    href="/go-guide/reference/idioms-and-gotchas/"
-  />
+  <LinkCard title="Concurrency" description="Goroutines, channels, and select; ctx.Done() is just a channel, and the Start/Stop watcher pattern lives here." href="/go-guide/language/07-concurrency/" />
+  <LinkCard title="Sync & the Memory Model" description="The semaphore + atomic.Bool primitives the action lock combines with WithValue." href="/go-guide/language/09-sync-and-memory-model/" />
+  <LinkCard title="Errors" description="context.Canceled / context.DeadlineExceeded as sentinels checked with errors.Is." href="/go-guide/language/05-errors/" />
+  <LinkCard title="gRPC & Protobuf" description="How a context's deadline crosses the wire as gRPC metadata." href="/go-guide/project/04-grpc-and-protobuf/" />
+  <LinkCard title="Architecture & Request Flow" description="The latency-sensitive query path where statement-timeout deadlines live." href="/go-guide/project/01-architecture-request-flow/" />
+  <LinkCard title="errx & Observability" description="The ErrorContext / InfoContext slog idiom and OTel baggage carried in ctx." href="/go-guide/project/09-errors-and-observability/" />
+  <LinkCard title="Idioms & Gotchas" description="defer cancel(), no Context in structs, unexported WithValue keys." href="/go-guide/reference/idioms-and-gotchas/" />
 </CardGrid>

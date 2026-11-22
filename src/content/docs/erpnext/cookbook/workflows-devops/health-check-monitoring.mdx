@@ -1,6 +1,6 @@
 ---
 title: Health Check & Monitoring Endpoint
-description: Expose a guest-accessible health endpoint and a Prometheus metrics exporter, then wire up Prometheus, Grafana, and Alertmanager.
+description: "Expose a guest-accessible health_check (HTTP 503 on failure) and a Prometheus metrics exporter, then wire Prometheus, Grafana, and Alertmanager."
 sidebar:
   order: 8
 ---
@@ -10,16 +10,11 @@ import { LinkCard, FileTree, Steps } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** Build a `/api/method/health`-style endpoint that load balancers and
-monitoring tools can poll to know whether the ScoopJoy bench is actually serving
-traffic — database, Redis, workers, scheduler, and disk all included.
+**Problem:** A `/api/method/health`-style endpoint that load balancers and monitoring tools can poll — database, Redis, workers, scheduler, and disk all included.
 
-**Solution:** Ship two unauthenticated whitelisted methods — a JSON `health_check`
-that returns HTTP 503 when any component is unhealthy, and a `prometheus_metrics`
-exporter in the Prometheus text exposition format — then point a Prometheus +
-Grafana + Alertmanager stack at them.
+**Solution:** Two unauthenticated whitelisted methods — a JSON `health_check` that returns HTTP 503 when any component is unhealthy, and a `prometheus_metrics` exporter in the Prometheus text exposition format — then point a Prometheus + Grafana + Alertmanager stack at them:
 
-<Mermaid title="Monitoring data flow" height={420} code={`
+<Mermaid title="LB polls health_check; Prometheus scrapes metrics → Alertmanager/Grafana → ops" height={420} code={`
 flowchart LR
   LB["Load balancer / Nginx"] -->|"GET health_check"| F["ScoopJoy bench"]
   P["Prometheus"] -->|"scrape metrics"| F
@@ -28,30 +23,23 @@ flowchart LR
   A -->|"email / Slack"| OPS["ScoopJoy ops"]
 `} />
 
-This recipe creates the two API methods inside the app plus a self-contained
-`monitoring/` directory for the stack config:
-
 <FileTree>
 - apps/scoopjoy/scoopjoy/
   - api/
-    - **health.py** the JSON health endpoint
-    - **metrics.py** the Prometheus exporter
+    - **health.py** — the JSON health endpoint
+    - **metrics.py** — the Prometheus exporter
 - monitoring/
-  - prometheus.yml scrape config
-  - alert_rules.yml alerting rules
-  - grafana-dashboard.json the ops dashboard
-  - docker-compose.yml the monitoring stack
-  - alertmanager.yml routing + receivers
-  - grafana-provisioning/ datasource + dashboard providers
+  - prometheus.yml — scrape config
+  - alert_rules.yml — alerting rules
+  - grafana-dashboard.json — the ops dashboard
+  - docker-compose.yml — the monitoring stack
+  - alertmanager.yml — routing + receivers
+  - grafana-provisioning/ — datasource + dashboard providers
 </FileTree>
 
 ## Step 1: Health Check API
 
-The endpoint runs one cheap probe per component, collects each into a `checks`
-dict, and flips the overall status to `unhealthy` if any probe fails. The
-`allow_guest=True` decorator lets a load balancer call it without a session, and
-setting `frappe.local.response.http_status_code = 503` is what makes an unhealthy
-result detectable by Nginx upstream checks and AWS ALBs.
+One cheap probe per component, collected into a `checks` dict; overall flips to `unhealthy` if any probe fails. `allow_guest=True` lets a load balancer call it without a session, and setting `http_status_code = 503` is what makes Nginx upstream checks and AWS ALBs detect failure. The scheduler and disk probes return a third `degraded` status for warning thresholds that shouldn't pull the node out of rotation:
 
 ```python title="scoopjoy/scoopjoy/api/health.py" {6,38-40}
 import frappe
@@ -65,33 +53,18 @@ def health_check():
     """Comprehensive health check endpoint for load balancers and monitoring.
 
     GET /api/method/scoopjoy.scoopjoy.api.health.health_check
-
-    Returns:
-        JSON with component statuses and overall health.
     """
     start = time.monotonic()
     checks = {}
     overall_healthy = True
 
-    # 1. Database connectivity
     checks["database"] = _check_database()
-
-    # 2. Redis cache connectivity
     checks["redis_cache"] = _check_redis("cache")
-
-    # 3. Redis queue connectivity
     checks["redis_queue"] = _check_redis("queue")
-
-    # 4. Worker status
     checks["workers"] = _check_workers()
-
-    # 5. Scheduler status
     checks["scheduler"] = _check_scheduler()
-
-    # 6. Disk space
     checks["disk"] = _check_disk_space()
 
-    # Determine overall status
     for component, result in checks.items():
         if result["status"] == "unhealthy":
             overall_healthy = False
@@ -109,17 +82,13 @@ def health_check():
         "checks": checks,
     }
 
-    # Return 503 if unhealthy (for load balancer to detect)
     if not overall_healthy:
         frappe.local.response.http_status_code = 503
 
     return response
 ```
 
-Each probe is its own helper so a single failing component doesn't take down the
-whole endpoint. Note the scheduler and disk checks return a third `degraded`
-status — distinct from `unhealthy` — for warning thresholds that shouldn't pull
-the node out of rotation.
+Each probe is its own helper so one failing component doesn't take down the whole endpoint:
 
 ```python title="scoopjoy/scoopjoy/api/health.py"
 def _check_database():
@@ -152,8 +121,7 @@ def _check_redis(purpose):
             val = r.get_value("_health_check_ping")
         else:
             import redis
-            queue_url = frappe.conf.redis_queue
-            r = redis.from_url(queue_url)
+            r = redis.from_url(frappe.conf.redis_queue)
             r.ping()
             val = "pong"
 
@@ -261,10 +229,7 @@ def _get_app_version(app_name):
 
 ## Step 2: Prometheus Metrics Exporter
 
-The metrics endpoint hand-builds the Prometheus text exposition format — a list of
-`# HELP` / `# TYPE` comment lines followed by `metric_name{labels} value` samples.
-The key trick is overriding the response type so Frappe returns `text/plain`
-instead of JSON.
+Hand-builds the Prometheus text exposition format (`# HELP` / `# TYPE` lines, then `metric{labels} value` samples), overriding the response type to `text/plain`. Mixes infrastructure gauges (`scoopjoy_db_ping_seconds`, `scoopjoy_disk_free_bytes`) with business gauges (`scoopjoy_sales_today_total`) so one scrape feeds both ops and sales dashboards:
 
 ```python title="scoopjoy/scoopjoy/api/metrics.py" {64-68}
 import frappe
@@ -276,7 +241,6 @@ def prometheus_metrics():
     """Prometheus-compatible metrics endpoint.
 
     GET /api/method/scoopjoy.scoopjoy.api.metrics.prometheus_metrics
-
     Returns plain text in Prometheus exposition format.
     """
     lines = []
@@ -360,7 +324,6 @@ def prometheus_metrics():
     lines.append('# TYPE scoopjoy_disk_total_bytes gauge')
     lines.append(f'scoopjoy_disk_total_bytes {usage.total}')
 
-    # Set content type for Prometheus
     frappe.local.response.update({
         "type": "text",
         "content_type": "text/plain; version=0.0.4; charset=utf-8",
@@ -369,14 +332,9 @@ def prometheus_metrics():
     return "\n".join(lines) + "\n"
 ```
 
-The exporter mixes infrastructure gauges (`scoopjoy_db_ping_seconds`,
-`scoopjoy_disk_free_bytes`) with business gauges (`scoopjoy_sales_today_total`,
-`scoopjoy_documents_total`) so the same scrape feeds both ops dashboards and
-sales monitoring.
+## Step 3: Prometheus configuration
 
-## Step 3: Prometheus Configuration
-
-Point Prometheus at the metrics method's full dotted path and scrape over HTTPS.
+Point Prometheus at the metrics method's full dotted path over HTTPS:
 
 ```yaml title="monitoring/prometheus.yml"
 global:
@@ -409,103 +367,82 @@ scrape_configs:
           - "localhost:9100"  # node_exporter
 ```
 
-## Step 4: Alert Rules
+## Step 4: Alert rules
 
-The rules combine infrastructure alerts (`ScoopJoyDown`, `DiskSpaceCritical`,
-`DatabaseSlow`) with a business alert (`NoSalesActivity` during business hours).
-The `expr` fields are PromQL — Prometheus evaluates them every
-`evaluation_interval`, and the `for` window suppresses flapping.
+Infrastructure alerts (`ScoopJoyDown`, `DiskSpaceCritical`, `DatabaseSlow`) plus a business alert (`NoSalesActivity` during business hours). The `for` window suppresses flapping:
 
 ```yaml title="monitoring/alert_rules.yml"
 groups:
   - name: scoopjoy_alerts
     rules:
-      # Health check failures
       - alert: ScoopJoyDown
         expr: up{job="scoopjoy"} == 0
         for: 2m
-        labels:
-          severity: critical
+        labels: {severity: critical}
         annotations:
           summary: "ScoopJoy application is down"
           description: "The ScoopJoy health endpoint has been unreachable for 2 minutes."
 
-      # High error rate
       - alert: HighErrorRate
         expr: scoopjoy_errors_last_hour > 50
         for: 5m
-        labels:
-          severity: warning
+        labels: {severity: warning}
         annotations:
           summary: "High error rate detected"
           description: "More than 50 errors in the last hour."
 
-      # Scheduler stopped
       - alert: SchedulerDisabled
         expr: scoopjoy_scheduler_enabled == 0
         for: 5m
-        labels:
-          severity: critical
+        labels: {severity: critical}
         annotations:
           summary: "Frappe scheduler is disabled"
           description: "The background scheduler has been disabled. Recurring jobs will not run."
 
-      # Background job queue growing
       - alert: JobQueueBacklog
         expr: scoopjoy_background_jobs{status="queued"} > 100
         for: 10m
-        labels:
-          severity: warning
+        labels: {severity: warning}
         annotations:
           summary: "Background job queue backlog"
           description: "Queue {{ $labels.queue }} has {{ $value }} queued jobs."
 
-      # Failed jobs
       - alert: FailedBackgroundJobs
         expr: scoopjoy_background_jobs{status="failed"} > 10
         for: 5m
-        labels:
-          severity: warning
+        labels: {severity: warning}
         annotations:
           summary: "Failed background jobs detected"
           description: "Queue {{ $labels.queue }} has {{ $value }} failed jobs."
 
-      # Disk space critical
       - alert: DiskSpaceCritical
         expr: (scoopjoy_disk_free_bytes / scoopjoy_disk_total_bytes) * 100 < 10
         for: 5m
-        labels:
-          severity: critical
+        labels: {severity: critical}
         annotations:
           summary: "Disk space critically low"
           description: "Less than 10% disk space remaining."
 
-      # Database slow
       - alert: DatabaseSlow
         expr: scoopjoy_db_ping_seconds > 0.5
         for: 5m
-        labels:
-          severity: warning
+        labels: {severity: warning}
         annotations:
           summary: "Database response time high"
           description: "Database ping time is {{ $value }}s (threshold: 0.5s)."
 
-      # No sales (business hours check)
       - alert: NoSalesActivity
         expr: scoopjoy_sales_today_total == 0 and hour() >= 10 and hour() <= 22
         for: 60m
-        labels:
-          severity: info
+        labels: {severity: info}
         annotations:
           summary: "No sales recorded today"
           description: "No sales invoices have been submitted today during business hours."
 ```
 
-## Step 5: Grafana Dashboard JSON
+## Step 5: Grafana dashboard JSON
 
-A trimmed dashboard: an "Application Health" stat panel mapping `up` to UP/DOWN
-plus business and infrastructure panels driven by the metrics above. Import this
-JSON via Grafana provisioning (Step 6) rather than clicking through the UI.
+Trimmed dashboard: an "Application Health" stat panel mapping `up` to UP/DOWN, plus business and infrastructure panels. Import via provisioning (Step 6), not by clicking through the UI:
 
 ```json title="monitoring/grafana-dashboard.json"
 {
@@ -610,10 +547,9 @@ JSON via Grafana provisioning (Step 6) rather than clicking through the UI.
 }
 ```
 
-## Step 6: Docker Compose for the Monitoring Stack
+## Step 6: Docker Compose for the monitoring stack
 
-Run Prometheus, Grafana, Alertmanager, and node_exporter as a self-contained
-stack next to (or separate from) the bench.
+Run Prometheus, Grafana, Alertmanager, and node_exporter as a self-contained stack next to (or separate from) the bench:
 
 ```yaml title="monitoring/docker-compose.yml"
 services:
@@ -659,8 +595,7 @@ volumes:
   grafana_data:
 ```
 
-Alertmanager routes critical alerts to a tighter `repeat_interval` and fans every
-alert out to both email and Slack.
+Alertmanager routes critical alerts to a tighter `repeat_interval` and fans every alert out to email + Slack:
 
 ```yaml title="monitoring/alertmanager.yml"
 global:
@@ -698,8 +633,7 @@ receivers:
         channel: "#scoopjoy-alerts-critical"
 ```
 
-Two small provisioning files wire the datasource and auto-load the dashboard on
-Grafana startup.
+Two provisioning files wire the datasource and auto-load the dashboard on Grafana startup:
 
 ```yaml title="monitoring/grafana-provisioning/datasources/prometheus.yml"
 apiVersion: 1
@@ -721,33 +655,18 @@ providers:
       path: /var/lib/grafana/dashboards
 ```
 
-Once the files are in place, bring the stack up:
-
 <Steps>
 
-1. From the `monitoring/` directory, start everything: `docker compose up -d`.
-
-2. Open Prometheus at `http://localhost:9090/targets` and confirm the `scoopjoy`
-   target is `UP`.
-
-3. Open Grafana at `http://localhost:3000` (admin / `scoopjoy_grafana`) — the
-   "ScoopJoy Operations" dashboard is auto-provisioned.
+1. From the `monitoring/` directory, start the stack: `docker compose up -d`.
+2. Open Prometheus at `http://localhost:9090/targets` — the `scoopjoy` target should read `UP`.
+3. Open Grafana at `http://localhost:3000` (admin / `scoopjoy_grafana`) — the "ScoopJoy Operations" dashboard is auto-provisioned.
 
 </Steps>
 
 :::note[Why this works]
-The health check endpoint uses `allow_guest=True` so load balancers can hit it
-without authentication, and it returns HTTP 503 when unhealthy — which ALBs and
-Nginx upstream health checks detect automatically. The Prometheus metrics endpoint
-exports data in the standard exposition format, making it scrapable by any
-Prometheus instance without custom exporters. The alert rules cover both
-infrastructure (disk, DB, workers) and business (no sales) scenarios.
+`allow_guest=True` lets load balancers hit the health endpoint without auth, and HTTP 503 on failure is detected automatically by ALBs and Nginx upstream checks. The metrics endpoint emits the standard Prometheus exposition format, so any Prometheus instance scrapes it with no custom exporter. Alert rules cover both infrastructure (disk, DB, workers) and business (no sales) scenarios.
 :::
 
 :::caution[Common mistake]
-Making the health check too expensive. If it runs complex queries or full system
-diagnostics on every request, it becomes a DoS vector since it is unauthenticated.
-Keep individual checks lightweight (simple pings, count queries). For expensive
-diagnostics, use a separate authenticated endpoint or run them on a schedule and
-cache the results.
+Making the health check too expensive — if it runs complex queries on every request, it becomes a DoS vector since it's unauthenticated. Keep each check a lightweight ping/count. For expensive diagnostics, use a separate authenticated endpoint or run them on a schedule and cache the results.
 :::

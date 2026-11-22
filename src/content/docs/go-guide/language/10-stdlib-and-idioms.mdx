@@ -1,19 +1,15 @@
 ---
 title: Standard Library Essentials & Idioms
-description: The slice of Go's standard library you reach for daily — io streaming, JSON and YAML, the time package, slices/maps/cmp, functional options, iterators, and slog.
+description: "`io.Reader`/`Writer` for streaming, `bufio` to amortize syscalls, `encoding/json` + `yaml.v3` with struct tags, `slices`/`maps`/`cmp`, functional options, range-over-func iterators, and `log/slog`."
 sidebar:
   order: 10
 ---
 
 import { Tabs, TabItem, LinkCard, CardGrid } from "@astrojs/starlight/components";
 
-A handful of standard-library packages do most of the work in any real Go program: `io`/`bufio` for streaming, `encoding/json` and `gopkg.in/yaml.v3` for config and wire formats, `time` for timeouts and tickers, and the Go 1.21+ generic trio `slices`/`maps`/`cmp`. On top of those sit a few idioms — functional options, range-over-func iterators (Go 1.23+), and structured logging with `log/slog`. We'll meet each first as a tiny isolated example, then as real code in the example system — a distributed SQL proxy in front of PostgreSQL — where these choices have visible performance and correctness consequences.
-
-This chapter leans on a few earlier ones: [interfaces & composition](/go-guide/language/03-interfaces-composition/) (`io.Reader`/`io.Writer` are the canonical small interfaces), [generics](/go-guide/language/06-generics/) (`slices`/`maps`/`cmp`/`iter` are all generic), [errors](/go-guide/language/05-errors/) (loaders wrap with `%w`), [context](/go-guide/language/08-context/) (timers pair with `ctx.Done()`), and [concurrency](/go-guide/language/07-concurrency/).
-
 ## `io.Reader` / `io.Writer` / `io.Closer`: the universal stream interfaces
 
-These three one-method interfaces are the backbone of all I/O in Go. Anything that produces bytes satisfies `io.Reader`; anything that consumes them satisfies `io.Writer`. Concrete types like `net.Conn`, `*bytes.Buffer`, `*os.File`, `http.ResponseWriter`, and `*strings.Reader` all implement them *implicitly* — there is no `implements` keyword (see [interfaces](/go-guide/language/03-interfaces-composition/)).
+One-method interfaces that are the backbone of all I/O. `net.Conn`, `*bytes.Buffer`, `*os.File`, `http.ResponseWriter`, `*strings.Reader` all satisfy them implicitly:
 
 ```go
 type Reader interface { Read(p []byte) (n int, err error) }
@@ -21,7 +17,7 @@ type Writer interface { Write(p []byte) (n int, err error) }
 type Closer interface { Close() error }
 ```
 
-The contract that trips up newcomers: `Read` returns `(n, err)` where `n` can be `> 0` *and* `err == io.EOF` in the same call. `io.EOF` is a **sentinel value**, not a failure — it is the normal signal that the stream ended.
+The contract that trips up newcomers: `Read` can return `n > 0` **and** `err == io.EOF` in the same call. `io.EOF` is a **sentinel**, not a failure — the normal signal that the stream ended:
 
 ```go title="copyAll: treat io.EOF as 'done', not as an error"
 func copyAll(dst io.Writer, src io.Reader) error {
@@ -43,9 +39,7 @@ func copyAll(dst io.Writer, src io.Reader) error {
 }
 ```
 
-Interfaces combine by embedding: `io.ReadWriteCloser` is just `Reader` + `Writer` + `Closer`. The idiom "accept interfaces, return structs" means functions take the *narrowest* interface they need, so they work with files, sockets, in-memory buffers, and test fakes alike.
-
-Here's that idiom in practice. An event parser accepts any `io.Reader` — the caller can pass a file, a pipe from a subprocess, or a `*bytes.Buffer` in a test, and the function never knows the difference:
+Interfaces combine by embedding: `io.ReadWriteCloser` = `Reader` + `Writer` + `Closer`. "Accept interfaces, return structs" means functions take the *narrowest* interface they need. An event parser accepts any `io.Reader` — file, pipe, or `*bytes.Buffer` in a test:
 
 ```go title="test/endtoend/shardsetup/events.go"
 func ParseEvents(t *testing.T, r io.Reader) []map[string]any {
@@ -66,25 +60,15 @@ func ParseEvents(t *testing.T, r io.Reader) []map[string]any {
 }
 ```
 
-`io.EOF` shows up as a *normal terminator* elsewhere too. The Postgres wire client returns it to signal the *end of a COPY stream*, not a problem — when the server sends `CopyDone`, the read returns `nil, io.EOF`, and the doc comment makes the intent explicit:
-
-```go title="internal/pgprotocol/client/conn.go"
-// Returns the data bytes, or io.EOF when CopyDone is received to signal end of stream.
-...
-	return nil, io.EOF
-```
+`io.EOF` is a normal terminator elsewhere too: the PG wire client returns it to signal the *end of a COPY stream* (`return nil, io.EOF` on `CopyDone`).
 
 :::caution[Gotcha]
-Never log `io.EOF` as an error. Callers must distinguish it with `err == io.EOF` or `errors.Is(err, io.EOF)`. A loop that prints `log.Error(err)` on every `Read` will spam your logs with a benign end-of-stream marker. The COPY loop here treats `io.EOF` as the loop's *exit condition*.
-:::
-
-:::tip[Idiom]
-Prefer `bytes.NewReader([]byte)` / `strings.NewReader(string)` to wrap in-memory data as an `io.Reader` in tests, instead of writing to a temp file. They allocate nothing beyond a tiny header.
+Never log `io.EOF` as an error. Callers distinguish it with `err == io.EOF` or `errors.Is(err, io.EOF)`. In tests, prefer `bytes.NewReader([]byte)` / `strings.NewReader(string)` over a temp file — they allocate nothing beyond a tiny header.
 :::
 
 ## `bufio`: amortizing syscalls on the hot path
 
-Every raw `conn.Read` / `conn.Write` is a *syscall*. On a query path that fans out across services, that overhead adds up. `bufio.Reader` and `bufio.Writer` wrap an underlying `io.Reader`/`io.Writer` and batch many small operations into a few large syscalls.
+Every raw `conn.Read`/`conn.Write` is a syscall. `bufio.Reader`/`bufio.Writer` batch many small operations into a few large syscalls:
 
 ```go title="Batch many small writes into one syscall on Flush"
 bw := bufio.NewWriter(conn)
@@ -96,12 +80,10 @@ if err := bw.Flush(); err != nil { // ONE syscall flushes everything
 ```
 
 :::caution[Gotcha]
-A `bufio.Writer` does nothing until you call `Flush()`. Forgetting `Flush` is the classic "my write disappeared" bug — the bytes are sitting in the buffer, never sent.
+A `bufio.Writer` does nothing until you call `Flush()`. Forgetting `Flush` is the classic "my write disappeared" bug.
 :::
 
-`bufio.NewScanner` is the line-oriented reader you saw in `ParseEvents` above: `scanner.Scan()` returns `false` at EOF, and `scanner.Text()` gives the current line without the trailing newline.
-
-A busy gateway accepts and drops thousands of connections, so allocating fresh buffers per connection would churn the heap. The Postgres server connection instead recycles its buffered reader and writer through a `sync.Pool`. The key method is `Reset`, which rebinds a buffer to a new underlying connection without reallocating its internal byte array:
+`bufio.NewScanner` is the line-oriented reader: `scanner.Scan()` returns false at EOF; `scanner.Text()` is the current line without the trailing newline. A busy gateway recycles its buffered reader/writer through a `sync.Pool`, using `Reset` to rebind without reallocating:
 
 ```go title="internal/pgprotocol/server/conn.go"
 // check out, rebind to this connection
@@ -118,29 +100,17 @@ if c.bufferedReader != nil {
 }
 ```
 
-The client side stores the same pair as struct fields:
-
-```go title="internal/pgprotocol/client/conn.go"
-type Conn struct {
-	conn           net.Conn
-	bufferedReader *bufio.Reader
-	bufferedWriter *bufio.Writer
-	bufMu          sync.Mutex
-	...
-}
-```
-
 :::caution[Gotcha]
-When pooling buffered readers/writers you **must** call `Reset(newConn)` *before use* and `Reset(nil)` *before returning to the pool*. If you skip `Reset(nil)`, the pooled buffer keeps a live reference to the now-closed connection — a memory leak, and a correctness bug if the buffer still holds bytes from the previous connection.
+When pooling buffered readers/writers you **must** call `Reset(newConn)` before use and `Reset(nil)` before returning to the pool — otherwise the pooled buffer keeps a live reference to the now-closed connection (a leak, and a correctness bug if it still holds the previous connection's bytes).
 :::
 
-:::note
-The client conn also carries an `outboundPoolBuf *[]byte` field whose long comment explains an escape-analysis subtlety: it stores the *pointer* the pool returned (rather than `&localSlice`), because `sync.Pool.Put` retaining `&localSlice` would force that slice header to escape to the heap on every call. That's an advanced pooling micro-optimization; see [pointers, values & memory](/go-guide/language/04-pointers-values-memory/) for escape analysis.
-:::
+## `encoding/json`: struct tags, streaming, pitfalls
 
-## `encoding/json`: struct tags, streaming, and marshaling pitfalls
+`json.Marshal(v)` → `[]byte`; `json.Unmarshal(data, &v)` fills a value. Field mapping is driven by **struct tags**. Three rules:
 
-`json.Marshal(v)` turns a value into `[]byte`; `json.Unmarshal(data, &v)` fills a value. Field mapping is driven by **struct tags**.
+1. **Only exported (capitalized) fields are marshaled/unmarshaled.** A lowercase field's tag is dead.
+2. **With no tag, the exported field *name* is the key verbatim** — `HostName` → `"HostName"`, not `"host_name"`.
+3. **`omitempty` drops zero values** (`0`, `""`, `nil`, `false`, empty slice/map). `json:"-"` excludes entirely.
 
 ```go title="JSON struct tags"
 type Person struct {
@@ -150,13 +120,7 @@ type Person struct {
 }
 ```
 
-Three rules every newcomer must internalize:
-
-1. **Only exported (capitalized) fields are marshaled or unmarshaled.** `json.Unmarshal` silently ignores lowercase fields — the tag on `private` above does nothing.
-2. **With no tag, the exported field *name* becomes the key verbatim.** A field `HostName` serializes to `"HostName"`, *not* `"host_name"` and *not* `"hostName"`.
-3. **`omitempty` drops zero values** (`0`, `""`, `nil`, `false`, empty slice/map). `json:"-"` excludes the field entirely.
-
-`json.NewEncoder(w).Encode(v)` writes JSON *directly* to any `io.Writer` with no intermediate `[]byte`. A `/version` HTTP handler does exactly this — note the anonymous struct with `omitempty` tags and the RFC 3339 time formatting:
+`json.NewEncoder(w).Encode(v)` writes JSON *directly* to any `io.Writer` with no intermediate `[]byte`. A `/version` HTTP handler does exactly this (anonymous struct, `omitempty`, RFC 3339 time):
 
 ```go title="internal/servenv/pages.go" {16-18,20-21}
 func versionHandler(w http.ResponseWriter, _ *http.Request) {
@@ -181,48 +145,11 @@ func versionHandler(w http.ResponseWriter, _ *http.Request) {
 }
 ```
 
-`http.ResponseWriter` is an `io.Writer`, so the JSON streams straight to the socket. The `Modified bool` field has no `omitempty`, so it always appears — a deliberate choice, because `false` is meaningful here.
-
-Untagged structs are a common surprise. A `Lock` type with **no JSON tags at all** pretty-prints with `json.MarshalIndent`:
-
-```go title="internal/topo/locks.go"
-type Lock struct {
-	Action   string
-	HostName string
-	UserName string
-	Time     string
-	Options  lockOptions
-	Status   string
-}
-
-func (l *Lock) ToJSON() (string, error) {
-	data, err := json.MarshalIndent(l, "", "  ")
-	if err != nil {
-		return "", errx.Wrapf(err, "cannot JSON-marshal node")
-	}
-	return string(data), nil
-}
-```
-
-The emitted JSON keys are `"Action"`, `"HostName"`, `"UserName"`, … — the exported names verbatim. The comment on the type (`// It needs to be public as we JSON-serialize it.`) is the reason the fields are exported in the first place.
-
-:::caution[Gotcha]
-People expecting `snake_case` JSON are surprised when an untagged struct emits `PascalCase`. If a consumer needs `host_name`, you must add `json:"host_name"`. Conversely, if a struct field is lowercase, `json.Unmarshal` will silently leave it at its zero value with no error — a frequent source of "why is my config field empty?" bugs.
-:::
-
-:::note
-`MarshalIndent(v, "", "  ")` is the pretty-print form (prefix `""`, indent two spaces). Use plain `json.Marshal` for compact wire output and `MarshalIndent` only for human-facing debug output. `ToJSON` also wraps the error with `errx.Wrapf` (see [errors](/go-guide/language/05-errors/) and [errx & observability](/go-guide/project/09-errors-and-observability/)).
-:::
-
-When the shape is unknown, unmarshal into `map[string]any`. `ParseEvents` from earlier does this for arbitrary log lines: `var m map[string]any; json.Unmarshal(line, &m)`. JSON numbers decode to `float64`, objects to `map[string]any`, arrays to `[]any` — you type-assert as you read.
-
-:::note
-Generated proto messages are *not* serialized with `encoding/json` here — they use `protojson` (see [gRPC & protobuf](/go-guide/project/04-grpc-and-protobuf/)). Don't reach for `encoding/json` on a proto type.
-:::
+`http.ResponseWriter` is an `io.Writer`, so JSON streams straight to the socket. `Modified bool` has no `omitempty`, so it always appears — `false` is meaningful here. An untagged struct (a `Lock` type) pretty-prints with `json.MarshalIndent` and emits `"Action"`, `"HostName"`, … — the exported names verbatim. When the shape is unknown, unmarshal into `map[string]any` (JSON numbers decode to `float64`, objects to `map[string]any`, arrays to `[]any`). Generated proto messages are *not* serialized with `encoding/json` here — they use `protojson`.
 
 ## `gopkg.in/yaml.v3`: typed config + validate-after-unmarshal
 
-YAML config loads with `gopkg.in/yaml.v3` (the module graph also pulls `go.yaml.in/yaml/*` transitively, but the import path you write is `gopkg.in/yaml.v3`). The API mirrors `encoding/json` but uses **separate `yaml:"..."` tags**.
+The API mirrors `encoding/json` but uses separate **`yaml:"..."` tags**:
 
 ```go title="YAML uses its own tag namespace"
 type Config struct {
@@ -233,7 +160,7 @@ var c Config
 _ = yaml.Unmarshal(data, &c)
 ```
 
-A telemetry sampler config is the cleanest end-to-end example — a typed struct (including a nested `map[string]CategoryConfig`), `yaml.Unmarshal`, then **post-unmarshal validation**:
+A telemetry sampler config is the cleanest end-to-end example — typed struct (with a nested `map[string]CategoryConfig`), `yaml.Unmarshal`, then **post-unmarshal validation**:
 
 ```go title="internal/telemetry/sampler.go" {12-17}
 type SamplingConfig struct {
@@ -263,19 +190,15 @@ func loadSamplingConfig(path string) (*SamplingConfig, error) {
 }
 ```
 
-This is the **validate-after-unmarshal idiom**: unmarshalers fill structural data but can't enforce business rules ("a `default` category must exist", "probabilities must be in `[0,1]`"). You check those *after* a successful `Unmarshal` and return wrapped errors.
+This is the **validate-after-unmarshal idiom**: unmarshalers fill structural data but can't enforce business rules ("a `default` category must exist") — you check those *after* a successful `Unmarshal` and return wrapped errors. The same loader uses `maps.Copy` to merge six maps into one before validating.
 
 :::caution[Gotcha]
-`yaml:"..."` and `json:"..."` are two independent tag mechanisms. A struct that round-trips through both formats needs *both* tag sets: `` `json:"port" yaml:"port"` ``. A `json:"port"` tag alone has zero effect on `yaml.Unmarshal` — yaml.v3 falls back to a lowercased field name, which may or may not match your file.
-:::
-
-:::note
-The same loader uses `maps.Copy` to merge six maps into one before validating — covered below. For how YAML config sits alongside the Viper-based flag/env config system, see [config](/go-guide/project/03-config-and-flags/).
+`yaml:"..."` and `json:"..."` are two independent tag mechanisms. A struct round-tripping through both needs *both* tag sets: `` `json:"port" yaml:"port"` ``. A `json:"port"` tag alone has zero effect on `yaml.Unmarshal` — yaml.v3 falls back to a lowercased field name, which may or may not match your file.
 :::
 
 ## `time`: Duration, Ticker, Timer, and the `time.After` trap
 
-`time.Duration` is an `int64` count of nanoseconds with typed unit constants. Build durations by multiplying a number by a unit — never bare integers.
+`time.Duration` is an `int64` count of nanoseconds with typed unit constants — build durations by multiplying by a unit, never bare integers:
 
 ```go title="Durations are typed and add like numbers"
 d := 15 * time.Second
@@ -290,10 +213,6 @@ const RemoteOperationTimeout = 15 * time.Second
 const DefaultHealthStreamStalenessTimeout = 90 * time.Second
 const PollResponseWait = 500 * time.Millisecond
 ```
-
-:::caution[Gotcha]
-`15 * time.Second` works; `time.Duration(15) * time.Second` also works; but `15 * 1_000_000_000` is just an untyped int — it compiles where a `Duration` is expected (untyped constant conversion) but reads as a magic number. Always use the unit constants.
-:::
 
 For repeated work that must stop cleanly on shutdown, the canonical pattern is a `Ticker` plus `defer ticker.Stop()` inside a `for { select { ... } }`:
 
@@ -313,13 +232,7 @@ func (cm *CancelManager) refreshPrefixCachePeriodically(ctx context.Context) {
 }
 ```
 
-`ticker.C` is a channel that receives a value every interval; the `select` races it against `ctx.Done()` so cancellation wins immediately (see [context](/go-guide/language/08-context/)).
-
-:::caution[Gotcha]
-A `Ticker` you never `Stop()` keeps firing forever and leaks its underlying timer goroutine. Always pair `NewTicker` with `defer ticker.Stop()`.
-:::
-
-For a single deferred callback, `time.AfterFunc(d, fn)` runs `fn` **once, on its own goroutine**, after `d`. A failover buffer uses it as a safety timer and cancels it (`sb.maxDurationTimer.Stop()`) when the failover ends early:
+A `Ticker` you never `Stop()` keeps firing forever and leaks its underlying timer goroutine — always pair `NewTicker` with `defer ticker.Stop()`. For a single deferred callback, `time.AfterFunc(d, fn)` runs `fn` **once, on its own goroutine**, after `d`; a failover buffer uses it as a safety timer and cancels it (`sb.maxDurationTimer.Stop()`) when the failover ends early:
 
 ```go title="internal/gateway/buffer/shard_buffer.go"
 sb.maxDurationTimer = time.AfterFunc(sb.buf.config.MaxFailoverDuration.Get(), func() {
@@ -329,37 +242,14 @@ sb.maxDurationTimer = time.AfterFunc(sb.buf.config.MaxFailoverDuration.Get(), fu
 ```
 
 :::caution[Gotcha]
-Because `AfterFunc`'s callback runs on a *separate* goroutine, it must be goroutine-safe with respect to everything it touches. This code captures a `gen` (generation counter) so a *stale* callback that fires after a new failover started is ignored — a classic guard for timer races. See [concurrency](/go-guide/language/07-concurrency/).
+`AfterFunc`'s callback runs on a *separate* goroutine, so it must be goroutine-safe with respect to everything it touches. This code captures a `gen` (generation counter) so a *stale* callback that fires after a new failover started is ignored. And `time.After(d)` in a `select` allocates a new `Timer` per call — before Go 1.23 an unfired one wasn't GC'd until it fired, so a loop selecting on `time.After` on the non-firing branch leaked one timer per iteration. Reserve `time.After` for one-shot timeouts (typically in tests); for repeated waits hoist a single `time.NewTicker`.
 :::
 
-So: use a `Ticker` for *repeated* periodic work in a loop you own; use `AfterFunc` for a *single* deferred callback you don't want to block a goroutine waiting on. Forgetting `Stop()` leaks the timer in both cases (an unfired `AfterFunc` timer still holds resources until it fires).
-
-That brings us to the most common timer mistake. `time.After(d)` returns a channel that fires once after `d`. It's convenient in a `select`, but each call **allocates a new Timer**:
-
-```go title="BAD: a fresh Timer every loop iteration"
-for {
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(time.Minute): // new Timer per loop
-		doWork()
-	}
-}
-```
-
-:::caution[Gotcha]
-Before Go 1.23 an unfired `time.After` timer was *not* garbage-collected until it fired, so a loop that `select`s on `time.After` and frequently takes the *other* branch leaked one timer per iteration. Go 1.23 lets the GC reclaim unreferenced timers, but you still pay an allocation per iteration. For repeated waits, hoist a single `time.NewTicker` (as the cancel loop above does). Reserve `time.After` for one-shot timeouts, typically in tests.
-:::
-
-For machine- and human-readable timestamps, RFC 3339 is the default choice — `time.Now().Format(time.RFC3339)`, often normalized to UTC first as in the version handler's `snap.commitTime.UTC().Format(time.RFC3339)`.
-
-:::note
-Go's time-format layout is the reference date `Mon Jan 2 15:04:05 MST 2006`, not `%Y-%m-%d`. Use the predefined constants (`time.RFC3339`, `time.Kitchen`, …) whenever one fits rather than spelling out the layout.
-:::
+For machine- and human-readable timestamps, RFC 3339 is the default: `time.Now().UTC().Format(time.RFC3339)`. Go's time-format layout is the reference date `Mon Jan 2 15:04:05 MST 2006`, not `%Y-%m-%d` — use the predefined constants (`time.RFC3339`, `time.Kitchen`, …) when one fits.
 
 ## The `slices` and `cmp` packages (Go 1.21+)
 
-The generic `slices` package replaces hand-rolled loops for common slice operations. `cmp` supplies `cmp.Compare` and the `cmp.Ordered` constraint (any type with `<`).
+`slices` replaces hand-rolled loops for common slice operations; `cmp` supplies `cmp.Compare` and the `cmp.Ordered` constraint:
 
 ```go title="Common slices operations"
 xs := []int{3, 1, 2}
@@ -369,7 +259,7 @@ ys := slices.Clone(xs)       // independent copy
 eq := slices.Equal(xs, ys)   // true
 ```
 
-`slices.Contains` pairs naturally with a variadic parameter — here, checking whether an error's SQLSTATE matches any of several codes (via `errors.As`, see [errors](/go-guide/language/05-errors/)):
+`slices.Contains` pairs with a variadic parameter — checking whether an error's SQLSTATE matches any of several codes:
 
 ```go title="internal/errx/code.go"
 func IsErrorCode(err error, codes ...string) bool {
@@ -384,7 +274,7 @@ func IsErrorCode(err error, codes ...string) bool {
 }
 ```
 
-For ordering by a derived key, `slices.SortFunc` takes a **comparator that returns an `int`** (negative / zero / positive), which you build with `cmp.Compare`:
+For ordering by a derived key, `slices.SortFunc` takes a **comparator returning an `int`** (negative/zero/positive), built with `cmp.Compare`:
 
 ```go title="internal/orchestrator/recovery/analysis/shard_analysis.go"
 func compareLeaderTimeline(a, b *PoolerAnalysis) int {
@@ -398,10 +288,8 @@ func compareLeaderTimeline(a, b *PoolerAnalysis) int {
 slices.SortFunc(staleLeaders, compareLeaderTimeline)
 ```
 
-The comparator contract: return `< 0` if `a` should sort before `b`, `0` if equal, `> 0` if after. `cmp.Compare(x, y)` returns exactly that for any `cmp.Ordered` type.
-
 :::caution[Gotcha]
-`slices.SortFunc` wants an **`int` comparator**, while the older `sort.Slice` wanted a **`bool` less-than** (`func(i, j int) bool`). Porting `sort.Slice(s, func(i,j int) bool { return s[i] < s[j] })` to `slices.SortFunc(s, func(a,b T) int { return cmp.Compare(a,b) })` and accidentally returning a `bool` is a common compile error; or, worse, returning only `1`/`0` (never negative) silently breaks ordering. Always go through `cmp.Compare`.
+`slices.SortFunc` wants an **`int` comparator**; the older `sort.Slice` wanted a **`bool` less-than**. Always go through `cmp.Compare(a, b)` — returning a `bool`, or only ever `1`/`0` (never negative), silently breaks ordering.
 :::
 
 ## The `maps` package — and why some of it gets banned
@@ -412,25 +300,10 @@ dst := map[string]int{}
 maps.Copy(dst, m) // merge m into dst
 ```
 
-The telemetry loader from earlier merges six span-mapping maps into one before validation:
-
-```go title="internal/telemetry/sampler.go"
-allMappings := make(map[string]string)
-maps.Copy(allMappings, config.GRPC.Services)
-maps.Copy(allMappings, config.GRPC.Methods)
-maps.Copy(allMappings, config.HTTP.Exact)
-maps.Copy(allMappings, config.HTTP.Patterns)
-maps.Copy(allMappings, config.Spans.Exact)
-maps.Copy(allMappings, config.Spans.Patterns)
-```
-
-There's a sharper lesson hiding in the `maps` package, though, and this codebase makes it concrete.
+The telemetry loader merges six span-mapping maps into one before validation via repeated `maps.Copy`. But there's a sharper lesson:
 
 :::caution[Gotcha — map order is non-deterministic on purpose]
-Go *randomizes map iteration order on every run*, to stop code from depending on it. In a distributed-consensus system that's a **correctness** problem, not just a cosmetic one: if two replicas iterate a map of voters or candidates in different orders, they can diverge or produce irreproducible test failures. So map order is treated as a first-class concern in the consensus code.
-:::
-
-The rule has teeth. A custom golangci-lint *ruleguard* rule **bans** the stdlib `maps.Keys/Values/All` inside the consensus package:
+Go *randomizes map iteration order on every run* to stop code depending on it. In a distributed-consensus system that's a **correctness** problem, not cosmetic: two replicas iterating a map of voters in different orders can diverge, and tests become irreproducible. A custom golangci-lint *ruleguard* rule **bans** stdlib `maps.Keys/Values/All` inside the consensus package, and a sibling bans raw `for k := range someMap` there. The blessed replacement is `sortedmaps`, which sorts keys before iterating:
 
 ```go title="internal/ruleguard/rules.go"
 func requireSortedMapsOverStdlibMaps(m dsl.Matcher) {
@@ -445,8 +318,6 @@ func requireSortedMapsOverStdlibMaps(m dsl.Matcher) {
 }
 ```
 
-A sibling rule even bans raw `for k := range someMap` in that package. The blessed replacement is a small `sortedmaps` package that sorts keys before iterating:
-
 ```go title="internal/sortedmaps/sortedmaps.go"
 func Keys[K cmp.Ordered, V any](m map[K]V) []K {
 	keys := make([]K, 0, len(m))
@@ -458,30 +329,23 @@ func Keys[K cmp.Ordered, V any](m map[K]V) []K {
 }
 ```
 
-:::caution[Gotcha]
-In Go 1.23+, the stdlib `maps.Keys(m)` / `maps.Values(m)` return **iterators** (`iter.Seq`), *not* slices. Older tutorials show `keys := maps.Keys(m)` yielding a `[]K` — that no longer compiles; you must wrap with `slices.Sorted(maps.Keys(m))` or `slices.Collect(maps.Keys(m))`. `sortedmaps.Keys` sidesteps the whole issue by returning a *sorted* `[]K` directly. When you copy-paste a `maps.Keys` snippet from the internet, check which Go version it assumed.
+In Go 1.23+ stdlib `maps.Keys(m)` returns an **iterator** (`iter.Seq`), not a slice — wrap with `slices.Sorted(maps.Keys(m))` or `slices.Collect(maps.Keys(m))`; `sortedmaps.Keys` sidesteps this by returning a sorted `[]K` directly. General rule: **never assume map order** — sort keys first (`slices.Sort`) or use a `sortedmaps`-style helper when you serialize, log deterministically, or compare map iteration.
 :::
 
-The general lesson, for any Go code: **never assume map order**. If you serialize a map, log it deterministically, or compare two maps' iteration, sort the keys first (`slices.Sort`) or use a `sortedmaps`-style helper.
+## `sort` vs `slices`
 
-## `sort` vs `slices`: which to reach for
-
-The pre-generics `sort` package still exists and still appears in older code. New code prefers the generic `slices` functions:
-
-| Old (`sort`)                              | New (`slices` + `cmp`)                      |
-| ----------------------------------------- | ------------------------------------------- |
-| `sort.Ints(s)` / `sort.Strings(s)`        | `slices.Sort(s)`                            |
+| Old (`sort`) | New (`slices` + `cmp`) |
+|---|---|
+| `sort.Ints(s)` / `sort.Strings(s)` | `slices.Sort(s)` |
 | `sort.Slice(s, func(i,j int) bool {...})` | `slices.SortFunc(s, func(a,b T) int {...})` |
-| `sort.SliceStable(...)`                   | `slices.SortStableFunc(...)`                |
-| `sort.SearchInts(...)`                    | `slices.BinarySearch(...)`                  |
+| `sort.SliceStable(...)` | `slices.SortStableFunc(...)` |
+| `sort.SearchInts(...)` | `slices.BinarySearch(...)` |
 
-:::tip[Idiom]
-In new code, default to `slices.Sort`/`slices.SortFunc`. Reach for `sort` only when implementing `sort.Interface` on a custom type for an API that demands it, or when editing existing `sort`-based code where consistency beats churn. Remember the comparator-convention difference from the previous section.
-:::
+In new code, default to `slices.Sort`/`slices.SortFunc`; reach for `sort` only when implementing `sort.Interface` for an API that demands it.
 
 ## The functional-options pattern
 
-Go has no keyword arguments or default parameters. When a constructor has many optional knobs, the idiomatic solution is **functional options**: a constructor takes required args plus `opts ...Option`, where `Option` is a function that mutates the config.
+No keyword arguments or default parameters — the idiom is **functional options**: a constructor takes required args plus `opts ...Option`, where `Option` is a function that mutates the config:
 
 ```go title="The functional-options shape"
 type Option func(*config)
@@ -501,12 +365,12 @@ func New(required string, opts ...Option) *Thing {
 // Call: New("x"), or New("x", WithTimeout(5*time.Second))
 ```
 
-You'll see this used for two distinct purposes. The first is optional *production* tuning, and the second is *test seams* that inject a controllable dependency. Both look identical at the call site:
+Used for two distinct purposes that look identical at the call site — production tuning and test seams:
 
 <Tabs syncKey="options-use">
   <TabItem label="Production tuning">
 
-A retry helper defines `type Option func(*retryConfig)` and applies options in a loop inside `New`. `WithInitialDelay` tweaks *production behavior* — whether to wait before attempt 0:
+A retry helper defines `type Option func(*retryConfig)` and applies options in a loop inside `New`. `WithInitialDelay` tweaks *production behavior*:
 
 ```go title="internal/retry/retry.go"
 type Option func(*retryConfig)
@@ -560,12 +424,12 @@ func New(ctx context.Context, config *Config, logger *slog.Logger, opts ...Optio
 </Tabs>
 
 :::tip[Idiom]
-Functional options are cleaner than exporting a settable field because the default is enforced at construction and callers cannot forget to set it. A test passes `WithNowFunc(func() time.Time { return fixed })`; production callers simply omit it and get `time.Now`.
+Functional options are cleaner than exporting a settable field because the default is enforced at construction and callers cannot forget to set it. A test passes `WithNowFunc(func() time.Time { return fixed })`; production callers omit it and get `time.Now`.
 :::
 
 ## Range-over-func iterators (Go 1.23+)
 
-Go 1.23 lets you `range` over a *function* of a specific shape. An iterator is a function that takes a `yield` callback and calls it for each element; if `yield` returns `false`, iteration must stop (that is how `break` propagates).
+You can `range` over a *function* of a specific shape. An iterator takes a `yield` callback and calls it per element; if `yield` returns `false`, iteration must stop (that's how `break` propagates):
 
 ```go title="A minimal single-value iterator"
 // Single value:      func(yield func(V) bool)
@@ -598,7 +462,7 @@ func (r *Retry) Attempts(ctx context.Context) func(yield func(int, error) bool) 
 }
 ```
 
-The payoff is that retry logic reads like an ordinary loop:
+The payoff: retry logic reads like an ordinary loop:
 
 ```go title="Retrying reads like a plain for-range loop"
 r := retry.New(100*time.Millisecond, 30*time.Second)
@@ -614,9 +478,7 @@ for attempt, err := range r.Attempts(ctx) {
 }
 ```
 
-`startAttempt` does the backoff wait inside a `select` on a timer vs `ctx.Done()`, tying the iterator's pacing to context cancellation. When the loop body executes `break` or `return`, `yield` returns `false` and the iterator returns.
-
-The key/value form uses `iter.Seq2[K, V]`. The `sortedmaps.All` helper returns one so callers get sorted, deterministic ranging — a drop-in replacement for `range myMap` that guarantees order:
+`startAttempt` does the backoff wait inside a `select` on a timer vs `ctx.Done()`, tying the iterator's pacing to context cancellation. When the loop body executes `break`/`return`, `yield` returns `false` and the iterator returns. The key/value form uses `iter.Seq2[K, V]` — `sortedmaps.All` returns one so callers get sorted, deterministic ranging: `for k, v := range sortedmaps.All(myMap) { ... }`:
 
 ```go title="internal/sortedmaps/sortedmaps.go"
 func All[K cmp.Ordered, V any](m map[K]V) iter.Seq2[K, V] {
@@ -628,17 +490,15 @@ func All[K cmp.Ordered, V any](m map[K]V) iter.Seq2[K, V] {
 		}
 	}
 }
-
-// Used as: for k, v := range sortedmaps.All(myMap) { ... }
 ```
 
 :::caution[Gotcha]
-The `if !yield(...) { return }` early-return is *mandatory*, not optional. If your iterator keeps calling `yield` after it returns `false`, you break `break`, `return`, and `defer` semantics in the consumer's loop, and the runtime will panic with "range function continued iteration after function did a non-local jump". Always check `yield`'s return value. See [generics](/go-guide/language/06-generics/) for the `iter.Seq`/`iter.Seq2` type machinery.
+The `if !yield(...) { return }` early-return is **mandatory**, not optional. If your iterator keeps calling `yield` after it returns `false`, you break `break`/`return`/`defer` semantics in the consumer's loop and the runtime panics with "range function continued iteration after function did a non-local jump".
 :::
 
 ## Structured logging with `log/slog`
 
-`slog` is Go's standard structured logger (since 1.21). Here it's used pervasively as a **dependency-injected `*slog.Logger`** passed into constructors and stored as a struct field — never a package-global.
+`slog` is the standard structured logger (since 1.21), used pervasively as a **dependency-injected `*slog.Logger`** passed into constructors and stored as a struct field — never a package-global:
 
 ```go title="Constructing an slog logger"
 logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -647,7 +507,7 @@ logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 logger.Info("server started", "port", 8080, "tls", true)
 ```
 
-The variadic `Info(msg, key, val, ...)` form is convenient but boxes every argument into `[]any` (heap allocation). The low-allocation path builds a `[]slog.Attr` with **typed constructors** and calls `LogAttrs`. A query-log function on the latency-sensitive path uses typed attrs, conditional appends, an `Enabled` guard, and `LogAttrs`:
+The variadic `Info(msg, key, val, ...)` form boxes every argument into `[]any` (heap allocation). The low-allocation path builds a `[]slog.Attr` with **typed constructors** and calls `LogAttrs`. A query-log function on the latency-sensitive path uses typed attrs, conditional appends, an `Enabled` guard, and `LogAttrs`:
 
 ```go title="internal/gateway/handler/querylog.go" {3-4}
 if !isWarn {
@@ -680,48 +540,21 @@ if entry.Error != nil {
 logger.LogAttrs(ctx, level, "query completed", attrs...)
 ```
 
-Three idioms in one function:
-
-- **Typed attr constructors** — `slog.String`, `slog.Int64`, `slog.Float64`, `slog.Bool`, `slog.Any` — avoid the `[]any` boxing that the `key, val` variadic form incurs.
-- **Conditional appends** — optional fields are only added when present, so the log line stays lean.
-- **`logger.Enabled(ctx, level)` guard** — if the handler is filtering out `DEBUG`, the function returns *before* building the attrs slice, so you don't pay the construction cost for a line that will be dropped.
-
-`logger.With(...)` returns a **new** `*slog.Logger` with attributes permanently bound — every subsequent line from that derived logger carries them:
-
-```go title="internal/gateway/buffer/buffer.go"
-b := &Buffer{
-	logger: logger.With("component", "buffer"),
-	...
-}
-```
-
-Now every log line the buffer emits includes `component=buffer` automatically.
-
-:::caution[Gotcha]
-`logger.With(...)` does **not** mutate the receiver — it returns a new logger. `logger.With("k","v")` on its own (discarding the result) does nothing. You must *store* the returned logger (as `Buffer` does in its `logger` field) for the bound attribute to appear on later lines.
-:::
-
-:::note
-Passing `ctx` to `LogAttrs`/`InfoContext` is also what lets a slog-to-OpenTelemetry bridge inject `trace_id` and `span_id` from the context automatically. That wiring lives in the observability layer — see [errx & observability](/go-guide/project/09-errors-and-observability/).
-:::
-
-:::tip[Idiom]
-For hot paths, prefer `LogAttrs(ctx, level, msg, attrs...)` with typed `slog.Attr` values; for cold paths, the `logger.Info(msg, "k", v)` form is fine. Choose the handler with `slog.NewTextHandler` (human-readable) or `slog.NewJSONHandler` (machine-parseable), and set the minimum level via `slog.HandlerOptions{Level: ...}`.
-:::
+Three idioms in one function: **typed attr constructors** (`slog.String`, `slog.Int64`, `slog.Float64`, `slog.Bool`, `slog.Any`) avoid the `[]any` boxing; **conditional appends** keep the line lean; and the **`logger.Enabled(ctx, level)` guard** returns *before* building the attrs slice when the level is filtered out, so you don't pay construction cost for a dropped line. `logger.With(...)` returns a **new** `*slog.Logger` with attributes permanently bound — it does *not* mutate the receiver, so you must store the returned logger (e.g. `logger.With("component", "buffer")` in a struct field) for the bound attribute to appear on later lines. Passing `ctx` to `LogAttrs`/`InfoContext` is also what lets a slog-to-OpenTelemetry bridge inject `trace_id`/`span_id` automatically. For hot paths prefer `LogAttrs(ctx, level, msg, attrs...)` with typed `slog.Attr`; for cold paths `logger.Info(msg, "k", v)` is fine. Choose the handler with `slog.NewTextHandler` (human) or `slog.NewJSONHandler` (machine), and set the minimum level via `slog.HandlerOptions{Level: ...}`.
 
 ## Checkpoints
 
 1. A loop reads from an `io.Reader` and gets `(n=20, err=io.EOF)` on one call. Is that an error? What should the loop do with the 20 bytes?
-   <details><summary>Answer</summary>It is not an error — `io.EOF` is the normal end-of-stream sentinel. The 20 bytes are valid data: process `buf[:20]` first, then treat `io.EOF` as the loop's exit condition (`return nil`). `Read` is allowed to return `n > 0` together with `io.EOF` in the same call.</details>
+   <details><summary>Answer</summary>Not an error — `io.EOF` is the normal end-of-stream sentinel. The 20 bytes are valid data: process `buf[:20]` first, then treat `io.EOF` as the loop's exit condition (`return nil`). `Read` may return `n > 0` with `io.EOF` in the same call.</details>
 
-2. Why provide a `sortedmaps` helper instead of just using the stdlib `maps.Keys`? Name both a correctness reason and an API reason.
-   <details><summary>Answer</summary>Correctness: Go randomizes map iteration order every run, which can make consensus replicas diverge and tests irreproducible — `sortedmaps` sorts keys first for determinism, and a ruleguard lint bans stdlib `maps.Keys/Values/All` in the consensus package. API: in Go 1.23+ stdlib `maps.Keys` returns an *iterator* (`iter.Seq`), not a slice, whereas `sortedmaps.Keys` returns a sorted `[]K` directly.</details>
+2. Why provide a `sortedmaps` helper instead of just using stdlib `maps.Keys`? Name both a correctness reason and an API reason.
+   <details><summary>Answer</summary>Correctness: Go randomizes map iteration order every run, which can make consensus replicas diverge and tests irreproducible — `sortedmaps` sorts keys first, and a ruleguard lint bans stdlib `maps.Keys/Values/All` in the consensus package. API: in Go 1.23+ stdlib `maps.Keys` returns an *iterator* (`iter.Seq`), not a slice, whereas `sortedmaps.Keys` returns a sorted `[]K` directly.</details>
 
 3. What is the difference between the comparator `slices.SortFunc` expects and the one `sort.Slice` expects, and how do you build the former safely?
    <details><summary>Answer</summary>`slices.SortFunc` wants `func(a, b T) int` returning negative/zero/positive; `sort.Slice` wanted `func(i, j int) bool` (less-than). Build the `int` comparator with `cmp.Compare(a, b)`. Returning a `bool` (or only ever `1`/`0`, never negative) silently breaks ordering.</details>
 
 4. You write `logger.With("component", "buffer")` on its own line and the attribute never appears in later logs. Why?
-   <details><summary>Answer</summary><code>With</code> returns a *new* `*slog.Logger`; it does not mutate the receiver. You discarded the return value. You must assign it (e.g. store it in a struct field) and log through the *returned* logger.</details>
+   <details><summary>Answer</summary>`With` returns a *new* `*slog.Logger`; it does not mutate the receiver. You discarded the return value. You must assign it (e.g. store it in a struct field) and log through the *returned* logger.</details>
 
 ## Exercises
 
@@ -731,7 +564,7 @@ For hot paths, prefer `LogAttrs(ctx, level, msg, attrs...)` with typed `slog.Att
 
 3. Run `grep -rn 'slices.SortFunc' .`. For two call sites, write out the comparator's contract (what negative/zero/positive means for ordering) and confirm whether it goes through `cmp.Compare`.
 
-4. Read `requireSortedMapsOverStdlibMaps` and `requireSortedMapIteration` in `internal/ruleguard/rules.go` alongside the package doc of `internal/sortedmaps/sortedmaps.go`. In one paragraph, explain why map iteration order is a correctness concern in consensus code, and what `sortedmaps.All` returns that stdlib `maps.All` does not.
+4. Read `requireSortedMapsOverStdlibMaps` and `requireSortedMapIteration` in `internal/ruleguard/rules.go` alongside the package doc of `internal/sortedmaps/sortedmaps.go`. Explain why map iteration order is a correctness concern in consensus code, and what `sortedmaps.All` returns that stdlib `maps.All` does not.
 
 5. Compare the timer lifecycle in `internal/gateway/cancel.go` (`NewTicker` + `defer Stop` in a `select` loop) with `internal/gateway/buffer/shard_buffer.go` (`time.AfterFunc` + `Stop`). Describe when you'd pick a `Ticker` vs `AfterFunc`, and what leaks if you forget `Stop` in each case.
 
@@ -746,54 +579,14 @@ For hot paths, prefer `LogAttrs(ctx, level, msg, attrs...)` with typed `slog.Att
 ## See also
 
 <CardGrid>
-  <LinkCard
-    title="Interfaces & Composition"
-    description="io.Reader/Writer/Closer and the 'accept interfaces' idiom."
-    href="/go-guide/language/03-interfaces-composition/"
-  />
-  <LinkCard
-    title="Pointers, Values & Memory"
-    description="The sync.Pool escape-analysis aside in the pgprotocol client."
-    href="/go-guide/language/04-pointers-values-memory/"
-  />
-  <LinkCard
-    title="Errors"
-    description="The %w / errx.Wrapf wrapping seen in the YAML and JSON loaders."
-    href="/go-guide/language/05-errors/"
-  />
-  <LinkCard
-    title="Generics"
-    description="The type-parameter mechanics behind slices, maps, cmp.Ordered, and iter.Seq2."
-    href="/go-guide/language/06-generics/"
-  />
-  <LinkCard
-    title="Concurrency"
-    description="sync.Pool, AfterFunc callbacks on separate goroutines, and select over timer channels."
-    href="/go-guide/language/07-concurrency/"
-  />
-  <LinkCard
-    title="Context"
-    description="The ctx.Done() + select pattern that paces retry.Attempts and the cancel loop."
-    href="/go-guide/language/08-context/"
-  />
-  <LinkCard
-    title="Config"
-    description="How YAML config (the telemetry sampler) sits beside the flag/env system."
-    href="/go-guide/project/03-config-and-flags/"
-  />
-  <LinkCard
-    title="pg-wire & sqltypes"
-    description="The io/bufio plumbing in the Postgres protocol code, in depth."
-    href="/go-guide/project/07-pg-wire-and-sqltypes/"
-  />
-  <LinkCard
-    title="errx & Observability"
-    description="The slog-to-OTel bridge and telemetry wiring."
-    href="/go-guide/project/09-errors-and-observability/"
-  />
-  <LinkCard
-    title="Idioms & Gotchas"
-    description="Map-order determinism, the time.After leak, the SortFunc int-comparator, and JSON tag rules at a glance."
-    href="/go-guide/reference/idioms-and-gotchas/"
-  />
+  <LinkCard title="Interfaces & Composition" description="io.Reader/Writer/Closer and the 'accept interfaces' idiom." href="/go-guide/language/03-interfaces-composition/" />
+  <LinkCard title="Pointers, Values & Memory" description="The sync.Pool escape-analysis aside in the pgprotocol client." href="/go-guide/language/04-pointers-values-memory/" />
+  <LinkCard title="Errors" description="The %w / errx.Wrapf wrapping seen in the YAML and JSON loaders." href="/go-guide/language/05-errors/" />
+  <LinkCard title="Generics" description="The type-parameter mechanics behind slices, maps, cmp.Ordered, and iter.Seq2." href="/go-guide/language/06-generics/" />
+  <LinkCard title="Concurrency" description="sync.Pool, AfterFunc callbacks on separate goroutines, and select over timer channels." href="/go-guide/language/07-concurrency/" />
+  <LinkCard title="Context" description="The ctx.Done() + select pattern that paces retry.Attempts and the cancel loop." href="/go-guide/language/08-context/" />
+  <LinkCard title="Config" description="How YAML config (the telemetry sampler) sits beside the flag/env system." href="/go-guide/project/03-config-and-flags/" />
+  <LinkCard title="pg-wire & sqltypes" description="The io/bufio plumbing in the Postgres protocol code, in depth." href="/go-guide/project/07-pg-wire-and-sqltypes/" />
+  <LinkCard title="errx & Observability" description="The slog-to-OTel bridge and telemetry wiring." href="/go-guide/project/09-errors-and-observability/" />
+  <LinkCard title="Idioms & Gotchas" description="Map-order determinism, the time.After leak, the SortFunc int-comparator, and JSON tag rules at a glance." href="/go-guide/reference/idioms-and-gotchas/" />
 </CardGrid>

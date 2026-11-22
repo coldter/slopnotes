@@ -1,6 +1,6 @@
 ---
 title: "Schedules — Retries, Repeats & Polling"
-description: "Declarative time policies in Effect v4 — retry/repeat schedules, backoff constructors, min vs max composition, input-typed predicates, jitter, instrumentation, and production-grade retry patterns."
+description: "Declarative time policies in Effect v4: retry/repeat schedules, backoff constructors, min vs max composition, input-typed predicates, jitter, instrumentation, and production retry patterns."
 sidebar:
   order: 17
 ---
@@ -8,7 +8,7 @@ sidebar:
 import { LinkCard } from "@astrojs/starlight/components";
 import Mermaid from "~/components/Mermaid.astro";
 
-A `for` loop with `await sleep(n)` is not a retry policy. It is a side-effectful loop that happens to wait. You cannot test it without waiting, compose it without nesting, log it without interleaving, or bound it without adding branches. In Effect, a schedule **is** the policy — an immutable value that decides *whether* to continue, *how long* to wait, and *what* it remembered.
+A `for` loop with `await sleep(n)` is not a retry policy — it's a side-effectful loop that happens to wait. You can't test it without waiting, compose it without nesting, log it without interleaving, or bound it without branches. In Effect a schedule **is** the policy: an immutable value that decides *whether* to continue, *how long* to wait, and *what* it remembered.
 
 ```ts title="src/retry-loop-vs-value.ts"
 // loop-shaped "policy" — not a value
@@ -28,11 +28,7 @@ const policy = Schedule.exponential("250 millis").pipe(
 )
 ```
 
-This chapter is the schedule system end to end: how `Schedule` is modeled in v4, the constructor catalog, the composition semantics that actually matter (`min` vs `max`), typed inputs that gate retryability, delay shaping, instrumentation, and how schedules plug into `Effect.retry`, `Effect.repeat`, and streams.
-
 ## Anatomy of a schedule
-
-### The type
 
 ```ts title="src/schedule-type.ts"
 import type { Schedule } from "effect"
@@ -40,26 +36,22 @@ import type { Schedule } from "effect"
 //                                                 output   input  error  services
 //                                                    │       │      │      │
 type RetryPolicy = Schedule<Duration.Duration, HttpError, never, never>
-//     success value  ↑ required input ↓ not yet  failed?   requirements
 ```
 
 `Schedule<Output, Input, Error, Env>`:
 
 | Parameter | Role | Where it surfaces |
 |---|---|---|
-| `Output` | what the schedule *produces* each step (often a delay or a count) | `Effect.repeat` returns it; `Effect.retry` ignores it |
+| `Output` | what the schedule *produces* each step (often a delay or count) | `Effect.repeat` returns it; `Effect.retry` ignores it |
 | `Input` | what each step *receives* — the error for `retry`, the success for `repeat` | typed by `Schedule.setInputType<T>()` |
 | `Error` | how a schedule itself can fail (rare; e.g. `Schedule.cron` parse error) | propagates into `retry`/`repeat` error channel |
-| `Env` | services the schedule needs (opening the policy to logging, random, config) | must be provided alongside the effect |
+| `Env` | services the schedule needs (logging, random, config) | must be provided alongside the effect |
 
-Two invariants worth internalizing:
-
-1. **A schedule is not stateful.** The *value* holds no mutable state. Each execution obtains a fresh step function that closes over its own attempt counters and timing.
-2. **Input is the decision signal.** Retry schedules inspect the *error*; repeat schedules inspect the *success*. The output is *not* the decision — the decision is whether the schedule *continues*.
+Two invariants: a schedule is **not stateful** — the value holds no mutable state; each execution gets a fresh step function closing over its own counters. And **input is the decision signal** — retry schedules inspect the error, repeat schedules the success; output is not the decision.
 
 ### From value to step
 
-v4 makes stepping explicit and replaces v3's `ScheduleDriver`:
+v4 makes stepping explicit and removes v3's `ScheduleDriver` — step functions via `toStep` plus `TestClock` replace it:
 
 ```ts title="src/schedule-step.ts"
 import { Duration, Effect, Schedule } from "effect"
@@ -99,7 +91,7 @@ const onceAfter = (d: Duration.DurationInput) =>
 | `Schedule.fromStep(effectOfStep)` | step → schedule | build custom policies |
 | `Schedule.fromStepWithMetadata(effectOfStep)` | metadata-aware step → schedule | predicates on timing without threading `now` yourself |
 
-Metadata threading is explicit in v4. The per-step view:
+Metadata threading is explicit. The per-step view:
 
 ```ts title="src/schedule-metadata.ts"
 import type { Duration, Schedule } from "effect"
@@ -112,15 +104,9 @@ type FullMeta<O, I> = Schedule.Metadata<O, I>
 // InputMeta<I> & { output: O, duration: Duration.Duration }
 ```
 
-:::note[ScheduleDriver is gone]
-v3 exposed `ScheduleDriver` (`driver.next(input)`). v4 removes it. Step functions via `toStep` plus `TestClock` control replace it. Custom schedule authors implement the `step` effect returning `(now, input) => Pull<...>`.
-:::
-
 ## Constructors
 
-Every constructor returns a schedule that never fails on its own (aside from `cron`, which validates its expression). Delays that leave the schedule are `Duration` values — the retry/repeat machinery `sleep`s them for you.
-
-### Counting and spacing
+Every constructor returns a schedule that never fails on its own (aside from `cron`, which validates its expression). Delays leaving the schedule are `Duration` values — the retry/repeat machinery `sleep`s them for you.
 
 ```ts title="src/schedule-basics.ts"
 import { Schedule } from "effect"
@@ -131,11 +117,9 @@ const forever = Schedule.forever          // outputs: 0, 1, 2, ... (never done)
 
 // fixed delay after each step completes
 const everySecond = Schedule.spaced("1 seconds")
-const every30s    = Schedule.spaced("30 seconds")
 
-// fixed *cadence* aligned to a wall-clock grid (skips catch-up on slow actions)
+// fixed *cadence* aligned to a wall-clock grid (no catch-up on slow actions)
 const onTheSecond = Schedule.fixed("1 seconds")
-const onTheMinute = Schedule.fixed("1 minutes")
 
 // windowed to interval boundaries
 const windowed5s = Schedule.windowed("5 seconds")
@@ -160,9 +144,7 @@ const forOneMinute = Schedule.during("1 minutes")
 | `Schedule.fibonacci(one)` | `Duration.Duration` | Fib sequence from `one` | never |
 | `Schedule.cron(expr, tz?)` | `Duration.Duration` | until next cron tick | never (or parse error) |
 
-:::tip[spaced vs fixed]
-`spaced("10 seconds")` sleeps 10 s **after** each run completes — simple backoff, immune to action duration. `fixed("10 seconds")` sleeps until the *next* grid tick — suitable for "every 10 s on the clock"; if the action overruns an interval the next delay is `Duration.zero` rather than negative, and missed ticks are not replayed.
-:::
+`spaced("10 seconds")` sleeps 10 s **after** each run completes — simple backoff, immune to action duration. `fixed("10 seconds")` sleeps until the *next* grid tick — for "every 10 s on the clock"; if the action overruns an interval the next delay is `Duration.zero` and missed ticks aren't replayed.
 
 ### Backoff family
 
@@ -179,11 +161,11 @@ const nightly2am  = Schedule.cron("0 2 * * *", "America/New_York")
 const weekly      = Schedule.cron("0 9 * * MON")
 ```
 
-There is no `Schedule.delayed` or `Schedule.backoff` helper in v4. Tune delays with `Schedule.modifyDelay` / `Schedule.jittered` (below) or by composing an exponential schedule with a cap.
+There is no `Schedule.delayed` or `Schedule.backoff` helper in v4. Tune delays with `Schedule.modifyDelay` / `Schedule.jittered`, or compose an exponential schedule with a cap.
 
 ## Composition — the part that matters
 
-Schedules compose into new schedules. The two combining forms are easy to confuse until you think in terms of *continuation* and *delay selection*.
+Schedules compose into new schedules. The two combining forms differ in *continuation* and *delay selection*:
 
 <Mermaid title="min vs max: who continues, who sets the delay" height={320} code={`
 flowchart LR
@@ -201,6 +183,8 @@ flowchart LR
   classDef max fill:#f0fdf4,stroke:#16a34a
 `} />
 
+Notice: `min` keeps retrying with the *faster* delay (so it caps an exponential); `max` stops when *either* stops (so `recurs(5)` bounds the attempts).
+
 | Combinator | Continues while | Delay chosen | Output | Mnemonic / use |
 |---|---|---|---|---|
 | `Schedule.min([a, b, ...])` | **ANY** continues (`OR` over termination) | **minimum** (fastest) | `Duration` | *keep trying*: cap an exponential, race two intervals picking the sooner |
@@ -209,26 +193,20 @@ flowchart LR
 | `Schedule.concatResult(a, b)` | same sequencing | same | `Result<O2, O>` (which phase) | track which policy produced the current step |
 | `Schedule.upTo(s, { times, duration })` | bounded by count/time | preserved | `O` | shorthand for `while(({attempt,elapsed})=>...)` on `s` |
 
-:::note[v3 renames]
-`Schedule.either` → `Schedule.min`. `Schedule.both`/`Schedule.intersect` → `Schedule.max`. `Schedule.andThen` → `Schedule.concat`. `Schedule.check` → `Schedule.while`. `Schedule.delayed` → `Schedule.modifyDelay`. `Schedule.count` → `Schedule.forever` + `upTo({ times })`. The new names are load-bearing: "min delay" and "max delay" now read directly in callsites.
-:::
+v3 renames: `either` → `min`; `both`/`intersect` → `max`; `andThen` → `concat`; `check` → `while`; `delayed` → `modifyDelay`; `count` → `forever` + `upTo({ times })`. The new names are load-bearing: "min delay" and "max delay" read directly at callsites.
 
 ### When to reach for which
 
 ```ts title="src/schedule-compose.ts"
 import { Effect, Schedule } from "effect"
 
-// CAPPED EXPONENTIAL (keep-trying semantics): exponential capped at 10s → min
-// Continues while EITHER wants to continue → effectively forever (both infinite)
-// Delay is the faster of the two → min(250*2^n, 10s)
+// CAPPED EXPONENTIAL (keep-trying): min picks the faster of exponential vs cap
 const cappedExpo = Schedule.min([
   Schedule.exponential("250 millis"),
   Schedule.spaced("10 seconds")
 ])
 
-// BOUNDED EXPONENTIAL (stop after N): exponential limited to 6 attempts → max
-// Continues while BOTH want to continue → stops after 6 steps
-// Delay is the slower (exponential delay, recurs contributes zero)
+// BOUNDED EXPONENTIAL (stop after N): max stops when either stops → after 6 steps
 const boundedExpo = Schedule.max([
   Schedule.exponential("250 millis"),
   Schedule.recurs(6)
@@ -251,14 +229,11 @@ const untilSettled = Schedule.spaced("500 millis").pipe(
 )
 ```
 
-The worked rule of thumb:
-
-- You want a **ceiling** on delay (cap) → `min([...exponential, spaced(cap)])`. Continues while either would → exponential never stops, cap never stops → still retries indefinitely, but delay never exceeds cap.
-- You want a **limit** on attempts or elapsed time → `max([...delayPolicy, recurs(n)])` or `.pipe(Schedule.upTo(...))`. Continues only while both would → the limit's termination wins.
+Rule of thumb: you want a **ceiling** on delay (cap) → `min([...exponential, spaced(cap)])` (still retries indefinitely, delay never exceeds cap). You want a **limit** on attempts or elapsed → `max([...delayPolicy, recurs(n)])` or `.pipe(Schedule.upTo(...))` (the limit's termination wins).
 
 ## Typed inputs and predicates
 
-A schedule that retries *everything* fails fast on nothing. v4 gates retryability through the `Input` channel.
+A schedule that retries *everything* fails fast on nothing. v4 gates retryability through the `Input` channel:
 
 ```ts title="src/schedule-typed.ts"
 import { Schedule, Schema } from "effect"
@@ -276,7 +251,7 @@ const retryableOnly = Schedule.exponential("200 millis").pipe(
 )
 
 // equivalent inline via `while` predicate shape:
-// while receives Metadata<{output,input,duration,attempt,start,now,elapsed,elapsedSincePrevious}>
+// while receives Metadata { output, input, duration, attempt, start, now, elapsed, elapsedSincePrevious }
 const withStatusGate = Schedule.spaced("500 millis").pipe(
   Schedule.setInputType<HttpError>(),
   Schedule.while(({ input }) => input.status >= 500 && input.status < 600)
@@ -298,20 +273,16 @@ const whileWithEffect = Schedule.spaced("500 millis").pipe(
 | Step | What it does | Why |
 |---|---|---|
 | `Schedule.setInputType<T>()` | retypes the schedule's `Input` to `T` | without it, downstream `while` sees `unknown` and can't read `retryable` |
-| `Schedule.while(pred)` | keep recurring while predicate returns `true` | failure to pass → `Cause.done` → retry/repeat stops |
-| `Schedule.tap(f)` | same continuation as `input`, but runs an effect on each step's metadata | instrumentation (see below) |
+| `Schedule.while(pred)` | keep recurring while predicate returns `true` | false → `Cause.done` → retry/repeat stops |
+| `Schedule.tap(f)` | same continuation, but runs an effect on each step's metadata | instrumentation |
 
-Predicates are *inclusive*: `true` means "continue, wait `duration`"; `false` means "done — surface the last error/value". This is why `while(({ input }) => input.retryable)` reads as "retry while retryable".
-
-:::caution[Builder form saves you from setInputType repetition]
-When the schedule is constructed inline at the `retry` callsite you can use the builder overload to avoid threading `setInputType` manually — see [Retry — three call shapes](#retry--three-call-shapes).
-:::
+Predicates are *inclusive*: `true` means "continue, wait `duration`"; `false` means "done — surface the last error/value". That's why `while(({ input }) => input.retryable)` reads as "retry while retryable". When the schedule is built inline at the `retry` callsite, the builder overload (`Effect.retry(($) => $(...).pipe(...))`) threads `setInputType` automatically — see below.
 
 ## Delay shaping, jitter, and instrumentation
 
 ### Jitter — not optional in production
 
-If 500 clients share a `spaced("1 seconds")` schedule and a backend goes down for exactly 2 seconds, they all wake together and hammer the recovery. Jitter decorrelates wakeups.
+If 500 clients share `spaced("1 seconds")` and a backend goes down for exactly 2 seconds, they all wake together and hammer the recovery. Jitter decorrelates wakeups:
 
 ```ts title="src/schedule-jitter.ts"
 import { Schedule } from "effect"
@@ -325,12 +296,9 @@ const cappedWithJitter = Schedule.min([
   Schedule.exponential("250 millis"),
   Schedule.spaced("10 seconds")
 ]).pipe(Schedule.jittered)
-
-// per-request decorrelation without capping
-const perRequest = Schedule.spaced("1 seconds").pipe(Schedule.jittered)
 ```
 
-`jittered` scales each delay by a uniform factor in `[0.8, 1.2]` using `Random.next`. There is no `jittered(max, min)` overload in v4 — for fully custom distributions, use `modifyDelay`:
+`jittered` scales each delay by a uniform factor in `[0.8, 1.2]` using `Random.next`. No `jittered(max, min)` overload in v4 — for custom distributions, use `modifyDelay`:
 
 ```ts title="src/schedule-custom-delay.ts"
 import { Duration, Effect, Random, Schedule } from "effect"
@@ -353,6 +321,7 @@ const cappedExplicit = Schedule.exponential("250 millis").pipe(
   )
 )
 ```
+
 ### tap — log and meter without changing the policy
 
 ```ts title="src/schedule-tap.ts"
@@ -415,8 +384,6 @@ const either  = Schedule.forever.pipe(Schedule.upTo({ times: 20, duration: "2 mi
 
 ## Using schedules — retry and repeat
 
-### One mental model, two combinators
-
 | Combinator | Input fed to schedule | Output of schedule | Success means |
 |---|---|---|---|
 | `Effect.retry` | the *error* `E` | ignored (delays only) | original effect eventually succeeded — return its `A` |
@@ -444,7 +411,7 @@ const retryPolicy = Schedule.spaced("200 millis").pipe(
 
 const viaPolicy = fetchUser("42").pipe(Effect.retry(retryPolicy))
 
-// 2) builder form — assists inference, avoids explicit setInputType
+// 2) builder form — assists inference, avoids explicit setInputType;
 //    the `$` helper carries the error type through
 const viaBuilder = fetchUser("42").pipe(
   Effect.retry(($) =>
@@ -489,15 +456,11 @@ Effect.retry(policy: Schedule<B, NoInfer<E>, Error, Env>)
 Effect.retry(builder: ($: <O,E,R>(_: Schedule<O,NoInfer<E>,E,R>) => Schedule<O,E,E,R>) => Schedule<B,NoInfer<E>,Error,Env>)
 ```
 
-The dual two-argument form `Effect.retry(self, policy)` is also valid. The same three shapes exist on `Effect.repeat` with `Repeat.Options<A>` typed over the success channel.
-
-:::tip[Prefer the builder when predicates touch the error shape]
-The `$` builder propagates the error type through `setInputType` automatically, so `({ input }) => input.retryable` infers without annotation. With a standalone policy value, add `Schedule.setInputType<YourError>()` once before piping into `while`/`tap`.
-:::
+The dual two-argument form `Effect.retry(self, policy)` is also valid. The same three shapes exist on `Effect.repeat` with `Repeat.Options<A>` typed over the success channel. Prefer the builder when predicates touch the error shape — `({ input }) => input.retryable` infers without annotation.
 
 ### Exhaustion is an error — handle it
 
-When the schedule says "done" while the effect is still failing, the failure propagates out of `retry`. If nothing handles it, you will see the *last error* with extra cause context about the schedule drain. Two patterns:
+When the schedule says "done" while the effect is still failing, the failure propagates out of `retry`:
 
 ```ts title="src/retry-exhaustion.ts"
 import { Effect, Schedule, Schema } from "effect"
@@ -534,8 +497,8 @@ const withFallback: Effect.Effect<User, never> =
 declare const serveStaleUser: Effect.Effect<User, never>
 ```
 
-:::caution[orDie hides the cause — only use it at a true boundary]
-`Effect.orDie` converts typed errors into defects. Reach for it at the edge of a self-contained request handler where no caller could recover from the typed error anyway. If any caller might distinguish "404 not found" from "gave up after 3 retries", keep the error typed.
+:::caution[orDie hides the cause — only at a true boundary]
+`Effect.orDie` converts typed errors into defects. Reach for it at the edge of a self-contained request handler where no caller could recover anyway. If any caller might distinguish "404 not found" from "gave up after 3 retries", keep the error typed.
 :::
 
 ### Repeat — collecting successes
@@ -548,7 +511,7 @@ declare const poll: Effect.Effect<number, string>
 // repeat the effect and collect its successes according to the schedule
 const repeated: Effect.Effect<number, string> =
   poll.pipe(Effect.repeat(Schedule.recurs(3)))
-  // poll runs 4 times total (1 initial + 3 repeats); returns last success (number)
+  // poll runs 4 times total (1 initial + 3 repeats); returns last success
 
 // repeat and transform schedule output — e.g., count repetitions
 const counted = poll.pipe(
@@ -571,9 +534,7 @@ const repeatWhileNotDone = poll.pipe(
 // failure inside `repeat` still fails; to fold a failed repeat use repeatOrElse
 ```
 
-:::note[repeat vs retry at a glance]
-`Schedule.recurs(3)` with `retry` means *up to 3 retries* (4 total attempts). With `repeat` it means *3 repetitions* (4 total evaluations). The schedule counts recurrences *between* evaluations identically — only the input channel (error vs success) differs. `Effect.repeat` fulfills `Output` on completion; `Effect.retry` fulfills the *original* effect's success type on eventual success.
-:::
+`Schedule.recurs(3)` with `retry` means *up to 3 retries* (4 total attempts); with `repeat` it means *3 repetitions* (4 total evaluations). The schedule counts recurrences *between* evaluations identically — only the input channel (error vs success) differs. `Effect.repeat` fulfills `Output` on completion; `Effect.retry` fulfills the *original* effect's success type on eventual success.
 
 ### Combining schedules with other combinators
 
@@ -596,11 +557,9 @@ interface Response { readonly body: string }
 declare namespace Response { const cached: Response }
 ```
 
-Because `Effect.timeout` interrupts on deadline (see [chapter 13](/effect-ts/13-fibers/)), the retried branch releases its resources correctly between attempts.
+Because `Effect.timeout` interrupts on deadline (chapter 13), the retried branch releases its resources correctly between attempts.
 
 ## Schedules and streams — polling without loops
-
-Two distinct roles for schedules in streaming code:
 
 ### Schedule *as* a stream source for polling
 
@@ -644,14 +603,6 @@ declare const fetchFeed: Effect.Effect<Array<Item>, FetchError>
 type Item = { id: string }
 class FetchError extends Error {}
 
-// as retry backoff inside a stream step
-const feedWithRetries: Stream.Stream<Item, FetchError> =
-  Stream.fromIterableEffect(fetchFeed).pipe(
-    Stream.flatMap((items) => Stream.fromIterable(items)),
-    Stream.catchAll((e) => Stream.fail(e))
-  )
-// retry at the effect level wraps the *call*, stream governs the *flow*
-
 // as effect retry for the fetch itself, then spread into a stream
 const feedStream: Stream.Stream<Item, FetchError> =
   Stream.fromEffect(fetchFeed.pipe(Effect.retry(pollingSchedule))).pipe(
@@ -661,7 +612,7 @@ const feedStream: Stream.Stream<Item, FetchError> =
 
 ### Stream-specialized schedule combinators
 
-`Stream` exposes schedule-like controls directly on the stream — internally they reuse the same step machinery:
+`Stream` exposes schedule-like controls directly — internally they reuse the same step machinery:
 
 ```ts title="src/stream-schedule-ops.ts"
 import { Schedule, Stream } from "effect"
@@ -679,13 +630,9 @@ const shaped = source.pipe(
 )
 ```
 
-:::tip[Stream.fromEffectSchedule]
-`Stream.fromEffectSchedule(effect, schedule)` runs `effect`, then follows the schedule, yielding each success until the schedule says stop — a concise source when the producer is a single effect with a cadence. Prefer `Stream.paginate` when each page determines the cursor for the next fetch; see [chapter 19](/effect-ts/19-streams/).
-:::
+`Stream.fromEffectSchedule(effect, schedule)` runs `effect`, then follows the schedule, yielding each success until the schedule says stop — a concise source when the producer is a single effect with a cadence. Prefer `Stream.paginate` when each page determines the cursor for the next fetch (chapter 19).
 
 ## What v4 removed or renamed
-
-If you are porting v3 schedule code, a short migration checklist:
 
 | v3 | v4 | Note |
 |---|---|---|
@@ -696,15 +643,15 @@ If you are porting v3 schedule code, a short migration checklist:
 | `Schedule.check(pred)` | `Schedule.while(pred)` | effectful predicate on `Metadata` |
 | `Schedule.delayed(f)` | `Schedule.modifyDelay(f)` | re-derive delay from `Metadata` |
 | `Schedule.count` | `Schedule.forever` | zero-based output; cap with `upTo({ times })` |
-| `Schedule.collectAll` / `collectWhile` / etc | *removed* | use `Effect.repeat` + `Stream` collection or `Schedule.map` + `Schedule.CurrentMetadata` |
+| `Schedule.collectAll` / `collectWhile` / etc | *removed* | use `Effect.repeat` + `Stream` collection or `Schedule.map` |
 | `Schedule.capped` / manual caps | `Schedule.min([expo, spaced(cap)])` | idiomatic capped exponential |
 | `Schedule.retry(n)` on `Effect` | `Effect.retry({ times: n })` or `Schedule.recurs(n)` | no combinator called `retry` on `Schedule` itself |
 
-The `collect*` family removal is intentional: schedules are no longer a collection tool. Returning accumulated arrays from retries couples concurrency, memory, and policy. Collect with `Stream.runCollect`, or keep the schedule's `Output` lean and let the surrounding effect decide accumulation.
+The `collect*` family removal is intentional: schedules are no longer a collection tool. Collect with `Stream.runCollect`, or keep the schedule's `Output` lean and let the surrounding effect decide accumulation.
 
 ## The production retry schedule — worked example
 
-The canonical production pattern from `ai-docs/src/06_schedule/10_schedules.ts` combines everything above. Walk it line by line, then adapt it.
+The canonical production pattern combines everything above:
 
 ```ts title="src/production-retry.ts"
 import { Duration, Effect, Schedule, Schema, Random } from "effect"
@@ -715,12 +662,11 @@ export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", {
   retryable: Schema.Boolean
 }) {}
 
-// ── the policy ──
-// 1. exponential starting at 250 ms, doubled each retry (500, 1000, 2000, ...)
+// 1. exponential starting at 250 ms, doubled each retry
 // 2. capped at 10 s — min([...]) picks the faster of exponential vs the cap
 // 3. decorrelated with jitter so concurrent clients desynchronize
 // 4. input-typed to HttpError so `retryable` is checked at the type level
-// 5. non-retryable errors fail fast without waiting or wasting attempts
+// 5. non-retryable errors fail fast without wasting attempts
 export const productionRetrySchedule = Schedule.min([
   Schedule.exponential("250 millis"),
   Schedule.spaced("10 seconds")
@@ -790,7 +736,7 @@ export const boundedRetrySchedule = Schedule.max([
 ])
 ```
 
-Read the composition out loud to check it: *"min of exponential and once-per-10s is still an infinite retry policy whose delay is the faster of the two — so it caps. Jitter decorrelates it. While input.retryable gates it so we fail fast on 4xx."* If any clause in that sentence surprises you, translate it back to the table in the composition section — it is a direct rendering of the `min`/`max` semantics.
+Read the composition out loud: *"min of exponential and once-per-10s is still an infinite retry policy whose delay is the faster of the two — so it caps. Jitter decorrelates it. While input.retryable gates it so we fail fast on 4xx."*
 
 :::caution[Cap and limit are different concerns]
 Do not read `Schedule.min([exponential, spaced("10s")])` as "stop after 10 seconds". It is a *delay cap*, not an *attempt limit*. For "stop after 10 s *elapsed*", add `Schedule.upTo({ duration: "10 seconds" })` or wrap in `Schedule.max([...cap, Schedule.recurs(n)])`. Mixing those up turns a throttling cap into a liveness limit or vice versa.

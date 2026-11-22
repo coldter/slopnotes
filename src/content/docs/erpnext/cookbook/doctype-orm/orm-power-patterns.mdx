@@ -1,6 +1,6 @@
 ---
 title: ORM Power Patterns
-description: Bulk inserts, atomic counters, conditional aggregation, subqueries, complex filters, safe raw SQL, and row-level locking with Frappe's ORM.
+description: "Bulk inserts, atomic counters, conditional aggregation, subqueries, complex filters, safe raw SQL, and row-level locking with Frappe's ORM."
 sidebar:
   order: 6
 ---
@@ -9,21 +9,11 @@ import { LinkCard } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** Perform complex data operations efficiently in Frappe — without
-dropping to hand-written SQL where the ORM already has a fast, safe path, and
-without leaving correctness bugs (race conditions, deadlocks, injection) where it
-doesn't.
+**Problem:** Complex data operations efficiently in Frappe — using the ORM's fast, safe path where it has one, and raw SQL with correct locking where it doesn't. Eight patterns, each self-contained — jump to the one you need.
 
-This recipe is a tour of eight power patterns for the ScoopJoy backend, each
-pairing a real problem with the right `frappe.db` / `frappe.qb` / `frappe.get_all`
-tool. Each subheading stands on its own — jump to the one you need.
+### 1. Bulk insert 10,000 records
 
-### Bulk insert 10,000 records
-
-**Problem:** Insert thousands of records without the overhead of `doc.insert()` for
-each.
-
-**Solution:** Use `frappe.db.bulk_insert` for raw speed, skipping controller hooks.
+`frappe.db.bulk_insert` skips validation, controllers, and hooks — use only for trusted, pre-validated data (imports, migrations). It generates one multi-row `INSERT` per chunk: ~2s for 10K records vs ~200s with loop inserts. You must supply `name`, `creation`, `modified`, `owner`, `modified_by`, `docstatus` yourself — no autoname, no hooks:
 
 ```python title="scoopjoy/scoopjoy/utils/bulk_ops.py" {35-41}
 import frappe
@@ -86,25 +76,9 @@ def slow_insert_for_comparison(records):
     frappe.db.commit()
 ```
 
-:::note[Why this works]
-`frappe.db.bulk_insert` generates a single multi-row `INSERT` statement per chunk,
-reducing database round trips from 10,000 to 2. For 10K records, this typically
-runs in ~2 seconds vs ~200 seconds with loop inserts.
-:::
+### 2. Atomic counter update
 
-:::caution[Common mistake]
-Forgetting to set `name`, `creation`, `modified`, `owner`, and `modified_by`
-fields. `bulk_insert` does NOT trigger `autoname` or any controller hooks — you
-must supply all required fields manually.
-:::
-
-### Atomic counter update
-
-**Problem:** Increment a counter (e.g., visit count) without read-modify-write race
-conditions.
-
-**Solution:** Use `frappe.db.sql` with `SET x = x + 1` — the database handles
-atomicity.
+`SET x = x + 1` is a single atomic SQL operation — the DB holds a row-level lock for the duration of the `UPDATE`, so two concurrent requests can't read the same value. For stock decrements, guard with `qty_on_hand >= %s` and check `ROW_COUNT()` to catch underflow:
 
 ```python title="scoopjoy/scoopjoy/utils/counters.py"
 import frappe
@@ -142,18 +116,9 @@ def decrement_stock_count(item_code, warehouse, qty):
         frappe.throw(f"Insufficient stock for {item_code} in {warehouse}")
 ```
 
-:::note[Why this works]
-`SET x = x + 1` is a single atomic SQL operation. The database engine holds a
-row-level lock for the duration of the `UPDATE`, preventing two concurrent requests
-from reading the same value.
-:::
+### 3. Conditional aggregation with frappe.qb
 
-### Conditional aggregation with `frappe.qb`
-
-**Problem:** Generate a pivot-style summary — total sales by outlet, broken down by
-payment mode.
-
-**Solution:** Use `CASE WHEN` inside aggregate functions via `frappe.qb`.
+`CASE WHEN` inside `SUM` acts as a per-row conditional filter within each group — the pivot happens in a single pass:
 
 ```python title="scoopjoy/scoopjoy/utils/reports.py"
 import frappe
@@ -195,17 +160,9 @@ def sales_by_payment_mode():
     return query.run(as_dict=True)
 ```
 
-:::note[Why this works]
-`CASE WHEN` inside `SUM` acts as a conditional filter per row within each group —
-the database does the pivot in a single pass, far more efficient than multiple
-queries per payment mode.
-:::
+### 4. Subquery filters
 
-### Subquery filters
-
-**Problem:** Get all customers who placed at least one order above 50,000 INR.
-
-**Solution:** Use a subquery with `frappe.qb`.
+`EXISTS` with a correlated subquery is often faster than `JOIN + GROUP BY` when you only need existence — the DB stops at the first matching row:
 
 ```python title="scoopjoy/scoopjoy/utils/reports.py (append)"
 import frappe
@@ -262,20 +219,9 @@ def customers_with_max_order_value():
     return query.run(as_dict=True)
 ```
 
-:::note[Why this works]
-`EXISTS` with a correlated subquery is often faster than `JOIN + GROUP BY` when you
-only need to check existence. The database stops scanning the subquery at the first
-matching row (`LIMIT 1` is implicit in `EXISTS`).
-:::
+### 5. EXISTS vs JOIN — when to use which
 
-### `EXISTS` vs `JOIN` — when to use which
-
-**Problem:** You need to filter a parent table based on a condition in a
-child/related table. Should you use `EXISTS` or `JOIN`?
-
-**Solution:** Rules of thumb with benchmarkable examples — use `EXISTS` when you
-only need parent columns and a boolean "does at least one child match?" check; use
-`JOIN` when you need columns or aggregates from both tables.
+Use `EXISTS` when you only need parent columns and a boolean "does at least one child match?" check (stops at first match, O(1) per parent). Use `JOIN` when you need columns or aggregates from both tables — but watch for 1:N duplicates, which need `GROUP BY` or `DISTINCT`:
 
 ```python title="scoopjoy/scoopjoy/utils/query_patterns.py"
 import frappe
@@ -283,13 +229,7 @@ from pypika.terms import ExistsCriterion
 
 
 def outlets_with_complaints_exists():
-    """USE EXISTS when:
-    - You only need parent data (no child columns in SELECT)
-    - Child table has many matching rows per parent (avoids duplicates)
-    - You want a boolean check: "does at least one child match?"
-
-    EXISTS stops at the first match per parent row — O(1) per parent.
-    """
+    """USE EXISTS: only parent columns needed, boolean check, many children per parent."""
     Outlet = frappe.qb.DocType("SJ Franchise Outlet")
     Note = frappe.qb.DocType("SJ Note")
 
@@ -310,13 +250,7 @@ def outlets_with_complaints_exists():
 
 
 def outlets_with_complaint_details_join():
-    """USE JOIN when:
-    - You need columns from both tables in SELECT
-    - You need aggregation on child data (COUNT, SUM)
-    - The relationship is 1:1 or nearly 1:1
-
-    JOIN can produce duplicates for 1:N — use GROUP BY or DISTINCT.
-    """
+    """USE JOIN: child columns needed in SELECT (or aggregation on child data)."""
     Outlet = frappe.qb.DocType("SJ Franchise Outlet")
     Note = frappe.qb.DocType("SJ Note")
 
@@ -339,19 +273,16 @@ def outlets_with_complaint_details_join():
     ).run(as_dict=True)
 ```
 
-### `frappe.get_all` with complex filters
+### 6. frappe.get_all with complex filters
 
-**Problem:** Use `or_filters`, nested conditions, and advanced operators.
-
-**Solution:** Leverage Frappe's filter syntax — lists of
-`[doctype, field, operator, value]`.
+`frappe.get_all` translates filter dicts into parameterized SQL (injection-safe in v16). Operators: `in`, `!=`, `>=`, `between`, `like`/`not like`, `is set`/`is not set`, plus `or_filters` for OR clauses and nested `[doctype, field, operator, value]` lists:
 
 ```python title="scoopjoy/scoopjoy/utils/query_patterns.py (append)"
 import frappe
 
 
 def search_outlets_complex():
-    """Demonstrate all filter operators available in frappe.get_all."""
+    """Demonstrate the filter operators available in frappe.get_all."""
 
     # Basic AND filters
     results = frappe.get_all(
@@ -418,27 +349,16 @@ def search_outlets_complex():
     }
 ```
 
-:::note[Why this works]
-`frappe.get_all` translates these filter dicts into parameterized SQL via the query
-builder. The `or_filters` dict produces an `OR` clause that combines with any
-`filters` dict via `AND`. In v16, all these filters go through strict validation to
-prevent SQL injection.
-:::
+### 7. Raw SQL — parameterized, never f-strings
 
-### Raw SQL with parameterized queries
-
-**Problem:** Sometimes you need raw SQL for complex queries, but must avoid SQL
-injection.
-
-**Solution:** ALWAYS use `%s` placeholders with `frappe.db.sql`. NEVER use
-f-strings or `.format()` for values.
+Always use `%s` placeholders with `frappe.db.sql`. The only acceptable f-string use is for table/column names validated against known DocTypes:
 
 ```python title="scoopjoy/scoopjoy/utils/query_patterns.py (append)"
 import frappe
 
 
 def raw_query_safe(city, min_revenue, start_date, end_date):
-    """CORRECT: Parameterized query — values are escaped by the DB driver."""
+    """CORRECT: parameterized query — values are escaped by the DB driver."""
     return frappe.db.sql(
         """
         SELECT
@@ -462,18 +382,6 @@ def raw_query_safe(city, min_revenue, start_date, end_date):
     )
 
 
-def raw_query_DANGEROUS(city, min_revenue):
-    """WRONG: SQL injection vulnerability. NEVER DO THIS.
-
-    If city = "Mumbai'; DROP TABLE `tabSales Invoice`; --"
-    the entire table is gone.
-    """
-    # return frappe.db.sql(
-    #     f"SELECT * FROM `tabSJ Franchise Outlet` WHERE city = '{city}'"
-    # )
-    raise SecurityError("This function exists only as a warning. Never use string interpolation in SQL.")
-
-
 def raw_query_with_dynamic_table(doctype_name, filters):
     """When table names must be dynamic, validate against known DocTypes."""
     # Validate the doctype exists (prevents table name injection)
@@ -488,19 +396,13 @@ def raw_query_with_dynamic_table(doctype_name, filters):
     )
 ```
 
-:::caution[Common mistake]
-Using f-strings for SQL values. Even trusted internal code can receive unexpected
-input from API calls. Always use `%s` placeholders. The only acceptable use of
-f-strings in SQL is for table/column names that you have validated against known
-DocTypes.
+:::caution[SQL injection]
+Never interpolate values into SQL with f-strings — `city = "Mumbai'; DROP TABLE ..."` would execute. Always `%s` placeholders for values; f-strings only for table/column names validated against the `DocType` registry.
 :::
 
-### Database-level locking
+### 8. Database-level locking
 
-**Problem:** Two users simultaneously approve the same leave application, causing
-double deduction from the leave balance.
-
-**Solution:** Use `SELECT ... FOR UPDATE` to lock the row during the transaction.
+`SELECT ... FOR UPDATE` holds an exclusive lock on the selected rows until the transaction commits — this prevents two concurrent requests from reading the same balance and both deducting. Always acquire locks in a **deterministic order** (e.g. sorted by name) to prevent deadlocks:
 
 ```python title="scoopjoy/scoopjoy/utils/locking.py"
 import frappe
@@ -508,12 +410,7 @@ from frappe import _
 
 
 def deduct_leave_balance(employee, leave_type, days):
-    """Thread-safe leave balance deduction using row-level locking.
-
-    SELECT ... FOR UPDATE locks the row until the transaction commits.
-    Any other transaction trying to read FOR UPDATE on the same row
-    will block until this transaction completes.
-    """
+    """Thread-safe leave balance deduction using row-level locking."""
     # Lock the row
     balance = frappe.db.sql(
         """
@@ -546,17 +443,16 @@ def deduct_leave_balance(employee, leave_type, days):
         """,
         (days, frappe.session.user, balance[0].name),
     )
-    # Lock is released when the transaction commits (at end of request or explicit commit)
+    # Lock is released when the transaction commits
     return current - days
 
 
 def transfer_stock_between_warehouses(item_code, from_wh, to_wh, qty):
     """Atomic stock transfer with deadlock prevention.
 
-    IMPORTANT: Always lock rows in consistent order (alphabetical by warehouse name)
-    to prevent deadlocks when two transfers happen simultaneously in opposite directions.
+    Always lock rows in consistent order (alphabetical by warehouse name)
+    so two simultaneous opposite-direction transfers can't deadlock.
     """
-    # Sort warehouses to ensure consistent lock ordering
     wh_ordered = sorted([from_wh, to_wh])
 
     for wh in wh_ordered:
@@ -569,8 +465,7 @@ def transfer_stock_between_warehouses(item_code, from_wh, to_wh, qty):
             (item_code, wh),
         )
 
-    # Now both rows are locked — safe to update
-    # Deduct from source
+    # Both rows locked — safe to update. Deduct from source:
     frappe.db.sql(
         """
         UPDATE `tabSJ Stock Ledger`
@@ -595,15 +490,6 @@ def transfer_stock_between_warehouses(item_code, from_wh, to_wh, qty):
     )
 ```
 
-:::note[Why this works]
-`FOR UPDATE` tells the database to hold an exclusive lock on the selected rows until
-the current transaction commits or rolls back. This prevents two concurrent requests
-from reading the same balance and both deducting, which would cause an incorrect
-final value.
-:::
-
-:::caution[Common mistake]
-Locking rows in different orders across different code paths. If Transaction A locks
-Row 1 then Row 2, and Transaction B locks Row 2 then Row 1, you get a deadlock.
-Always acquire locks in a deterministic order (e.g., sorted by primary key or name).
+:::caution[Deadlock ordering]
+Locking rows in different orders across code paths causes deadlocks: if Transaction A locks Row 1 then Row 2, and Transaction B locks Row 2 then Row 1, both wait forever. Always acquire locks in a deterministic order (sorted by primary key or name).
 :::

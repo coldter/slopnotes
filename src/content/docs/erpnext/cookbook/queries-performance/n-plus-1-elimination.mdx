@@ -1,6 +1,6 @@
 ---
 title: N+1 Query Elimination
-description: Collapse a 200-query franchise dashboard into 3 batch queries using joins, aggregations, and Python lookup dictionaries.
+description: "Collapse a 201-query franchise dashboard into 3 batch queries using JOINs, GROUP BY aggregations, window functions, and Python lookup dicts."
 sidebar:
   order: 5
 ---
@@ -9,23 +9,16 @@ import { LinkCard, Tabs, TabItem } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** The ScoopJoy franchise dashboard takes seconds to load. Each active
-outlet triggers its own queries for metrics, top items, and owner details, so the
-page fires 50+ database round-trips. You need to bring that down to a handful of
-queries regardless of how many outlets exist.
+**Problem:** The ScoopJoy franchise dashboard fires 50+ queries — each outlet triggers its own document load, invoice count, revenue sum, and owner lookup. Bring it down to a handful regardless of outlet count.
 
-**Solution:** Replace iterative `frappe.get_doc` calls inside a loop with a few
-batch queries — JOINs and `GROUP BY` aggregations — then stitch the results
-together in Python using lookup dictionaries for O(1) access.
+**Solution:** Replace per-row `frappe.get_doc` calls inside loops with a few batch queries (JOINs, `GROUP BY` aggregations, window functions), then stitch results in Python with lookup dictionaries for O(1) access.
 
 ## The N+1 disaster
 
-The slow version runs `1 + 4N` queries: one to list outlets, then four per outlet
-inside the loop (full document load, invoice count, revenue sum, owner lookup).
-With 50 outlets that is 201 queries.
+The slow version runs `1 + 4N` queries: one to list outlets, then four per outlet (full doc load, invoice count, revenue sum, owner lookup). With 50 outlets that's 201 queries, ~2.5s:
 
 ```python title="scoopjoy/scoopjoy/api/dashboard_slow.py" {17,20,23,29,36}
-# BAD -- DO NOT USE -- shown for comparison
+# BAD — DO NOT USE — shown for comparison
 import frappe
 from frappe.utils import today, get_first_day
 
@@ -40,7 +33,7 @@ def get_dashboard_data_slow():
 
     result = []
     for outlet in outlets:  # Loop: N iterations
-        # Query 2 per outlet: full document load (fetches ALL fields + child tables)
+        # Query 2 per outlet: full document load (ALL fields + child tables)
         doc = frappe.get_doc("Franchise Outlet", outlet.name)
 
         # Query 3 per outlet: count invoices
@@ -56,7 +49,7 @@ def get_dashboard_data_slow():
             WHERE franchise_outlet = %s AND docstatus = 1 AND posting_date >= %s
         """, (outlet.name, month_start))[0][0] or 0
 
-        # Query 5 per outlet: get owner name
+        # Query 5 per outlet: owner name
         owner_name = frappe.db.get_value("Supplier", doc.franchise_owner, "supplier_name")
 
         result.append({
@@ -70,17 +63,13 @@ def get_dashboard_data_slow():
 
     elapsed = frappe.utils.time.time() - start
     frappe.logger().info(f"Dashboard SLOW: {len(outlets)} outlets, {elapsed:.2f}s")
-    # Typical: 50 outlets = 201 queries, ~2.5 seconds
 
     return result
 ```
 
 ## The fix: 3 queries total
 
-The fast version is three batch queries no matter how many outlets you have: a
-JOIN for outlet data plus owner name, a `GROUP BY` aggregation for sales metrics,
-and a single window-function query for the top item per outlet. The loop at the
-end only walks dictionaries — zero extra database calls.
+Three batch queries no matter how many outlets: a JOIN for outlet data + owner name, a `GROUP BY` aggregation for sales metrics, and one window-function query for top item per outlet. The final loop only walks dictionaries — zero extra database calls:
 
 ```python title="scoopjoy/scoopjoy/api/dashboard_fast.py" {13-23,28-37,40,46-60,67}
 import frappe
@@ -130,7 +119,7 @@ def get_dashboard_data_fast():
     # Build lookup dictionary: O(1) access per outlet
     sales_lookup = {row.franchise_outlet: row for row in sales_data}
 
-    # ---- Query 3: Top item per outlet (single query with window function) ----
+    # ---- Query 3: Top item per outlet (single window-function query) ----
     top_items_raw = frappe.db.sql("""
         SELECT franchise_outlet, item_name, total_qty
         FROM (
@@ -168,17 +157,12 @@ def get_dashboard_data_fast():
 
     elapsed = frappe.utils.time.time() - start
     frappe.logger().info(f"Dashboard FAST: {len(outlets)} outlets, {elapsed:.2f}s")
-    # Typical: 50 outlets = 3 queries, ~0.08 seconds (30x faster)
+    # Typical: 50 outlets = 3 queries, ~0.08s (30x faster)
 
     return result
 ```
 
-The three building blocks: the `left_join` folds the owner's
-`supplier_name` into the outlet row so there is no per-outlet `get_value`; the
-`GROUP BY` aggregation returns one row of metrics per outlet, keyed into
-`sales_lookup` for O(1) access; and the `ROW_NUMBER() OVER (PARTITION BY ...)`
-window function picks the single top item per outlet in one pass instead of N
-separate "top item" queries.
+The three building blocks: the `left_join` folds the owner's name into the outlet row (no per-outlet `get_value`); the `GROUP BY` returns one metrics row per outlet, keyed into `sales_lookup` for O(1) access; and `ROW_NUMBER() OVER (PARTITION BY ...)` picks the single top item per outlet in one pass instead of N queries.
 
 ## Side-by-side
 
@@ -191,17 +175,15 @@ separate "top item" queries.
 | **Total queries** | **`1 + 4N`** (201 for 50 outlets) | **3** (constant) |
 | **Typical time** | **~2.5s** | **~0.08s** |
 
-You can also see the two endpoints flipped against each other:
-
 <Tabs>
   <TabItem label="Before (1 + 4N queries)">
 
   ```python title="scoopjoy/scoopjoy/api/dashboard_slow.py"
   for outlet in outlets:  # Loop: N iterations
-      doc = frappe.get_doc("Franchise Outlet", outlet.name)          # +1 query
-      order_count = frappe.db.count("Sales Invoice", filters={...})  # +1 query
-      revenue = frappe.db.sql("SELECT SUM(grand_total) ...")         # +1 query
-      owner_name = frappe.db.get_value("Supplier", ..., "supplier_name")  # +1 query
+      doc = frappe.get_doc("Franchise Outlet", outlet.name)              # +1 query
+      order_count = frappe.db.count("Sales Invoice", filters={...})      # +1 query
+      revenue = frappe.db.sql("SELECT SUM(grand_total) ...")             # +1 query
+      owner_name = frappe.db.get_value("Supplier", ..., "supplier_name") # +1 query
   ```
 
   </TabItem>
@@ -211,7 +193,7 @@ You can also see the two endpoints flipped against each other:
   outlets = frappe.qb.from_(Outlet).left_join(Supplier)...run(as_dict=True)  # Query 1
   sales_data = frappe.qb.from_(SI).groupby(SI.franchise_outlet)...run()      # Query 2
   top_items_raw = frappe.db.sql("... ROW_NUMBER() OVER (PARTITION BY ...)")  # Query 3
-  # then combine in Python with O(1) dict lookups -- zero extra queries
+  # then combine in Python with O(1) dict lookups — zero extra queries
   ```
 
   </TabItem>
@@ -219,16 +201,10 @@ You can also see the two endpoints flipped against each other:
 
 ## Cache singleton settings with get_cached_doc
 
-For singleton settings documents, reach for `frappe.get_cached_doc` instead of
-`frappe.get_doc`. The cached variant hits Redis (and auto-invalidates on save), so
-repeat reads never touch the database.
+For singleton settings, use `frappe.get_cached_doc` instead of `frappe.get_doc` — the cached variant hits Redis (auto-invalidated on save), so repeat reads never touch the database:
 
 ```python title="scoopjoy/scoopjoy/api/dashboard_fast.py"
 def get_franchise_settings():
-    """
-    Use get_cached_doc for singleton settings documents.
-    This hits Redis, not the database, on subsequent calls.
-    """
     # GOOD: cached in Redis, auto-invalidated on save
     settings = frappe.get_cached_doc("Franchise Settings")
 
@@ -244,29 +220,24 @@ def get_franchise_settings():
 
 ## Preload child tables in one query
 
-Child-table data is another classic N+1 trap. Both `frappe.get_all` (with dotted
-field names) and `frappe.qb` can pull parent and child rows in a single query.
+Child-table data is another classic N+1 trap. Both `frappe.get_all` (dotted field names) and `frappe.qb` pull parent + child rows in a single query:
 
 ```python title="scoopjoy/scoopjoy/api/dashboard_fast.py"
 def get_outlets_with_operating_hours():
-    """
-    Fetch parent + child table data without N+1.
-    frappe.get_all supports fetching linked document fields directly.
-    """
-    # GOOD: Single query with child table fields
+    """Fetch parent + child table data without N+1."""
+    # GOOD: single query with child table fields via dot notation
     outlets = frappe.get_all(
         "Franchise Outlet",
         filters={"is_active": 1},
         fields=[
             "name", "outlet_name", "city",
-            # Pull fields from child table via dot notation
             "`tabOutlet Operating Hours`.day as operating_day",
             "`tabOutlet Operating Hours`.opening_time",
             "`tabOutlet Operating Hours`.closing_time",
         ],
     )
 
-    # Or use frappe.qb for more control:
+    # Or frappe.qb for more control:
     Outlet = frappe.qb.DocType("Franchise Outlet")
     Hours = frappe.qb.DocType("Outlet Operating Hours")
 
@@ -289,14 +260,9 @@ def get_outlets_with_operating_hours():
 ```
 
 :::note[Why this works]
-The core insight is replacing per-row database calls with batch queries, then
-using Python dictionaries for O(1) lookups. A dictionary lookup is ~100ns; a
-database query is ~1ms minimum (10,000x slower). The window function query for top
-items replaces what would otherwise be N separate "top item" queries.
+Replace per-row database calls with batch queries, then use Python dictionaries for O(1) lookups — a dict lookup is ~100ns vs a database query at ~1ms minimum (10,000x slower). The window-function query replaces what would otherwise be N separate "top item" queries.
 :::
 
 :::caution[Common mistake]
-Using `frappe.get_doc()` when you only need 2-3 fields. `get_doc` loads the entire
-document plus all child tables. Use `frappe.db.get_value()` or `frappe.get_all()`
-with specific fields instead.
+Using `frappe.get_doc()` when you only need 2–3 fields — it loads the entire document plus all child tables. Use `frappe.db.get_value()` or `frappe.get_all()` with specific `fields` instead.
 :::

@@ -1,6 +1,6 @@
 ---
 title: Channel Pipeline
-description: Build a multi-stage producer-processor-consumer pipeline with coroutine channels — the Kotlin equivalent of a Go channel pipeline.
+description: "Build a multi-stage producer-processor-consumer pipeline with coroutine channels — the Kotlin equivalent of a Go channel pipeline."
 sidebar:
   order: 2
 ---
@@ -15,37 +15,19 @@ import { Steps, FileTree, LinkCard } from "@astrojs/starlight/components";
 
 ## Goal
 
-Build a multi-stage producer-processor-consumer pipeline using coroutine
-channels — the Kotlin equivalent of a Go channel pipeline. Each stage is its own
-coroutine that reads from an input channel and emits onto a new one, so the whole
-thing streams concurrently and shuts down cleanly when the source dries up.
-
-If you've wired up Go pipelines with `chan int` and a goroutine per stage, this is
-the same shape. Kotlin's `produce { }` builder is the analogue of "spawn a
-goroutine that owns and closes an output channel."
+Build a five-stage pipeline using coroutine channels. Each stage is its own coroutine reading from an input channel and emitting onto a new one — streams concurrently, shuts down cleanly when the source dries up.
 
 ## What you'll build
 
-A five-stage pipeline that flows numbers through transformation, filtering, and
-formatting before a consumer collects them:
-
 <Steps>
 
-1. **Producer** — generates numbers `1..N` and emits them on a `ReceiveChannel<Int>`.
-2. **Stage 1 — Square** — reads from the producer, emits `value * value`.
-3. **Stage 2 — Filter** — keeps only values above a configurable threshold.
-4. **Stage 3 — Format** — converts each number to a formatted `String` (e.g. `"Result: 144"`).
-5. **Consumer** — collects every formatted string and prints them.
+1. **Producer** — generates `1..N` on a `ReceiveChannel<Int>`.
+2. **Square** — reads, emits `value * value` (with fan-out workers).
+3. **Filter** — keeps values above a threshold.
+4. **Format** — converts to `String`.
+5. **Consumer** — collects and prints.
 
 </Steps>
-
-Each stage is a separate coroutine built with `produce`. On top of the core flow,
-the solution also:
-
-- Prints **metrics** — items handled per stage, plus end-to-end throughput (items/second).
-- Supports a **configurable number of workers** per stage (fan-out).
-- Demonstrates **graceful shutdown** — when the producer finishes, each stage drains
-  its input and completes, closing its own output in turn.
 
 <Mermaid title="Channel pipeline stages" code={`
 flowchart TB
@@ -57,23 +39,17 @@ flowchart TB
 
 ## The worked solution
 
-A single-module Gradle project — one `Main.kt` holds every stage plus the
-orchestration in `main`.
+One `Main.kt` holds every stage plus the `runBlocking` driver.
 
 <FileTree>
 - pipeline/
-  - build.gradle.kts coroutines dep + application plugin
-  - settings.gradle.kts project name
+  - build.gradle.kts
+  - settings.gradle.kts
   - src/main/kotlin/
-    - **Main.kt** all five stages plus the runBlocking driver
+    - **Main.kt** all five stages + main
 </FileTree>
 
 ### build.gradle.kts
-
-The only runtime dependency is `kotlinx-coroutines-core`, which provides
-`produce`, `Channel`, and the structured-concurrency machinery. The `application`
-plugin gives you `./gradlew run` against the top-level `main` (compiled to the
-synthetic `MainKt` class).
 
 ```kotlin title="build.gradle.kts" {2,11}
 plugins {
@@ -81,24 +57,16 @@ plugins {
     application
 }
 
-repositories {
-    mavenCentral()
-}
+repositories { mavenCentral() }
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
-
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
     testImplementation(kotlin("test"))
 }
 
-application {
-    mainClass.set("MainKt")
-}
-
-tasks.test {
-    useJUnitPlatform()
-}
+application { mainClass.set("MainKt") }
+tasks.test { useJUnitPlatform() }
 ```
 
 ```kotlin title="settings.gradle.kts"
@@ -107,37 +75,18 @@ rootProject.name = "pipeline"
 
 ### The producer
 
-`produce { }` is the key builder. It's an extension on `CoroutineScope` that
-launches a coroutine, hands you a `ProducerScope<T>` (so you can `send`), and
-returns a `ReceiveChannel<T>` for downstream consumers. Crucially, **the channel
-is closed automatically when the block finishes** — that's the graceful-shutdown
-signal that cascades down the pipeline. No manual `close()`, no Go-style
-`defer close(ch)`.
-
-The `capacity = 10` argument gives each channel a buffered slot count, so a fast
-producer can run ahead of a slow consumer up to 10 items before it suspends —
-that's backpressure for free.
+`produce { }` launches a coroutine, hands you a `ProducerScope<T>`, returns a `ReceiveChannel<T>`. **The channel closes automatically when the block finishes** — no manual `close()`, no Go-style `defer close(ch)`. `capacity = 10` gives backpressure.
 
 ```kotlin title="src/main/kotlin/Main.kt" {1,3}
 fun CoroutineScope.produceNumbers(count: Int): ReceiveChannel<Int> = produce(capacity = 10) {
-    for (i in 1..count) {
-        send(i)
-    }
+    for (i in 1..count) send(i)
     println("[Producer] Sent $count numbers, closing.")
 }
 ```
 
 ### Stage 1 — Square (with fan-out)
 
-This stage takes a `workers` parameter and demonstrates **fan-out**: it launches
-`workers` child coroutines that all read from the *same* input channel with
-`for (value in input)`. The channel hands each item to exactly one worker, so they
-naturally load-balance. An `AtomicInteger` tallies items across the workers safely.
-
-The stage `send`s its squared `Long` onto the output channel as work completes.
-Once every worker job has `join`ed (the input channel is exhausted and all loops
-have ended), the `produce` block returns — closing the output channel and signaling
-the next stage.
+`workers` child coroutines all read from the *same* input channel — each item goes to exactly one worker (load balancing). An `AtomicInteger` tallies safely.
 
 ```kotlin title="src/main/kotlin/Main.kt" {7-14,16}
 fun CoroutineScope.squareStage(
@@ -160,19 +109,10 @@ fun CoroutineScope.squareStage(
 ```
 
 :::note[Why `for (value in input)` drains cleanly]
-Iterating a `ReceiveChannel` with a `for` loop receives until the channel is
-closed *and* empty, then exits normally — no sentinel value, no
-`v, ok := <-ch` check like Go. Because the upstream `produce` block closes its
-channel when it finishes, every worker loop ends on its own and the stage drains
-to completion.
+Iterating a `ReceiveChannel` with `for` receives until closed *and* empty, then exits — no sentinel, no `v, ok := <-ch` like Go. Upstream `produce` closes its channel, so every worker loop ends on its own.
 :::
 
 ### Stage 2 — Filter
-
-A single-coroutine stage: read each `Long`, forward only the ones above the
-threshold, and count both the passed and dropped items for the metrics line. Same
-auto-close behavior — when `input` is drained, the block ends and the output
-channel closes.
 
 ```kotlin title="src/main/kotlin/Main.kt" {6-12}
 fun CoroutineScope.filterStage(
@@ -182,22 +122,14 @@ fun CoroutineScope.filterStage(
     var passed = 0
     var dropped = 0
     for (value in input) {
-        if (value > threshold) {
-            send(value)
-            passed++
-        } else {
-            dropped++
-        }
+        if (value > threshold) { send(value); passed++ }
+        else { dropped++ }
     }
     println("[Filter]   Passed $passed, dropped $dropped (threshold > $threshold).")
 }
 ```
 
 ### Stage 3 — Format
-
-The simplest stage: turn each `Long` into a display `String` via a string template
-(`"Result: $value"`). It changes the channel's element type from `Long` to
-`String`, which is why the next channel is a `ReceiveChannel<String>`.
 
 ```kotlin title="src/main/kotlin/Main.kt"
 fun CoroutineScope.formatStage(
@@ -214,27 +146,19 @@ fun CoroutineScope.formatStage(
 
 ### The consumer
 
-The terminal stage isn't a `produce` builder — it doesn't emit anything — so it's
-an ordinary `suspend fun` that loops the final channel into a list. When the
-formatting channel closes, the loop ends and the collected results are returned.
+Terminal stage — not a `produce`, just a `suspend fun` that loops the final channel into a list.
 
 ```kotlin title="src/main/kotlin/Main.kt"
 suspend fun consume(input: ReceiveChannel<String>): List<String> {
     val results = mutableListOf<String>()
-    for (value in input) {
-        results.add(value)
-    }
+    for (value in input) results.add(value)
     return results
 }
 ```
 
-### Wiring it together in `main`
+### Wiring it together
 
-`runBlocking` provides the `CoroutineScope` that every `produce` extension hangs
-off, and it won't return until all the child coroutines (every stage) have
-finished — that's structured concurrency doing the lifecycle management for you.
-Building the pipeline is just chaining each stage's output into the next stage's
-input. `measureTimeMillis` wraps the whole run so we can report throughput.
+`runBlocking` provides the scope; it won't return until all child coroutines finish. Chaining stages is just piping output → input.
 
 ```kotlin title="src/main/kotlin/Main.kt" {10-15}
 fun main() = runBlocking {
@@ -242,12 +166,11 @@ fun main() = runBlocking {
     val threshold = 50L
     val workerCount = 3
 
-    println("Pipeline: produce(1..$count) -> square(x$workerCount workers) -> filter(>$threshold) -> format -> consume")
+    println("Pipeline: produce(1..$count) -> square(x$workerCount) -> filter(>$threshold) -> format -> consume")
     println("=".repeat(80))
 
     val results: List<String>
     val elapsed = measureTimeMillis {
-        // Build pipeline: each stage reads from the previous and returns a new channel
         val numbers = produceNumbers(count)
         val squared = squareStage(numbers, workers = workerCount)
         val filtered = filterStage(squared, threshold)
@@ -255,15 +178,11 @@ fun main() = runBlocking {
         results = consume(formatted)
     }
 
-    // Print results
     println("=".repeat(80))
     println("Results (${results.size} items):")
     results.take(10).forEach { println("  $it") }
-    if (results.size > 10) {
-        println("  ... and ${results.size - 10} more")
-    }
+    if (results.size > 10) println("  ... and ${results.size - 10} more")
 
-    // Metrics
     println("=".repeat(80))
     val throughput = if (elapsed > 0) results.size * 1000.0 / elapsed else 0.0
     println("Total time: ${elapsed}ms")
@@ -272,7 +191,7 @@ fun main() = runBlocking {
 }
 ```
 
-The full file also imports the coroutine machinery at the top:
+Imports at the top of the file:
 
 ```kotlin title="src/main/kotlin/Main.kt"
 import kotlinx.coroutines.*
@@ -282,18 +201,14 @@ import kotlin.system.measureTimeMillis
 ```
 
 :::tip[Coming from Go]
-The whole pipeline maps almost one-to-one onto Go: `produce { }` is "a goroutine
-that owns its output channel and closes it on return," `for (value in input)` is
-`for value := range ch`, and `runBlocking` waiting for all stages is what a
-`sync.WaitGroup` (or an `errgroup`) buys you manually. The win is that closing and
-draining are automatic — you never forget a `close(ch)`.
+`produce { }` is "a goroutine that owns its output channel and closes it on return," `for (value in input)` is `for value := range ch`, and `runBlocking` waiting for all stages is what a `sync.WaitGroup` buys you manually. The win: closing and draining are automatic — you never forget a `close(ch)`.
 :::
 
 ## Run it
 
 <Steps>
 
-1. Run the pipeline (the `application` plugin runs `main` directly):
+1. Run the pipeline:
 
    ```bash
    ./gradlew run
@@ -307,9 +222,7 @@ draining are automatic — you never forget a `close(ch)`.
 
 </Steps>
 
-Each stage prints its own metrics line as it drains, then `main` prints the first
-10 results, total time, and throughput — so you can watch the stages complete in
-order as the channels close from the producer downward.
+Each stage prints its metrics line as it drains, then `main` prints results, total time, and throughput.
 
 :::tip[Stretch goals]
 - Add a "tee" stage that duplicates the stream to two outputs.

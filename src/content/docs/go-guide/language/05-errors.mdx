@@ -1,6 +1,6 @@
 ---
 title: Errors
-description: How Go models failures as plain values with the error interface, and how a real system wraps, inspects, and classifies them so failures survive RPC boundaries.
+description: "`error` is a one-method interface; wrap with `%w`/`errx.Wrapf` so `errors.Is`/`As` can walk the chain — and classify on codes/SQLSTATE, never on message text."
 sidebar:
   order: 5
 ---
@@ -8,15 +8,9 @@ sidebar:
 import { LinkCard, CardGrid } from "@astrojs/starlight/components";
 import Mermaid from "~/components/Mermaid.astro";
 
-Go has no exceptions for normal control flow. A function that can fail returns an `error` as its last result, and the caller checks it. That is the entire model — there is no `try`, no `catch`, no checked-exception list. The interesting engineering lives in *how* you classify, wrap, and inspect those error values.
-
-To make that concrete, we'll read the example system (a distributed SQL proxy), which layers a canonical-code error model — its structured-error package, `errx` — on top of the stdlib so that failures survive an RPC hop and can drive retry and metric decisions. The Go is all standard; the example system just shows what a production error strategy looks like.
-
-This chapter leans on a few earlier ones: the `error` interface and `errors.As` from [Interfaces & composition](/go-guide/language/03-interfaces-composition/), and value-vs-pointer receivers and the typed-nil trap from [Pointers, values & memory](/go-guide/language/04-pointers-values-memory/). The project-track companion is [errx & observability](/go-guide/project/09-errors-and-observability/).
+No exceptions. A fallible function returns an `error` as its last result; the caller checks it. The engineering lives in how you classify, wrap, and inspect errors across an RPC boundary — that's the `errx` package in this repo.
 
 ## `error` is just an interface
-
-`error` is a one-method interface defined in the language's `builtin` package:
 
 ```go
 type error interface {
@@ -24,7 +18,7 @@ type error interface {
 }
 ```
 
-Any type with an `Error() string` method *is* an `error`. There's nothing magic about it — you can define your own:
+Any type with `Error() string` *is* an `error`:
 
 ```go
 type parseError struct {
@@ -41,7 +35,7 @@ func parse(s string) error {
 }
 ```
 
-The codebase has several concrete types that satisfy `error` the same way. The PostgreSQL diagnostic type is the clearest: a struct carrying all 14 PostgreSQL error fields, made into an `error` by a single method.
+The PostgreSQL diagnostic type works the same way — a struct carrying all 14 PG error fields, made an `error` by one method:
 
 ```go title="internal/errx/pgdiagnostic.go"
 func (d *PgDiagnostic) Error() string {
@@ -53,23 +47,21 @@ func (d *PgDiagnostic) Error() string {
 ```
 
 :::caution[Gotcha — the nil-receiver guard is not paranoia]
-A method on a pointer receiver in Go can be called even when the pointer is `nil` — the method runs with `d == nil` and only crashes if it *dereferences* a nil field. `Error()` checks `if d == nil` first, so a `(*PgDiagnostic)(nil)` boxed into an `error` interface still produces a sensible string instead of panicking. This is the same machinery as the typed-nil-interface trap at the end of this chapter and in [Pointers, values & memory](/go-guide/language/04-pointers-values-memory/).
+A pointer-receiver method can be called on a `nil` pointer — it runs with `d == nil` and only crashes if it *dereferences* a field. `Error()` checks `if d == nil` first, so a `(*PgDiagnostic)(nil)` boxed into `error` still produces a sensible string instead of panicking. This is the typed-nil-interface trap; see [Interfaces](/go-guide/language/03-interfaces-composition/).
 :::
 
-The other error types you'll meet here are `*fundamental` (the basic coded error), `*wrapping` (the context-adding wrapper), and `TopoError` (a *value*-type error). Each is just a struct with an `Error() string` method.
+Other error types here: `*fundamental` (basic coded error), `*wrapping` (context-adding wrapper), and `TopoError` (a value-type error) — each a struct with `Error() string`.
 
-## Creating errors, and why propagation needs more than `fmt.Errorf`
+## Creating errors: `Wrap`/`Wrapf`, not `fmt.Errorf`, for propagation
 
-The stdlib gives you two constructors:
+Stdlib constructors:
 
 ```go
 err1 := errors.New("connection refused")          // static message
 err2 := fmt.Errorf("connect to %s failed", addr)   // formatted message
 ```
 
-`errors.New` returns a pointer to a tiny unexported struct; `fmt.Errorf` builds a formatted string. Both are fine for *creating* a leaf error.
-
-What the example system adds is that its leaf errors carry a **canonical code** and a **stack trace**, captured at the call site:
+The repo's leaf errors also carry a **canonical code** and a **stack trace** captured at the call site:
 
 ```go title="internal/errx/errx.go"
 func New(code rpcpb.Code, message string) error {
@@ -81,19 +73,11 @@ func New(code rpcpb.Code, message string) error {
 }
 ```
 
-Because of that, the package has a propagation rule: errors are wrapped with `Wrap`/`Wrapf`, never `fmt.Errorf`, so the stack trace and canonical code survive every layer.
+Propagation rule: wrap with `Wrap`/`Wrapf`, never `fmt.Errorf`, so the stack and code survive every layer. Reserve `fmt.Errorf` for purely local validation strings that never propagate. (The package also keeps a legacy `Cause()`/`RootCause()` API descended from `pkg/errors`.)
 
-:::tip[Idiom — `Wrap`/`Wrapf` for propagation, not `fmt.Errorf`]
-`fmt.Errorf("...: %w", err)` works fine in plain Go, but here it would drop the stack trace and bypass the canonical-code machinery. Reserve `fmt.Errorf` for purely *local* validation strings — a one-shot message that is never propagated up the stack.
-:::
+## Wrapping and unwrapping: `%w` and `Unwrap() error`
 
-:::note
-The wrapping and stack machinery descends from `github.com/pkg/errors`, which predates the stdlib's `%w`/`Unwrap`. That lineage is why the package keeps a `Cause()`/`RootCause()` API and `fmt.Formatter` support alongside the modern interfaces — old compatibility, kept deliberately.
-:::
-
-## Wrapping and unwrapping: `%w` and the `Unwrap() error` contract
-
-Wrapping lets a higher layer add context while keeping the original error inspectable. In the stdlib, the `%w` verb in `fmt.Errorf` produces an error whose `Unwrap() error` method returns the wrapped error:
+`%w` in `fmt.Errorf` links the chain so `errors.Is`/`errors.As` can traverse it; `%v` severs it:
 
 ```go
 func loadConfig(path string) error {
@@ -106,9 +90,7 @@ func loadConfig(path string) error {
 }
 ```
 
-`%v` would format the inner error as a plain string and sever the chain; `%w` keeps it linked so `errors.Is`/`errors.As` can traverse it. An error joins the chain by exposing `Unwrap() error`.
-
-The `*wrapping` type implements that contract — and also a *second*, older unwrap method inherited from `pkg/errors`:
+`*wrapping` implements both the stdlib contract and the older `pkg/errors` one:
 
 ```go title="internal/errx/errx.go"
 func (w *wrapping) Error() string { return w.msg + ": " + w.cause.Error() }
@@ -119,16 +101,14 @@ func (w *wrapping) Cause() error  { return w.cause }
 func (w *wrapping) Unwrap() error { return w.cause }
 ```
 
-So two parallel unwrap mechanisms coexist:
-
-- **`Unwrap() error`** — the stdlib contract. `errors.Is`/`errors.As` use it. This is the one you reach for almost always.
-- **`Cause() error`** — the older `causer` interface from `pkg/errors`. `Cause` returns the immediate cause; `RootCause` walks all the way to the bottom.
+- **`Unwrap() error`** — the stdlib contract; `errors.Is`/`As` use it. Reach for this almost always.
+- **`Cause() error`** — the older `causer` interface; `RootCause` walks to the bottom.
 
 :::caution[Gotcha — `errx.Unwrap` is NOT `errors.Unwrap`]
-The package exports its own `Unwrap` with the signature `func Unwrap(err error) (wasWrapped bool, unwrapped error)` — it returns a *boolean plus* the error and only peels a `*wrapping`. The stdlib `errors.Unwrap` returns a single `error`. Same short name, different functions. When you mean the standard chain traversal, use `errors.Is`/`errors.As` (which call the lowercase `Unwrap() error` method), not the exported `errx.Unwrap`.
+The package exports its own `Unwrap(err) (wasWrapped bool, unwrapped error)` that peels only a `*wrapping`. The stdlib `errors.Unwrap` returns a single `error`. When you mean standard chain traversal, use `errors.Is`/`errors.As`, not `errx.Unwrap`.
 :::
 
-One small but important detail: `Wrap` short-circuits on `nil`, so callers can wrap unconditionally without an `if err != nil` guard:
+`Wrap` short-circuits on `nil`, so callers can wrap unconditionally:
 
 ```go title="internal/errx/errx.go"
 func Wrap(err error, message string) error {
@@ -141,19 +121,14 @@ func Wrap(err error, message string) error {
 
 ## `errors.Is` vs `errors.As`
 
-These two functions walk the `Unwrap()` chain so you can inspect a wrapped error without manually peeling layers. The difference is what they match on.
+Both walk the `Unwrap()` chain. They differ in what they match on:
 
-`errors.Is(err, target)` asks *"is this error, or anything it wraps, equal to `target` (or does any link claim to match it via a custom `Is` method)?"* Use it for **sentinel** values:
-
-```go
-if errors.Is(err, io.EOF) {
-    // reached end of stream
-}
-```
-
-`errors.As(err, &target)` asks *"is there a link in the chain whose concrete type matches `target`'s type? If so, assign it into `target`."* Use it for **typed** errors you want to read fields off:
+- `errors.Is(err, target)` — "is this error, or anything it wraps, **equal to** `target` (or does a link claim a match via a custom `Is`)?" → use for **sentinels**.
+- `errors.As(err, &target)` — "is there a link whose **concrete type** matches? If so, assign it into `target`." → use for **typed** errors you read fields off.
 
 ```go
+if errors.Is(err, io.EOF) { /* end of stream */ }
+
 var perr *parseError
 if errors.As(err, &perr) {
     fmt.Println("failed at line", perr.line)  // perr now points at the matching link
@@ -161,10 +136,10 @@ if errors.As(err, &perr) {
 ```
 
 :::caution[Gotcha — `errors.As` takes a pointer to the target]
-The second argument must be a *pointer to* the variable you want filled in (here `&perr`, a `**parseError`). Passing the value itself is a compile-time or runtime error. The function assigns the first matching link into `*target`.
+The second argument is a *pointer to* the variable to fill (here `&perr`, a `**parseError`). Passing the value itself is an error.
 :::
 
-The codebase uses `errors.As(err, &diag)` pervasively to pull a `*PgDiagnostic` out of a chain that `Wrapf` has layered several times over. A plain type assertion `err.(*PgDiagnostic)` would fail, because the *outermost* error is a `*wrapping`, not the diagnostic. Here's the pattern combined with sentinel checks:
+The repo uses `errors.As(err, &diag)` pervasively to pull a `*PgDiagnostic` out of a `Wrapf`-layered chain (a plain type assertion would fail — the outermost error is `*wrapping`). Combined with sentinel checks:
 
 ```go title="internal/errx/errx.go"
 var diag *PgDiagnostic
@@ -187,15 +162,17 @@ if errors.Is(err, io.EOF) ||
 }
 ```
 
-:::note
-Note the "don't return false here" comment. A single wrapped chain can contain *both* a `*PgDiagnostic` (at the SQLSTATE level) *and* an underlying I/O sentinel like `io.EOF` (at the transport level). The function deliberately doesn't return early after the SQLSTATE checks, so a non-connection SQLSTATE can't mask a real transport failure underneath it — a good illustration of why `errors.As` and `errors.Is` examine the *whole chain*, not just the top.
-:::
+One wrapped chain can hold *both* a `*PgDiagnostic` (SQLSTATE level) and an underlying `io.EOF` (transport level) — so don't return early after the SQLSTATE checks.
 
 ## Sentinel errors vs typed errors
 
-These are the two ways to make an error *recognizable* by callers.
+| | Sentinel | Typed error |
+|---|---|---|
+| Shape | package-level `var` from `errors.New` | struct carrying structured data |
+| Match with | `errors.Is` (identity) | `errors.As` (or custom `Is`) |
+| Carries | just a message | fields you read |
 
-A **sentinel** is a package-level `var` created once and compared by identity with `errors.Is`. It carries no data beyond its message:
+Sentinels from the pool:
 
 ```go title="internal/pooler/internal/pools/connpool/pool.go"
 var (
@@ -205,15 +182,13 @@ var (
 )
 ```
 
-Consumers match by identity, no matter how many layers wrapped it:
-
 ```go
 if errors.Is(err, ErrManagerClosed) || errors.Is(err, connpool.ErrPoolClosed) {
     // pool/manager is shutting down — handle gracefully
 }
 ```
 
-A **typed** error is a struct (or value) carrying structured data, extracted with `errors.As` or matched by a custom `Is` method. The most instructive one here is `TopoError`, because it's a **value type** with a **custom `Is` method**:
+`TopoError` is the instructive typed error — a **value type** with a **custom `Is`** that compares only `.Code`:
 
 ```go title="internal/topo/errors.go"
 type TopoError struct {
@@ -229,25 +204,17 @@ func (e TopoError) Is(target error) bool {
 }
 ```
 
-Because `Is` compares **only `.Code`** and ignores `.Message`, a caller can match by *category* without caring about the node name baked into the message:
-
 ```go title="internal/gateway/discovery.go"
 if errors.Is(watchData.Err, &topoclient.TopoError{Code: topoclient.NoNode}) {
     // a topo node was deleted — handle the deletion event
 }
 ```
 
-:::caution[Gotcha — category matching requires the custom `Is`]
-Without `TopoError.Is`, `errors.Is` would fall back to `==`, comparing the *whole struct value* including `Message`. Since the message embeds the node path, that comparison would almost never be true. The custom `Is` is what makes "match any NoNode error" work. Note the asymmetry: the *stored* error is a `TopoError` value, but callers pass a `*TopoError` pointer as the target — the `Is` method handles that by type-asserting `target.(*TopoError)`.
-:::
+Without the custom `Is`, `errors.Is` falls back to `==`, comparing the whole struct including `Message` (which embeds the node path) — almost never true. The custom `Is` is what makes "match any NoNode error" work.
 
-:::tip[Idiom — pick by what the caller needs]
-Choose a sentinel when callers only need to ask "is it this?"; choose a typed error when they need data or category matching. `ErrPoolClosed` carries no useful payload, so a sentinel is right. `PgDiagnostic` carries SQLSTATE, severity, position, hint, and more — callers read those fields — so it must be a typed error.
-:::
+## The `if err != nil` discipline — classify on code, not message
 
-## The `if err != nil` discipline, and classifying on code, not message
-
-Errors are the last return value and flow up explicitly. The canonical shape is to check, decorate, and return:
+Canonical shape — check, decorate, return:
 
 ```go title="internal/gateway/poolergateway/grpc_query_service.go"
 res, err := g.client.ExecuteQuery(ctx, req)
@@ -256,9 +223,9 @@ if err != nil {
 }
 ```
 
-Read that inner-to-outer: `FromGRPC` reconstructs an error (preserving the canonical code and any `PgDiagnostic`) from the gRPC status, then `Wrapf` adds local context and a fresh stack frame. This exact two-step repeats dozens of times across the gateway.
+Inner-to-outer: `FromGRPC` reconstructs an error (preserving code + `PgDiagnostic`) from the gRPC status; `Wrapf` adds local context and a fresh stack frame. This two-step repeats across the gateway.
 
-On top of the chain sits a **canonical code** layer, so callers branch on a small enumeration rather than parsing strings. `Code` is the classifier:
+Callers branch on a **canonical code** enum, not strings:
 
 ```go title="internal/errx/errx.go"
 func Code(err error) rpcpb.Code {
@@ -274,7 +241,7 @@ func Code(err error) rpcpb.Code {
     }
     switch err {
     case context.Canceled:
-        return rpcpb.Code_CANCELED            // sentinel → canonical code
+        return rpcpb.Code_CANCELED
     case context.DeadlineExceeded:
         return rpcpb.Code_DEADLINE_EXCEEDED
     }
@@ -282,7 +249,7 @@ func Code(err error) rpcpb.Code {
 }
 ```
 
-The `err.(ErrorWithCode)` line is a **type assertion to an interface** (see [Interfaces & composition](/go-guide/language/03-interfaces-composition/)). `ErrorWithCode` is a minimal interface that *embeds* `error`:
+`err.(ErrorWithCode)` is a type assertion to an interface that embeds `error`:
 
 ```go title="internal/errx/state.go"
 type ErrorWithCode interface {
@@ -291,7 +258,7 @@ type ErrorWithCode interface {
 }
 ```
 
-`*fundamental` satisfies it by implementing `ErrorCode() rpcpb.Code`. For PostgreSQL errors, the equivalent classifier matches on **SQLSTATE**, again via `errors.As`:
+For PostgreSQL errors, classify on **SQLSTATE** via `errors.As`:
 
 ```go title="internal/errx/code.go"
 func IsErrorCode(err error, codes ...string) bool {
@@ -306,7 +273,7 @@ func IsErrorCode(err error, codes ...string) bool {
 }
 ```
 
-This isn't academic — it has operational teeth. The gateway decides whether to buffer-and-retry a query during a planned failover purely from the code:
+Operational teeth — the gateway buffers-and-retries during a planned failover purely from the code:
 
 ```go title="internal/gateway/poolergateway/pooler_gateway.go"
 func classifyError(err error, target *query.Target) errorAction {
@@ -321,12 +288,12 @@ func classifyError(err error, target *query.Target) errorAction {
 ```
 
 :::caution[Gotcha — never branch on the message text]
-`PXF01.ID` is `"PXF01"` and `PgSSReadOnlyTransaction` is `"25006"` — stable identifiers. String-matching `err.Error()` would silently break the moment a message is reworded, translated, or wrapped with extra context. Classify on the code.
+`PXF01.ID` is `"PXF01"`, `PgSSReadOnlyTransaction` is `"25006"` — stable identifiers. String-matching `err.Error()` silently breaks when a message is reworded, translated, or wrapped. Classify on the code.
 :::
 
 ### PX codes are synthetic SQLSTATEs
 
-`PXError` is a template that produces a `*PgDiagnostic` whose SQLSTATE `Code` field holds a project-specific 5-character ID like `PXF01` or `PXD01`. These are **not real PostgreSQL codes** — they occupy the SQLSTATE slot so clients can spot system-specific conditions. A helper distinguishes them by prefix for metric attribution:
+`PXError` is a template producing a `*PgDiagnostic` whose SQLSTATE `Code` holds a project-specific 5-char ID like `PXF01`/`PXD01` — not real PostgreSQL codes; they occupy the SQLSTATE slot so clients can spot system conditions. A helper distinguishes them by prefix for metric attribution:
 
 ```go title="internal/errx/error_helpers.go"
 var diag *PgDiagnostic
@@ -338,9 +305,9 @@ if errors.As(err, &diag) {
 }
 ```
 
-## Decorating errors with `defer` + named return values
+## Decorating errors with `defer` + named returns
 
-Sometimes you want to observe or alter the final error *after all return paths have run* — to record a metric, set a span status, or annotate. Go's tool for that is a deferred closure combined with a **named return value**.
+To observe/alter the final error after all return paths — record a metric, set span status — use a deferred closure over a **named return**:
 
 ```go
 func doWork() (retErr error) {                 // named return
@@ -354,17 +321,11 @@ func doWork() (retErr error) {                 // named return
 }
 ```
 
-:::note[Refresher — what `defer` guarantees]
-Three baseline rules: (1) a deferred call runs when the enclosing **function returns** (including via panic), not at end of block; (2) multiple deferred calls run in **LIFO order**; (3) a deferred call's **arguments are evaluated when `defer` executes**, not at return time. Rule 3 is the subtle one — and exactly what the named-return technique below works around.
+:::caution[Gotcha — only works with a named return]
+A deferred closure sees the named return's final value because it runs after `return` assigns it. `defer logIfErr(err)` would capture `err` at defer-registration time (usually `nil`), not at return time.
 :::
 
-:::caution[Gotcha — this only works with a named return]
-A deferred closure sees the *named* return variable's final value because the closure runs after the `return` statement has assigned it. If instead you wrote `defer logIfErr(err)`, Go would capture the value of `err` at the moment `defer` was registered — usually `nil` — not the value at return time. Named returns (or passing a pointer, below) are what make post-return inspection possible.
-:::
-
-Both variants show up in practice.
-
-**Variant A — closure over the named return.** A backup routine records success/failure metrics by inspecting `retErr`:
+**Variant A — closure over the named return** (backup metrics):
 
 ```go title="internal/pooler/internal/manager/rpc_backup.go"
 func (pm *PoolerManager) backupLocked(ctx context.Context /* ... */) (retBackupID string, retErr error) {
@@ -377,11 +338,11 @@ func (pm *PoolerManager) backupLocked(ctx context.Context /* ... */) (retBackupI
             metrics.IncBackupFailures(ctx)
         }
     }()
-    // ... many `return "", err` paths below; each is observed by the defer ...
+    // ... many `return "", err` paths; each is observed by the defer ...
 }
 ```
 
-**Variant B — pass `*error` (a pointer to the named return) into a helper.** This keeps the decoration logic in one reusable method by passing the *address* of the named return:
+**Variant B — pass `*error` into a helper** (shared decoration logic):
 
 ```go title="internal/gateway/scatterconn/scatter_conn.go"
 defer sc.endAction(ctx, span, start, conn.Database(), tableGroup, shard, &retErr)
@@ -402,27 +363,23 @@ func (sc *ScatterConn) endAction(ctx context.Context, span trace.Span, start tim
 }
 ```
 
-Because `endAction` receives `&retErr`, it reads the *final* error after every return path has assigned it — the helper just dereferences `*err`. Reach for Variant A when the logic is short and local; reach for Variant B when you want one shared helper invoked from several functions.
-
-:::tip[Idiom — `errors.Join` for aggregation]
-When a function must attempt several cleanups and report *all* failures, `errors.Join(errs...)` collapses a slice into one error whose chain matches any constituent under `errors.Is`/`errors.As`. `Join` returns `nil` if every element is `nil`, so you can append unconditionally and join at the end: `return errors.Join(errs...)`.
-:::
+Variant A when the logic is short and local; Variant B when one helper is shared across functions. `errors.Join(errs...)` collapses a slice into one error whose chain matches any constituent — returns `nil` if all are `nil`.
 
 ## `panic`/`recover` — and when *not* to use them
 
-`panic` unwinds the stack running deferred functions; `recover`, called inside a deferred function, stops the unwinding and returns the panic value. This is Go's mechanism for truly *unrecoverable* situations and programmer bugs — **not** for ordinary failures, which return `error`.
+`panic` unwinds the stack running defers; `recover` (inside a deferred func) stops the unwind. Use them for truly unrecoverable situations and programmer bugs — **not** ordinary failures, which return `error`:
 
 ```go
 func mustParse(s string) int {
     n, err := strconv.Atoi(s)
     if err != nil {
-        panic("mustParse: " + err.Error())  // only when the input is guaranteed valid by construction
+        panic("mustParse: " + err.Error())  // only when the input is guaranteed valid
     }
     return n
 }
 ```
 
-The interesting choice the example system makes is to model "this should never happen" as a **normal error**, not a panic. The `PXD01` template is the idiomatic alternative:
+The repo models "this should never happen" as a normal error, not a panic — the `PXD01` template:
 
 ```go title="internal/errx/code.go"
 PXD01 = &PXError{
@@ -432,14 +389,12 @@ PXD01 = &PXError{
 }
 ```
 
-A routing invariant that "can't" be violated returns `PXD01.New(...)` instead of crashing the process:
-
 ```go title="internal/pooler/internal/poolerserver/pooler.go"
 return errx.PXD01.New("target tablegroup %q does not match pooler tablegroup %q",
     target.TableGroup, s.tableGroup)
 ```
 
-The one place it genuinely uses `recover()` is at a **goroutine/connection boundary**, so one panicking client connection can't take down the whole server:
+The one genuine `recover()` is at a **goroutine/connection boundary**, so one panicking client can't take down the server:
 
 ```go title="internal/pgprotocol/server/listener.go"
 func (l *Listener) handleConnection(conn *Conn) {
@@ -462,16 +417,12 @@ func (l *Listener) handleConnection(conn *Conn) {
 ```
 
 :::caution[Gotcha — `recover` only catches panics in *its own goroutine*]
-A panic in a goroutine you spawn crashes the entire process unless *that* goroutine has its own deferred `recover`. The listener spawns one goroutine per connection and recovers *inside* it — which is exactly why a recover at `main()` would be useless here. See [Concurrency](/go-guide/language/07-concurrency/) for the goroutine-boundary rules. The deferred func also does the unregister/cleanup/close regardless of whether a panic occurred, so a crashed connection still releases its resources.
-:::
-
-:::tip[Idiom — recover at the boundary, not everywhere]
-Sprinkling `recover()` through normal code to "handle errors" is an anti-pattern — it hides bugs and breaks the `if err != nil` contract callers rely on. Recover only where a goroutine boundary lets you contain blast radius (a per-request or per-connection handler), and even then, log it as the bug it is.
+A panic in a spawned goroutine crashes the whole process unless *that* goroutine has its own deferred `recover` — which is why recovering at `main()` would be useless here. Don't sprinkle `recover()` through normal code to "handle errors"; it hides bugs and breaks the `if err != nil` contract. Recover only at a goroutine boundary to contain blast radius, and log it as the bug it is.
 :::
 
 ## Errors across the RPC wire: codes survive, identities are special-cased
 
-When an error crosses a gRPC boundary it gets serialized and reconstructed, so object identity is lost. The **code** is what must survive. `ToGRPC` attaches the `PgDiagnostic` as a status detail and stamps the canonical code; `FromGRPC` reconstructs it on the other side.
+Across gRPC, object identity is lost — the **code** is what must survive. `ToGRPC` attaches the `PgDiagnostic` as a status detail and stamps the canonical code; `FromGRPC` reconstructs it:
 
 <Mermaid title="An error crossing the gRPC boundary" code={`
 flowchart LR
@@ -484,8 +435,6 @@ flowchart LR
     FG --> R["reconstructed errx error (code + SQLSTATE preserved)"]
   end
 `} />
-
-`FromGRPC` is where the reconstruction rules live:
 
 ```go title="internal/errx/grpc.go"
 func FromGRPC(err error) error {
@@ -519,12 +468,12 @@ func FromGRPC(err error) error {
 ```
 
 :::caution[Gotcha — `io.EOF` must never be wrapped]
-Stream-finished detection compares against `io.EOF` by identity (`err == io.EOF` / `errors.Is(err, io.EOF)`). `FromGRPC` special-cases it and returns it untouched. Wrapping `io.EOF` — even with `Wrapf` — would silently break stream termination, because the wrapped value is no longer the same object. The human-readable *message* may be reworded across the boundary; the *code/SQLSTATE* is the contract.
+Stream-finished detection compares against `io.EOF` by identity. `FromGRPC` special-cases it and returns it untouched; wrapping it would silently break stream termination. The human-readable *message* may be reworded across the boundary; the *code/SQLSTATE* is the contract.
 :::
 
 ### The typed-nil-interface trap
 
-One more Go-specific hazard that errors expose constantly: a `nil` *typed pointer* boxed into an interface is **not** a `nil` interface.
+A `nil` typed pointer boxed into an interface is **not** a nil interface:
 
 ```go
 func badIdea() error {
@@ -538,35 +487,35 @@ if err != nil {          // TRUE — the interface has a type (*PgDiagnostic) ev
 }
 ```
 
-This is why `PgDiagnostic.Error()` defends with `if d == nil` (back in the first section). The safe rule: return the untyped `nil` literal (`return nil`), or keep the variable typed as `error` rather than as a concrete pointer, so a "no error" path produces a genuinely nil interface. See [Pointers, values & memory](/go-guide/language/04-pointers-values-memory/) for why the interface header carries a type word.
+That's why `PgDiagnostic.Error()` defends with `if d == nil`. Safe rule: return the untyped `nil` literal, or keep the variable typed as `error`. See [Pointers, values & memory](/go-guide/language/04-pointers-values-memory/) for why the interface header carries a type word.
 
 ## Checkpoints
 
 <details><summary>Why use <code>errors.As(err, &diag)</code> instead of a type assertion <code>err.(*PgDiagnostic)</code> to get a PostgreSQL diagnostic?</summary>
-By the time the error reaches the inspecting code it has usually been wrapped one or more times by `Wrapf`, so the outermost concrete type is `*wrapping`, not `*PgDiagnostic`. A type assertion only checks the top of the chain and would fail; `errors.As` walks the `Unwrap()` chain and assigns the first `*PgDiagnostic` it finds into `&diag`.</details>
+By the time the error reaches the inspecting code it has usually been wrapped by <code>Wrapf</code>, so the outermost concrete type is <code>*wrapping</code>, not <code>*PgDiagnostic</code>. A type assertion checks only the top of the chain and would fail; <code>errors.As</code> walks the <code>Unwrap()</code> chain and assigns the first <code>*PgDiagnostic</code> into <code>&diag</code>.</details>
 
 <details><summary>What breaks if you wrap an <code>io.EOF</code> returned from a gRPC stream?</summary>
-Stream-finished detection relies on `err == io.EOF` identity (and `errors.Is(err, io.EOF)`). `FromGRPC` deliberately returns `io.EOF` unwrapped. Wrapping it changes the value so the finished-stream `==` check no longer recognizes it, silently breaking stream termination — which is why the code avoids wrapping it at all rather than relying on `errors.Is` to peer through the wrap.</details>
+Stream-finished detection relies on <code>err == io.EOF</code> identity (and <code>errors.Is(err, io.EOF)</code>). <code>FromGRPC</code> deliberately returns <code>io.EOF</code> unwrapped. Wrapping it changes the value so the finished-stream check no longer recognizes it, silently breaking stream termination.</details>
 
-<details><summary>Why must the deferred metric-recording closure in <code>backupLocked</code> use a <em>named</em> return value <code>retErr</code>?</summary>
-A deferred closure observes the named return variable's value *after* the `return` statement assigns it. If the function used a bare `error` return and the defer captured a local `err`, it would see the value at defer-registration time (typically nil), not the final error. The `*error`-pointer variant (a helper taking `&retErr`) is the other way to achieve the same post-return visibility.</details>
+<details><summary>Why must the deferred metric-recording closure in <code>backupLocked</code> use a <em>named</em> return <code>retErr</code>?</summary>
+A deferred closure observes the named return's value *after* the <code>return</code> statement assigns it. With a bare <code>error</code> return and the defer capturing a local <code>err</code>, it would see the value at defer-registration time (typically nil), not the final error. The <code>*error</code>-pointer variant (a helper taking <code>&retErr</code>) achieves the same post-return visibility.</details>
 
-<details><summary>Why is <code>PXD01.New(...)</code> returned instead of calling <code>panic</code> for a "this should never happen" routing invariant?</summary>
-Unexpected conditions are treated as recoverable failures that propagate up as ordinary errors carrying a `[BUG]` code, so one bad request fails cleanly with a diagnostic that clients and metrics can classify (`PX`-prefixed codes are tagged `"internal"`) instead of crashing the process. `panic`/`recover` is reserved for the goroutine boundary in `handleConnection`, where it contains blast radius rather than implementing control flow.</details>
+<details><summary>Why is <code>PXD01.New(...)</code> returned instead of <code>panic</code> for a "this should never happen" invariant?</summary>
+Unexpected conditions are recoverable failures that propagate as ordinary errors carrying a <code>[BUG]</code> code, so one bad request fails cleanly with a diagnostic clients/metrics can classify (<code>PX</code>-prefixed → <code>"internal"</code>) instead of crashing the process. <code>panic</code>/<code>recover</code> is reserved for the goroutine boundary in <code>handleConnection</code>.</details>
 
 ## Exercises
 
-1. Grep for `errors.As(err, &diag)` (and `&pgDiag`) across the service and shared packages. Pick three call sites and, for each, explain in two sentences why a wrapped chain (not a bare `*PgDiagnostic`) is expected there — trace back to the `Wrapf` that produced the wrapping.
+1. Grep `errors.As(err, &diag)` (and `&pgDiag`) across the service/shared packages. Pick three call sites; for each, explain in two sentences why a wrapped chain is expected there — trace back to the `Wrapf` that produced it.
 
-2. Read `internal/topo/errors.go`. Explain why `TopoError` uses a **value** receiver on `Is` and is stored as a value, yet callers pass `&topoclient.TopoError{Code: ...}` (a pointer) as the `errors.Is` target. Trace exactly how the `Is` method handles the pointer target via its type assertion.
+2. Read `internal/topo/errors.go`. Explain why `TopoError` uses a **value** receiver on `Is` and is stored as a value, yet callers pass `&topoclient.TopoError{Code: ...}` (a pointer) as the `errors.Is` target. Trace how `Is` handles the pointer target via its type assertion.
 
-3. Find every package-level sentinel declared with `errors.New` under `internal/pooler/internal/pools` and, for each, find the matching `errors.Is` consumer. Argue why a sentinel (not a typed error) was the right choice for these specific conditions.
+3. Find every package-level sentinel declared with `errors.New` under `internal/pooler/internal/pools` and, for each, find the matching `errors.Is` consumer. Argue why a sentinel (not a typed error) was right for these conditions.
 
-4. Compare the two defer-based decoration styles: the named-return closure in `backupLocked` versus the `*error` pointer passed to a helper (`endAction`). When would you reach for each?
+4. Compare the two defer-based decoration styles: the named-return closure in `backupLocked` vs the `*error` pointer passed to `endAction`. When do you reach for each?
 
-5. Trace one error from PostgreSQL to the client: start at a constructor in `internal/errx/code.go`, follow `ToGRPC` (how the `PgDiagnostic` becomes a gRPC status detail), then `FromGRPC`. Identify at which step the canonical SQLSTATE/code is preserved versus where the human-readable message may change, and explain why `io.EOF` and the gRPC `DeadlineExceeded`/`Canceled` codes are special-cased.
+5. Trace one error from PostgreSQL to the client: start at a constructor in `internal/errx/code.go`, follow `ToGRPC` (the `PgDiagnostic` becomes a gRPC status detail), then `FromGRPC`. Identify where the canonical SQLSTATE/code is preserved vs where the message may change, and why `io.EOF` and the gRPC `DeadlineExceeded`/`Canceled` codes are special-cased.
 
-6. Find the single non-test `recover()` in `internal/pgprotocol/server/listener.go`. Explain why recovering inside the per-connection goroutine (and not at `main()`) is the correct boundary, and what would happen to *other* clients if the deferred recover were removed.
+6. Find the single non-test `recover()` in `internal/pgprotocol/server/listener.go`. Explain why recovering inside the per-connection goroutine (not at `main()`) is the correct boundary, and what happens to *other* clients if it were removed.
 
 ## Next
 
@@ -579,44 +528,12 @@ Unexpected conditions are treated as recoverable failures that propagate up as o
 ## See also
 
 <CardGrid>
-  <LinkCard
-    title="errx & observability"
-    description="The project-track deep dive: gRPC code propagation, SQLSTATE classification, and how errors feed metrics and tracing."
-    href="/go-guide/project/09-errors-and-observability/"
-  />
-  <LinkCard
-    title="Interfaces & composition"
-    description="error is an interface, ErrorWithCode embeds error, and errors.As relies on interface satisfaction."
-    href="/go-guide/language/03-interfaces-composition/"
-  />
-  <LinkCard
-    title="Pointers, values & memory"
-    description="The typed-nil-pointer-as-non-nil-interface trap, value vs pointer receivers, and passing *error to a deferred helper."
-    href="/go-guide/language/04-pointers-values-memory/"
-  />
-  <LinkCard
-    title="Concurrency"
-    description="Why recover only catches panics in its own goroutine, and the per-connection goroutine boundary."
-    href="/go-guide/language/07-concurrency/"
-  />
-  <LinkCard
-    title="Context"
-    description="context.Canceled / context.DeadlineExceeded are sentinels checked by Code and FromGRPC."
-    href="/go-guide/language/08-context/"
-  />
-  <LinkCard
-    title="gRPC & Protobuf"
-    description="ToGRPC / FromGRPC, the rpcpb.Code enum, and the RPCError proto detail."
-    href="/go-guide/project/04-grpc-and-protobuf/"
-  />
-  <LinkCard
-    title="Idioms & Gotchas"
-    description="Sentinel vs typed errors, %w wrapping, SQLSTATE, and canonical codes."
-    href="/go-guide/reference/idioms-and-gotchas/"
-  />
-  <LinkCard
-    title="Glossary"
-    description="Terms: error, sentinel, wrapping, SQLSTATE, canonical code."
-    href="/go-guide/reference/glossary/"
-  />
+  <LinkCard title="errx & observability" description="The project-track deep dive: gRPC code propagation, SQLSTATE classification, metrics and tracing." href="/go-guide/project/09-errors-and-observability/" />
+  <LinkCard title="Interfaces & composition" description="error is an interface, ErrorWithCode embeds error, errors.As relies on interface satisfaction." href="/go-guide/language/03-interfaces-composition/" />
+  <LinkCard title="Pointers, values & memory" description="The typed-nil-pointer-as-non-nil-interface trap, value vs pointer receivers, passing *error to a deferred helper." href="/go-guide/language/04-pointers-values-memory/" />
+  <LinkCard title="Concurrency" description="Why recover only catches panics in its own goroutine; the per-connection goroutine boundary." href="/go-guide/language/07-concurrency/" />
+  <LinkCard title="Context" description="context.Canceled / context.DeadlineExceeded are sentinels checked by Code and FromGRPC." href="/go-guide/language/08-context/" />
+  <LinkCard title="gRPC & Protobuf" description="ToGRPC / FromGRPC, the rpcpb.Code enum, and the RPCError proto detail." href="/go-guide/project/04-grpc-and-protobuf/" />
+  <LinkCard title="Idioms & Gotchas" description="Sentinel vs typed errors, %w wrapping, SQLSTATE, canonical codes." href="/go-guide/reference/idioms-and-gotchas/" />
+  <LinkCard title="Glossary" description="Terms: error, sentinel, wrapping, SQLSTATE, canonical code." href="/go-guide/reference/glossary/" />
 </CardGrid>

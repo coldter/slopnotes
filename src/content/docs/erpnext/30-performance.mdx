@@ -1,65 +1,43 @@
 ---
 title: Performance Optimization
-description: Tune every layer of an ERPNext deployment — MariaDB, Redis, Gunicorn, background workers, and Frappe ORM patterns — and validate it under load.
+description: "Find bottlenecks with the slow-query log and bench doctor, then tune MariaDB, Redis, Gunicorn, and worker queues — and fix N+1 ORM patterns — verified with Locust load tests."
 sidebar:
   order: 30
 ---
 
-import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
+import { Steps, Tabs, TabItem, LinkCard } from "@astrojs/starlight/components";
 
-Frappe v16 is roughly 2× faster than v15 thanks to the Caffeine project's
-architectural improvements. But even with those gains, a poorly configured
-deployment will bottleneck under load. This chapter works through systematic
-performance optimization across every layer of the stack, all tuned for a
-real-world ScoopJoy franchise deployment.
+Find where time is actually spent before optimizing — guessing wastes effort on the wrong layer.
 
 ## Identifying bottlenecks
 
-Before you optimize anything, find out where time is actually being spent.
-Guessing wastes effort on the wrong layer.
-
 ```bash
-# Check worker queue depth (high = workers can't keep up)
-bench doctor
-
-# Check slow queries
+bench doctor                                        # worker queue depth: high = workers can't keep up
 sudo mariadb -e "SELECT * FROM mysql.slow_log ORDER BY start_time DESC LIMIT 20;"
-
-# Check system resources
-htop        # CPU and memory per process
-iostat -x 1 # Disk I/O wait
-vmstat 1    # Overall system health
-
-# Check Redis memory usage
+htop                                                # CPU/memory per process
+iostat -x 1                                         # disk I/O wait
+vmstat 1                                            # overall system health
 redis-cli INFO memory | grep used_memory_human
 redis-cli INFO clients | grep connected_clients
 ```
 
-Common bottleneck patterns and where to look first:
-
-| Symptom | Likely Cause | Solution |
-|---------|-------------|----------|
-| Slow page loads | Slow database queries | Indexing, query optimization |
-| Background jobs backing up | Too few workers | Increase worker count |
-| High memory usage | Large `innodb_buffer_pool_size` + app memory | Right-size buffer pool |
-| Intermittent timeouts | Gunicorn workers saturated | Add more workers |
-| Slow report generation | Full table scans | Add indexes, use caching |
+| Symptom | Likely cause | Fix first |
+|---------|--------------|-----------|
+| Slow page loads | Slow DB queries | Indexing, query optimization |
+| Jobs backing up | Too few workers | Increase worker count |
+| High memory usage | Oversized buffer pool + app memory | Right-size buffer pool |
+| Intermittent timeouts | Gunicorn workers saturated | Add workers |
+| Slow reports | Full table scans | Indexes + caching |
 
 ## Database optimization
 
-The database is the most common bottleneck in a Frappe deployment. Two levers
-matter most: tuning the engine itself, and making sure your queries hit indexes.
+### MariaDB tuning (8GB server shared with the app)
 
-### MariaDB tuning for a 50-user franchise deployment
-
-These settings assume an 8GB server shared with the app. On a dedicated
-database server, allocate 70-80% of RAM to `innodb_buffer_pool_size`.
+On a dedicated DB server, give `innodb_buffer_pool_size` 70–80% of RAM.
 
 ```ini title="/etc/mysql/mariadb.conf.d/99-performance.cnf"
 [mysqld]
-# ─── InnoDB Engine ───────────────────────────────────
-# Allocate 70-80% of available RAM on dedicated DB servers
-# For a server with 8GB RAM shared with the app:
+# ─── InnoDB ───
 innodb_buffer_pool_size    = 3G
 innodb_buffer_pool_instances = 3
 innodb_log_file_size       = 1G
@@ -71,69 +49,56 @@ innodb_io_capacity_max     = 4000
 innodb_read_io_threads     = 4
 innodb_write_io_threads    = 4
 
-# ─── Connections ─────────────────────────────────────
+# ─── Connections ───
 max_connections            = 200
 wait_timeout               = 600
 interactive_timeout        = 600
 
-# ─── Query Cache (MariaDB still supports this) ──────
+# ─── Query cache ───
 query_cache_type           = 1
 query_cache_size           = 64M
 query_cache_limit          = 2M
 
-# ─── Temp Tables ─────────────────────────────────────
+# ─── Temp tables ───
 tmp_table_size             = 128M
 max_heap_table_size        = 128M
 
-# ─── Sorting and Joins ──────────────────────────────
+# ─── Sorting / joins ───
 sort_buffer_size           = 4M
 join_buffer_size           = 4M
 read_rnd_buffer_size       = 1M
 
-# ─── Logging ─────────────────────────────────────────
+# ─── Logging ───
 slow_query_log             = 1
 slow_query_log_file        = /var/log/mysql/slow.log
 long_query_time            = 1
 log_queries_not_using_indexes = 1
 
-# ─── Character Set ───────────────────────────────────
+# ─── Character set ───
 character-set-server       = utf8mb4
 collation-server           = utf8mb4_unicode_ci
 ```
 
 ### Index management
 
-Frappe creates basic indexes automatically, but custom queries and reports
-often need additional ones. Add them in a patch or in an `after_migrate` hook so
-they're reproducible across environments.
+Frappe creates basic indexes automatically; add yours in a patch or `after_migrate` hook so they're reproducible:
 
 ```python title="scoopjoy/scoopjoy/patches/add_custom_indexes.py"
 import frappe
 
 def add_custom_indexes():
-    """Add indexes for frequently queried franchise fields."""
-
-    # Index on franchise outlet lookups
+    """Indexes for frequently queried franchise fields."""
     frappe.db.add_index("Sales Invoice", ["franchise_outlet", "posting_date"])
-
-    # Index for dashboard queries
     frappe.db.add_index("Sales Invoice", ["franchise_outlet", "docstatus", "posting_date"])
-
-    # Index for stock reconciliation lookups
     frappe.db.add_index("Stock Ledger Entry", ["warehouse", "posting_date", "item_code"])
-
-    # Composite index for the franchise royalty report
     frappe.db.add_index("Sales Invoice", ["franchise_outlet", "docstatus", "grand_total"])
 ```
 
 ### Slow query log analysis
 
-Once the slow query log is on, aggregate it to find the queries that cost the
-most cumulative time — frequency × average duration, not just the single
-slowest query.
+Rank by **frequency × average duration**, not just the single slowest query:
 
 ```bash
-# Enable slow query log if not already enabled
 sudo mariadb -e "SET GLOBAL slow_query_log = 1;"
 sudo mariadb -e "SET GLOBAL long_query_time = 1;"
 ```
@@ -152,14 +117,12 @@ LIMIT 20;
 ```
 
 ```bash
-# Or use mysqldumpslow for simpler analysis
 sudo mysqldumpslow -s at -t 20 /var/log/mysql/slow.log
 ```
 
 ### Read replicas for heavy reports
 
-For reports that scan large datasets, offload them to a read replica so they
-don't compete with transactional traffic on the primary.
+Offload big aggregations to a replica so they don't compete with transactions:
 
 ```json title="sites/icecream.localhost/site_config.json"
 {
@@ -168,15 +131,11 @@ don't compete with transactional traffic on the primary.
 }
 ```
 
-With `read_from_replica` enabled, heavy aggregation queries are routed to the
-replica automatically — your report code doesn't change.
-
 ```python title="scoopjoy/scoopjoy/report/franchise_royalty/franchise_royalty.py"
 import frappe
 
 def execute(filters=None):
-    # Heavy aggregation query runs on the replica automatically
-    # when read_from_replica is enabled
+    # Runs on the replica automatically when read_from_replica is enabled
     data = frappe.db.sql("""
         SELECT
             si.franchise_outlet,
@@ -194,27 +153,16 @@ def execute(filters=None):
 
 ## Redis optimization
 
-Frappe uses Redis for caching and queues. Tuning memory limits and eviction
-policy keeps it from either thrashing or silently dropping queued jobs.
+Frappe uses two Redis connections:
 
-### Cache configuration
+| Instance | Default port | Purpose | Memory | Eviction |
+|----------|-------------|---------|--------|----------|
+| `redis_cache` | 13000 | Doc cache, sessions | 256MB–1GB | `allkeys-lru` (evict freely) |
+| `redis_queue` | 11000 | Job queues, pub/sub | 128MB–512MB | `noeviction` — losing a queued job is data loss |
 
-Frappe uses two separate Redis connections:
-
-| Instance | Default Port | Purpose | Recommended Memory |
-|----------|-------------|---------|-------------------|
-| `redis_cache` | 13000 | Document cache, session data | 256MB - 1GB |
-| `redis_queue` | 11000 | Background job queues, pub/sub | 128MB - 512MB |
-
-:::tip[Pro tip]
-Since Frappe v15, `redis_socketio` was merged into `redis_queue`. There is no
-need for a separate SocketIO Redis instance — only two Redis instances are
-required: `redis_cache` and `redis_queue`.
+:::tip[Since v15, redis_socketio merged into redis_queue]
+Only two Redis instances are needed: `redis_cache` and `redis_queue`. No separate SocketIO Redis.
 :::
-
-Note the difference in eviction policy: the cache can evict freely
-(`allkeys-lru`), but the queue must never evict (`noeviction`) — losing a queued
-job is data loss.
 
 ```ini title="/etc/redis/redis-cache.conf"
 maxmemory 512mb
@@ -230,81 +178,60 @@ save 900 1
 appendonly yes
 ```
 
-### `frappe.cache` usage patterns
+### frappe.cache patterns
 
-The standard cache-aside pattern: check the cache, fall back to the database on
-a miss, and store the result with a TTL. This is the same pattern you'd reach
-for with `ioredis` in Express, just with Frappe's helper API.
-
-:::tip[Pro tip]
-In v15+/v16, use `frappe.cache` (without parentheses) as a property. Older
-guides show `frappe.cache()` (with parentheses), which was the v14 syntax. Both
-may work, but the property form is the modern convention.
-:::
+Cache-aside: check cache, fall back to DB on miss, store with TTL. In v15+/v16 use `frappe.cache` as a **property** (older guides show `frappe.cache()` — v14 syntax):
 
 ```python
 import frappe
 
-# ─── Basic key-value caching ────────────────────────
+# Basic key-value
 def get_franchise_config(outlet):
-    """Cache franchise configuration for fast lookups."""
     cache_key = f"franchise_config:{outlet}"
-
-    # Try cache first
     config = frappe.cache.get_value(cache_key)
     if config:
         return config
 
-    # Cache miss: fetch from database
     config = frappe.get_doc("Franchise Outlet", outlet).as_dict()
-
-    # Store in cache with 1-hour TTL
     frappe.cache.set_value(cache_key, config, expires_in_sec=3600)
-
     return config
 
-# ─── Hash-based caching for structured data ──────────
+# Hash-based for structured per-outlet stats
 def get_outlet_daily_stats(outlet, date):
-    """Use Redis hashes for per-outlet daily statistics."""
     hkey = f"outlet_stats:{date}"
-
     stats = frappe.cache.hget(hkey, outlet)
     if stats:
         return stats
 
     stats = calculate_daily_stats(outlet, date)
     frappe.cache.hset(hkey, outlet, stats)
-
     return stats
 
-# ─── Cache invalidation ─────────────────────────────
+# Invalidation on new data
 def on_sales_invoice_submit(doc, method):
-    """Clear cached stats when new data arrives."""
     if doc.franchise_outlet:
         date = str(doc.posting_date)
         frappe.cache.hdel(f"outlet_stats:{date}", doc.franchise_outlet)
         frappe.cache.delete_value(f"franchise_config:{doc.franchise_outlet}")
 ```
 
-### A cache strategy for franchise data
+### Centralized cache manager
 
-Centralizing cache keys and TTLs in one manager class keeps invalidation honest
-— there's a single place that knows every key for an outlet.
+One class owns every key + TTL for an outlet, so invalidation stays honest:
 
 ```python title="scoopjoy/scoopjoy/caching.py"
 import frappe
-import json
 
 class FranchiseCacheManager:
     """Centralized cache management for franchise operations."""
 
-    MENU_CACHE_TTL = 1800       # 30 minutes
+    MENU_CACHE_TTL = 1800       # 30 min
     CONFIG_CACHE_TTL = 3600     # 1 hour
-    STATS_CACHE_TTL = 300       # 5 minutes
+    STATS_CACHE_TTL = 300       # 5 min
 
     @staticmethod
     def get_outlet_menu(outlet):
-        """Cache the active menu for each outlet (changes infrequently)."""
+        """Cache the active menu per outlet (changes infrequently)."""
         key = f"franchise_menu:{outlet}"
         menu = frappe.cache.get_value(key)
         if menu is None:
@@ -314,55 +241,53 @@ class FranchiseCacheManager:
                 fields=["item_code", "item_name", "price", "category"],
                 order_by="category, item_name"
             )
-            frappe.cache.set_value(key, menu,
-                                   expires_in_sec=FranchiseCacheManager.MENU_CACHE_TTL)
+            frappe.cache.set_value(key, menu, expires_in_sec=FranchiseCacheManager.MENU_CACHE_TTL)
         return menu
 
     @staticmethod
     def get_dashboard_stats(outlet):
-        """Cache dashboard stats with short TTL for near-real-time data."""
+        """Near-real-time stats, short TTL."""
         key = f"franchise_dashboard:{outlet}"
         stats = frappe.cache.get_value(key)
         if stats is None:
             stats = _compute_dashboard_stats(outlet)
-            frappe.cache.set_value(key, stats,
-                                   expires_in_sec=FranchiseCacheManager.STATS_CACHE_TTL)
+            frappe.cache.set_value(key, stats, expires_in_sec=FranchiseCacheManager.STATS_CACHE_TTL)
         return stats
 
     @staticmethod
     def invalidate_outlet(outlet):
-        """Clear all caches for an outlet after configuration changes."""
-        keys = [
+        """Clear all caches for an outlet after config changes."""
+        for key in [
             f"franchise_menu:{outlet}",
             f"franchise_dashboard:{outlet}",
             f"franchise_config:{outlet}",
-        ]
-        for key in keys:
+        ]:
             frappe.cache.delete_value(key)
 ```
 
 ## Gunicorn tuning
 
-Gunicorn runs the WSGI app in production. The formula `(2 * CPU_cores) + 1`
-gives a sensible baseline worker count:
+Workers = `(2 × CPU cores) + 1`:
 
-| Server Spec | Workers | Notes |
-|-------------|---------|-------|
-| 2 CPU / 4GB RAM | 5 | Small franchise (10-20 users) |
-| 4 CPU / 8GB RAM | 9 | Medium franchise (30-50 users) |
-| 8 CPU / 16GB RAM | 17 | Large deployment (50-100 users) |
-| 16 CPU / 32GB RAM | 33 | Enterprise (100+ users) |
+| Server spec | Workers | Fits |
+|-------------|---------|------|
+| 2 CPU / 4GB | 5 | 10–20 users |
+| 4 CPU / 8GB | 9 | 30–50 users |
+| 8 CPU / 16GB | 17 | 50–100 users |
+| 16 CPU / 32GB | 33 | 100+ users |
+
+Each worker uses 150–300MB RAM — size accordingly.
 
 <Steps>
 
-1. Set the worker count and HTTP timeout:
+1. Set worker count and timeout:
 
    ```bash
    bench config gunicorn_workers 9
    bench config http_timeout 120
    ```
 
-2. Regenerate the Supervisor config and reload:
+2. Regenerate Supervisor and reload:
 
    ```bash
    bench setup supervisor
@@ -372,83 +297,53 @@ gives a sensible baseline worker count:
 
 </Steps>
 
-:::tip[Pro tip]
-Monitor worker utilization with `sudo supervisorctl status`. If all workers
-show high CPU consistently, add more workers. If workers are mostly idle, reduce
-the count to save memory — each Gunicorn worker uses 150-300MB RAM.
-:::
-
 ## Background job optimization
 
-Heavy work belongs off the request path. Choosing the right queue keeps quick
-notifications from getting stuck behind a 20-minute data import.
+Pick the queue by expected duration so quick notifications never sit behind a 20-minute import:
 
-### Queue selection guidelines
-
-| Queue | Timeout | Use For |
+| Queue | Timeout | Use for |
 |-------|---------|---------|
-| `short` | 300s (5 min) | Notifications, cache updates, email sends |
-| `default` | 300s (5 min) | Standard operations, PDF generation, report emails |
-| `long` | 1500s (25 min) | Data imports, bulk updates, heavy reports, backups |
+| `short` | 300s | Notifications, cache updates, email |
+| `default` | 300s | Standard ops, PDF generation, report emails |
+| `long` | 1500s | Imports, bulk updates, heavy reports, backups |
 
 ```python
 import frappe
 
-# Enqueue to the right queue based on expected duration
-def submit_franchise_royalty_report(outlet, period):
-    """Heavy aggregation -- use long queue."""
-    frappe.enqueue(
-        "scoopjoy.tasks.generate_royalty_report",
-        queue="long",
-        timeout=1200,
-        outlet=outlet,
-        period=period
-    )
+# Heavy aggregation → long queue
+frappe.enqueue(
+    "scoopjoy.tasks.generate_royalty_report",
+    queue="long", timeout=1200, outlet=outlet, period=period
+)
 
-def send_daily_summary_email(outlet):
-    """Quick email send -- use short queue."""
-    frappe.enqueue(
-        "scoopjoy.tasks.send_summary_email",
-        queue="short",
-        outlet=outlet
-    )
+# Quick email → short queue
+frappe.enqueue(
+    "scoopjoy.tasks.send_summary_email",
+    queue="short", outlet=outlet
+)
 ```
 
-### Worker count per queue
-
-Split worker processes across queues for a 50-user franchise deployment — more
-on the queue that does the bulk of the work, fewer (but longer-lived) on `long`.
+Worker counts per queue (50-user deployment):
 
 ```ini title="config/supervisor.conf"
-; Supervisor worker configuration
 [program:frappe-bench-frappe-worker-short]
-numprocs=2     ; Quick tasks, high throughput
+numprocs=2     ; quick tasks, high throughput
 
 [program:frappe-bench-frappe-worker-default]
-numprocs=3     ; Bulk of work
+numprocs=3     ; bulk of the work
 
 [program:frappe-bench-frappe-worker-long]
-numprocs=2     ; Heavy tasks, fewer but longer-running
+numprocs=2     ; heavy tasks, fewer but longer-running
 ```
 
 ## Frontend optimization
 
-### Production asset build
-
-Always build minified, concatenated assets for production. Building a single app
-is much faster when you're iterating on just your code.
-
 ```bash
-# Build minified, concatenated assets for production
-bench build --production
-
-# Build specific app only (faster)
-bench build --app scoopjoy --production
+bench build --production              # minified, concatenated assets
+bench build --app scoopjoy --production  # single app, faster iteration
 ```
 
-### CDN setup for static files
-
-Serve static assets from a CDN to cut server load and improve global latency.
+Serve assets from a CDN to cut server load:
 
 ```json title="sites/icecream.localhost/site_config.json"
 {
@@ -466,23 +361,17 @@ location /assets {
 }
 ```
 
-## Frappe-specific performance tips
-
-These ORM patterns make the biggest difference in real-world Frappe
-applications. They're the equivalent of avoiding `SELECT *` and N+1 queries in
-any backend — Frappe just hides the cost behind friendly helpers.
+## ORM patterns that matter
 
 ### 1. Always specify fields in `get_all()`
 
-Without an explicit `fields` list, `get_all()` fetches every column, including
-large text fields you don't need.
+Without `fields`, every column is fetched — including large text fields:
 
 ```python
-# BAD: Fetches all columns including large text fields
-invoices = frappe.get_all("Sales Invoice",
-    filters={"franchise_outlet": outlet})
+# BAD: fetches all columns
+invoices = frappe.get_all("Sales Invoice", filters={"franchise_outlet": outlet})
 
-# GOOD: Fetch only what you need
+# GOOD: only what you need
 invoices = frappe.get_all("Sales Invoice",
     filters={"franchise_outlet": outlet},
     fields=["name", "posting_date", "grand_total", "status"],
@@ -491,90 +380,75 @@ invoices = frappe.get_all("Sales Invoice",
 
 ### 2. Use `get_value()` instead of `get_doc()` for simple lookups
 
-`get_doc()` loads the entire document including every child table. For a single
-field, that's enormous waste.
+`get_doc()` loads the whole document including child tables:
 
 ```python
-# BAD: Loads entire document with all child tables
+# BAD: full document load for one field
 doc = frappe.get_doc("Franchise Outlet", outlet_name)
 owner = doc.franchise_owner
 
-# GOOD: Single column fetch, no document loading
+# GOOD: single-column fetch
 owner = frappe.db.get_value("Franchise Outlet", outlet_name, "franchise_owner")
 
-# GOOD: Multiple columns in one query
+# GOOD: multiple columns in one query
 owner, region, status = frappe.db.get_value(
-    "Franchise Outlet", outlet_name,
-    ["franchise_owner", "region", "status"]
+    "Franchise Outlet", outlet_name, ["franchise_owner", "region", "status"]
 )
 ```
 
-### 3. Avoid database calls in loops
-
-The classic N+1 problem. Fetch in bulk with an `in` filter, and use
-`bulk_insert` instead of inserting one document at a time.
+### 3. Never query in a loop (N+1)
 
 ```python
-# BAD: N+1 query problem
+# BAD: N+1
 for outlet_name in outlet_names:
     doc = frappe.get_doc("Franchise Outlet", outlet_name)
     results.append(doc.franchise_owner)
 
-# GOOD: Single query with bulk fetch
+# GOOD: one bulk query
 results = frappe.get_all("Franchise Outlet",
     filters={"name": ["in", outlet_names]},
     fields=["name", "franchise_owner"])
 
-# BAD: Insert in a loop
+# BAD: insert in a loop
 for item in items:
-    doc = frappe.get_doc({"doctype": "Sales Invoice Item", ...})
-    doc.insert()
+    frappe.get_doc({"doctype": "Sales Invoice Item", ...}).insert()
 
-# GOOD: Use bulk insert
+# GOOD: bulk insert
 frappe.db.bulk_insert("Sales Invoice Item",
     fields=["item_code", "qty", "rate"],
-    values=[(item["code"], item["qty"], item["rate"]) for item in items])
+    values=[(i["code"], i["qty"], i["rate"]) for i in items])
 ```
 
-### 4. Use `frappe.enqueue()` for heavy operations
+### 4. Enqueue heavy operations
 
-Don't block the HTTP request on a 30-second computation. Return immediately and
-process in the background, then notify the user when it's done.
+Don't block the HTTP request on a 30-second computation:
 
 ```python
-# BAD: Blocking the HTTP request with a heavy computation
+# BAD: blocks the request
 @frappe.whitelist()
 def generate_franchise_report(outlet, from_date, to_date):
-    # This could take 30+ seconds for large datasets
-    data = compute_report(outlet, from_date, to_date)
-    return data
+    return compute_report(outlet, from_date, to_date)  # 30+ seconds
 
-# GOOD: Return immediately, process in background
+# GOOD: return immediately, process in background
 @frappe.whitelist()
 def generate_franchise_report(outlet, from_date, to_date):
     frappe.enqueue(
         "scoopjoy.reports.compute_and_email_report",
-        queue="long",
-        timeout=600,
-        outlet=outlet,
-        from_date=from_date,
-        to_date=to_date,
+        queue="long", timeout=600,
+        outlet=outlet, from_date=from_date, to_date=to_date,
         user=frappe.session.user
     )
     return {"status": "queued", "message": "Report will be emailed when ready."}
 ```
 
-### 5. Custom caching for expensive computations
-
-Wrap a costly dashboard query in cache-aside with a short TTL so repeated views
-within a few minutes are free.
+### 5. Cache expensive computations
 
 ```python
 import frappe
 
 @frappe.whitelist()
 def get_franchise_dashboard(outlet):
-    """Dashboard data with intelligent caching."""
+    """Dashboard data with 5-minute cache."""
     cache_key = f"franchise_dashboard_v2:{outlet}"
 
     data = frappe.cache.get_value(cache_key)
@@ -608,16 +482,13 @@ def get_franchise_dashboard(outlet):
         """, outlet, as_dict=True)
     }
 
-    # Cache for 5 minutes
     frappe.cache.set_value(cache_key, data, expires_in_sec=300)
     return data
 ```
 
-## Worked example: optimizing a slow script report
+## Worked example: slow script report, 45s → 0.3s
 
-A practical case: a franchise royalty report that took 45 seconds to run. The
-slow version commits two N+1 sins — one query per outlet, then one full document
-load per invoice.
+The slow version commits two N+1 sins — one query per outlet, then a full doc load per invoice:
 
 <Tabs>
   <TabItem label="Before (45s)">
@@ -638,7 +509,7 @@ load per invoice.
 
           total = 0
           for inv in invoices:
-              # N+1 again: loading full doc for each invoice
+              # N+1 again: full doc load per invoice
               doc = frappe.get_doc("Sales Invoice", inv.name)
               total += doc.grand_total
 
@@ -656,7 +527,7 @@ load per invoice.
 
   ```python title="scoopjoy/scoopjoy/report/franchise_royalty/franchise_royalty.py"
   def execute(filters=None):
-      # Single query with aggregation -- replaces hundreds of queries
+      # Single aggregation query replaces hundreds of queries
       data = frappe.db.sql("""
           SELECT
               si.franchise_outlet AS outlet,
@@ -679,18 +550,11 @@ load per invoice.
   </TabItem>
 </Tabs>
 
-**Result:** query time dropped from 45 seconds to 0.3 seconds. The key
-optimizations:
-
-1. Replaced N+1 queries with a single aggregation query.
-2. Used `INNER JOIN` instead of loading documents.
-3. Used `SUM()` in SQL instead of Python loops.
-4. Added a composite index: `frappe.db.add_index("Sales Invoice", ["franchise_outlet", "docstatus", "posting_date"])`.
+Fixes: single aggregation query instead of N+1, `INNER JOIN` instead of doc loads, `SUM()` in SQL instead of Python loops, plus the composite index `frappe.db.add_index("Sales Invoice", ["franchise_outlet", "docstatus", "posting_date"])`.
 
 ## Load testing with Locust
 
-Validate your optimizations under realistic load. Weight the tasks to match real
-traffic — viewing the dashboard far more often than creating an invoice.
+Weight tasks to match real traffic — dashboards far more than invoice creation:
 
 ```python title="locustfile.py"
 from locust import HttpUser, task, between
@@ -709,13 +573,11 @@ class FranchiseUser(HttpUser):
 
     @task(5)
     def view_dashboard(self):
-        """Most common action: viewing the dashboard."""
         self.client.get("/api/method/frappe.client.get_count",
             params={"doctype": "Sales Invoice"})
 
     @task(3)
     def list_invoices(self):
-        """List recent sales invoices."""
         self.client.get("/api/resource/Sales Invoice",
             params={
                 "fields": '["name","posting_date","grand_total","status"]',
@@ -725,26 +587,19 @@ class FranchiseUser(HttpUser):
 
     @task(2)
     def view_invoice(self):
-        """View a single invoice detail."""
         self.client.get("/api/resource/Sales Invoice/ACC-SINV-2026-00001")
 
     @task(1)
     def create_invoice(self):
-        """Create a new sales invoice (write operation)."""
         self.client.post("/api/resource/Sales Invoice",
             json={
                 "customer": "Test Franchise Customer",
-                "items": [{
-                    "item_code": "FRANCHISE-ITEM-001",
-                    "qty": 1,
-                    "rate": 100
-                }]
+                "items": [{"item_code": "FRANCHISE-ITEM-001", "qty": 1, "rate": 100}]
             },
             headers={"X-Frappe-CSRF-Token": self.csrf_token})
 
     @task(1)
     def run_report(self):
-        """Run a report (expensive operation)."""
         self.client.get("/api/method/frappe.desk.query_report.run",
             params={
                 "report_name": "Franchise Royalty Report",
@@ -752,26 +607,27 @@ class FranchiseUser(HttpUser):
             })
 ```
 
-Run the load test:
-
 ```bash
-# Install locust
 pip install locust
 
-# Run with 50 concurrent users, spawning 5/second
+# 50 concurrent users, spawn 5/sec, 10 minutes
 locust -f locustfile.py --users 50 --spawn-rate 5 --run-time 10m
 
-# Headless mode for CI/CD
+# Headless for CI/CD
 locust -f locustfile.py --headless --users 50 --spawn-rate 5 \
   --run-time 5m --csv=results/load-test
 ```
 
-Target benchmarks for a 50-user franchise deployment:
+Target benchmarks for a 50-user deployment:
 
-| Metric | Target | Action if Exceeded |
+| Metric | Target | Action if exceeded |
 |--------|--------|--------------------|
 | P50 response time | < 500ms | Check slow queries |
 | P95 response time | < 2s | Add Gunicorn workers |
 | P99 response time | < 5s | Investigate specific endpoints |
 | Error rate | < 0.1% | Check worker logs |
 | Throughput | > 50 req/s | Scale horizontally |
+
+## Next
+
+<LinkCard title="Next: Multi-Company" href="/erpnext/31-multi-company/" description="Run multiple companies and franchise outlets on one bench with data isolation." />

@@ -1,48 +1,25 @@
 ---
 title: Deep Modules
-description: Six consolidations that hide tenant resolution, token verification, operator auth, and hostname lifecycle behind small, well-tested interfaces.
+description: "Six consolidations — `@repo/tenancy`, `@repo/auth-tokens`, `tenantOperations`, operator auth, `ssoProviderRepository`, `customHostnameLifecycle` — that hide complex rules behind small typed interfaces."
 sidebar:
   order: 7
 ---
 
 import { Steps } from "@astrojs/starlight/components";
 
-A **deep module** is a small, simple interface that hides a lot of
-implementation — a narrow door into a big room. The term is John Ousterhout's;
-the idea is the leverage: callers work against a few well-named methods instead
-of re-deriving the same rules from prose every time they touch the concept. The
-opposite is a *shallow* module — one that exposes almost as much interface as it
-has implementation, so it barely earns its keep (think a wrapper class whose
-methods map one-to-one onto a SQL query each).
+A **deep module** (John Ousterhout's term) is a small, simple interface that hides a lot of implementation — a narrow door into a big room. Callers work against a few well-named methods instead of re-deriving the same rules from prose. The opposite, a *shallow* module, exposes almost as much interface as implementation and barely earns its keep.
 
-Six concepts in this system started out shallow and scattered: the same idea
-spread across several files, each consumer re-implementing the rules. This
-chapter consolidates each one behind a single entry point. Read every section as
-the same four beats:
+Six concepts in this system started shallow and scattered — the same idea spread across several files, each consumer re-implementing the rules. Each section below follows the same four beats: **the problem** (the concept lives in N files and drifts), **the module** (one small typed interface, the only way in), **what it hides**, **the test boundary** (test the small interface, not the internals).
 
-- **The problem** — the concept lives in N files, and the rules drift.
-- **The module** — one small typed interface, the only way in.
-- **What it hides** — the implementation now behind that door.
-- **The test boundary** — you test the small interface, not the internals.
-
-The payoff is that every later consumer targets the deep boundary and never grows
-shallow again.
-
-One of the six, `@repo/tenancy`, is already a runtime boundary that auth, server,
-and custom-hostname flows all depend on, so it lands early (Phase A). The other
-five are consolidations applied once the core multi-tenant behavior is stable
-(Phase C).
+`@repo/tenancy` is already a runtime boundary all workers depend on, so it lands early (Phase A). The other five consolidate once core multi-tenant behavior is stable (Phase C).
 
 ## Implementation order
 
-The order is strict because each step builds on the one before it — schema before
-the package that queries it, the token verifier before the service that reads
-`org.sessionVersion`:
+Strict, because each step builds on the one before it — schema before the package that queries it, the token verifier before the service that reads `org.sessionVersion`:
 
 <Steps>
 
-1. The Phase 0 spike validates the Better Auth SSO schema and the Cloudflare
-   hostname state model.
+1. The Phase 0 spike validates the Better Auth SSO schema and the Cloudflare hostname state model.
 2. Phase A schema migrations land.
 3. Phase A: `@repo/tenancy` — every worker uses it.
 4. Phase C: `@repo/auth-tokens` — the verifier-side helper.
@@ -56,12 +33,7 @@ the package that queries it, the token verifier before the service that reads
 
 ## Tenancy package
 
-Tenant context is the first thing every request needs and the easiest thing to let
-fragment. Spread across `parseHostname`, two tenant middlewares (one in `apps/server`,
-one in `apps/auth`), `cache-fanout.ts`, and the `bumpTenantCacheVersion` RPC, it
-becomes five files for one concept — and the cache-key shape leaks into invalidation
-code in three separate workers. Pulling it into one package gives every worker a
-single way to turn a host into an organization.
+Tenant context is the first thing every request needs and the easiest to fragment — spread across `parseHostname`, two tenant middlewares, `cache-fanout.ts`, and the `bumpTenantCacheVersion` RPC, it's five files for one concept, and the cache-key shape leaks into invalidation code in three workers. One package gives every worker a single way to turn a host into an organization.
 
 ```ts title="packages/tenancy/src/index.ts"
 export type TenantContext = {
@@ -100,43 +72,15 @@ export function createInvalidator(env: { CACHE: KVNamespace }): Invalidator;
 export function createFanOutInvalidator(env: { CACHE: KVNamespace; API: AuthRpc; AUTH: AuthRpc }): FanOutInvalidator;
 ```
 
-What the package hides behind that interface:
+What it hides: the `parseHostname` rules (lowercase + NFC + regex + reserved names + tombstone check); the Cache API key shape (version prefix + kind/key segments); the KV version-bump TTL; the deleted-org filter (`WHERE deleted_at IS NULL`); the admin-host exclusion; the reverse-lookup join paths (subdomain via `organizations.slug`, custom hostname via the `tenant_custom_hostnames` join).
 
-- The `parseHostname` rules — lowercase plus NFC normalization, the regex, reserved
-  names, and the tombstone check.
-- The Cache API key shape — the version prefix and the kind/key segments.
-- The KV version-bump TTL.
-- The deleted-org filter (`WHERE deleted_at IS NULL`).
-- The admin-host exclusion.
-- The reverse-lookup join paths: a subdomain resolves through `organizations.slug`;
-  a custom hostname joins `tenant_custom_hostnames` to `organizations`.
+The invalidator is split in two on purpose. `apps/auth` has no binding back to `apps/admin`, so it gets the plain `Invalidator` (own-colo only) and reuses `apps/auth → apps/server.invalidateTenant(...)` for cross-server invalidation. The admin worker gets the `FanOutInvalidator`. The asymmetry of the binding graph is reflected in the type, so a worker can't accidentally call a fan-out method it has no binding for.
 
-The invalidator is split in two on purpose. `apps/auth` has no binding back to
-`apps/admin`, so it gets the plain `Invalidator` (own-colo only) and reuses the
-existing `apps/auth → apps/server.invalidateTenant(...)` binding for cross-server
-invalidation. The admin worker gets the `FanOutInvalidator`, which calls both
-`apps/server` and `apps/auth`. The asymmetry of the binding graph is reflected in
-the type, so a worker can't accidentally call a fan-out method it has no binding for.
-
-**Test boundary:** integration tests against an in-process Postgres with a mocked
-Cache and KV, asserting:
-
-- Resolution by slug returns the expected org.
-- Resolution by custom hostname joins correctly.
-- Soft-deleted orgs return `null`.
-- A cache miss writes a positive entry; a cache hit returns without touching the DB.
-- The negative-cache TTL is short.
-- A version bump invalidates entries written under the old version.
-
-This one suite replaces four separate test files from the earlier design.
+**Test boundary:** integration tests against in-process Postgres with a mocked Cache and KV — resolution by slug, resolution by custom hostname, soft-deleted orgs return `null`, cache-miss writes a positive entry, cache hit skips the DB, short negative TTL, version bump invalidates old-version entries. One suite replaces four separate test files.
 
 ## Auth tokens package
 
-JWT verification started life as a protocol written in prose: every consumer was
-told to check `aud`, `iss`, `org.host`, `org.id`, and that `sessionVersion >= db`.
-No module owned it, so each new consumer re-implemented the same checks from an
-English description — exactly the kind of duplication that drifts. The fix is to
-make the protocol a module that returns a typed result.
+JWT verification started as a protocol written in prose: every consumer was told to check `aud`, `iss`, `org.host`, `org.id`, and `sessionVersion >= db`. No module owned it, so each consumer re-implemented the checks from an English description — exactly the duplication that drifts. The fix: make the protocol a module that returns a typed result.
 
 ```ts title="packages/auth-tokens/src/index.ts"
 export type AuthorizedClaims = {
@@ -162,45 +106,28 @@ export type VerifyOpts = {
   jwks: JWKSResolver;
 };
 
-// Stateful variant — for internal verifiers with DB access (uses the up-to-date sessionVersion).
+// Stateful variant — for internal verifiers with DB access (reads the live sessionVersion).
 export async function verifyTenantJwt(
   token: string,
   opts: VerifyOpts & { db: DrizzleClient },
 ): Promise<AuthorizedClaims | VerifyError>;
 
-// Stateless variant — for external verifiers (the caller supplies the version they last saw).
+// Stateless variant — for external verifiers (caller supplies the version they last saw).
 export async function verifyTenantJwtStateless(
   token: string,
   opts: VerifyOpts & { expectedMinSessionVersion: number },
 ): Promise<AuthorizedClaims | VerifyError>;
 ```
 
-The two variants exist because two kinds of verifier exist. An internal verifier in
-another worker has DB access and can read the live `sessionVersion`, so it uses
-`verifyTenantJwt`. An external, downstream service has no DB access, so it uses
-`verifyTenantJwtStateless` and supplies the most recent version it saw.
+Two variants because two kinds of verifier exist: an internal verifier in another worker has DB access and uses `verifyTenantJwt`; an external downstream service has no DB access and uses `verifyTenantJwtStateless` with the most recent version it saw.
 
-Minting deliberately stays in Better Auth. Its `jwt` plugin keeps owning key
-management and JWKS distribution — JWKS (JSON Web Key Set) being the public phone
-book of signing keys: a verifier fetches it once, then validates token signatures
-offline against it. This package only consumes tokens; the design just extends
-`definePayload` to add the `org` claim. Replacing Better Auth's mint side would
-break its session helpers and force the team to manage JWKS by hand — a large
-maintenance burden for no gain. Internal verifiers (other workers) and external
-verifiers alike fetch JWKS from Better Auth's `/api/auth/jwks` endpoint and cache it
-with `createRemoteJWKSet`.
+Minting deliberately stays in Better Auth. Its `jwt` plugin keeps owning key management and JWKS distribution — replacing the mint side would break its session helpers and force you to manage JWKS by hand. This package only consumes tokens; the design just extends `definePayload` to add the `org` claim. All verifiers fetch JWKS from Better Auth's `/api/auth/jwks` and cache it with `createRemoteJWKSet`.
 
-The test boundary is round-trip tests covering every claim combination and every
-failure mode — the coverage the prose protocol never had.
+**Test boundary:** round-trip tests covering every claim combination and every failure mode — the coverage the prose protocol never had.
 
 ## Tenant operations
 
-Every operator-on-tenant mutation — create, suspend, restore, delete — has to
-coordinate four things in the same transaction: the DB writes, a dual-scope audit
-record, a session-version bump, and (after commit) a cache invalidation. Spread
-across many endpoint handlers, nothing structurally guarantees that the *next*
-endpoint someone writes remembers all four. A service that owns the coordination
-turns "remember four steps" into "call one method."
+Every operator-on-tenant mutation — create, suspend, restore, delete — must coordinate four things in one transaction: DB writes, a dual-scope audit record, a session-version bump, and (post-commit) a cache invalidation. Spread across many endpoint handlers, nothing structurally guarantees the next endpoint remembers all four. A service that owns the coordination turns "remember four steps" into "call one method."
 
 ```ts title="apps/server/src/services/tenant-operations/index.ts"
 type TenantOperator = { kind: "global_admin"; admin: GlobalAdmin } | { kind: "system"; reason: string };
@@ -215,8 +142,7 @@ export class TenantOperations {
 }
 ```
 
-Each method runs the same shape of transaction, with the version bump, session
-deletes, and slug tombstone switched on only for the operations that need them:
+Each method runs the same transaction shape, with the version bump, session deletes, and slug tombstone switched on only for the operations that need them:
 
 ```text
 db.transaction([
@@ -229,20 +155,11 @@ db.transaction([
 post-commit: invalidator.fanOut(spec)   // + bump version on rename (rename deferred to v2)
 ```
 
-The `by` parameter is a union because not every mutation is operator-initiated.
-Billing-driven suspension and scheduled DPA-deletion run as the system, which needs
-a typed actor that isn't a global admin. The audit log already supports
-`actor_type: "system"`; the union types the call site so a system mutation can't
-masquerade as an operator.
+The `by` parameter is a union because not every mutation is operator-initiated: billing-driven suspension and scheduled DPA-deletion run as the system, which needs a typed actor that isn't a global admin. The audit log already supports `actor_type: "system"`; the union types the call site so a system mutation can't masquerade as an operator.
 
-`rename` is deliberately absent. A slug rename invalidates SSO callback URLs
-registered with external IdPs — the IdP holds an absolute URL pointing at the old
-hostname, so the rename breaks SSO until the tenant updates their IdP config.
-"Hide this from callers" is the wrong abstraction here, because the operator genuinely
-has to coordinate with the tenant. v2 adds rename with an explicit operator runbook
-rather than pretending it's a transparent operation.
+`rename` is deliberately absent. A slug rename invalidates SSO callback URLs registered with external IdPs — the IdP holds an absolute URL pointing at the old hostname. v2 adds rename with an explicit operator runbook rather than pretending it's transparent.
 
-With the service in place, the admin endpoints shrink to wrappers:
+With the service in place, admin endpoints shrink to wrappers:
 
 ```ts title="apps/admin/src/modules/tenants/handler.ts" {6}
 suspendTenant.guard = [requireOperator("tenant.suspend")];
@@ -254,19 +171,11 @@ suspendTenant.handler = async (c) => {
 };
 ```
 
-Five lines after validation, and the four-piece coordination is invisible to the
-route. The test boundary lives on the service, not the handlers: each method is
-tested for its transactional invariants — partial-failure rollback, the dual audit
-row count, session-version monotonicity, and that post-commit invalidation is
-actually called.
+Five lines after validation, and the four-piece coordination is invisible to the route. **Test boundary** on the service, not the handlers: each method tested for partial-failure rollback, dual audit row count, session-version monotonicity, and that post-commit invalidation is actually called.
 
 ## Operator authentication
 
-The admin worker's identity boundary spans three things: verifying the Cloudflare
-Access JWT, the enrollment-token flow on first login, and DB-side activity tracking.
-Left as separate middleware snippets across several places, it's hard to reason about
-as one boundary. Folding it into one function gives the admin worker a single "who is
-this operator?" call that returns a typed result.
+The admin worker's identity boundary spans three things: verifying the CF Access JWT, the enrollment-token flow on first login, and DB-side activity tracking. Left as separate middleware snippets, it's hard to reason about as one boundary. One function gives the admin worker a single "who is this operator?" call with a typed result:
 
 ```ts title="apps/admin/src/auth/authenticate-operator.ts"
 type AuthFailure =
@@ -287,27 +196,11 @@ export async function authenticateOperator(
 ): Promise<{ ok: true; admin: GlobalAdmin } | { ok: false; failure: AuthFailure }>;
 ```
 
-What it hides:
-
-- CF Access JWT verification against the team JWKS.
-- Service-token rejection.
-- The first-login enrollment-token claim flow.
-- The `lastActiveAt` ping.
-- A stable failure mapping for the SPA (`ENROLLMENT_REQUIRED`, deactivated, invalid
-  token).
-
-The test boundary is one place: JWT success and failure, service-token rejection,
-the enrollment-token claim race, a deactivated user, and JWKS reset behavior are all
-exercised against this single interface.
+What it hides: CF Access JWT verification against the team JWKS; service-token rejection; the first-login enrollment-token claim flow; the `lastActiveAt` ping; a stable failure mapping for the SPA (`ENROLLMENT_REQUIRED`, deactivated, invalid token). **Test boundary:** JWT success and failure, service-token rejection, the enrollment-token claim race, a deactivated user, and JWKS reset behavior — all exercised against this single interface.
 
 ## Operator authorization
 
-The earlier design answered "what can an operator do?" with four separate pieces —
-the policies, a `whereGlobalAdminRole` builder, an `adminBypassTenantIsolation`
-middleware, and a `buildGlobalAdminPrincipal` attribute layout. A reader couldn't
-answer "can `support` suspend a tenant?" without cross-referencing all four. A single
-permission matrix, with the action type *derived* from it, makes the answer one
-lookup.
+The earlier design answered "what can an operator do?" with four separate pieces — policies, a `whereGlobalAdminRole` builder, an `adminBypassTenantIsolation` middleware, and a `buildGlobalAdminPrincipal` attribute layout. A single permission matrix, with the action type *derived* from it, makes the answer one lookup:
 
 ```ts title="packages/authorization/src/operator.ts" {16}
 export const OPERATOR_PERMISSIONS = {
@@ -342,42 +235,19 @@ export function canOperator(admin: GlobalAdmin, action: OperatorAction): boolean
 }
 ```
 
-The key move is that `OperatorAction` is `keyof typeof OPERATOR_PERMISSIONS`. Every
-action in the matrix is automatically a valid action, and an unknown action is a
-compile error — there's no second union to keep in sync. The
-`as const satisfies Record<string, readonly GlobalAdminRole[]>` clause keeps the
-literal types while still checking the shape.
+The key move: `OperatorAction` is `keyof typeof OPERATOR_PERMISSIONS`. Every action in the matrix is automatically valid, and an unknown action is a compile error — no second union to keep in sync. The `as const satisfies Record<...>` clause keeps literal types while checking the shape.
 
-This matrix coexists with the existing `whereGlobalAdminRole` policy builder.
-`OPERATOR_PERMISSIONS` is the source of truth for **operator-only actions** on the
-`tenant` and `platform` resources. The `whereGlobalAdminRole` DSL builder remains for
-the rare case where a `global_admin` touches an **org-scoped resource** through the
-existing `authorize("...")` Hono adapter — for example, reading a tenant's audit log
-via the existing audit-logs route. In v1 that's rare (the admin worker uses
-`requireOperator` everywhere), but the builder stays for future extension.
+This matrix coexists with the existing `whereGlobalAdminRole` policy builder. `OPERATOR_PERMISSIONS` is the source of truth for **operator-only actions** on `tenant` and `platform` resources; `whereGlobalAdminRole` remains for the rare case where a `global_admin` touches an **org-scoped resource** through the existing `authorize("...")` Hono adapter.
 
 :::caution[Why `global_admin` is not in `systemAdminRoles`]
-The existing evaluator's `systemAdminRoles` bypass returns "pass" for any principal
-in that list, **skipping condition evaluation entirely**. Adding `global_admin` to
-`systemAdminRoles` *and* using `whereGlobalAdminRole` policies would let the bypass
-short-circuit the per-role check — every operator would silently become a
-`super_admin` again. So `global_admin` is added to `roles` but **not** to
-`systemAdminRoles`. The cross-tenant bypass is instead encoded in the action
-contract: operator actions on `tenant`/`platform` resources are apex-level by
-definition, with no `resolveOrganization` step.
+The existing evaluator's `systemAdminRoles` bypass returns "pass" for any principal in that list, **skipping condition evaluation entirely**. Adding `global_admin` to `systemAdminRoles` *and* using `whereGlobalAdminRole` policies would let the bypass short-circuit the per-role check — every operator would silently become a `super_admin`. So `global_admin` is added to `roles` but **not** to `systemAdminRoles`. The cross-tenant bypass is instead encoded in the action contract: operator actions on `tenant`/`platform` resources are apex-level by definition, with no `resolveOrganization` step.
 :::
 
-The test boundary is a matrix test generated directly from `OPERATOR_PERMISSIONS`:
-every `(action, role)` pair against its allow and deny case, mirroring the existing
-`__tests__/typed-actions.test.ts` pattern.
+**Test boundary:** a matrix test generated directly from `OPERATOR_PERMISSIONS` — every `(action, role)` pair against its allow and deny case.
 
 ## SSO provider repository
 
-The earlier design had a `secrets.ts` with two functions wrapping two SQL calls — the
-textbook shallow module. Worse, plaintext IdP secrets were passed around freely, so a
-single accidental log line could leak every tenant's IdP credentials. The repository
-makes the safe path the only path: reads never return plaintext, and plaintext is
-reachable only inside a scoped closure.
+The earlier design had a `secrets.ts` with two functions wrapping two SQL calls — the textbook shallow module. Worse, plaintext IdP secrets were passed around freely, so one accidental log line could leak every tenant's IdP credentials. The repository makes the safe path the only path: reads never return plaintext, and plaintext is reachable only inside a scoped closure.
 
 ```ts title="apps/server/src/modules/sso-config/repository.ts"
 // Co-located with the sso-config module, NOT a separate package.
@@ -396,10 +266,7 @@ export class SsoProviderRepository {
 }
 ```
 
-There's a complication: Better Auth's SSO plugin reads provider rows directly from
-`node_modules`, so those reads can't be intercepted. To encrypt at rest while keeping
-Better Auth working, the underlying table stores ciphertext and a Postgres view
-exposes plaintext for Better Auth alone:
+Complication: Better Auth's SSO plugin reads provider rows directly from `node_modules`, so those reads can't be intercepted. To encrypt at rest while keeping Better Auth working, the underlying table stores ciphertext and a Postgres view exposes plaintext for Better Auth alone:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -415,25 +282,15 @@ CREATE VIEW sso_providers_decrypted AS
   FROM sso_providers;
 ```
 
-The decryption key is provided per session with `SET LOCAL app.sso_key = '...'`.
-Better Auth's adapter is configured to read from `sso_providers_decrypted` instead of
-`sso_providers`, while the application's own code reads the raw, encrypted
-`sso_providers` table by default. `withDecryptedSecret` opens a connection, sets the
-session key, queries the view, hands the secret to the closure, and closes the
-connection so the key can't be reused.
+The decryption key is provided per session with `SET LOCAL app.sso_key = '...'`. Better Auth's adapter reads from `sso_providers_decrypted`; application code reads the raw encrypted `sso_providers` by default. `withDecryptedSecret` opens a connection, sets the session key, queries the view, hands the secret to the closure, and closes the connection so the key can't be reused.
 
 :::tip[Defense in depth]
-Logger middleware (`@repo/shared/logger`) strips any field named `secret`,
-`clientSecret`, or `enrollmentToken` from structured log output — so even a careless
-log call can't leak a credential.
+Logger middleware (`@repo/shared/logger`) strips any field named `secret`, `clientSecret`, or `enrollmentToken` from structured log output — even a careless log call can't leak a credential.
 :::
 
 ## Custom hostname lifecycle
 
-The earlier design split one concept across three pieces: `cloudflare-api.ts`, the
-`tenancy` HTTP module, and the `hostname-reconciler.ts` cron handler. A single
-service owns the whole lifecycle — add, verify, reconcile, remove — so the cron and
-the HTTP routes call the same code path.
+The earlier design split one concept across three pieces: `cloudflare-api.ts`, the `tenancy` HTTP module, and the `hostname-reconciler.ts` cron handler. A single service owns the whole lifecycle — add, verify, reconcile, remove — so the cron and the HTTP routes call the same code path.
 
 ```ts title="apps/server/src/services/custom-hostnames/index.ts"
 export class CustomHostnameLifecycle {
@@ -449,19 +306,9 @@ export class CustomHostnameLifecycle {
 }
 ```
 
-It's co-located in `apps/server` rather than promoted to a package because it has
-three call sites and all three live in `apps/server`: the HTTP module routes, the
-cron scheduled handler, and the admin worker's support actions (which reach it via
-`ApiBinding` RPC). One service, three consumers — no package needed. The full
-state machine these methods drive is covered in
-[Custom Hostnames](/multi-tenant/custom-hostnames/).
-
-The test boundary is state-transition tests with a mocked CF API, and the reconciler
-cron becomes a thin caller of `reconcileAll()`.
+Co-located in `apps/server` rather than promoted to a package: it has three call sites and all three live in `apps/server` (the HTTP module routes, the cron scheduled handler, and the admin worker's support actions via `ApiBinding` RPC). One service, three consumers — no package needed. The state machine these methods drive is in [Custom Hostnames](/multi-tenant/custom-hostnames/). **Test boundary:** state-transition tests with a mocked CF API; the reconciler cron becomes a thin caller of `reconcileAll()`.
 
 ## Refactor effort per module
-
-The consolidations are bounded work. Here's the scope of each:
 
 | Module | Scope | New code | Refactored code |
 | --- | --- | --- | --- |
@@ -472,43 +319,20 @@ The consolidations are bounded work. Here's the scope of each:
 | `ssoProviderRepository` | new module + Postgres view | ~250 LOC | sso-config module + Better Auth adapter config |
 | `customHostnameLifecycle` | new service | ~400 LOC | 3 call sites refactor to wrappers |
 
-After `@repo/tenancy` lands in Phase A, the remaining Phase C work is roughly two
-weeks of focused refactoring.
+After `@repo/tenancy` lands in Phase A, the remaining Phase C work is roughly two weeks of focused refactoring.
 
 ## Why deepen now, not later
 
-The natural inclination is to ship Phases A and B first and consolidate later. Done
-that way, the workers accumulate inconsistencies — different cache-key formats across
-middlewares, different audit-emission patterns across routes — that only get harder to
-unify after the fact. Moving `@repo/tenancy` into Phase A avoids the worst of that
-drift, and Phase C finishes the remaining consolidations before the admin and
-control-plane surface grows too broad to refactor cheaply.
-
-The cost is paying for boundary design once, upfront. The win is that Phase A and B
-handlers can target the deep boundary from day one and never grow shallow.
+Shipping Phases A and B first and consolidating later lets the workers accumulate inconsistencies — different cache-key formats across middlewares, different audit-emission patterns across routes — that only get harder to unify after the fact. Moving `@repo/tenancy` into Phase A avoids the worst of that drift; Phase C finishes the remaining consolidations before the admin and control-plane surface grows too broad to refactor cheaply. The cost is paying for boundary design once, upfront. The win: Phase A and B handlers target the deep boundary from day one and never grow shallow.
 
 ## Pitfalls when building deep modules
 
-A few traps recur when consolidating like this:
-
 :::caution[Don't hide state in module scope]
-Deep modules that need caches (JWKS, tenant resolution) must **expose the cache as an
-injected dependency**, not stash it in module scope. Module-scope state forces tests
-to call `vi.resetModules()` between cases; an injected cache is just another mocked
-dep.
+Deep modules that need caches (JWKS, tenant resolution) must **expose the cache as an injected dependency**, not stash it in module scope. Module-scope state forces tests to call `vi.resetModules()` between cases; an injected cache is just another mocked dep.
 :::
 
-- **One `AGENTS.md` per package.** A project convention: every new package gets one,
-  scoped to that package's role and conventions.
-- **No cyclic dependencies.** `@repo/tenancy` imports schemas from `@repo/db`, so
-  `@repo/db` must **never** import from `@repo/tenancy`. The same rule holds for
-  `@repo/auth-tokens`.
-- **Refactor order is strict.** Schema migrations come before the tenancy package;
-  the tenancy package before tenant-operations; and `@repo/auth-tokens` before
-  tenant-operations, because tenant-operations uses `org.sessionVersion`.
-- **`AdminApiEntrypoint` is the only route from `apps/admin` to `apps/server`.**
-  Don't expose admin RPC methods on the existing `ApiEntrypoint`, which is also
-  reachable from `apps/auth`.
-- **Test at the boundary, not inside it.** The whole point of deepening is testability
-  at the small interface — resist the urge to write unit tests for every internal
-  helper.
+- **One `AGENTS.md` per package** — a project convention, scoped to that package's role.
+- **No cyclic dependencies.** `@repo/tenancy` imports schemas from `@repo/db`, so `@repo/db` must **never** import from `@repo/tenancy`. Same rule for `@repo/auth-tokens`.
+- **Refactor order is strict.** Schema migrations before the tenancy package; the tenancy package before tenant-operations; `@repo/auth-tokens` before tenant-operations (it uses `org.sessionVersion`).
+- **`AdminApiEntrypoint` is the only route from `apps/admin` to `apps/server`.** Don't expose admin RPC methods on the existing `ApiEntrypoint`, which is also reachable from `apps/auth`.
+- **Test at the boundary, not inside it.** Resist unit-testing every internal helper — those tests just make refactoring painful.

@@ -1,32 +1,17 @@
 ---
 title: Who Owns the User Row?
-description: The central question of integrating a centralized IdP into an app that already has a users table — and a per-column source-of-truth model that answers it.
+description: "Adopting Auther stops you owning authentication — the per-column source-of-truth model decides who owns each field on your existing users table."
 sidebar:
   order: 10
 ---
 
-You already have a `users` table. Two dozen foreign keys point at it, half your
-queries `JOIN` against it, and your auth middleware turns its rows into principals.
-Now you're adopting Auther, a centralized identity provider — and suddenly a third
-party owns identity. So who owns the row?
+You have a `users` table. Foreign keys point at it, queries `JOIN` against it, your auth middleware turns its rows into principals. Adopting Auther means a third party now owns identity — so who owns the row?
 
-That's the question this whole part of the guide turns on. When you adopt a
-centralized IdP, you stop owning authentication: Auther runs sign-up, sign-in,
-password hashes, 2FA, session tokens, and key rotation. Your app gets a signed JWT
-with claims, and that's it. (If you haven't yet, the
-[Auther overview](/auther/overview/) explains what the server itself does.)
-
-But your app database is not a blank slate, and you can't hand it a JWT and walk
-away. The one decision that makes the entire integration tractable is this: for
-every piece of data on the user row, decide who is allowed to be the source of
-truth. Get that right and schema, sync, and failure handling all fall out of it.
+You stop owning *authentication*: Auther runs sign-up, sign-in, password hashes, 2FA, session tokens, key rotation. Your app gets a signed JWT. But your database isn't a blank slate — the fix is deciding, for every column on the user row, a single source of truth.
 
 ## What you already have
 
-In the running reference example — the `hono-node-template-2026` monorepo — the
-schema you start with looks like this. The auth-related tables come straight from
-better-auth; the rest are ordinary domain tables with foreign keys back to
-`users.id`.
+In the `hono-node-template-2026` monorepo, the starting schema:
 
 ```sql title="packages/db/src/schema/auth.ts"
 users              (id, email, name, emailVerified, image, status, roleSlugs, ...)
@@ -47,9 +32,7 @@ members                    (user_id, org_id)
 auth_relations             (subject_id, object_id, relation)  -- plain text
 ```
 
-Every one of those arrows assumes the row on the other end exists locally. And your
-application code is riddled with references that assume the same — filters, lookups,
-cascading deletes, and the helper that turns a user into a principal:
+Application code assumes the row exists locally:
 
 ```ts
 // apps/server/src/modules/notifications/service.ts
@@ -65,63 +48,36 @@ await db.delete(schema.sessions).where(eq(schema.sessions.userId, session.userId
 const principal = principalFromUser(c.get("user"));
 ```
 
-Now Auther wants to run identity. Faced with that, every engineer reaches for one of
-two shortcuts first — and both are traps.
-
 ## The two tempting shortcuts (both wrong)
 
-:::caution[Shortcut 1: "Auther owns identity now, so drop the local `users` table."]
-Sounds clean. But the moment that table is gone, every FK cascade dangles, every
-`INNER JOIN users` in code like `apps/server/src/modules/users/handler.ts` has
-nothing to join to, and every `user.name` you display has to become a network call
-to Auther. The "delete one table" change metastasizes into a weeks-long refactor of
-every query that ever touched a user — and you're left chasing orphaned rows that
-point at users your database no longer knows.
+:::caution[Shortcut 1: "Drop the local `users` table."]
+Every FK cascade dangles, every `INNER JOIN users` has nothing to join to, and every `user.name` you display becomes a network call to Auther. The "delete one table" change metastasizes into a weeks-long refactor — plus orphaned rows pointing at users your DB no longer knows.
 :::
 
-:::caution[Shortcut 2: "Leave the database alone and bolt Auther on the side."]
-The opposite instinct: keep everything as-is, run Auther next to the untouched
-database. Now you have two identity stores, and the day one of them changes they
-start drifting. A user updates their email in Auther — your app keeps showing the
-old one in every list and notification. An admin bans a user in Auther — your app
-still lets them in on a JWT it cached an hour ago. The two stores tell different
-stories about the same person, and you have no rule for which one wins.
+:::caution[Shortcut 2: "Bolt Auther on the side, leave the database alone."]
+Two identity stores drift the moment one changes. A user updates their email in Auther — your app shows the old one. An admin bans a user in Auther — your app still lets them in on a cached JWT. No rule for which store wins.
 :::
 
-## Frame it as ownership, column by column
+## Ownership, column by column
 
-The way out is neither "all Auther" nor "all local" — it's both, decided one column
-at a time. The correct framing is **ownership**: for each column on the user row,
-pick a single source of truth. Some fields are pure identity and belong to Auther;
-some are pure product state and stay in your app; a few are genuinely split.
+Neither "all Auther" nor "all local" — both, decided per column. Some fields are pure identity (Auther's); some are product state (yours); a few are split. This table is the contract everything else builds on:
 
-Done for the whole row, that decision is the centerpiece of the entire integration —
-this one table is the contract everything else is built on:
+| Column | Authoritative in | Notes |
+| --- | --- | --- |
+| `id` | Auther | Local row uses Auther's ID verbatim as PK |
+| `email`, `emailVerified` | Auther | Your app mirrors for joins/display |
+| `name`, `image` | Auther | Your app mirrors |
+| password / argon2id hash | Auther | Your app never stores |
+| 2FA secret / backup codes | Auther | Your app never stores |
+| `status` (active/inactive) | Auther | Auther's admin plugin (`banned` + `banReason`) |
+| `failedLoginAttempts` | Auther | Auther's login-security plugin |
+| `lockedUntil` | Auther | Same |
+| `twoFactorEnabled` | Auther | Inferable from Auther's userinfo endpoint |
+| `onboardingCompletedAt` | **Your app** | Pure product state |
+| `notificationPreferences` | **Your app** | Your app |
+| `roleSlugs` | Split | Platform roles → Auther; app-domain roles → your app |
+| `activeOrganizationId` | **Your app** | Tenant selection is an app concern (see [Edge Cases](/auther/integration/edge-cases/)) |
 
-| Column                     | Authoritative in | Notes                                                |
-| -------------------------- | ---------------- | ---------------------------------------------------- |
-| `id`                       | Auther           | Local row uses Auther's ID verbatim as PK            |
-| `email`, `emailVerified`   | Auther           | Your app mirrors for joins/display                   |
-| `name`, `image`            | Auther           | Your app mirrors                                     |
-| password / argon2id hash   | Auther           | Your app never stores                                |
-| 2FA secret / backup codes  | Auther           | Your app never stores                                |
-| `status` (active/inactive) | Auther           | Auther's admin plugin (`banned` + `banReason`)       |
-| `failedLoginAttempts`      | Auther           | Auther's login-security plugin                       |
-| `lockedUntil`              | Auther           | Same                                                 |
-| `twoFactorEnabled`         | Auther           | Inferable from Auther's userinfo endpoint            |
-| `onboardingCompletedAt`    | **Your app**     | Pure product state; Auther doesn't know about it     |
-| `notificationPreferences`  | **Your app**     | Your app                                             |
-| `roleSlugs`                | Split            | Platform roles → Auther; app-domain roles → your app |
-| `activeOrganizationId`     | **Your app**     | Tenant selection is an app concern (see the [Edge Cases Catalog](/auther/integration/edge-cases/)) |
+Mirrored columns (`email`, `name`, `image`) keep joins and display lookups local while Auther stays the authority — you just keep the mirror fresh. "Your app" columns are data Auther has no opinion about, so nothing syncs. Once every column has exactly one owner, schema, sync, and failure modes follow mechanically.
 
-:::note[Why this works]
-The mirrored columns (`email`, `name`, `image`) keep your joins and display lookups
-fast and local, while Auther stays the authority that can change them — you just
-have to keep the mirror fresh. The columns marked "Your app" are data Auther has no
-opinion about, so there's nothing to sync. Once every column has exactly one owner,
-schema design, the sync mechanism, and the failure modes all follow mechanically.
-:::
-
-With ownership decided, the next question is structural: should a local `users`
-table exist at all, and if so, what lives in it? That's the subject of the
-[four integration archetypes](/auther/integration/archetypes/).
+The structural question — should a local `users` table exist at all — is the [four integration archetypes](/auther/integration/archetypes/).

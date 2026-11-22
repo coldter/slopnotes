@@ -1,6 +1,6 @@
 ---
 title: Materialized View Pattern
-description: Pre-aggregate sales data into a summary DocType, refreshed by a scheduled job and incremental hooks, for sub-100ms dashboards.
+description: "Pre-aggregate sales into a summary DocType refreshed by a nightly job plus incremental on_submit hooks, for sub-100ms dashboards."
 sidebar:
   order: 7
 ---
@@ -9,20 +9,13 @@ import { LinkCard } from "@astrojs/starlight/components";
 
 <LinkCard title="← Frappe Cookbook" href="/erpnext/cookbook/" />
 
-**Problem:** A ScoopJoy dashboard needs pre-aggregated daily sales data.
-Computing it in real-time from `Sales Invoice` with 500K+ records takes 3+
-seconds. You need sub-100ms response times.
+**Problem:** A ScoopJoy dashboard needs pre-aggregated daily sales, but computing it live from 500K+ Sales Invoice rows takes 3+ seconds. You need sub-100ms.
 
-**Solution:** Use a custom DocType as a materialized view — a `Daily Sales
-Summary` populated by a scheduled job and incrementally updated whenever an
-invoice is submitted or cancelled.
+**Solution:** A custom DocType as a materialized view — `Daily Sales Summary`, one row per outlet per day — populated by a nightly scheduled job and incrementally updated on invoice submit/cancel.
 
-## Step 1: Create the materialized-view DocType
+## Step 1: The materialized-view DocType
 
-The summary DocType stores one row per outlet per day. The `autoname`
-`format:DSS-{posting_date}-{franchise_outlet}` gives each row a deterministic
-name so the refresh job can upsert by name, and `fetch_from` pulls outlet
-metadata for free.
+One row per outlet per day. `autoname: format:DSS-{posting_date}-{franchise_outlet}` gives each row a deterministic name so the refresh job can upsert by name; `fetch_from` pulls outlet metadata for free:
 
 ```json title="scoopjoy/scoopjoy/doctype/daily_sales_summary/daily_sales_summary.json" {5}
 {
@@ -58,9 +51,7 @@ metadata for free.
 
 ## Step 2: The aggregation engine
 
-`refresh_daily_summary` runs the expensive `GROUP BY` once, then upserts a
-summary row per outlet. Because the document name is derived from the date and
-outlet, an existing row is loaded and overwritten rather than duplicated.
+`refresh_daily_summary` runs the expensive `GROUP BY` once, then upserts a summary row per outlet. Because the document name derives from date + outlet, an existing row is loaded and overwritten rather than duplicated:
 
 ```python title="scoopjoy/scoopjoy/utils/daily_summary.py" {14-30,42-46}
 import frappe
@@ -141,10 +132,7 @@ def refresh_daily_summary(date=None, outlet=None):
     return len(rows)
 ```
 
-The "top item per outlet" is a windowed query — `ROW_NUMBER() OVER (PARTITION
-BY ...)` ranks items within each outlet, and the outer query keeps only the
-rank-1 row. This is one of those cases where raw SQL is clearer than the query
-builder:
+The "top item per outlet" is a windowed query — `ROW_NUMBER() OVER (PARTITION BY ...)` ranks items within each outlet and the outer query keeps only rank 1. Raw SQL is clearer here than the query builder:
 
 ```sql title="scoopjoy/scoopjoy/utils/daily_summary.py — _get_top_items_for_date()"
 SELECT franchise_outlet, item_name, total_qty
@@ -182,31 +170,22 @@ def _get_top_items_for_date(date, outlet_names):
 
 ### Incremental update on submit/cancel
 
-Wired through `doc_events`, this refreshes only the affected outlet and date
-when an invoice changes — keeping the summary near-real-time without rescanning
-everything.
+Wired through `doc_events`, this refreshes only the affected outlet + date when an invoice changes — near-real-time without rescanning everything:
 
 ```python title="scoopjoy/scoopjoy/utils/daily_summary.py"
 def on_sales_invoice_change(doc, method):
-    """
-    Called via doc_events hook when a Sales Invoice is submitted or cancelled.
-    Refreshes only the affected outlet + date.
-    """
+    """Called via doc_events hook on Sales Invoice submit/cancel."""
     if doc.franchise_outlet and doc.posting_date:
         refresh_daily_summary(date=doc.posting_date, outlet=doc.franchise_outlet)
 ```
 
 ### Scheduled nightly refresh
 
-The nightly job refreshes today and yesterday, so late or backdated entries are
-caught even if no submit event fired for them.
+Refreshes today and yesterday, so late or backdated entries are caught even if no submit event fired:
 
 ```python title="scoopjoy/scoopjoy/utils/daily_summary.py"
 def scheduled_daily_refresh():
-    """
-    Nightly job: refresh today and yesterday (catches late entries).
-    Register in hooks.py scheduler_events.
-    """
+    """Nightly job: refresh today and yesterday. Register in hooks.py scheduler_events."""
     refresh_daily_summary(date=today())
     refresh_daily_summary(date=add_days(today(), -1))
     frappe.logger().info("Daily Sales Summary: nightly refresh complete")
@@ -214,13 +193,12 @@ def scheduled_daily_refresh():
 
 ### Rebuild historical data
 
-For backfilling a whole range — run from the bench console — iterate day by day
-and publish progress so the operator sees movement on large rebuilds.
+For backfilling a range from the bench console, iterate day by day with progress:
 
 ```python title="scoopjoy/scoopjoy/utils/daily_summary.py"
 def rebuild_historical_summaries(from_date, to_date):
     """
-    Rebuild summaries for a date range. Use from bench console:
+    Rebuild summaries for a date range. From bench console:
     >>> from scoopjoy.scoopjoy.utils.daily_summary import rebuild_historical_summaries
     >>> rebuild_historical_summaries("2025-01-01", "2025-03-31")
     """
@@ -248,9 +226,7 @@ def rebuild_historical_summaries(from_date, to_date):
 
 ## Step 3: Dashboard API reads from the summary
 
-Every dashboard metric now queries the small summary table instead of the raw
-invoice table — month-to-date totals, a 30-day trend, and the top 10 outlets are
-three quick aggregations over a few thousand rows.
+Every dashboard metric now queries the small summary table instead of the raw invoice table — MTD totals, a 30-day trend, and top 10 outlets are three quick aggregations over a few thousand rows:
 
 ```python title="scoopjoy/scoopjoy/api/dashboard.py" {12-22}
 import frappe
@@ -267,7 +243,7 @@ def get_dashboard_metrics():
     DSS = frappe.qb.DocType("Daily Sales Summary")
     month_start = get_first_day(today())
 
-    # Month-to-date metrics -- single query on the summary table
+    # Month-to-date metrics — single query on the summary table
     mtd = (
         frappe.qb.from_(DSS)
         .select(
@@ -315,10 +291,7 @@ def get_dashboard_metrics():
     }
 ```
 
-## Step 4: Wire it up in `hooks.py`
-
-Register the incremental update on the `Sales Invoice` lifecycle events and the
-nightly refresh under `scheduler_events`.
+## Step 4: Wire it up in hooks.py
 
 ```python title="scoopjoy/hooks.py"
 doc_events = {
@@ -343,16 +316,9 @@ scheduler_events = {
 ```
 
 :::note[Why this works]
-The `Daily Sales Summary` DocType acts as a materialized view. Instead of
-scanning 500K+ invoice rows, the dashboard reads from ~3,000 summary rows (100
-outlets × 30 days). The incremental update on `on_submit` keeps it
-near-real-time, while the nightly refresh catches edge cases like backdated
-entries and corrections.
+The `Daily Sales Summary` DocType acts as a materialized view: instead of scanning 500K+ invoice rows, the dashboard reads ~3,000 summary rows (100 outlets × 30 days). The incremental update on `on_submit` keeps it near-real-time; the nightly refresh catches backdated entries and corrections.
 :::
 
 :::caution[Common mistake]
-Updating the summary synchronously inside `on_submit` for complex aggregations.
-If the summary refresh takes 500ms, every invoice submission slows down by
-500ms. For expensive refreshes, use `frappe.enqueue()` to run the update in a
-background job.
+Updating the summary synchronously inside `on_submit` when the aggregation is expensive — if the refresh takes 500ms, every invoice submission slows by 500ms. For heavy refreshes, use `frappe.enqueue()` to run the update in a background job.
 :::
