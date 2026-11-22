@@ -1,4 +1,4 @@
-import { PAGE_TITLE_ID } from "node_modules/@astrojs/starlight/constants";
+import { PAGE_TITLE_ID } from "@/lib/utils/starlight";
 
 
 

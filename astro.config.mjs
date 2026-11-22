@@ -19,6 +19,10 @@ export const locales = locals
 
 // https://astro.build/config
 export default defineConfig({
+  // Starlight 0.43 follows Astro's default `attribute` scoping strategy. The
+  // component overrides here were built against the previous `where` strategy,
+  // so keep it to avoid specificity and class-forwarding regressions.
+  scopedStyleStrategy: "where",
   // The catalog moved from /courses/ to /content/. Keep old links working.
   redirects: {
     "/courses": "/content/",
